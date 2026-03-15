@@ -53,6 +53,9 @@ pub struct CacheKit {
 
     #[cfg(feature = "l1")]
     l1: Option<crate::l1::L1Cache>,
+
+    #[cfg(feature = "encryption")]
+    encryption: Option<std::sync::Arc<crate::encryption::EncryptionLayer>>,
 }
 
 impl CacheKit {
@@ -90,15 +93,16 @@ impl CacheKit {
             .max_payload_bytes(config.max_payload_bytes)
             .l1_capacity(config.l1_capacity);
 
-        if let Some(ns) = config.namespace {
+        if let Some(ns) = config.namespace.clone() {
             builder = builder.namespace(ns);
         }
 
-        // TODO: Encryption wiring (Chunk 7)
-        // if let Some(ref master_key) = config.master_key {
-        //     let namespace = config.namespace.as_deref().unwrap_or("default");
-        //     builder = builder.encryption_from_bytes(master_key, namespace)?;
-        // }
+        // Wire up encryption if master key is configured
+        #[cfg(feature = "encryption")]
+        if let Some(ref master_key) = config.master_key {
+            let namespace = config.namespace.as_deref().unwrap_or("default");
+            builder = builder.encryption_from_bytes(master_key, namespace)?;
+        }
 
         Ok(builder)
     }
@@ -217,6 +221,25 @@ impl CacheKit {
         Ok(self.backend.exists(&self.namespaced_key(key)).await?)
     }
 
+    // ── Secure cache ─────────────────────────────────────────────────────────
+
+    /// Return a [`SecureCache`] handle that encrypts all values before storage.
+    ///
+    /// L1 stores **ciphertext** (not plaintext) to preserve the zero-knowledge
+    /// property across all cache layers.
+    ///
+    /// # Errors
+    /// Returns `CachekitError::Config` if no encryption layer is configured.
+    /// Configure encryption via [`CacheKitBuilder::encryption`] or
+    /// [`CacheKitBuilder::encryption_from_bytes`].
+    #[cfg(feature = "encryption")]
+    pub fn secure(&self) -> Result<SecureCache<'_>, CachekitError> {
+        let enc = self.encryption.as_ref().ok_or_else(|| {
+            CachekitError::Config("encryption requires CACHEKIT_MASTER_KEY or .encryption() on builder".to_owned())
+        })?;
+        Ok(SecureCache { client: self, encryption: enc })
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     fn check_payload_size(&self, size: usize) -> Result<(), CachekitError> {
@@ -227,6 +250,109 @@ impl CacheKit {
             });
         }
         Ok(())
+    }
+}
+
+// ── SecureCache ──────────────────────────────────────────────────────────────
+
+/// Encrypted cache handle returned by [`CacheKit::secure()`].
+///
+/// All values are serialized, then encrypted with AES-256-GCM before storage.
+/// L1 stores ciphertext to maintain zero-knowledge guarantees.
+#[cfg(feature = "encryption")]
+pub struct SecureCache<'a> {
+    client: &'a CacheKit,
+    encryption: &'a crate::encryption::EncryptionLayer,
+}
+
+#[cfg(feature = "encryption")]
+impl std::fmt::Debug for SecureCache<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecureCache")
+            .field("tenant_id", &self.encryption.tenant_id())
+            .finish()
+    }
+}
+
+#[cfg(feature = "encryption")]
+impl<'a> SecureCache<'a> {
+    /// Encrypt and store `value` under `key` using the client's default TTL.
+    pub async fn set<T: Serialize>(&self, key: &str, value: &T) -> Result<(), CachekitError> {
+        self.set_with_ttl(key, value, self.client.default_ttl).await
+    }
+
+    /// Encrypt and store `value` under `key` with an explicit `ttl`.
+    pub async fn set_with_ttl<T: Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+        ttl: Duration,
+    ) -> Result<(), CachekitError> {
+        validate_key(key)?;
+
+        if ttl < Duration::from_secs(1) {
+            return Err(CachekitError::Config(format!(
+                "TTL must be at least 1 second; got {ttl:?}"
+            )));
+        }
+
+        // Serialize then encrypt
+        let plaintext = serializer::serialize(value)?;
+        self.client.check_payload_size(plaintext.len())?;
+        let ciphertext = self.encryption.encrypt(&plaintext, key)?;
+
+        let full_key = self.client.namespaced_key(key);
+        self.client.backend.set(&full_key, ciphertext.clone(), Some(ttl)).await?;
+
+        // Write-through to L1 with ciphertext (preserves zero-knowledge)
+        #[cfg(feature = "l1")]
+        if let Some(ref l1) = self.client.l1 {
+            l1.set(&full_key, &ciphertext, ttl);
+        }
+
+        Ok(())
+    }
+
+    /// Retrieve, decrypt, and deserialize a value stored under `key`.
+    ///
+    /// Checks L1 (which holds ciphertext) before the backend.
+    pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, CachekitError> {
+        validate_key(key)?;
+        let full_key = self.client.namespaced_key(key);
+
+        // L1 hit (ciphertext)
+        #[cfg(feature = "l1")]
+        if let Some(ref l1) = self.client.l1 {
+            if let Some(ciphertext) = l1.get(&full_key) {
+                let plaintext = self.encryption.decrypt(&ciphertext, key)?;
+                return Ok(Some(serializer::deserialize(&plaintext)?));
+            }
+        }
+
+        // L2 backend
+        let ciphertext = match self.client.backend.get(&full_key).await? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+
+        // Populate L1 with ciphertext on L2 hit
+        #[cfg(feature = "l1")]
+        if let Some(ref l1) = self.client.l1 {
+            l1.set(&full_key, &ciphertext, self.client.default_ttl);
+        }
+
+        let plaintext = self.encryption.decrypt(&ciphertext, key)?;
+        Ok(Some(serializer::deserialize(&plaintext)?))
+    }
+
+    /// Delete an encrypted key. Behaves identically to [`CacheKit::delete`].
+    pub async fn delete(&self, key: &str) -> Result<bool, CachekitError> {
+        self.client.delete(key).await
+    }
+
+    /// Check if an encrypted key exists. Behaves identically to [`CacheKit::exists`].
+    pub async fn exists(&self, key: &str) -> Result<bool, CachekitError> {
+        self.client.exists(key).await
     }
 }
 
@@ -245,6 +371,9 @@ pub struct CacheKitBuilder {
 
     #[cfg(feature = "l1")]
     no_l1: bool,
+
+    #[cfg(feature = "encryption")]
+    encryption: Option<std::sync::Arc<crate::encryption::EncryptionLayer>>,
 }
 
 impl CacheKitBuilder {
@@ -297,6 +426,39 @@ impl CacheKitBuilder {
         self
     }
 
+    /// Configure encryption from raw master key bytes and tenant ID.
+    ///
+    /// The master key must be at least 16 bytes (32 recommended).
+    /// Keys are derived per-tenant via HKDF-SHA256.
+    #[cfg(feature = "encryption")]
+    pub fn encryption_from_bytes(mut self, master_key: &[u8], tenant_id: &str) -> Result<Self, CachekitError> {
+        let layer = crate::encryption::EncryptionLayer::new(master_key, tenant_id)?;
+        self.encryption = Some(std::sync::Arc::new(layer));
+        Ok(self)
+    }
+
+    /// Configure encryption from a hex-encoded master key string.
+    ///
+    /// Convenience wrapper that hex-decodes then delegates to
+    /// [`Self::encryption_from_bytes`].
+    #[cfg(feature = "encryption")]
+    pub fn encryption(self, hex_key: &str, tenant_id: &str) -> Result<Self, CachekitError> {
+        let bytes =
+            hex::decode(hex_key).map_err(|e| CachekitError::Config(format!("master key is not valid hex: {e}")))?;
+        self.encryption_from_bytes(&bytes, tenant_id)
+    }
+
+    // Stub for when encryption feature is disabled.
+    #[cfg(not(feature = "encryption"))]
+    pub fn encryption_from_bytes(self, _master_key: &[u8], _tenant_id: &str) -> Result<Self, CachekitError> {
+        Ok(self)
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    pub fn encryption(self, _hex_key: &str, _tenant_id: &str) -> Result<Self, CachekitError> {
+        Ok(self)
+    }
+
     /// Finalise and build the [`CacheKit`] client.
     ///
     /// Returns an error if no backend was provided.
@@ -321,6 +483,9 @@ impl CacheKitBuilder {
 
             #[cfg(feature = "l1")]
             l1,
+
+            #[cfg(feature = "encryption")]
+            encryption: self.encryption,
         })
     }
 }
