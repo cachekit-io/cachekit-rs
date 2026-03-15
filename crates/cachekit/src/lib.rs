@@ -13,10 +13,12 @@ compile_error!("features `workers` and `l1` are mutually exclusive — moka requ
 pub mod backend;
 pub mod client;
 pub mod config;
-pub mod encryption;
 pub mod error;
 pub mod key;
 pub mod serializer;
+
+#[cfg(feature = "encryption")]
+pub mod encryption;
 
 #[cfg(feature = "l1")]
 pub mod l1;
@@ -26,7 +28,18 @@ pub use client::{CacheKit, CacheKitBuilder, SharedBackend};
 pub use config::CachekitConfig;
 pub use error::{BackendError, BackendErrorKind, CachekitError};
 
+#[cfg(feature = "encryption")]
+pub use client::SecureCache;
+#[cfg(feature = "encryption")]
+pub use encryption::EncryptionLayer;
+
+#[cfg(feature = "macros")]
+pub use cachekit_macros::cachekit;
+
 /// Convenient glob import for the most common types.
 pub mod prelude {
     pub use crate::{BackendError, BackendErrorKind, CacheKit, CacheKitBuilder, CachekitConfig, CachekitError};
+
+    #[cfg(feature = "encryption")]
+    pub use crate::{EncryptionLayer, SecureCache};
 }

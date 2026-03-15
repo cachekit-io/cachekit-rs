@@ -76,3 +76,6 @@ pub mod cachekitio;
 
 #[cfg(feature = "redis")]
 pub mod redis;
+
+#[cfg(feature = "workers")]
+pub mod workers;

@@ -11,7 +11,7 @@ description = "Production-ready Redis caching for Rust. Supports cachekit.io Saa
 default = ["cachekitio", "encryption", "l1"]
 cachekitio = ["dep:reqwest"]
 redis = ["dep:fred"]
-workers = ["dep:worker", "dep:js-sys"]
+workers = ["dep:worker", "dep:js-sys", "dep:getrandom"]
 encryption = ["cachekit-core/encryption"]
 l1 = ["dep:moka"]
 macros = ["dep:cachekit-macros"]
@@ -40,6 +40,7 @@ moka = { version = "0.12", optional = true, features = ["sync"] }
 # Optional: Cloudflare Workers
 worker = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
+getrandom = { version = "0.2", optional = true, features = ["js"] }
 
 # Optional: proc-macro decorator
 cachekit-macros = { version = "0.1", path = "../cachekit-macros", optional = true }
