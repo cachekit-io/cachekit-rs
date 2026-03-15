@@ -21,12 +21,12 @@ pub mod serializer;
 #[cfg(feature = "l1")]
 pub mod l1;
 
-// Re-exports — populated as modules are implemented
-// pub use client::CacheKit;          // Chunk 6
+// Re-exports
+pub use client::{CacheKit, CacheKitBuilder, SharedBackend};
 pub use config::CachekitConfig;
 pub use error::{BackendError, BackendErrorKind, CachekitError};
 
 /// Convenient glob import for the most common types.
 pub mod prelude {
-    pub use crate::{BackendError, BackendErrorKind, CachekitConfig, CachekitError};
+    pub use crate::{BackendError, BackendErrorKind, CacheKit, CacheKitBuilder, CachekitConfig, CachekitError};
 }
