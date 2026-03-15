@@ -36,6 +36,12 @@ pub use encryption::EncryptionLayer;
 #[cfg(feature = "macros")]
 pub use cachekit_macros::cachekit;
 
+/// Re-exports for proc-macro generated code. Not part of the public API.
+#[doc(hidden)]
+pub mod __private {
+    pub use rmp_serde;
+}
+
 /// Convenient glob import for the most common types.
 pub mod prelude {
     pub use crate::{BackendError, BackendErrorKind, CacheKit, CacheKitBuilder, CachekitConfig, CachekitError};

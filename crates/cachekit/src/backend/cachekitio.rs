@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use zeroize::Zeroizing;
 
 use crate::backend::{Backend, HealthStatus};
-use crate::error::BackendError;
+use crate::error::{BackendError, BackendErrorKind};
 
 // ── CachekitIO ────────────────────────────────────────────────────────────────
 
@@ -52,6 +52,18 @@ impl CachekitIO {
     }
 }
 
+// ── Error helpers ────────────────────────────────────────────────────────────
+
+/// Convert a reqwest error into a BackendError, preserving the source.
+fn reqwest_err(e: reqwest::Error) -> BackendError {
+    let kind = if e.is_timeout() {
+        BackendErrorKind::Timeout
+    } else {
+        BackendErrorKind::Transient
+    };
+    BackendError { kind, message: e.to_string(), source: Some(Box::new(e)) }
+}
+
 // ── Backend impl ──────────────────────────────────────────────────────────────
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -64,17 +76,11 @@ impl Backend for CachekitIO {
             .bearer_auth(self.api_key.as_str())
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    BackendError::timeout(e.to_string())
-                } else {
-                    BackendError::transient(e.to_string())
-                }
-            })?;
+            .map_err(reqwest_err)?;
 
         match resp.status().as_u16() {
             200 => {
-                let bytes = resp.bytes().await.map_err(|e| BackendError::transient(e.to_string()))?;
+                let bytes = resp.bytes().await.map_err(reqwest_err)?;
                 Ok(Some(bytes.to_vec()))
             }
             404 => Ok(None),
@@ -97,13 +103,7 @@ impl Backend for CachekitIO {
             req = req.header("X-Cache-TTL", ttl.as_secs().to_string());
         }
 
-        let resp = req.send().await.map_err(|e| {
-            if e.is_timeout() {
-                BackendError::timeout(e.to_string())
-            } else {
-                BackendError::transient(e.to_string())
-            }
-        })?;
+        let resp = req.send().await.map_err(reqwest_err)?;
 
         let status = resp.status().as_u16();
         if (200..300).contains(&status) {
@@ -121,13 +121,7 @@ impl Backend for CachekitIO {
             .bearer_auth(self.api_key.as_str())
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    BackendError::timeout(e.to_string())
-                } else {
-                    BackendError::transient(e.to_string())
-                }
-            })?;
+            .map_err(reqwest_err)?;
 
         match resp.status().as_u16() {
             200 | 204 => Ok(true),
@@ -146,13 +140,7 @@ impl Backend for CachekitIO {
             .bearer_auth(self.api_key.as_str())
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    BackendError::timeout(e.to_string())
-                } else {
-                    BackendError::transient(e.to_string())
-                }
-            })?;
+            .map_err(reqwest_err)?;
 
         match resp.status().as_u16() {
             200 => Ok(true),
@@ -172,13 +160,7 @@ impl Backend for CachekitIO {
             .bearer_auth(self.api_key.as_str())
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    BackendError::timeout(e.to_string())
-                } else {
-                    BackendError::transient(e.to_string())
-                }
-            })?;
+            .map_err(reqwest_err)?;
 
         let latency = start.elapsed();
         let status = resp.status().as_u16();

@@ -18,7 +18,7 @@ fn redis_err(e: RedisError) -> BackendError {
         RedisErrorKind::Canceled => BackendErrorKind::Transient,
         _ => BackendErrorKind::Permanent,
     };
-    BackendError { kind, message: e.to_string() }
+    BackendError { kind, message: e.to_string(), source: Some(Box::new(e)) }
 }
 
 // ── RedisBackend ──────────────────────────────────────────────────────────────

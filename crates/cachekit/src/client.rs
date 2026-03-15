@@ -18,6 +18,20 @@ pub type SharedBackend = std::sync::Arc<dyn Backend>;
 #[cfg(target_arch = "wasm32")]
 pub type SharedBackend = std::rc::Rc<dyn Backend>;
 
+// ── SharedEncryption type alias ──────────────────────────────────────────────
+
+/// Thread-safe reference to the encryption layer.
+///
+/// On native targets `Arc` is used (requires `Sync`).
+/// On `wasm32` the Workers runtime is single-threaded so `Rc` is sufficient
+/// and avoids the `!Sync` problem caused by `Cell<u64>` inside cachekit-core's
+/// nonce counter.
+#[cfg(all(feature = "encryption", not(target_arch = "wasm32")))]
+type SharedEncryption = std::sync::Arc<crate::encryption::EncryptionLayer>;
+
+#[cfg(all(feature = "encryption", target_arch = "wasm32"))]
+type SharedEncryption = std::rc::Rc<crate::encryption::EncryptionLayer>;
+
 // ── Key validation ────────────────────────────────────────────────────────────
 
 const MAX_KEY_BYTES: usize = 1024;
@@ -55,7 +69,7 @@ pub struct CacheKit {
     l1: Option<crate::l1::L1Cache>,
 
     #[cfg(feature = "encryption")]
-    encryption: Option<std::sync::Arc<crate::encryption::EncryptionLayer>>,
+    encryption: Option<SharedEncryption>,
 }
 
 impl CacheKit {
@@ -373,7 +387,7 @@ pub struct CacheKitBuilder {
     no_l1: bool,
 
     #[cfg(feature = "encryption")]
-    encryption: Option<std::sync::Arc<crate::encryption::EncryptionLayer>>,
+    encryption: Option<SharedEncryption>,
 }
 
 impl CacheKitBuilder {
@@ -433,7 +447,7 @@ impl CacheKitBuilder {
     #[cfg(feature = "encryption")]
     pub fn encryption_from_bytes(mut self, master_key: &[u8], tenant_id: &str) -> Result<Self, CachekitError> {
         let layer = crate::encryption::EncryptionLayer::new(master_key, tenant_id)?;
-        self.encryption = Some(std::sync::Arc::new(layer));
+        self.encryption = Some(SharedEncryption::new(layer));
         Ok(self)
     }
 

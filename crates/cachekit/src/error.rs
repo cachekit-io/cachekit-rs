@@ -71,27 +71,35 @@ pub struct BackendError {
     pub kind: BackendErrorKind,
     /// Human-readable description.
     pub message: String,
+    /// The underlying error that caused this backend error, if any.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[source]
+    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    /// The underlying error that caused this backend error, if any.
+    #[cfg(target_arch = "wasm32")]
+    #[source]
+    pub source: Option<Box<dyn std::error::Error>>,
 }
 
 impl BackendError {
     /// Create a transient (retryable) backend error.
     pub fn transient(message: impl Into<String>) -> Self {
-        Self { kind: BackendErrorKind::Transient, message: message.into() }
+        Self { kind: BackendErrorKind::Transient, message: message.into(), source: None }
     }
 
     /// Create a permanent (non-retryable) backend error.
     pub fn permanent(message: impl Into<String>) -> Self {
-        Self { kind: BackendErrorKind::Permanent, message: message.into() }
+        Self { kind: BackendErrorKind::Permanent, message: message.into(), source: None }
     }
 
     /// Create a timeout backend error.
     pub fn timeout(message: impl Into<String>) -> Self {
-        Self { kind: BackendErrorKind::Timeout, message: message.into() }
+        Self { kind: BackendErrorKind::Timeout, message: message.into(), source: None }
     }
 
     /// Create an authentication backend error.
     pub fn auth(message: impl Into<String>) -> Self {
-        Self { kind: BackendErrorKind::Authentication, message: message.into() }
+        Self { kind: BackendErrorKind::Authentication, message: message.into(), source: None }
     }
 
     /// Construct a [`BackendError`] from an HTTP status code and response body.
@@ -109,6 +117,6 @@ impl BackendError {
             _ => BackendErrorKind::Permanent,
         };
 
-        Self { kind, message }
+        Self { kind, message, source: None }
     }
 }

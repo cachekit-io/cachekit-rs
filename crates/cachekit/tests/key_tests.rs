@@ -2,7 +2,7 @@ use cachekit::key::generate_cache_key;
 
 #[test]
 fn key_with_namespace() {
-    let key = generate_cache_key("myns", "my_func", b"args");
+    let key = generate_cache_key("myns", "my_func", b"args").unwrap();
     // Format: {namespace}:{64-hex-char hash}
     let parts: Vec<&str> = key.splitn(2, ':').collect();
     assert_eq!(parts.len(), 2, "Expected namespace:hash format");
@@ -16,28 +16,28 @@ fn key_with_namespace() {
 
 #[test]
 fn key_deterministic() {
-    let a = generate_cache_key("ns", "func", b"args");
-    let b = generate_cache_key("ns", "func", b"args");
+    let a = generate_cache_key("ns", "func", b"args").unwrap();
+    let b = generate_cache_key("ns", "func", b"args").unwrap();
     assert_eq!(a, b);
 }
 
 #[test]
 fn key_different_args() {
-    let a = generate_cache_key("ns", "func", b"args1");
-    let b = generate_cache_key("ns", "func", b"args2");
+    let a = generate_cache_key("ns", "func", b"args1").unwrap();
+    let b = generate_cache_key("ns", "func", b"args2").unwrap();
     assert_ne!(a, b);
 }
 
 #[test]
 fn key_different_functions() {
-    let a = generate_cache_key("ns", "func_a", b"args");
-    let b = generate_cache_key("ns", "func_b", b"args");
+    let a = generate_cache_key("ns", "func_a", b"args").unwrap();
+    let b = generate_cache_key("ns", "func_b", b"args").unwrap();
     assert_ne!(a, b);
 }
 
 #[test]
 fn key_without_namespace() {
-    let key = generate_cache_key("", "func", b"args");
+    let key = generate_cache_key("", "func", b"args").unwrap();
     // No colon prefix — just the 64-char hex hash
     assert_eq!(key.len(), 64, "Without namespace, key is just the hash");
     assert!(
