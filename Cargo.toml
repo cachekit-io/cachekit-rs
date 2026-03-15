@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/cachekit", "crates/cachekit-macros"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://gitlab.com/cachekit/cachekit-rs"
