@@ -171,6 +171,8 @@ impl Backend for WorkersCachekitIO {
             let mut details = HashMap::new();
             details.insert("http_status".to_string(), status.to_string());
             Ok(HealthStatus {
+                is_healthy: true,
+                latency_ms: 0.0,
                 backend_type: "workers-cachekitio".to_string(),
                 details,
             })

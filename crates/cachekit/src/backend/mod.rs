@@ -10,9 +10,13 @@ use crate::error::BackendError;
 /// Describes the health of a backend at a point in time.
 #[derive(Debug, Clone)]
 pub struct HealthStatus {
+    /// Whether the backend is considered healthy.
+    pub is_healthy: bool,
+    /// Round-trip latency of the health check in milliseconds.
+    pub latency_ms: f64,
     /// Human-readable name for this backend implementation.
     pub backend_type: String,
-    /// Optional key-value details (latency, pool size, etc.).
+    /// Optional key-value details (pool size, version, etc.).
     pub details: HashMap<String, String>,
 }
 

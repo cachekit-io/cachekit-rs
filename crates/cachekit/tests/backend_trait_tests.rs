@@ -1,40 +1,9 @@
-use async_trait::async_trait;
-use cachekit::backend::{Backend, HealthStatus};
+mod common;
+
 use cachekit::error::{BackendError, CachekitError};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-// ── MockBackend ───────────────────────────────────────────────────────────────
-
-#[derive(Clone, Default)]
-struct MockBackend {
-    store: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-}
-
-#[async_trait]
-impl Backend for MockBackend {
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
-        Ok(self.store.lock().unwrap().get(key).cloned())
-    }
-
-    async fn set(&self, key: &str, value: Vec<u8>, _ttl: Option<Duration>) -> Result<(), BackendError> {
-        self.store.lock().unwrap().insert(key.to_owned(), value);
-        Ok(())
-    }
-
-    async fn delete(&self, key: &str) -> Result<bool, BackendError> {
-        Ok(self.store.lock().unwrap().remove(key).is_some())
-    }
-
-    async fn exists(&self, key: &str) -> Result<bool, BackendError> {
-        Ok(self.store.lock().unwrap().contains_key(key))
-    }
-
-    async fn health(&self) -> Result<HealthStatus, BackendError> {
-        Ok(HealthStatus { backend_type: "mock".to_owned(), details: HashMap::new() })
-    }
-}
+use crate::common::MockBackend;
+use cachekit::backend::Backend;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -82,6 +51,7 @@ async fn health_returns_backend_type() {
     let backend = MockBackend::default();
     let status = backend.health().await.unwrap();
     assert_eq!(status.backend_type, "mock");
+    assert!(status.is_healthy);
 }
 
 #[tokio::test]

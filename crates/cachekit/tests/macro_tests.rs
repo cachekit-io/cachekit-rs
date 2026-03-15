@@ -5,6 +5,8 @@
 
 #![cfg(feature = "macros")]
 
+mod common;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +19,7 @@ use cachekit::backend::{Backend, HealthStatus};
 use cachekit::error::BackendError;
 use cachekit::{cachekit, CacheKit, CachekitError};
 
-// ── MockBackend ──────────────────────────────────────────────────────────────
+// ── CountingBackend ──────────────────────────────────────────────────────────
 
 /// In-memory backend that also counts how many get/set calls it receives.
 #[derive(Debug, Default)]
@@ -58,6 +60,8 @@ impl Backend for CountingBackend {
 
     async fn health(&self) -> Result<HealthStatus, BackendError> {
         Ok(HealthStatus {
+            is_healthy: true,
+            latency_ms: 0.0,
             backend_type: "mock".to_owned(),
             details: HashMap::new(),
         })

@@ -3,57 +3,15 @@
 //! Run with:
 //!   cargo test --test encryption_tests --features cachekitio,encryption,l1
 
-use std::collections::HashMap;
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 
-use cachekit::backend::{Backend, HealthStatus};
-use cachekit::error::BackendError;
+use crate::common::MockBackend;
 use cachekit::{CacheKit, CachekitError};
-
-// ── MockBackend ───────────────────────────────────────────────────────────────
-
-#[derive(Debug, Default, Clone)]
-struct MockBackend {
-    store: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-}
-
-impl MockBackend {
-    fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-}
-
-#[async_trait]
-impl Backend for MockBackend {
-    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
-        Ok(self.store.lock().await.get(key).cloned())
-    }
-
-    async fn set(&self, key: &str, value: Vec<u8>, _ttl: Option<Duration>) -> Result<(), BackendError> {
-        self.store.lock().await.insert(key.to_owned(), value);
-        Ok(())
-    }
-
-    async fn delete(&self, key: &str) -> Result<bool, BackendError> {
-        Ok(self.store.lock().await.remove(key).is_some())
-    }
-
-    async fn exists(&self, key: &str) -> Result<bool, BackendError> {
-        Ok(self.store.lock().await.contains_key(key))
-    }
-
-    async fn health(&self) -> Result<HealthStatus, BackendError> {
-        Ok(HealthStatus {
-            backend_type: "mock".to_owned(),
-            details: HashMap::new(),
-        })
-    }
-}
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
 

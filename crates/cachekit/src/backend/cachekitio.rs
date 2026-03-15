@@ -167,9 +167,13 @@ impl Backend for CachekitIO {
 
         if (200..300).contains(&status) {
             let mut details = HashMap::new();
-            details.insert("latency_ms".to_string(), latency.as_millis().to_string());
             details.insert("http_status".to_string(), status.to_string());
-            Ok(HealthStatus { backend_type: "cachekitio".to_string(), details })
+            Ok(HealthStatus {
+                is_healthy: true,
+                latency_ms: latency.as_secs_f64() * 1000.0,
+                backend_type: "cachekitio".to_string(),
+                details,
+            })
         } else {
             let body = resp.bytes().await.unwrap_or_default();
             Err(BackendError::from_http_status(status, &body))
@@ -182,14 +186,14 @@ impl Backend for CachekitIO {
 /// Builder for [`CachekitIO`].
 #[derive(Default)]
 pub struct CachekitIOBuilder {
-    api_key: Option<String>,
+    api_key: Option<Zeroizing<String>>,
     api_url: Option<String>,
 }
 
 impl CachekitIOBuilder {
     /// Set the API key (required).
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
-        self.api_key = Some(key.into());
+        self.api_key = Some(Zeroizing::new(key.into()));
         self
     }
 
@@ -213,6 +217,7 @@ impl CachekitIOBuilder {
             .api_key
             .filter(|k| !k.is_empty())
             .ok_or_else(|| CachekitError::Config("api_key is required".to_string()))?;
+        // api_key is already Zeroizing<String> from the builder — no re-wrapping needed.
 
         let api_url = self.api_url.unwrap_or_else(|| "https://api.cachekit.io".to_string());
 
@@ -231,6 +236,6 @@ impl CachekitIOBuilder {
             .build()
             .map_err(|e| CachekitError::Config(format!("failed to build HTTP client: {e}")))?;
 
-        Ok(CachekitIO { client, api_key: Zeroizing::new(api_key), api_url })
+        Ok(CachekitIO { client, api_key, api_url })
     }
 }

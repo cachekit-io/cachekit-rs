@@ -36,6 +36,10 @@ type SharedEncryption = std::rc::Rc<crate::encryption::EncryptionLayer>;
 
 const MAX_KEY_BYTES: usize = 1024;
 
+/// Maximum TTL for L1 entries populated from L2 cache hits.
+/// Uses a short ceiling to limit staleness when the original TTL is unknown.
+const L1_BACKFILL_TTL_SECS: u64 = 30;
+
 fn validate_key(key: &str) -> Result<(), CachekitError> {
     if key.is_empty() {
         return Err(CachekitError::InvalidKey("key must not be empty".to_owned()));
@@ -89,14 +93,12 @@ impl CacheKit {
 
         let config = CachekitConfig::from_env()?;
 
-        let api_key = config
+        let api_key_z = config
             .api_key
-            .as_deref()
-            .ok_or_else(|| CachekitError::Config("CACHEKIT_API_KEY is required".to_owned()))?
-            .to_owned();
+            .ok_or_else(|| CachekitError::Config("CACHEKIT_API_KEY is required".to_owned()))?;
 
         let backend = CachekitIO::builder()
-            .api_key(api_key)
+            .api_key(api_key_z.as_str())
             .api_url(config.api_url)
             .build()
             .map_err(|e| CachekitError::Config(e.to_string()))?;
@@ -157,10 +159,11 @@ impl CacheKit {
 
         self.check_payload_size(bytes.len())?;
 
-        // Populate L1 on L2 hit
+        // Populate L1 on L2 hit (capped TTL to limit staleness)
         #[cfg(feature = "l1")]
         if let Some(ref l1) = self.l1 {
-            l1.set(&full_key, &bytes, self.default_ttl);
+            let l1_ttl = std::cmp::min(self.default_ttl, Duration::from_secs(L1_BACKFILL_TTL_SECS));
+            l1.set(&full_key, &bytes, l1_ttl);
         }
 
         Ok(Some(serializer::deserialize(&bytes)?))
@@ -338,6 +341,7 @@ impl<'a> SecureCache<'a> {
         #[cfg(feature = "l1")]
         if let Some(ref l1) = self.client.l1 {
             if let Some(ciphertext) = l1.get(&full_key) {
+                self.client.check_payload_size(ciphertext.len())?;
                 let plaintext = self.encryption.decrypt(&ciphertext, key)?;
                 return Ok(Some(serializer::deserialize(&plaintext)?));
             }
@@ -349,10 +353,13 @@ impl<'a> SecureCache<'a> {
             None => return Ok(None),
         };
 
-        // Populate L1 with ciphertext on L2 hit
+        self.client.check_payload_size(ciphertext.len())?;
+
+        // Populate L1 with ciphertext on L2 hit (capped TTL to limit staleness)
         #[cfg(feature = "l1")]
         if let Some(ref l1) = self.client.l1 {
-            l1.set(&full_key, &ciphertext, self.client.default_ttl);
+            let l1_ttl = std::cmp::min(self.client.default_ttl, Duration::from_secs(L1_BACKFILL_TTL_SECS));
+            l1.set(&full_key, &ciphertext, l1_ttl);
         }
 
         let plaintext = self.encryption.decrypt(&ciphertext, key)?;
@@ -480,6 +487,19 @@ impl CacheKitBuilder {
         let backend = self
             .backend
             .ok_or_else(|| CachekitError::Config("a backend must be provided via .backend()".to_owned()))?;
+
+        // Validate namespace if provided
+        if let Some(ref ns) = self.namespace {
+            if ns.is_empty() {
+                return Err(CachekitError::Config("namespace cannot be empty".into()));
+            }
+            if ns.len() > 255 {
+                return Err(CachekitError::Config("namespace exceeds 255 bytes".into()));
+            }
+            if !ns.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+                return Err(CachekitError::Config("namespace must be ASCII printable".into()));
+            }
+        }
 
         #[cfg(feature = "l1")]
         let l1 = if self.no_l1 {

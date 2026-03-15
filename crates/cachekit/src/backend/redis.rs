@@ -87,7 +87,12 @@ impl Backend for RedisBackend {
 
         let mut details = HashMap::new();
         details.insert("latency_ms".to_string(), latency.as_millis().to_string());
-        Ok(HealthStatus { backend_type: "redis".to_string(), details })
+        Ok(HealthStatus {
+            is_healthy: true,
+            latency_ms: latency.as_secs_f64() * 1000.0,
+            backend_type: "redis".to_string(),
+            details,
+        })
     }
 }
 
