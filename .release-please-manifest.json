@@ -1,3 +1,4 @@
 {
-  ".": "0.0.1-alpha.1"
+  "crates/cachekit": "0.0.1-alpha.1",
+  "crates/cachekit-macros": "0.1.0"
 }

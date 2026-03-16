@@ -15,9 +15,15 @@
     {"type": "build", "section": "Build System", "hidden": true}
   ],
   "packages": {
-    ".": {
+    "crates/cachekit": {
       "package-name": "cachekit-rs",
-      "changelog-path": "CHANGELOG.md"
+      "changelog-path": "CHANGELOG.md",
+      "component": "cachekit-rs"
+    },
+    "crates/cachekit-macros": {
+      "package-name": "cachekit-macros",
+      "changelog-path": "crates/cachekit-macros/CHANGELOG.md",
+      "component": "cachekit-macros"
     }
   }
 }
