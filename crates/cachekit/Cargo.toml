@@ -12,14 +12,14 @@ default = ["cachekitio", "encryption", "l1"]
 cachekitio = ["dep:reqwest"]
 redis = ["dep:fred"]
 workers = ["dep:worker", "dep:js-sys", "dep:getrandom"]
-# TODO(C1): Add "cachekit-core/wasm" to workers feature once cachekit-core
-# publishes with the `wasm` feature (selects aes-gcm backend instead of ring).
+# cachekit-core 0.2 folds aes-gcm into the `encryption` feature automatically on wasm32.
+# No separate `cachekit-core/wasm` activation needed.
 encryption = ["cachekit-core/encryption"]
 l1 = ["dep:moka"]
 macros = ["dep:cachekit-macros"]
 
 [dependencies]
-cachekit-core = { version = "0.1", features = ["messagepack"] }
+cachekit-core = { version = "0.2", features = ["messagepack"] }
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
 thiserror = "2.0"
