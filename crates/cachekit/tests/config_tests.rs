@@ -1,9 +1,11 @@
 use cachekit::config::{CachekitConfig, CachekitConfigBuilder};
+use serial_test::serial;
 use std::time::Duration;
 
 // ── from_env defaults ────────────────────────────────────────────────────────
 
 #[test]
+#[serial]
 fn config_from_env_defaults() {
     // Clear relevant env vars so we get defaults.
     std::env::remove_var("CACHEKIT_API_KEY");
@@ -24,6 +26,7 @@ fn config_from_env_defaults() {
 }
 
 #[test]
+#[serial]
 fn config_from_env_reads_api_key() {
     std::env::set_var("CACHEKIT_API_KEY", "test-key-123");
     let config = CachekitConfig::from_env().expect("from_env failed");
@@ -37,6 +40,7 @@ fn config_from_env_reads_api_key() {
 }
 
 #[test]
+#[serial]
 fn config_from_env_rejects_http_url() {
     std::env::set_var("CACHEKIT_API_URL", "http://insecure.example.com");
     let result = CachekitConfig::from_env();
@@ -46,6 +50,7 @@ fn config_from_env_rejects_http_url() {
 }
 
 #[test]
+#[serial]
 fn config_from_env_accepts_https_url() {
     std::env::set_var("CACHEKIT_API_URL", "https://custom.cachekit.io");
     let config = CachekitConfig::from_env().expect("from_env failed");
@@ -55,6 +60,7 @@ fn config_from_env_accepts_https_url() {
 }
 
 #[test]
+#[serial]
 fn config_from_env_rejects_short_master_key() {
     // 31 bytes = 62 hex chars — too short
     std::env::set_var("CACHEKIT_MASTER_KEY", "aa".repeat(31));
@@ -65,6 +71,7 @@ fn config_from_env_rejects_short_master_key() {
 }
 
 #[test]
+#[serial]
 fn config_from_env_accepts_32_byte_master_key() {
     // 32 bytes = 64 hex chars — minimum valid
     std::env::set_var("CACHEKIT_MASTER_KEY", "ab".repeat(32));
@@ -76,6 +83,7 @@ fn config_from_env_accepts_32_byte_master_key() {
 }
 
 #[test]
+#[serial]
 fn config_from_env_rejects_ttl_zero() {
     std::env::set_var("CACHEKIT_DEFAULT_TTL", "0");
     let result = CachekitConfig::from_env();
@@ -85,6 +93,7 @@ fn config_from_env_rejects_ttl_zero() {
 }
 
 #[test]
+#[serial]
 fn config_from_env_accepts_ttl_one() {
     std::env::set_var("CACHEKIT_DEFAULT_TTL", "1");
     let config = CachekitConfig::from_env().expect("from_env failed");
@@ -96,6 +105,7 @@ fn config_from_env_accepts_ttl_one() {
 // ── Debug redaction ───────────────────────────────────────────────────────────
 
 #[test]
+#[serial]
 fn config_debug_redacts_secrets() {
     std::env::set_var("CACHEKIT_API_KEY", "super-secret-key");
     std::env::set_var("CACHEKIT_MASTER_KEY", "ab".repeat(32));
