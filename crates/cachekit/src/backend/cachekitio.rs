@@ -43,7 +43,11 @@ impl CachekitIO {
     /// cache key do not break the URL structure.
     fn url(&self, key: &str) -> String {
         let encoded = urlencoding::encode(key);
-        format!("{}/v1/cache/{}", self.api_url.trim_end_matches('/'), encoded)
+        format!(
+            "{}/v1/cache/{}",
+            self.api_url.trim_end_matches('/'),
+            encoded
+        )
     }
 
     /// Build the health-check URL.
@@ -61,7 +65,11 @@ fn reqwest_err(e: reqwest::Error) -> BackendError {
     } else {
         BackendErrorKind::Transient
     };
-    BackendError { kind, message: e.to_string(), source: Some(Box::new(e)) }
+    BackendError {
+        kind,
+        message: e.to_string(),
+        source: Some(Box::new(e)),
+    }
 }
 
 // ── Backend impl ──────────────────────────────────────────────────────────────
@@ -91,7 +99,12 @@ impl Backend for CachekitIO {
         }
     }
 
-    async fn set(&self, key: &str, value: Vec<u8>, ttl: Option<Duration>) -> Result<(), BackendError> {
+    async fn set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
         let mut req = self
             .client
             .put(self.url(key))
@@ -145,9 +158,7 @@ impl Backend for CachekitIO {
         match resp.status().as_u16() {
             200 => Ok(true),
             404 => Ok(false),
-            status => {
-                Err(BackendError::from_http_status(status, &[]))
-            }
+            status => Err(BackendError::from_http_status(status, &[])),
         }
     }
 
@@ -219,7 +230,9 @@ impl CachekitIOBuilder {
             .ok_or_else(|| CachekitError::Config("api_key is required".to_string()))?;
         // api_key is already Zeroizing<String> from the builder — no re-wrapping needed.
 
-        let api_url = self.api_url.unwrap_or_else(|| "https://api.cachekit.io".to_string());
+        let api_url = self
+            .api_url
+            .unwrap_or_else(|| "https://api.cachekit.io".to_string());
 
         // Enforce HTTPS — plaintext HTTP must never transmit API keys or cached data.
         if !api_url.starts_with("https://") {
@@ -236,6 +249,10 @@ impl CachekitIOBuilder {
             .build()
             .map_err(|e| CachekitError::Config(format!("failed to build HTTP client: {e}")))?;
 
-        Ok(CachekitIO { client, api_key, api_url })
+        Ok(CachekitIO {
+            client,
+            api_key,
+            api_url,
+        })
     }
 }

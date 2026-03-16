@@ -54,10 +54,11 @@ impl EncryptionLayer {
             )));
         }
 
-        let tenant_keys =
-            cachekit_core::encryption::key_derivation::derive_tenant_keys(master_key_bytes, tenant_id).map_err(
-                |e| CachekitError::Encryption(format!("key derivation failed: {e}")),
-            )?;
+        let tenant_keys = cachekit_core::encryption::key_derivation::derive_tenant_keys(
+            master_key_bytes,
+            tenant_id,
+        )
+        .map_err(|e| CachekitError::Encryption(format!("key derivation failed: {e}")))?;
 
         let encryptor = ZeroKnowledgeEncryptor::new()
             .map_err(|e| CachekitError::Encryption(format!("encryptor init failed: {e}")))?;
@@ -102,13 +103,18 @@ impl EncryptionLayer {
     /// All lengths are 4-byte big-endian u32 to prevent boundary-confusion attacks.
     pub fn build_aad(&self, cache_key: &str, compressed: bool) -> Vec<u8> {
         let format_str = b"msgpack";
-        let compressed_str = if compressed { b"True" as &[u8] } else { b"False" };
+        let compressed_str = if compressed {
+            b"True" as &[u8]
+        } else {
+            b"False"
+        };
 
         let tenant_bytes = self.tenant_id.as_bytes();
         let key_bytes = cache_key.as_bytes();
 
         // Pre-allocate: version(1) + 4 length fields(16) + data
-        let capacity = 1 + 16 + tenant_bytes.len() + key_bytes.len() + format_str.len() + compressed_str.len();
+        let capacity =
+            1 + 16 + tenant_bytes.len() + key_bytes.len() + format_str.len() + compressed_str.len();
         let mut aad = Vec::with_capacity(capacity);
 
         aad.push(AAD_VERSION);

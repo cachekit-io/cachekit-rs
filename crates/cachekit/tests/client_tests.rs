@@ -34,9 +34,15 @@ fn mock_client() -> CacheKit {
 #[tokio::test]
 async fn client_set_and_get() {
     let client = mock_client();
-    let user = User { id: 1, name: "Alice".to_owned() };
+    let user = User {
+        id: 1,
+        name: "Alice".to_owned(),
+    };
 
-    client.set("user:1", &user).await.expect("set should succeed");
+    client
+        .set("user:1", &user)
+        .await
+        .expect("set should succeed");
 
     let retrieved: User = client
         .get("user:1")
@@ -59,15 +65,30 @@ async fn client_get_missing() {
 #[tokio::test]
 async fn client_delete() {
     let client = mock_client();
-    let user = User { id: 2, name: "Bob".to_owned() };
+    let user = User {
+        id: 2,
+        name: "Bob".to_owned(),
+    };
 
-    client.set("user:2", &user).await.expect("set should succeed");
+    client
+        .set("user:2", &user)
+        .await
+        .expect("set should succeed");
 
-    let existed = client.delete("user:2").await.expect("first delete should succeed");
+    let existed = client
+        .delete("user:2")
+        .await
+        .expect("first delete should succeed");
     assert!(existed, "delete should return true when key existed");
 
-    let already_gone = client.delete("user:2").await.expect("second delete should succeed");
-    assert!(!already_gone, "delete should return false when key was already absent");
+    let already_gone = client
+        .delete("user:2")
+        .await
+        .expect("second delete should succeed");
+    assert!(
+        !already_gone,
+        "delete should return false when key was already absent"
+    );
 }
 
 #[tokio::test]
@@ -98,22 +119,34 @@ async fn client_key_validation() {
     let client = mock_client();
 
     // Empty key
-    let err = client.get::<String>("").await.expect_err("empty key should be rejected");
-    assert!(matches!(err, CachekitError::InvalidKey(_)), "empty key: {err:?}");
+    let err = client
+        .get::<String>("")
+        .await
+        .expect_err("empty key should be rejected");
+    assert!(
+        matches!(err, CachekitError::InvalidKey(_)),
+        "empty key: {err:?}"
+    );
 
     // Control character (newline = 0x0A)
     let err = client
         .get::<String>("bad\nkey")
         .await
         .expect_err("control char key should be rejected");
-    assert!(matches!(err, CachekitError::InvalidKey(_)), "control char: {err:?}");
+    assert!(
+        matches!(err, CachekitError::InvalidKey(_)),
+        "control char: {err:?}"
+    );
 
     // DEL character (0x7F)
     let err = client
         .get::<String>("bad\x7Fkey")
         .await
         .expect_err("DEL char key should be rejected");
-    assert!(matches!(err, CachekitError::InvalidKey(_)), "DEL char: {err:?}");
+    assert!(
+        matches!(err, CachekitError::InvalidKey(_)),
+        "DEL char: {err:?}"
+    );
 
     // Key that is exactly 1025 bytes (one over the limit)
     let too_long = "a".repeat(1025);
@@ -121,7 +154,10 @@ async fn client_key_validation() {
         .get::<String>(&too_long)
         .await
         .expect_err("over-length key should be rejected");
-    assert!(matches!(err, CachekitError::InvalidKey(_)), "too long: {err:?}");
+    assert!(
+        matches!(err, CachekitError::InvalidKey(_)),
+        "too long: {err:?}"
+    );
 
     // Boundary case: exactly 1024 bytes should be accepted
     let client2 = CacheKit::builder()
@@ -131,5 +167,8 @@ async fn client_key_validation() {
         .expect("client builds");
     let at_limit = "a".repeat(1024);
     let result = client2.get::<String>(&at_limit).await;
-    assert!(result.is_ok(), "1024-byte key should be accepted: {result:?}");
+    assert!(
+        result.is_ok(),
+        "1024-byte key should be accepted: {result:?}"
+    );
 }

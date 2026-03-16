@@ -26,8 +26,16 @@ pub struct CachekitConfig {
 
 impl std::fmt::Debug for CachekitConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let api_key_repr = if self.api_key.is_some() { "[REDACTED]" } else { "None" };
-        let master_key_repr = if self.master_key.is_some() { "[REDACTED]" } else { "None" };
+        let api_key_repr = if self.api_key.is_some() {
+            "[REDACTED]"
+        } else {
+            "None"
+        };
+        let master_key_repr = if self.master_key.is_some() {
+            "[REDACTED]"
+        } else {
+            "None"
+        };
 
         f.debug_struct("CachekitConfig")
             .field("api_key", &api_key_repr)
@@ -80,8 +88,9 @@ impl CachekitConfig {
 
         // Master key — hex-decode and validate length >= 32 bytes
         if let Ok(val) = std::env::var("CACHEKIT_MASTER_KEY") {
-            let bytes = hex::decode(&val)
-                .map_err(|e| CachekitError::Config(format!("CACHEKIT_MASTER_KEY is not valid hex: {e}")))?;
+            let bytes = hex::decode(&val).map_err(|e| {
+                CachekitError::Config(format!("CACHEKIT_MASTER_KEY is not valid hex: {e}"))
+            })?;
             if bytes.len() < 32 {
                 return Err(CachekitError::Config(format!(
                     "CACHEKIT_MASTER_KEY must be at least 32 bytes ({} hex chars); got {} bytes",
@@ -94,11 +103,13 @@ impl CachekitConfig {
 
         // Default TTL — minimum 1 second
         if let Ok(val) = std::env::var("CACHEKIT_DEFAULT_TTL") {
-            let secs: u64 = val
-                .parse()
-                .map_err(|e| CachekitError::Config(format!("CACHEKIT_DEFAULT_TTL must be an integer: {e}")))?;
+            let secs: u64 = val.parse().map_err(|e| {
+                CachekitError::Config(format!("CACHEKIT_DEFAULT_TTL must be an integer: {e}"))
+            })?;
             if secs < 1 {
-                return Err(CachekitError::Config("CACHEKIT_DEFAULT_TTL must be at least 1 second".to_owned()));
+                return Err(CachekitError::Config(
+                    "CACHEKIT_DEFAULT_TTL must be at least 1 second".to_owned(),
+                ));
             }
             config.default_ttl = Duration::from_secs(secs);
         }
@@ -118,7 +129,9 @@ pub struct CachekitConfigBuilder {
 impl CachekitConfigBuilder {
     /// Create a new builder with defaults.
     pub fn new() -> Self {
-        Self { inner: CachekitConfig::default() }
+        Self {
+            inner: CachekitConfig::default(),
+        }
     }
 
     /// Set the API key.

@@ -84,22 +84,38 @@ pub struct BackendError {
 impl BackendError {
     /// Create a transient (retryable) backend error.
     pub fn transient(message: impl Into<String>) -> Self {
-        Self { kind: BackendErrorKind::Transient, message: message.into(), source: None }
+        Self {
+            kind: BackendErrorKind::Transient,
+            message: message.into(),
+            source: None,
+        }
     }
 
     /// Create a permanent (non-retryable) backend error.
     pub fn permanent(message: impl Into<String>) -> Self {
-        Self { kind: BackendErrorKind::Permanent, message: message.into(), source: None }
+        Self {
+            kind: BackendErrorKind::Permanent,
+            message: message.into(),
+            source: None,
+        }
     }
 
     /// Create a timeout backend error.
     pub fn timeout(message: impl Into<String>) -> Self {
-        Self { kind: BackendErrorKind::Timeout, message: message.into(), source: None }
+        Self {
+            kind: BackendErrorKind::Timeout,
+            message: message.into(),
+            source: None,
+        }
     }
 
     /// Create an authentication backend error.
     pub fn auth(message: impl Into<String>) -> Self {
-        Self { kind: BackendErrorKind::Authentication, message: message.into(), source: None }
+        Self {
+            kind: BackendErrorKind::Authentication,
+            message: message.into(),
+            source: None,
+        }
     }
 
     /// Construct a [`BackendError`] from an HTTP status code and response body.
@@ -117,6 +133,10 @@ impl BackendError {
             _ => BackendErrorKind::Permanent,
         };
 
-        Self { kind, message, source: None }
+        Self {
+            kind,
+            message,
+            source: None,
+        }
     }
 }

@@ -36,7 +36,10 @@ fn wrong_type_fails_gracefully() {
     // Serialize an integer, try to deserialize as a struct — must return Err.
     let bytes = serialize(&42u32).expect("serialize failed");
     let result: Result<Point, _> = deserialize(&bytes);
-    assert!(result.is_err(), "expected deserialization to fail for wrong type");
+    assert!(
+        result.is_err(),
+        "expected deserialization to fail for wrong type"
+    );
 }
 
 #[test]

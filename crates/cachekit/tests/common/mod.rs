@@ -30,7 +30,12 @@ impl Backend for MockBackend {
         Ok(self.store.lock().await.get(key).cloned())
     }
 
-    async fn set(&self, key: &str, value: Vec<u8>, _ttl: Option<Duration>) -> Result<(), BackendError> {
+    async fn set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
         self.store.lock().await.insert(key.to_owned(), value);
         Ok(())
     }

@@ -14,8 +14,7 @@ use cachekit::EncryptionLayer;
 // ── Python test fixtures ────────────────────────────────────────────────────
 
 /// Master key used by Python when generating the test vectors.
-const MASTER_KEY_HEX: &str =
-    "6161616161616161616161616161616161616161616161616161616161616161";
+const MASTER_KEY_HEX: &str = "6161616161616161616161616161616161616161616161616161616161616161";
 
 /// Tenant ID used by Python when generating the test vectors.
 const TENANT_ID: &str = "cross-sdk-test";

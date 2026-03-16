@@ -24,7 +24,10 @@ fn cachekit_error_from_backend_error() {
 
 #[test]
 fn payload_too_large_formatting() {
-    let err = CachekitError::PayloadTooLarge { size: 6_000_000, limit: 5_242_880 };
+    let err = CachekitError::PayloadTooLarge {
+        size: 6_000_000,
+        limit: 5_242_880,
+    };
     let display = format!("{err}");
     assert!(display.contains("6000000"), "display: {display}");
     assert!(display.contains("5242880"), "display: {display}");
@@ -65,5 +68,9 @@ fn backend_error_truncates_long_body() {
     let err = BackendError::from_http_status(500, &long_body);
     // message should not be longer than 256 chars from body + status prefix
     let body_part = err.message.replace("HTTP 500: ", "");
-    assert!(body_part.chars().count() <= 256, "body not truncated: {} chars", body_part.chars().count());
+    assert!(
+        body_part.chars().count() <= 256,
+        "body not truncated: {} chars",
+        body_part.chars().count()
+    );
 }

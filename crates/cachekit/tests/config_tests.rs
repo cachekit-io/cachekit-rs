@@ -30,7 +30,10 @@ fn config_from_env_reads_api_key() {
     std::env::remove_var("CACHEKIT_API_KEY");
 
     // Use .as_ref().map(|k| k.as_str()) NOT .as_deref()
-    assert_eq!(config.api_key.as_ref().map(|k| k.as_str()), Some("test-key-123"));
+    assert_eq!(
+        config.api_key.as_ref().map(|k| k.as_str()),
+        Some("test-key-123")
+    );
 }
 
 #[test]
@@ -101,8 +104,14 @@ fn config_debug_redacts_secrets() {
     std::env::remove_var("CACHEKIT_MASTER_KEY");
 
     let debug_str = format!("{config:?}");
-    assert!(!debug_str.contains("super-secret-key"), "api_key leaked in debug: {debug_str}");
-    assert!(debug_str.contains("[REDACTED]"), "expected [REDACTED] in debug: {debug_str}");
+    assert!(
+        !debug_str.contains("super-secret-key"),
+        "api_key leaked in debug: {debug_str}"
+    );
+    assert!(
+        debug_str.contains("[REDACTED]"),
+        "expected [REDACTED] in debug: {debug_str}"
+    );
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
@@ -122,7 +131,10 @@ fn config_builder_basic() {
     assert_eq!(config.default_ttl, Duration::from_secs(60));
     assert_eq!(config.namespace.as_deref(), Some("myapp"));
     assert_eq!(config.l1_capacity, 500);
-    assert_eq!(config.api_key.as_ref().map(|k| k.as_str()), Some("my-api-key"));
+    assert_eq!(
+        config.api_key.as_ref().map(|k| k.as_str()),
+        Some("my-api-key")
+    );
 }
 
 #[test]
@@ -135,7 +147,10 @@ fn config_builder_rejects_http_url() {
 fn config_builder_rejects_short_master_key() {
     let short_hex = "aa".repeat(31); // 31 bytes
     let result = CachekitConfigBuilder::new().master_key(&short_hex);
-    assert!(result.is_err(), "expected error for short master key in builder");
+    assert!(
+        result.is_err(),
+        "expected error for short master key in builder"
+    );
 }
 
 #[test]

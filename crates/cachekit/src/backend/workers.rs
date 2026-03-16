@@ -48,7 +48,11 @@ impl WorkersCachekitIO {
     /// Build the full URL for a cache key path segment.
     fn url(&self, key: &str) -> String {
         let encoded = urlencoding::encode(key);
-        format!("{}/v1/cache/{}", self.api_url.trim_end_matches('/'), encoded)
+        format!(
+            "{}/v1/cache/{}",
+            self.api_url.trim_end_matches('/'),
+            encoded
+        )
     }
 
     /// Build the health-check URL.
@@ -66,13 +70,16 @@ impl WorkersCachekitIO {
     ) -> Result<worker::Response, BackendError> {
         let mut headers = worker::Headers::new();
         headers
-            .set("Authorization", &format!("Bearer {}", self.api_key.as_str()))
+            .set(
+                "Authorization",
+                &format!("Bearer {}", self.api_key.as_str()),
+            )
             .map_err(|e| BackendError::permanent(format!("failed to set auth header: {e}")))?;
 
         for (name, value) in extra_headers {
-            headers
-                .set(name, &value)
-                .map_err(|e| BackendError::permanent(format!("failed to set header {name}: {e}")))?;
+            headers.set(name, &value).map_err(|e| {
+                BackendError::permanent(format!("failed to set header {name}: {e}"))
+            })?;
         }
 
         let mut init = worker::RequestInit::new();
@@ -123,13 +130,20 @@ impl Backend for WorkersCachekitIO {
         }
     }
 
-    async fn set(&self, key: &str, value: Vec<u8>, ttl: Option<Duration>) -> Result<(), BackendError> {
+    async fn set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
         let mut headers = vec![("Content-Type", "application/octet-stream".to_owned())];
         if let Some(ttl) = ttl {
             headers.push(("X-Cache-TTL", ttl.as_secs().to_string()));
         }
 
-        let mut resp = self.fetch("PUT", &self.url(key), Some(value), headers).await?;
+        let mut resp = self
+            .fetch("PUT", &self.url(key), Some(value), headers)
+            .await?;
         let status = resp.status_code();
 
         if (200..300).contains(&status) {

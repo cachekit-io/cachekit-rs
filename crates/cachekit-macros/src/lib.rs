@@ -43,7 +43,10 @@ impl Parse for MacroArgs {
                     secure = true;
                 }
                 other => {
-                    return Err(syn::Error::new(key.span(), format!("unknown attribute `{other}`")));
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!("unknown attribute `{other}`"),
+                    ));
                 }
             }
 
@@ -53,10 +56,18 @@ impl Parse for MacroArgs {
             }
         }
 
-        let client = client.ok_or_else(|| input.error("`client` is required: #[cachekit(client = name, ...)]"))?;
-        let ttl = ttl.ok_or_else(|| input.error("`ttl` is required: #[cachekit(client = name, ttl = 60)]"))?;
+        let client = client
+            .ok_or_else(|| input.error("`client` is required: #[cachekit(client = name, ...)]"))?;
+        let ttl = ttl.ok_or_else(|| {
+            input.error("`ttl` is required: #[cachekit(client = name, ttl = 60)]")
+        })?;
 
-        Ok(MacroArgs { client, ttl, namespace, secure })
+        Ok(MacroArgs {
+            client,
+            ttl,
+            namespace,
+            secure,
+        })
     }
 }
 
@@ -85,7 +96,10 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
         }
     }
 
-    Err(syn::Error::new_spanned(ty, "#[cachekit] function must return Result<T, CachekitError>"))
+    Err(syn::Error::new_spanned(
+        ty,
+        "#[cachekit] function must return Result<T, CachekitError>",
+    ))
 }
 
 // ── Proc-macro entry point ──────────────────────────────────────────────────

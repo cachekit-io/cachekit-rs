@@ -44,8 +44,14 @@ impl Backend for CountingBackend {
         Ok(self.store.lock().await.get(key).cloned())
     }
 
-    async fn set(&self, key: &str, value: Vec<u8>, _ttl: Option<Duration>) -> Result<(), BackendError> {
-        self.set_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    async fn set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        self.set_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.store.lock().await.insert(key.to_owned(), value);
         Ok(())
     }
@@ -92,7 +98,11 @@ async fn get_user_namespaced(cache: &CacheKit, id: u64) -> Result<User, Cachekit
 }
 
 #[cachekit(client = cache, ttl = 60)]
-async fn get_user_multi_args(cache: &CacheKit, org: String, id: u64) -> Result<User, CachekitError> {
+async fn get_user_multi_args(
+    cache: &CacheKit,
+    org: String,
+    id: u64,
+) -> Result<User, CachekitError> {
     Ok(User {
         name: format!("{org}/{id}"),
     })
@@ -137,8 +147,15 @@ async fn macro_different_args_different_keys() {
     let u1 = get_user(&cache, 1).await.unwrap();
     let u2 = get_user(&cache, 2).await.unwrap();
 
-    assert_ne!(u1, u2, "different args should produce different cache entries");
-    assert_eq!(backend.sets(), 2, "each distinct arg set should write to cache");
+    assert_ne!(
+        u1, u2,
+        "different args should produce different cache entries"
+    );
+    assert_eq!(
+        backend.sets(),
+        2,
+        "each distinct arg set should write to cache"
+    );
 }
 
 #[tokio::test]
@@ -157,16 +174,22 @@ async fn macro_with_namespace() {
 async fn macro_multi_args() {
     let (cache, backend) = mock_client_counting();
 
-    let u1 = get_user_multi_args(&cache, "acme".to_owned(), 1).await.unwrap();
+    let u1 = get_user_multi_args(&cache, "acme".to_owned(), 1)
+        .await
+        .unwrap();
     assert_eq!(u1.name, "acme/1");
 
     // Same args -> cache hit
-    let u2 = get_user_multi_args(&cache, "acme".to_owned(), 1).await.unwrap();
+    let u2 = get_user_multi_args(&cache, "acme".to_owned(), 1)
+        .await
+        .unwrap();
     assert_eq!(u2, u1);
     assert_eq!(backend.sets(), 1, "same args should hit cache");
 
     // Different args -> cache miss
-    let u3 = get_user_multi_args(&cache, "acme".to_owned(), 2).await.unwrap();
+    let u3 = get_user_multi_args(&cache, "acme".to_owned(), 2)
+        .await
+        .unwrap();
     assert_eq!(u3.name, "acme/2");
     assert_eq!(backend.sets(), 2, "different args should miss cache");
 }

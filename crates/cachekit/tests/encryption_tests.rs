@@ -63,7 +63,9 @@ async fn secure_set_and_get() {
         user_id: 42,
     };
 
-    let secure = client.secure().expect("secure() should work with encryption configured");
+    let secure = client
+        .secure()
+        .expect("secure() should work with encryption configured");
     secure.set("secret:42", &secret).await.expect("secure set");
 
     let retrieved: Secret = secure
@@ -168,11 +170,18 @@ async fn secure_wrong_key_fails_decryption() {
 
     // Manually swap the value to a different key in the backend
     let stored = backend.store.lock().await.get("key-a").cloned().unwrap();
-    backend.store.lock().await.insert("key-b".to_owned(), stored);
+    backend
+        .store
+        .lock()
+        .await
+        .insert("key-b".to_owned(), stored);
 
     // Decrypting with a different cache key should fail (AAD mismatch)
     let result: Result<Option<String>, _> = secure.get("key-b").await;
-    assert!(result.is_err(), "decryption with wrong cache key AAD must fail");
+    assert!(
+        result.is_err(),
+        "decryption with wrong cache key AAD must fail"
+    );
 }
 
 #[tokio::test]

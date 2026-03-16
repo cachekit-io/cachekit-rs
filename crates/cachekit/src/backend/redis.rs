@@ -18,7 +18,11 @@ fn redis_err(e: RedisError) -> BackendError {
         RedisErrorKind::Canceled => BackendErrorKind::Transient,
         _ => BackendErrorKind::Permanent,
     };
-    BackendError { kind, message: e.to_string(), source: Some(Box::new(e)) }
+    BackendError {
+        kind,
+        message: e.to_string(),
+        source: Some(Box::new(e)),
+    }
 }
 
 // ── RedisBackend ──────────────────────────────────────────────────────────────
@@ -62,7 +66,12 @@ impl Backend for RedisBackend {
         Ok(result.map(|b| b.to_vec()))
     }
 
-    async fn set(&self, key: &str, value: Vec<u8>, ttl: Option<Duration>) -> Result<(), BackendError> {
+    async fn set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
         let expiration = ttl.map(|d| Expiration::EX(d.as_secs().max(1) as i64));
         self.client
             .set::<(), _, _>(key, value.as_slice(), expiration, None, false)
@@ -141,9 +150,13 @@ impl RedisBackendBuilder {
     pub fn build(self) -> Result<RedisBackend, crate::error::CachekitError> {
         use crate::error::CachekitError;
 
-        let url = self.url.filter(|u| !u.is_empty()).ok_or_else(|| CachekitError::Config("url is required".to_string()))?;
+        let url = self
+            .url
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| CachekitError::Config("url is required".to_string()))?;
 
-        let config = RedisConfig::from_url(&url).map_err(|e| CachekitError::Config(format!("invalid Redis URL: {e}")))?;
+        let config = RedisConfig::from_url(&url)
+            .map_err(|e| CachekitError::Config(format!("invalid Redis URL: {e}")))?;
 
         let client = RedisClient::new(config, None, None, None);
         Ok(RedisBackend { client })

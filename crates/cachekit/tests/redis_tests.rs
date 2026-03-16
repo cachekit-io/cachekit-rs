@@ -9,13 +9,22 @@ mod redis_tests {
 
         let err = result.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("url is required"), "unexpected error message: {msg}");
+        assert!(
+            msg.contains("url is required"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]
     fn redis_builder_from_url() {
         // Connection is lazy — building succeeds even if Redis is not running.
-        let result = RedisBackendBuilder::default().url("redis://127.0.0.1:6379").build();
-        assert!(result.is_ok(), "expected Ok when a valid URL is provided, got: {:?}", result);
+        let result = RedisBackendBuilder::default()
+            .url("redis://127.0.0.1:6379")
+            .build();
+        assert!(
+            result.is_ok(),
+            "expected Ok when a valid URL is provided, got: {:?}",
+            result
+        );
     }
 }

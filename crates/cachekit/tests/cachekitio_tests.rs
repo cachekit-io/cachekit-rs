@@ -17,7 +17,9 @@ fn cachekitio_builder() {
 /// Building without an api_key must return a Config error.
 #[test]
 fn cachekitio_builder_missing_api_key() {
-    let result = CachekitIO::builder().api_url("https://api.example.com").build();
+    let result = CachekitIO::builder()
+        .api_url("https://api.example.com")
+        .build();
 
     assert!(result.is_err(), "expected error for missing api_key");
     let err = result.unwrap_err().to_string();

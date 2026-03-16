@@ -23,8 +23,7 @@ fn test_layer(tenant: &str) -> EncryptionLayer {
 ///
 /// Expected hex (spaces removed):
 ///   03 00000004 74657374 00000005 6d796b6579 00000007 6d73677061636b 00000005 46616c7365
-const PYTHON_AAD_HEX: &str =
-    "0300000004746573740000000\
+const PYTHON_AAD_HEX: &str = "0300000004746573740000000\
      56d796b657900000007\
      6d73677061636b00000005\
      46616c7365";
@@ -63,7 +62,9 @@ fn aad_v03_compressed_true() {
 
     // Verify the length prefix before "True" is correct (4 bytes)
     let true_len_offset = aad.len() - 4 - 4; // 4 for "True", 4 for length prefix
-    let len_bytes: [u8; 4] = aad[true_len_offset..true_len_offset + 4].try_into().unwrap();
+    let len_bytes: [u8; 4] = aad[true_len_offset..true_len_offset + 4]
+        .try_into()
+        .unwrap();
     let len = u32::from_be_bytes(len_bytes);
     assert_eq!(len, 4, "length prefix for \"True\" must be 4");
 }
@@ -88,8 +89,5 @@ fn aad_v03_different_tenants_different_aad() {
     let aad_a = layer_a.build_aad("same-key", false);
     let aad_b = layer_b.build_aad("same-key", false);
 
-    assert_ne!(
-        aad_a, aad_b,
-        "different tenants must produce different AAD"
-    );
+    assert_ne!(aad_a, aad_b, "different tenants must produce different AAD");
 }

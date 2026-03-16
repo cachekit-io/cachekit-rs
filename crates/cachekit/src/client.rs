@@ -42,7 +42,9 @@ const L1_BACKFILL_TTL_SECS: u64 = 30;
 
 fn validate_key(key: &str) -> Result<(), CachekitError> {
     if key.is_empty() {
-        return Err(CachekitError::InvalidKey("key must not be empty".to_owned()));
+        return Err(CachekitError::InvalidKey(
+            "key must not be empty".to_owned(),
+        ));
     }
     if key.len() > MAX_KEY_BYTES {
         return Err(CachekitError::InvalidKey(format!(
@@ -195,7 +197,9 @@ impl CacheKit {
         self.check_payload_size(bytes.len())?;
 
         let full_key = self.namespaced_key(key);
-        self.backend.set(&full_key, bytes.clone(), Some(ttl)).await?;
+        self.backend
+            .set(&full_key, bytes.clone(), Some(ttl))
+            .await?;
 
         // Write-through to L1
         #[cfg(feature = "l1")]
@@ -252,9 +256,14 @@ impl CacheKit {
     #[cfg(feature = "encryption")]
     pub fn secure(&self) -> Result<SecureCache<'_>, CachekitError> {
         let enc = self.encryption.as_ref().ok_or_else(|| {
-            CachekitError::Config("encryption requires CACHEKIT_MASTER_KEY or .encryption() on builder".to_owned())
+            CachekitError::Config(
+                "encryption requires CACHEKIT_MASTER_KEY or .encryption() on builder".to_owned(),
+            )
         })?;
-        Ok(SecureCache { client: self, encryption: enc })
+        Ok(SecureCache {
+            client: self,
+            encryption: enc,
+        })
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -319,7 +328,10 @@ impl<'a> SecureCache<'a> {
         let ciphertext = self.encryption.encrypt(&plaintext, key)?;
 
         let full_key = self.client.namespaced_key(key);
-        self.client.backend.set(&full_key, ciphertext.clone(), Some(ttl)).await?;
+        self.client
+            .backend
+            .set(&full_key, ciphertext.clone(), Some(ttl))
+            .await?;
 
         // Write-through to L1 with ciphertext (preserves zero-knowledge)
         #[cfg(feature = "l1")]
@@ -358,7 +370,10 @@ impl<'a> SecureCache<'a> {
         // Populate L1 with ciphertext on L2 hit (capped TTL to limit staleness)
         #[cfg(feature = "l1")]
         if let Some(ref l1) = self.client.l1 {
-            let l1_ttl = std::cmp::min(self.client.default_ttl, Duration::from_secs(L1_BACKFILL_TTL_SECS));
+            let l1_ttl = std::cmp::min(
+                self.client.default_ttl,
+                Duration::from_secs(L1_BACKFILL_TTL_SECS),
+            );
             l1.set(&full_key, &ciphertext, l1_ttl);
         }
 
@@ -452,7 +467,11 @@ impl CacheKitBuilder {
     /// The master key must be at least 16 bytes (32 recommended).
     /// Keys are derived per-tenant via HKDF-SHA256.
     #[cfg(feature = "encryption")]
-    pub fn encryption_from_bytes(mut self, master_key: &[u8], tenant_id: &str) -> Result<Self, CachekitError> {
+    pub fn encryption_from_bytes(
+        mut self,
+        master_key: &[u8],
+        tenant_id: &str,
+    ) -> Result<Self, CachekitError> {
         let layer = crate::encryption::EncryptionLayer::new(master_key, tenant_id)?;
         self.encryption = Some(SharedEncryption::new(layer));
         Ok(self)
@@ -464,14 +483,18 @@ impl CacheKitBuilder {
     /// [`Self::encryption_from_bytes`].
     #[cfg(feature = "encryption")]
     pub fn encryption(self, hex_key: &str, tenant_id: &str) -> Result<Self, CachekitError> {
-        let bytes =
-            hex::decode(hex_key).map_err(|e| CachekitError::Config(format!("master key is not valid hex: {e}")))?;
+        let bytes = hex::decode(hex_key)
+            .map_err(|e| CachekitError::Config(format!("master key is not valid hex: {e}")))?;
         self.encryption_from_bytes(&bytes, tenant_id)
     }
 
     // Stub for when encryption feature is disabled.
     #[cfg(not(feature = "encryption"))]
-    pub fn encryption_from_bytes(self, _master_key: &[u8], _tenant_id: &str) -> Result<Self, CachekitError> {
+    pub fn encryption_from_bytes(
+        self,
+        _master_key: &[u8],
+        _tenant_id: &str,
+    ) -> Result<Self, CachekitError> {
         Ok(self)
     }
 
@@ -484,9 +507,9 @@ impl CacheKitBuilder {
     ///
     /// Returns an error if no backend was provided.
     pub fn build(self) -> Result<CacheKit, CachekitError> {
-        let backend = self
-            .backend
-            .ok_or_else(|| CachekitError::Config("a backend must be provided via .backend()".to_owned()))?;
+        let backend = self.backend.ok_or_else(|| {
+            CachekitError::Config("a backend must be provided via .backend()".to_owned())
+        })?;
 
         // Validate namespace if provided
         if let Some(ref ns) = self.namespace {
@@ -497,7 +520,9 @@ impl CacheKitBuilder {
                 return Err(CachekitError::Config("namespace exceeds 255 bytes".into()));
             }
             if !ns.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
-                return Err(CachekitError::Config("namespace must be ASCII printable".into()));
+                return Err(CachekitError::Config(
+                    "namespace must be ASCII printable".into(),
+                ));
             }
         }
 

@@ -7,7 +7,11 @@ fn key_with_namespace() {
     let parts: Vec<&str> = key.splitn(2, ':').collect();
     assert_eq!(parts.len(), 2, "Expected namespace:hash format");
     assert_eq!(parts[0], "myns");
-    assert_eq!(parts[1].len(), 64, "Hash must be 64 hex chars (Blake2b-256)");
+    assert_eq!(
+        parts[1].len(),
+        64,
+        "Hash must be 64 hex chars (Blake2b-256)"
+    );
     assert!(
         parts[1].chars().all(|c| c.is_ascii_hexdigit()),
         "Hash must be hex"
@@ -40,9 +44,6 @@ fn key_without_namespace() {
     let key = generate_cache_key("", "func", b"args").unwrap();
     // No colon prefix — just the 64-char hex hash
     assert_eq!(key.len(), 64, "Without namespace, key is just the hash");
-    assert!(
-        key.chars().all(|c| c.is_ascii_hexdigit()),
-        "Must be hex"
-    );
+    assert!(key.chars().all(|c| c.is_ascii_hexdigit()), "Must be hex");
     assert!(!key.contains(':'), "No colon when namespace is empty");
 }

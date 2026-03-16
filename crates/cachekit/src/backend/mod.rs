@@ -34,7 +34,12 @@ pub trait Backend: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError>;
 
     /// Store `value` under `key`, optionally expiring after `ttl`.
-    async fn set(&self, key: &str, value: Vec<u8>, ttl: Option<Duration>) -> Result<(), BackendError>;
+    async fn set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> Result<(), BackendError>;
 
     /// Remove `key` and return `true` if it existed.
     async fn delete(&self, key: &str) -> Result<bool, BackendError>;
@@ -50,7 +55,12 @@ pub trait Backend: Send + Sync {
 #[async_trait(?Send)]
 pub trait Backend {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError>;
-    async fn set(&self, key: &str, value: Vec<u8>, ttl: Option<Duration>) -> Result<(), BackendError>;
+    async fn set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> Result<(), BackendError>;
     async fn delete(&self, key: &str) -> Result<bool, BackendError>;
     async fn exists(&self, key: &str) -> Result<bool, BackendError>;
     async fn health(&self) -> Result<HealthStatus, BackendError>;
