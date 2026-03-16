@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.rust }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.rust == 'beta' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: "1.85"
+            os: ubuntu-latest
+          - rust: stable
+            os: ubuntu-latest
+          - rust: stable
+            os: macos-latest
+          - rust: stable
+            os: windows-latest
+          - rust: beta
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        if: matrix.rust != '1.85'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        if: matrix.rust != '1.85'
+        run: cargo clippy --all-targets --features "cachekitio,redis,encryption,l1,macros" -- -D warnings
+
+      - name: Run tests
+        run: cargo test --features "cachekitio,redis,encryption,l1,macros"
+
+  wasm:
+    name: wasm32 compilation check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check wasm32 build
+        run: cargo check -p cachekit-rs --target wasm32-unknown-unknown --features workers,encryption --no-default-features
