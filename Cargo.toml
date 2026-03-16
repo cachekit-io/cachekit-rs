@@ -6,4 +6,4 @@ members = ["crates/cachekit", "crates/cachekit-macros"]
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://gitlab.com/cachekit/cachekit-rs"
+repository = "https://github.com/cachekit-io/cachekit-rs"
