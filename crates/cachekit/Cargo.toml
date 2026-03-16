@@ -1,11 +1,14 @@
 [package]
-name = "cachekit"
-version = "0.1.0"
+name = "cachekit-rs"
+version = "0.0.1-alpha.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Production-ready Redis caching for Rust. Supports cachekit.io SaaS, Redis, and Cloudflare Workers."
+
+[lib]
+name = "cachekit"
 
 [features]
 default = ["cachekitio", "encryption", "l1"]
