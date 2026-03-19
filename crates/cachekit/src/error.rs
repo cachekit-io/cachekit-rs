@@ -118,6 +118,14 @@ impl BackendError {
         }
     }
 
+    /// Sanitize error messages to strip API keys (CWE-532).
+    pub fn sanitize_message(msg: &str, api_key: &str) -> String {
+        if api_key.is_empty() {
+            return msg.to_string();
+        }
+        msg.replace(api_key, "***")
+    }
+
     /// Construct a [`BackendError`] from an HTTP status code and response body.
     ///
     /// The body is truncated to 256 Unicode scalar values to avoid inflating error messages.

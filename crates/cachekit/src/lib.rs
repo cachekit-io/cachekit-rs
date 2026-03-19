@@ -17,7 +17,10 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod key;
+pub mod metrics;
 pub mod serializer;
+pub mod session;
+pub mod url_validator;
 
 #[cfg(feature = "encryption")]
 pub mod encryption;

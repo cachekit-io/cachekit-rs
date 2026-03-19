@@ -75,18 +75,62 @@ pub trait TtlInspectable: Backend {
     /// Return the remaining TTL for `key`, or `None` if the key does not exist
     /// or has no expiry.
     async fn ttl(&self, key: &str) -> Result<Option<Duration>, BackendError>;
+
+    /// Refresh the TTL on an existing key. Default: not supported.
+    async fn refresh_ttl(&self, _key: &str, _ttl: Duration) -> Result<bool, BackendError> {
+        Err(BackendError::permanent(
+            "refresh_ttl not supported by this backend",
+        ))
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 pub trait TtlInspectable: Backend {
     async fn ttl(&self, key: &str) -> Result<Option<Duration>, BackendError>;
+
+    async fn refresh_ttl(&self, _key: &str, _ttl: Duration) -> Result<bool, BackendError> {
+        Err(BackendError::permanent(
+            "refresh_ttl not supported by this backend",
+        ))
+    }
+}
+
+// ── LockableBackend ─────────────────────────────────────────────────────────
+
+/// Optional extension for backends that support distributed locking.
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait]
+pub trait LockableBackend: Backend {
+    /// Acquire a distributed lock. Returns lock_id if acquired, None if contested.
+    async fn acquire_lock(
+        &self,
+        key: &str,
+        timeout_ms: u64,
+    ) -> Result<Option<String>, BackendError>;
+    /// Release a distributed lock. Returns true if released.
+    async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError>;
+}
+
+#[cfg(target_arch = "wasm32")]
+#[async_trait(?Send)]
+pub trait LockableBackend: Backend {
+    async fn acquire_lock(
+        &self,
+        key: &str,
+        timeout_ms: u64,
+    ) -> Result<Option<String>, BackendError>;
+    async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError>;
 }
 
 // ── Feature-gated backend modules ─────────────────────────────────────────────
 
 #[cfg(feature = "cachekitio")]
 pub mod cachekitio;
+#[cfg(feature = "cachekitio")]
+mod cachekitio_lock;
+#[cfg(feature = "cachekitio")]
+mod cachekitio_ttl;
 
 #[cfg(feature = "redis")]
 pub mod redis;

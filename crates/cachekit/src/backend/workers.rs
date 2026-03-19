@@ -12,6 +12,9 @@ use zeroize::Zeroizing;
 
 use crate::backend::{Backend, HealthStatus};
 use crate::error::BackendError;
+use crate::metrics::{metrics_headers, MetricsProvider};
+use crate::session::session_headers;
+use crate::url_validator::validate_cachekitio_url;
 
 // ── WorkersCachekitIO ────────────────────────────────────────────────────────
 
@@ -22,6 +25,7 @@ use crate::error::BackendError;
 pub struct WorkersCachekitIO {
     api_key: Zeroizing<String>,
     api_url: String,
+    metrics_provider: Option<MetricsProvider>,
 }
 
 /// Redact `api_key` from debug output.
@@ -57,7 +61,7 @@ impl WorkersCachekitIO {
 
     /// Build the health-check URL.
     fn health_url(&self) -> String {
-        format!("{}/v1/health", self.api_url.trim_end_matches('/'))
+        format!("{}/v1/cache/health", self.api_url.trim_end_matches('/'))
     }
 
     /// Execute a fetch request with the given method, URL, optional body, and extra headers.
@@ -74,11 +78,33 @@ impl WorkersCachekitIO {
                 "Authorization",
                 &format!("Bearer {}", self.api_key.as_str()),
             )
-            .map_err(|e| BackendError::permanent(format!("failed to set auth header: {e}")))?;
+            .map_err(|e| {
+                BackendError::permanent(BackendError::sanitize_message(
+                    &format!("failed to set auth header: {e}"),
+                    self.api_key.as_str(),
+                ))
+            })?;
 
         for (name, value) in extra_headers {
             headers.set(name, &value).map_err(|e| {
-                BackendError::permanent(format!("failed to set header {name}: {e}"))
+                BackendError::permanent(BackendError::sanitize_message(
+                    &format!("failed to set header {name}: {e}"),
+                    self.api_key.as_str(),
+                ))
+            })?;
+        }
+
+        // Inject session headers
+        for (name, value) in session_headers() {
+            headers.set(name, &value).map_err(|e| {
+                BackendError::permanent(format!("failed to set session header {name}: {e}"))
+            })?;
+        }
+
+        // Inject metrics headers
+        for (name, value) in metrics_headers(self.metrics_provider.as_ref()) {
+            headers.set(name, &value).map_err(|e| {
+                BackendError::permanent(format!("failed to set metrics header {name}: {e}"))
             })?;
         }
 
@@ -97,13 +123,19 @@ impl WorkersCachekitIO {
             init.with_body(Some(js_array.into()));
         }
 
-        let request = worker::Request::new_with_init(url, &init)
-            .map_err(|e| BackendError::transient(format!("failed to build request: {e}")))?;
+        let request = worker::Request::new_with_init(url, &init).map_err(|e| {
+            BackendError::transient(BackendError::sanitize_message(
+                &format!("failed to build request: {e}"),
+                self.api_key.as_str(),
+            ))
+        })?;
 
-        worker::Fetch::Request(request)
-            .send()
-            .await
-            .map_err(|e| BackendError::transient(format!("fetch failed: {e}")))
+        worker::Fetch::Request(request).send().await.map_err(|e| {
+            BackendError::transient(BackendError::sanitize_message(
+                &format!("fetch failed: {e}"),
+                self.api_key.as_str(),
+            ))
+        })
     }
 }
 
@@ -116,16 +148,22 @@ impl Backend for WorkersCachekitIO {
 
         match resp.status_code() {
             200 => {
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| BackendError::transient(format!("failed to read body: {e}")))?;
+                let bytes = resp.bytes().await.map_err(|e| {
+                    BackendError::transient(BackendError::sanitize_message(
+                        &format!("failed to read body: {e}"),
+                        self.api_key.as_str(),
+                    ))
+                })?;
                 Ok(Some(bytes))
             }
             404 => Ok(None),
             status => {
                 let body = resp.bytes().await.unwrap_or_default();
-                Err(BackendError::from_http_status(status, &body))
+                let sanitized = BackendError::sanitize_message(
+                    std::str::from_utf8(&body).unwrap_or(""),
+                    self.api_key.as_str(),
+                );
+                Err(BackendError::from_http_status(status, sanitized.as_bytes()))
             }
         }
     }
@@ -138,7 +176,7 @@ impl Backend for WorkersCachekitIO {
     ) -> Result<(), BackendError> {
         let mut headers = vec![("Content-Type", "application/octet-stream".to_owned())];
         if let Some(ttl) = ttl {
-            headers.push(("X-Cache-TTL", ttl.as_secs().to_string()));
+            headers.push(("X-TTL", ttl.as_secs().to_string()));
         }
 
         let mut resp = self
@@ -150,7 +188,11 @@ impl Backend for WorkersCachekitIO {
             Ok(())
         } else {
             let body = resp.bytes().await.unwrap_or_default();
-            Err(BackendError::from_http_status(status, &body))
+            let sanitized = BackendError::sanitize_message(
+                std::str::from_utf8(&body).unwrap_or(""),
+                self.api_key.as_str(),
+            );
+            Err(BackendError::from_http_status(status, sanitized.as_bytes()))
         }
     }
 
@@ -162,7 +204,11 @@ impl Backend for WorkersCachekitIO {
             404 => Ok(false),
             status => {
                 let body = resp.bytes().await.unwrap_or_default();
-                Err(BackendError::from_http_status(status, &body))
+                let sanitized = BackendError::sanitize_message(
+                    std::str::from_utf8(&body).unwrap_or(""),
+                    self.api_key.as_str(),
+                );
+                Err(BackendError::from_http_status(status, sanitized.as_bytes()))
             }
         }
     }
@@ -192,7 +238,11 @@ impl Backend for WorkersCachekitIO {
             })
         } else {
             let body = resp.bytes().await.unwrap_or_default();
-            Err(BackendError::from_http_status(status, &body))
+            let sanitized = BackendError::sanitize_message(
+                std::str::from_utf8(&body).unwrap_or(""),
+                self.api_key.as_str(),
+            );
+            Err(BackendError::from_http_status(status, sanitized.as_bytes()))
         }
     }
 }
@@ -204,6 +254,8 @@ impl Backend for WorkersCachekitIO {
 pub struct WorkersCachekitIOBuilder {
     api_key: Option<String>,
     api_url: Option<String>,
+    allow_custom_host: bool,
+    metrics_provider: Option<MetricsProvider>,
 }
 
 impl WorkersCachekitIOBuilder {
@@ -219,6 +271,18 @@ impl WorkersCachekitIOBuilder {
         self
     }
 
+    /// Allow non-standard hostnames (e.g. custom proxies). Private IPs are still blocked.
+    pub fn allow_custom_host(mut self, allow: bool) -> Self {
+        self.allow_custom_host = allow;
+        self
+    }
+
+    /// Provide L1 cache metrics for request telemetry headers.
+    pub fn metrics_provider(mut self, provider: MetricsProvider) -> Self {
+        self.metrics_provider = Some(provider);
+        self
+    }
+
     /// Consume the builder and construct a [`WorkersCachekitIO`].
     ///
     /// # Errors
@@ -226,6 +290,7 @@ impl WorkersCachekitIOBuilder {
     /// Returns an error if:
     /// - `api_key` was not set or is empty.
     /// - the resolved URL scheme is not `https`.
+    /// - the URL hostname is not permitted (see [`validate_cachekitio_url`]).
     pub fn build(self) -> Result<WorkersCachekitIO, crate::error::CachekitError> {
         use crate::error::CachekitError;
 
@@ -238,17 +303,13 @@ impl WorkersCachekitIOBuilder {
             .api_url
             .unwrap_or_else(|| "https://api.cachekit.io".to_string());
 
-        // Enforce HTTPS — plaintext HTTP must never transmit API keys.
-        if !api_url.starts_with("https://") {
-            return Err(CachekitError::Config(format!(
-                "api_url must use HTTPS, got: {}",
-                api_url
-            )));
-        }
+        // Validate URL: HTTPS, allowed host, no private IPs.
+        validate_cachekitio_url(&api_url, self.allow_custom_host)?;
 
         Ok(WorkersCachekitIO {
             api_key: Zeroizing::new(api_key),
             api_url,
+            metrics_provider: self.metrics_provider,
         })
     }
 }
