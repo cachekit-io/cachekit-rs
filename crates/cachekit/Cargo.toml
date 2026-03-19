@@ -33,7 +33,7 @@ zeroize = { version = "1", features = ["derive"] }
 urlencoding = "2"
 hex = "0.4"
 url = "2"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "js"] }
 
 # Optional: HTTP backend (native)
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "json"] }
