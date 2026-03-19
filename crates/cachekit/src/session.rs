@@ -35,7 +35,10 @@ mod tests {
     fn session_id_is_uuid_v4_format() {
         let headers = session_headers();
         let id = &headers[0].1;
-        assert!(uuid::Uuid::parse_str(id).is_ok(), "Session ID should be valid UUID");
+        assert!(
+            uuid::Uuid::parse_str(id).is_ok(),
+            "Session ID should be valid UUID"
+        );
         let parsed = uuid::Uuid::parse_str(id).unwrap();
         assert_eq!(parsed.get_version_num(), 4, "Should be UUID v4");
     }

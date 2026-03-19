@@ -130,15 +130,12 @@ impl WorkersCachekitIO {
             ))
         })?;
 
-        worker::Fetch::Request(request)
-            .send()
-            .await
-            .map_err(|e| {
-                BackendError::transient(BackendError::sanitize_message(
-                    &format!("fetch failed: {e}"),
-                    self.api_key.as_str(),
-                ))
-            })
+        worker::Fetch::Request(request).send().await.map_err(|e| {
+            BackendError::transient(BackendError::sanitize_message(
+                &format!("fetch failed: {e}"),
+                self.api_key.as_str(),
+            ))
+        })
     }
 }
 
@@ -151,15 +148,12 @@ impl Backend for WorkersCachekitIO {
 
         match resp.status_code() {
             200 => {
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| {
-                        BackendError::transient(BackendError::sanitize_message(
-                            &format!("failed to read body: {e}"),
-                            self.api_key.as_str(),
-                        ))
-                    })?;
+                let bytes = resp.bytes().await.map_err(|e| {
+                    BackendError::transient(BackendError::sanitize_message(
+                        &format!("failed to read body: {e}"),
+                        self.api_key.as_str(),
+                    ))
+                })?;
                 Ok(Some(bytes))
             }
             404 => Ok(None),

@@ -2,9 +2,12 @@ use crate::error::CachekitError;
 
 const ALLOWED_HOSTS: &[&str] = &["api.cachekit.io", "api.staging.cachekit.io"];
 
-pub fn validate_cachekitio_url(url_str: &str, allow_custom_host: bool) -> Result<(), CachekitError> {
-    let parsed =
-        url::Url::parse(url_str).map_err(|_| CachekitError::Config("CachekitIO API URL is malformed".to_string()))?;
+pub fn validate_cachekitio_url(
+    url_str: &str,
+    allow_custom_host: bool,
+) -> Result<(), CachekitError> {
+    let parsed = url::Url::parse(url_str)
+        .map_err(|_| CachekitError::Config("CachekitIO API URL is malformed".to_string()))?;
 
     if parsed.scheme() != "https" {
         return Err(CachekitError::Config(
@@ -34,7 +37,11 @@ pub fn validate_cachekitio_url(url_str: &str, allow_custom_host: bool) -> Result
 fn is_private_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() || v4.octets()[0] == 0
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.octets()[0] == 0
         }
         std::net::IpAddr::V6(v6) => {
             v6.is_loopback()
@@ -87,7 +94,10 @@ mod tests {
     fn generic_error_message() {
         let err = validate_cachekitio_url("https://evil.com", false).unwrap_err();
         let msg = err.to_string();
-        assert!(!msg.contains("api.cachekit.io"), "Should not enumerate allowlist");
+        assert!(
+            !msg.contains("api.cachekit.io"),
+            "Should not enumerate allowlist"
+        );
         assert!(
             !msg.contains("allow_custom_host"),
             "Should not reveal bypass flag"

@@ -80,10 +80,7 @@ impl LockableBackend for CachekitIO {
             urlencoding::encode(lock_id),
         );
 
-        let mut req = self
-            .client()
-            .delete(&url)
-            .bearer_auth(self.api_key_str());
+        let mut req = self.client().delete(&url).bearer_auth(self.api_key_str());
 
         for (name, value) in crate::session::session_headers() {
             req = req.header(name, value);

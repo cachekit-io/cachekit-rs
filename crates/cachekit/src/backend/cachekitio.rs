@@ -92,15 +92,9 @@ pub(crate) fn reqwest_err_sanitized(e: reqwest::Error, api_key: &str) -> Backend
 }
 
 /// Build a [`BackendError`] from an HTTP status + body, sanitizing the API key from output.
-pub(crate) fn from_http_status_sanitized(
-    status: u16,
-    body: &[u8],
-    api_key: &str,
-) -> BackendError {
-    let sanitized = BackendError::sanitize_message(
-        std::str::from_utf8(body).unwrap_or(""),
-        api_key,
-    );
+pub(crate) fn from_http_status_sanitized(status: u16, body: &[u8], api_key: &str) -> BackendError {
+    let sanitized =
+        BackendError::sanitize_message(std::str::from_utf8(body).unwrap_or(""), api_key);
     BackendError::from_http_status(status, sanitized.as_bytes())
 }
 

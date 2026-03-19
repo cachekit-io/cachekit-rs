@@ -29,10 +29,7 @@ impl TtlInspectable for CachekitIO {
             urlencoding::encode(key)
         );
 
-        let mut req = self
-            .client()
-            .get(&url)
-            .bearer_auth(self.api_key_str());
+        let mut req = self.client().get(&url).bearer_auth(self.api_key_str());
 
         for (name, value) in crate::session::session_headers() {
             req = req.header(name, value);
@@ -72,10 +69,7 @@ impl TtlInspectable for CachekitIO {
             urlencoding::encode(key)
         );
 
-        let body = serde_json::to_vec(&RefreshTtlRequest {
-            ttl: ttl.as_secs(),
-        })
-        .map_err(|e| {
+        let body = serde_json::to_vec(&RefreshTtlRequest { ttl: ttl.as_secs() }).map_err(|e| {
             BackendError::permanent(format!("failed to serialize refresh_ttl request: {e}"))
         })?;
 

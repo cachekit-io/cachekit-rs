@@ -78,7 +78,10 @@ mod tests {
             })
         });
         let headers = metrics_headers(Some(&provider));
-        let rate = headers.iter().find(|h| h.0 == "X-CacheKit-L1-Hit-Rate").unwrap();
+        let rate = headers
+            .iter()
+            .find(|h| h.0 == "X-CacheKit-L1-Hit-Rate")
+            .unwrap();
         assert_eq!(rate.1, "0.300"); // 3 / (3+2+5)
     }
 
@@ -93,7 +96,10 @@ mod tests {
             })
         });
         let headers = metrics_headers(Some(&provider));
-        let rate = headers.iter().find(|h| h.0 == "X-CacheKit-L1-Hit-Rate").unwrap();
+        let rate = headers
+            .iter()
+            .find(|h| h.0 == "X-CacheKit-L1-Hit-Rate")
+            .unwrap();
         assert_eq!(rate.1, "0.000");
     }
 
