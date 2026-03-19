@@ -8,6 +8,7 @@ fn cachekitio_builder() {
     let backend = CachekitIO::builder()
         .api_key("test-api-key")
         .api_url("https://api.example.com")
+        .allow_custom_host(true)
         .build()
         .expect("build should succeed");
 

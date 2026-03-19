@@ -12,7 +12,7 @@ name = "cachekit"
 
 [features]
 default = ["cachekitio", "encryption", "l1"]
-cachekitio = ["dep:reqwest"]
+cachekitio = ["dep:reqwest", "dep:serde_json"]
 redis = ["dep:fred"]
 workers = ["dep:worker", "dep:js-sys", "dep:getrandom"]
 # cachekit-core 0.2 folds aes-gcm into the `encryption` feature automatically on wasm32.
@@ -32,9 +32,12 @@ bytes = "1"
 zeroize = { version = "1", features = ["derive"] }
 urlencoding = "2"
 hex = "0.4"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
 
 # Optional: HTTP backend (native)
-reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "json"] }
+serde_json = { version = "1", optional = true }
 
 # Optional: Redis backend
 fred = { version = "9", optional = true }

@@ -6,6 +6,9 @@ use zeroize::Zeroizing;
 
 use crate::backend::{Backend, HealthStatus};
 use crate::error::{BackendError, BackendErrorKind};
+use crate::metrics::{metrics_headers, MetricsProvider};
+use crate::session::session_headers;
+use crate::url_validator::validate_cachekitio_url;
 
 // ── CachekitIO ────────────────────────────────────────────────────────────────
 
@@ -14,6 +17,7 @@ pub struct CachekitIO {
     client: reqwest::Client,
     api_key: Zeroizing<String>,
     api_url: String,
+    metrics_provider: Option<MetricsProvider>,
 }
 
 /// Redact `api_key` from debug output.
@@ -37,6 +41,21 @@ impl CachekitIO {
         &self.api_url
     }
 
+    /// Return a reference to the underlying HTTP client.
+    pub(crate) fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    /// Return the API key as a string slice (for bearer auth in sibling modules).
+    pub(crate) fn api_key_str(&self) -> &str {
+        self.api_key.as_str()
+    }
+
+    /// Return a reference to the optional metrics provider (for sibling modules).
+    pub(crate) fn metrics_provider(&self) -> Option<&MetricsProvider> {
+        self.metrics_provider.as_ref()
+    }
+
     /// Build the full URL for a cache key path segment.
     ///
     /// Keys are percent-encoded so that slashes or special characters in the
@@ -52,14 +71,14 @@ impl CachekitIO {
 
     /// Build the health-check URL.
     fn health_url(&self) -> String {
-        format!("{}/v1/health", self.api_url.trim_end_matches('/'))
+        format!("{}/v1/cache/health", self.api_url.trim_end_matches('/'))
     }
 }
 
 // ── Error helpers ────────────────────────────────────────────────────────────
 
-/// Convert a reqwest error into a BackendError, preserving the source.
-fn reqwest_err(e: reqwest::Error) -> BackendError {
+/// Convert a reqwest error into a BackendError, sanitizing the API key from the message.
+pub(crate) fn reqwest_err_sanitized(e: reqwest::Error, api_key: &str) -> BackendError {
     let kind = if e.is_timeout() {
         BackendErrorKind::Timeout
     } else {
@@ -67,9 +86,22 @@ fn reqwest_err(e: reqwest::Error) -> BackendError {
     };
     BackendError {
         kind,
-        message: e.to_string(),
+        message: BackendError::sanitize_message(&e.to_string(), api_key),
         source: Some(Box::new(e)),
     }
+}
+
+/// Build a [`BackendError`] from an HTTP status + body, sanitizing the API key from output.
+pub(crate) fn from_http_status_sanitized(
+    status: u16,
+    body: &[u8],
+    api_key: &str,
+) -> BackendError {
+    let sanitized = BackendError::sanitize_message(
+        std::str::from_utf8(body).unwrap_or(""),
+        api_key,
+    );
+    BackendError::from_http_status(status, sanitized.as_bytes())
 }
 
 // ── Backend impl ──────────────────────────────────────────────────────────────
@@ -78,23 +110,39 @@ fn reqwest_err(e: reqwest::Error) -> BackendError {
 #[async_trait]
 impl Backend for CachekitIO {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
-        let resp = self
+        let mut req = self
             .client
             .get(self.url(key))
-            .bearer_auth(self.api_key.as_str())
+            .bearer_auth(self.api_key.as_str());
+
+        for (name, value) in session_headers() {
+            req = req.header(name, value);
+        }
+        for (name, value) in metrics_headers(self.metrics_provider.as_ref()) {
+            req = req.header(name, value);
+        }
+
+        let resp = req
             .send()
             .await
-            .map_err(reqwest_err)?;
+            .map_err(|e| reqwest_err_sanitized(e, self.api_key.as_str()))?;
 
         match resp.status().as_u16() {
             200 => {
-                let bytes = resp.bytes().await.map_err(reqwest_err)?;
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| reqwest_err_sanitized(e, self.api_key.as_str()))?;
                 Ok(Some(bytes.to_vec()))
             }
             404 => Ok(None),
             status => {
                 let body = resp.bytes().await.unwrap_or_default();
-                Err(BackendError::from_http_status(status, &body))
+                let sanitized = BackendError::sanitize_message(
+                    std::str::from_utf8(&body).unwrap_or(""),
+                    self.api_key.as_str(),
+                );
+                Err(BackendError::from_http_status(status, sanitized.as_bytes()))
             }
         }
     }
@@ -113,47 +161,83 @@ impl Backend for CachekitIO {
             .body(value);
 
         if let Some(ttl) = ttl {
-            req = req.header("X-Cache-TTL", ttl.as_secs().to_string());
+            req = req.header("X-TTL", ttl.as_secs().to_string());
         }
 
-        let resp = req.send().await.map_err(reqwest_err)?;
+        for (name, value) in session_headers() {
+            req = req.header(name, value);
+        }
+        for (name, value) in metrics_headers(self.metrics_provider.as_ref()) {
+            req = req.header(name, value);
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| reqwest_err_sanitized(e, self.api_key.as_str()))?;
 
         let status = resp.status().as_u16();
         if (200..300).contains(&status) {
             Ok(())
         } else {
             let body = resp.bytes().await.unwrap_or_default();
-            Err(BackendError::from_http_status(status, &body))
+            let sanitized = BackendError::sanitize_message(
+                std::str::from_utf8(&body).unwrap_or(""),
+                self.api_key.as_str(),
+            );
+            Err(BackendError::from_http_status(status, sanitized.as_bytes()))
         }
     }
 
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
-        let resp = self
+        let mut req = self
             .client
             .delete(self.url(key))
-            .bearer_auth(self.api_key.as_str())
+            .bearer_auth(self.api_key.as_str());
+
+        for (name, value) in session_headers() {
+            req = req.header(name, value);
+        }
+        for (name, value) in metrics_headers(self.metrics_provider.as_ref()) {
+            req = req.header(name, value);
+        }
+
+        let resp = req
             .send()
             .await
-            .map_err(reqwest_err)?;
+            .map_err(|e| reqwest_err_sanitized(e, self.api_key.as_str()))?;
 
         match resp.status().as_u16() {
             200 | 204 => Ok(true),
             404 => Ok(false),
             status => {
                 let body = resp.bytes().await.unwrap_or_default();
-                Err(BackendError::from_http_status(status, &body))
+                let sanitized = BackendError::sanitize_message(
+                    std::str::from_utf8(&body).unwrap_or(""),
+                    self.api_key.as_str(),
+                );
+                Err(BackendError::from_http_status(status, sanitized.as_bytes()))
             }
         }
     }
 
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
-        let resp = self
+        let mut req = self
             .client
             .head(self.url(key))
-            .bearer_auth(self.api_key.as_str())
+            .bearer_auth(self.api_key.as_str());
+
+        for (name, value) in session_headers() {
+            req = req.header(name, value);
+        }
+        for (name, value) in metrics_headers(self.metrics_provider.as_ref()) {
+            req = req.header(name, value);
+        }
+
+        let resp = req
             .send()
             .await
-            .map_err(reqwest_err)?;
+            .map_err(|e| reqwest_err_sanitized(e, self.api_key.as_str()))?;
 
         match resp.status().as_u16() {
             200 => Ok(true),
@@ -165,13 +249,22 @@ impl Backend for CachekitIO {
     async fn health(&self) -> Result<HealthStatus, BackendError> {
         let start = std::time::Instant::now();
 
-        let resp = self
+        let mut req = self
             .client
             .get(self.health_url())
-            .bearer_auth(self.api_key.as_str())
+            .bearer_auth(self.api_key.as_str());
+
+        for (name, value) in session_headers() {
+            req = req.header(name, value);
+        }
+        for (name, value) in metrics_headers(self.metrics_provider.as_ref()) {
+            req = req.header(name, value);
+        }
+
+        let resp = req
             .send()
             .await
-            .map_err(reqwest_err)?;
+            .map_err(|e| reqwest_err_sanitized(e, self.api_key.as_str()))?;
 
         let latency = start.elapsed();
         let status = resp.status().as_u16();
@@ -187,7 +280,11 @@ impl Backend for CachekitIO {
             })
         } else {
             let body = resp.bytes().await.unwrap_or_default();
-            Err(BackendError::from_http_status(status, &body))
+            let sanitized = BackendError::sanitize_message(
+                std::str::from_utf8(&body).unwrap_or(""),
+                self.api_key.as_str(),
+            );
+            Err(BackendError::from_http_status(status, sanitized.as_bytes()))
         }
     }
 }
@@ -199,6 +296,8 @@ impl Backend for CachekitIO {
 pub struct CachekitIOBuilder {
     api_key: Option<Zeroizing<String>>,
     api_url: Option<String>,
+    allow_custom_host: bool,
+    metrics_provider: Option<MetricsProvider>,
 }
 
 impl CachekitIOBuilder {
@@ -214,6 +313,18 @@ impl CachekitIOBuilder {
         self
     }
 
+    /// Allow non-standard hostnames (e.g. custom proxies). Private IPs are still blocked.
+    pub fn allow_custom_host(mut self, allow: bool) -> Self {
+        self.allow_custom_host = allow;
+        self
+    }
+
+    /// Provide L1 cache metrics for request telemetry headers.
+    pub fn metrics_provider(mut self, provider: MetricsProvider) -> Self {
+        self.metrics_provider = Some(provider);
+        self
+    }
+
     /// Consume the builder and construct a [`CachekitIO`].
     ///
     /// # Errors
@@ -221,6 +332,7 @@ impl CachekitIOBuilder {
     /// Returns an error if:
     /// - `api_key` was not set.
     /// - the resolved URL scheme is not `https`.
+    /// - the URL hostname is not permitted (see [`validate_cachekitio_url`]).
     pub fn build(self) -> Result<CachekitIO, crate::error::CachekitError> {
         use crate::error::CachekitError;
 
@@ -228,19 +340,13 @@ impl CachekitIOBuilder {
             .api_key
             .filter(|k| !k.is_empty())
             .ok_or_else(|| CachekitError::Config("api_key is required".to_string()))?;
-        // api_key is already Zeroizing<String> from the builder — no re-wrapping needed.
 
         let api_url = self
             .api_url
             .unwrap_or_else(|| "https://api.cachekit.io".to_string());
 
-        // Enforce HTTPS — plaintext HTTP must never transmit API keys or cached data.
-        if !api_url.starts_with("https://") {
-            return Err(CachekitError::Config(format!(
-                "api_url must use HTTPS, got: {}",
-                api_url
-            )));
-        }
+        // Validate URL: HTTPS, allowed host, no private IPs.
+        validate_cachekitio_url(&api_url, self.allow_custom_host)?;
 
         let client = reqwest::Client::builder()
             .use_rustls_tls()
@@ -253,6 +359,7 @@ impl CachekitIOBuilder {
             client,
             api_key,
             api_url,
+            metrics_provider: self.metrics_provider,
         })
     }
 }
