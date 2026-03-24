@@ -3,6 +3,9 @@
 //! Supports cachekit.io SaaS, Redis, and Cloudflare Workers backends.
 //! Zero-knowledge encryption via AES-256-GCM with HKDF key derivation.
 
+// Production code lints — these only fire in src/, not tests/
+#![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 // Mutually exclusive feature guards
 #[cfg(all(feature = "workers", feature = "redis"))]
 compile_error!(

@@ -29,7 +29,7 @@ impl L1Cache {
     pub fn new(capacity: usize) -> Self {
         Self {
             store: Cache::builder()
-                .max_capacity(capacity as u64)
+                .max_capacity(u64::try_from(capacity).unwrap_or(u64::MAX))
                 .expire_after(L1Expiry)
                 .build(),
         }

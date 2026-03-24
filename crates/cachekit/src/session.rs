@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 struct SessionInfo {
     id: String,
-    start_ms: u64,
+    start_str: String,
 }
 
 static SESSION: OnceLock<SessionInfo> = OnceLock::new();
@@ -11,19 +11,24 @@ static SESSION: OnceLock<SessionInfo> = OnceLock::new();
 fn get_or_create() -> &'static SessionInfo {
     SESSION.get_or_init(|| {
         let id = uuid::Uuid::new_v4().to_string();
-        let start_ms = SystemTime::now()
+        let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64;
-        SessionInfo { id, start_ms }
+            .as_millis();
+        let start_ms = u64::try_from(millis).unwrap_or(u64::MAX);
+        SessionInfo {
+            id,
+            start_str: start_ms.to_string(),
+        }
     })
 }
 
-pub fn session_headers() -> [(&'static str, String); 2] {
+/// Return session identification headers. Values are static — zero allocations per call.
+pub fn session_headers() -> [(&'static str, &'static str); 2] {
     let s = get_or_create();
     [
-        ("X-CacheKit-Session-ID", s.id.clone()),
-        ("X-CacheKit-Session-Start", s.start_ms.to_string()),
+        ("X-CacheKit-Session-ID", s.id.as_str()),
+        ("X-CacheKit-Session-Start", s.start_str.as_str()),
     ]
 }
 
@@ -34,7 +39,7 @@ mod tests {
     #[test]
     fn session_id_is_uuid_v4_format() {
         let headers = session_headers();
-        let id = &headers[0].1;
+        let id = headers[0].1;
         assert!(
             uuid::Uuid::parse_str(id).is_ok(),
             "Session ID should be valid UUID"
@@ -44,6 +49,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn session_start_is_reasonable_epoch_millis() {
         let headers = session_headers();
         let start_ms: u64 = headers[1].1.parse().expect("Should be numeric");

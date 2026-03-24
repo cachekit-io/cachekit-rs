@@ -45,6 +45,7 @@ pub enum BackendErrorKind {
 
 impl BackendErrorKind {
     /// Returns `true` if it is safe to retry the operation.
+    #[must_use]
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Transient | Self::Timeout)
     }

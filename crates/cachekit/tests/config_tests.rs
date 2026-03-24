@@ -133,6 +133,7 @@ fn config_builder_basic() {
         .api_url("https://api.example.io")
         .expect("valid url")
         .default_ttl(Duration::from_secs(60))
+        .expect("valid ttl")
         .namespace("myapp")
         .l1_capacity(500)
         .build();

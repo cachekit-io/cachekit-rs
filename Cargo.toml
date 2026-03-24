@@ -7,3 +7,23 @@ edition = "2021"
 rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/cachekit-io/cachekit-rs"
+
+# ── Workspace lints ──────────────────────────────────────────────────────────
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Pedantic — cherry-picked for value
+cast_lossless = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+needless_pass_by_value = "warn"
+uninlined_format_args = "warn"
+unused_self = "warn"
+
+# Restriction — cherry-picked for safety
+# Note: unwrap_used/expect_used/panic are set in lib.rs via #![warn(...)]
+# to avoid firing in test code (allow-unwrap-in-tests has compatibility issues).
+dbg_macro = "deny"
+print_stdout = "warn"
+todo = "warn"

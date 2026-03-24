@@ -122,6 +122,7 @@ impl CachekitConfig {
 
 /// Fluent builder for [`CachekitConfig`].
 #[derive(Default)]
+#[must_use]
 pub struct CachekitConfigBuilder {
     inner: CachekitConfig,
 }
@@ -162,10 +163,15 @@ impl CachekitConfigBuilder {
         Ok(self)
     }
 
-    /// Set the default TTL.
-    pub fn default_ttl(mut self, ttl: Duration) -> Self {
+    /// Set the default TTL. Must be at least 1 second.
+    pub fn default_ttl(mut self, ttl: Duration) -> Result<Self, CachekitError> {
+        if ttl < Duration::from_secs(1) {
+            return Err(CachekitError::Config(
+                "default_ttl must be at least 1 second".to_owned(),
+            ));
+        }
         self.inner.default_ttl = ttl;
-        self
+        Ok(self)
     }
 
     /// Set the namespace prefix.

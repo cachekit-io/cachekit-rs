@@ -15,15 +15,28 @@ pub fn validate_cachekitio_url(
         ));
     }
 
-    if let Some(host) = parsed.host_str() {
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            if is_private_ip(ip) {
+    // Check for private IPs using the parsed Host enum (handles IPv6 brackets correctly).
+    match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => {
+            if is_private_ip(std::net::IpAddr::V4(v4)) {
                 return Err(CachekitError::Config(
                     "CachekitIO API URL must not point to a private IP address".to_string(),
                 ));
             }
         }
+        Some(url::Host::Ipv6(v6)) => {
+            if is_private_ip(std::net::IpAddr::V6(v6)) {
+                return Err(CachekitError::Config(
+                    "CachekitIO API URL must not point to a private IP address".to_string(),
+                ));
+            }
+        }
+        _ => {}
+    }
 
+    if let Some(host) = parsed.host_str() {
+        // Strip brackets from IPv6 host_str for allowlist matching.
+        let host = host.trim_start_matches('[').trim_end_matches(']');
         if !allow_custom_host && !ALLOWED_HOSTS.contains(&host) {
             return Err(CachekitError::Config(
                 "API URL hostname not permitted. See documentation.".to_string(),
@@ -44,6 +57,11 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
                 || v4.octets()[0] == 0
         }
         std::net::IpAddr::V6(v6) => {
+            // Detect IPv4-mapped (::ffff:x.x.x.x) addresses and check the embedded
+            // IPv4 address against the private range blocklist.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(std::net::IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 // fe80::/10 (link-local) and fc00::/7 (unique local)
@@ -88,6 +106,15 @@ mod tests {
         assert!(validate_cachekitio_url("https://10.0.0.1", true).is_err());
         assert!(validate_cachekitio_url("https://192.168.1.1", true).is_err());
         assert!(validate_cachekitio_url("https://169.254.169.254", true).is_err());
+    }
+
+    #[test]
+    fn blocks_ipv4_mapped_ipv6() {
+        // ::ffff:127.0.0.1 and ::ffff:169.254.169.254 must be blocked
+        assert!(validate_cachekitio_url("https://[::ffff:127.0.0.1]", true).is_err());
+        assert!(validate_cachekitio_url("https://[::ffff:10.0.0.1]", true).is_err());
+        assert!(validate_cachekitio_url("https://[::ffff:169.254.169.254]", true).is_err());
+        assert!(validate_cachekitio_url("https://[::ffff:192.168.1.1]", true).is_err());
     }
 
     #[test]

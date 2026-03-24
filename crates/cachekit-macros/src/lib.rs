@@ -88,6 +88,12 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
     // Walk through the type to find Result<T, E> and extract T.
     if let Type::Path(type_path) = ty {
         if let Some(seg) = type_path.path.segments.last() {
+            if seg.ident != "Result" {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "#[cachekit] function must return Result<T, CachekitError>",
+                ));
+            }
             if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
                 if let Some(syn::GenericArgument::Type(first)) = args.args.first() {
                     return Ok(first.clone());
@@ -126,13 +132,13 @@ pub fn cachekit(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as MacroArgs);
     let input_fn = parse_macro_input!(item as ItemFn);
 
-    match expand(args, input_fn) {
+    match expand(&args, input_fn) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
 }
 
-fn expand(args: MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
+fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     let client_ident = &args.client;
     let ttl_secs = args.ttl;
     let namespace = args.namespace.as_deref().unwrap_or("");
