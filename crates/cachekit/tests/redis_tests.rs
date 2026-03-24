@@ -23,8 +23,7 @@ mod redis_tests {
             .build();
         assert!(
             result.is_ok(),
-            "expected Ok when a valid URL is provided, got: {:?}",
-            result
+            "expected Ok when a valid URL is provided, got: {result:?}"
         );
     }
 }

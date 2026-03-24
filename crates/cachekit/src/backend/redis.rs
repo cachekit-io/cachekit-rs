@@ -10,6 +10,22 @@ use crate::error::{BackendError, BackendErrorKind};
 
 // ── Error mapping ─────────────────────────────────────────────────────────────
 
+/// Sanitize Redis error messages to avoid leaking connection URL passwords.
+fn sanitize_redis_message(msg: &str) -> String {
+    // Redis URLs may contain passwords: redis://:password@host:6379
+    // Strip anything between :// and @ to remove embedded credentials.
+    if let Some(proto_end) = msg.find("://") {
+        if let Some(at_pos) = msg[proto_end..].find('@') {
+            let mut sanitized = String::with_capacity(msg.len());
+            sanitized.push_str(&msg[..proto_end + 3]);
+            sanitized.push_str("[REDACTED]");
+            sanitized.push_str(&msg[proto_end + at_pos..]);
+            return sanitized;
+        }
+    }
+    msg.to_string()
+}
+
 fn redis_err(e: RedisError) -> BackendError {
     let kind = match e.kind() {
         RedisErrorKind::Auth => BackendErrorKind::Authentication,
@@ -20,7 +36,7 @@ fn redis_err(e: RedisError) -> BackendError {
     };
     BackendError {
         kind,
-        message: e.to_string(),
+        message: sanitize_redis_message(&e.to_string()),
         source: Some(Box::new(e)),
     }
 }
@@ -72,7 +88,10 @@ impl Backend for RedisBackend {
         value: Vec<u8>,
         ttl: Option<Duration>,
     ) -> Result<(), BackendError> {
-        let expiration = ttl.map(|d| Expiration::EX(d.as_secs().max(1) as i64));
+        let expiration = ttl.map(|d| {
+            let secs = i64::try_from(d.as_secs().max(1)).unwrap_or(i64::MAX);
+            Expiration::EX(secs)
+        });
         self.client
             .set::<(), _, _>(key, value.as_slice(), expiration, None, false)
             .await
@@ -117,8 +136,8 @@ impl TtlInspectable for RedisBackend {
         //   N  → remaining seconds
         let secs: i64 = self.client.ttl(key).await.map_err(redis_err)?;
         match secs {
-            -2 | -1 => Ok(None),
-            n => Ok(Some(Duration::from_secs(n as u64))),
+            ..0 => Ok(None),
+            n => Ok(Some(Duration::from_secs(n.unsigned_abs()))),
         }
     }
 }
@@ -127,6 +146,7 @@ impl TtlInspectable for RedisBackend {
 
 /// Builder for [`RedisBackend`].
 #[derive(Default)]
+#[must_use]
 pub struct RedisBackendBuilder {
     url: Option<String>,
 }
@@ -155,8 +175,12 @@ impl RedisBackendBuilder {
             .filter(|u| !u.is_empty())
             .ok_or_else(|| CachekitError::Config("url is required".to_string()))?;
 
-        let config = RedisConfig::from_url(&url)
-            .map_err(|e| CachekitError::Config(format!("invalid Redis URL: {e}")))?;
+        let config = RedisConfig::from_url(&url).map_err(|e| {
+            CachekitError::Config(format!(
+                "invalid Redis URL: {}",
+                sanitize_redis_message(&e.to_string())
+            ))
+        })?;
 
         let client = RedisClient::new(config, None, None, None);
         Ok(RedisBackend { client })

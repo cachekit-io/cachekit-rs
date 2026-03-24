@@ -52,16 +52,12 @@ impl WorkersCachekitIO {
     /// Build the full URL for a cache key path segment.
     fn url(&self, key: &str) -> String {
         let encoded = urlencoding::encode(key);
-        format!(
-            "{}/v1/cache/{}",
-            self.api_url.trim_end_matches('/'),
-            encoded
-        )
+        format!("{}/v1/cache/{}", self.api_url, encoded)
     }
 
     /// Build the health-check URL.
     fn health_url(&self) -> String {
-        format!("{}/v1/cache/health", self.api_url.trim_end_matches('/'))
+        format!("{}/v1/cache/health", self.api_url)
     }
 
     /// Execute a fetch request with the given method, URL, optional body, and extra headers.
@@ -114,7 +110,11 @@ impl WorkersCachekitIO {
             "PUT" => worker::Method::Put,
             "DELETE" => worker::Method::Delete,
             "HEAD" => worker::Method::Head,
-            _ => worker::Method::Get,
+            _ => {
+                return Err(BackendError::permanent(format!(
+                    "unsupported HTTP method: {method}"
+                )))
+            }
         });
         init.with_headers(headers);
 
@@ -251,8 +251,9 @@ impl Backend for WorkersCachekitIO {
 
 /// Builder for [`WorkersCachekitIO`].
 #[derive(Default)]
+#[must_use]
 pub struct WorkersCachekitIOBuilder {
-    api_key: Option<String>,
+    api_key: Option<Zeroizing<String>>,
     api_url: Option<String>,
     allow_custom_host: bool,
     metrics_provider: Option<MetricsProvider>,
@@ -261,7 +262,7 @@ pub struct WorkersCachekitIOBuilder {
 impl WorkersCachekitIOBuilder {
     /// Set the API key (required).
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
-        self.api_key = Some(key.into());
+        self.api_key = Some(Zeroizing::new(key.into()));
         self
     }
 
@@ -306,8 +307,11 @@ impl WorkersCachekitIOBuilder {
         // Validate URL: HTTPS, allowed host, no private IPs.
         validate_cachekitio_url(&api_url, self.allow_custom_host)?;
 
+        // Trim trailing slash once so url()/health_url() don't repeat it per-request.
+        let api_url = api_url.trim_end_matches('/').to_string();
+
         Ok(WorkersCachekitIO {
-            api_key: Zeroizing::new(api_key),
+            api_key,
             api_url,
             metrics_provider: self.metrics_provider,
         })

@@ -5,11 +5,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::cachekitio::{from_http_status_sanitized, reqwest_err_sanitized, CachekitIO};
+use super::cachekitio::{reqwest_err_sanitized, CachekitIO};
 use super::TtlInspectable;
 use crate::error::BackendError;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TtlResponse {
     ttl: Option<u64>,
 }
@@ -25,18 +26,12 @@ impl TtlInspectable for CachekitIO {
     async fn ttl(&self, key: &str) -> Result<Option<Duration>, BackendError> {
         let url = format!(
             "{}/v1/cache/{}/ttl",
-            self.api_url().trim_end_matches('/'),
+            self.api_url(),
             urlencoding::encode(key)
         );
 
-        let mut req = self.client().get(&url).bearer_auth(self.api_key_str());
-
-        for (name, value) in crate::session::session_headers() {
-            req = req.header(name, value);
-        }
-        for (name, value) in crate::metrics::metrics_headers(self.metrics_provider()) {
-            req = req.header(name, value);
-        }
+        let req =
+            self.with_standard_headers(self.client().get(&url).bearer_auth(self.api_key_str()));
 
         let resp = req
             .send()
@@ -51,41 +46,35 @@ impl TtlInspectable for CachekitIO {
                 Ok(body.ttl.map(Duration::from_secs))
             }
             404 => Ok(None),
-            status => {
-                let body = resp.bytes().await.unwrap_or_default();
-                Err(from_http_status_sanitized(
-                    status,
-                    &body,
-                    self.api_key_str(),
-                ))
-            }
+            _ => Err(self.error_from_response(resp).await),
         }
     }
 
     async fn refresh_ttl(&self, key: &str, ttl: Duration) -> Result<bool, BackendError> {
+        let secs = ttl.as_secs();
+        if secs == 0 {
+            return Err(BackendError::permanent(
+                "refresh_ttl requires at least 1 second".to_string(),
+            ));
+        }
+
         let url = format!(
             "{}/v1/cache/{}/ttl",
-            self.api_url().trim_end_matches('/'),
+            self.api_url(),
             urlencoding::encode(key)
         );
 
-        let body = serde_json::to_vec(&RefreshTtlRequest { ttl: ttl.as_secs() }).map_err(|e| {
+        let body = serde_json::to_vec(&RefreshTtlRequest { ttl: secs }).map_err(|e| {
             BackendError::permanent(format!("failed to serialize refresh_ttl request: {e}"))
         })?;
 
-        let mut req = self
-            .client()
-            .patch(&url)
-            .bearer_auth(self.api_key_str())
-            .header("Content-Type", "application/json")
-            .body(body);
-
-        for (name, value) in crate::session::session_headers() {
-            req = req.header(name, value);
-        }
-        for (name, value) in crate::metrics::metrics_headers(self.metrics_provider()) {
-            req = req.header(name, value);
-        }
+        let req = self.with_standard_headers(
+            self.client()
+                .patch(&url)
+                .bearer_auth(self.api_key_str())
+                .header("Content-Type", "application/json")
+                .body(body),
+        );
 
         let resp = req
             .send()
@@ -95,14 +84,7 @@ impl TtlInspectable for CachekitIO {
         match resp.status().as_u16() {
             200 | 204 => Ok(true),
             404 => Ok(false),
-            status => {
-                let body_bytes = resp.bytes().await.unwrap_or_default();
-                Err(from_http_status_sanitized(
-                    status,
-                    &body_bytes,
-                    self.api_key_str(),
-                ))
-            }
+            _ => Err(self.error_from_response(resp).await),
         }
     }
 }

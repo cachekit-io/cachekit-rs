@@ -39,18 +39,29 @@ impl EncryptionLayer {
     /// Create a new encryption layer with HKDF-derived tenant keys.
     ///
     /// # Arguments
-    /// * `master_key_bytes` — Raw master key (minimum 16 bytes, 32 recommended)
+    /// * `master_key_bytes` — Raw master key (minimum 32 bytes for AES-256)
     /// * `tenant_id` — Tenant identifier for cryptographic isolation
     ///
     /// # Errors
-    /// - Master key too short (< 16 bytes per HKDF requirement)
+    /// - Master key too short (< 32 bytes)
     /// - HKDF derivation failure
     /// - Encryptor initialization failure
     pub fn new(master_key_bytes: &[u8], tenant_id: &str) -> Result<Self, CachekitError> {
-        if master_key_bytes.len() < 16 {
+        if master_key_bytes.len() < 32 {
             return Err(CachekitError::Encryption(format!(
-                "master key must be at least 16 bytes; got {}",
+                "master key must be at least 32 bytes; got {}",
                 master_key_bytes.len()
+            )));
+        }
+        if tenant_id.is_empty() {
+            return Err(CachekitError::Encryption(
+                "tenant_id must not be empty".to_owned(),
+            ));
+        }
+        if tenant_id.len() > 255 {
+            return Err(CachekitError::Encryption(format!(
+                "tenant_id must be at most 255 bytes; got {}",
+                tenant_id.len()
             )));
         }
 
@@ -119,24 +130,35 @@ impl EncryptionLayer {
 
         aad.push(AAD_VERSION);
 
+        // All components are bounded: tenant_id <= 255 (validated in new()),
+        // cache_key <= 1024 (validated by client), format/compressed are constants.
+        // Safe to use len_u32 helper which saturates on overflow.
+
         // tenant_id
-        aad.extend_from_slice(&(tenant_bytes.len() as u32).to_be_bytes());
+        aad.extend_from_slice(&len_u32(tenant_bytes.len()).to_be_bytes());
         aad.extend_from_slice(tenant_bytes);
 
         // cache_key
-        aad.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
+        aad.extend_from_slice(&len_u32(key_bytes.len()).to_be_bytes());
         aad.extend_from_slice(key_bytes);
 
         // format
-        aad.extend_from_slice(&(format_str.len() as u32).to_be_bytes());
+        aad.extend_from_slice(&len_u32(format_str.len()).to_be_bytes());
         aad.extend_from_slice(format_str);
 
         // compressed flag
-        aad.extend_from_slice(&(compressed_str.len() as u32).to_be_bytes());
+        aad.extend_from_slice(&len_u32(compressed_str.len()).to_be_bytes());
         aad.extend_from_slice(compressed_str);
 
         aad
     }
+}
+
+/// Convert a usize length to u32 for AAD encoding, saturating on overflow.
+/// In practice all inputs are validated to fit (tenant_id <= 255, cache_key <= 1024).
+#[allow(clippy::cast_possible_truncation)]
+fn len_u32(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
 }
 
 impl std::fmt::Debug for EncryptionLayer {
@@ -195,7 +217,7 @@ mod tests {
         let result = EncryptionLayer::new(b"short", "tenant");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("at least 16 bytes"), "got: {msg}");
+        assert!(msg.contains("at least 32 bytes"), "got: {msg}");
     }
 
     #[test]

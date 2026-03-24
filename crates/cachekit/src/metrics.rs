@@ -34,11 +34,11 @@ pub fn metrics_headers(provider: Option<&MetricsProvider>) -> Vec<(&'static str,
     };
 
     vec![
-        ("X-CacheKit-L1-Status", "miss".to_string()),
+        ("X-CacheKit-L1-Status", "enabled".to_string()),
         ("X-CacheKit-L1-Hits", stats.l1_hits.to_string()),
         ("X-CacheKit-L2-Hits", stats.l2_hits.to_string()),
         ("X-CacheKit-Misses", stats.misses.to_string()),
-        ("X-CacheKit-L1-Hit-Rate", format!("{:.3}", hit_rate)),
+        ("X-CacheKit-L1-Hit-Rate", format!("{hit_rate:.3}")),
     ]
 }
 
@@ -105,6 +105,7 @@ mod tests {
 
     #[test]
     fn disabled_when_provider_panics() {
+        #[allow(clippy::panic)]
         let provider: MetricsProvider = Arc::new(|| panic!("boom"));
         let headers = metrics_headers(Some(&provider));
         assert_eq!(headers[0].1, "disabled");

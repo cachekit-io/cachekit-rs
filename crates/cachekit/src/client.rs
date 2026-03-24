@@ -88,7 +88,7 @@ impl CacheKit {
     ///
     /// Creates a [`crate::backend::cachekitio::CachekitIO`] backend from the
     /// config. Requires the `cachekitio` feature.
-    #[cfg(feature = "cachekitio")]
+    #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
     pub fn from_env() -> Result<CacheKitBuilder, CachekitError> {
         use crate::backend::cachekitio::CachekitIO;
         use crate::config::CachekitConfig;
@@ -134,6 +134,55 @@ impl CacheKit {
         }
     }
 
+    /// Validate key and return the namespaced version.
+    fn resolve_key(&self, key: &str) -> Result<String, CachekitError> {
+        validate_key(key)?;
+        Ok(self.namespaced_key(key))
+    }
+
+    // ── L1 helpers ───────────────────────────────────────────────────────────
+
+    /// Try L1 cache first. Returns Some(bytes) on hit.
+    #[cfg(feature = "l1")]
+    fn l1_get(&self, full_key: &str) -> Option<Vec<u8>> {
+        self.l1.as_ref().and_then(|l1| l1.get(full_key))
+    }
+
+    /// Populate L1 from an L2 hit with capped TTL to limit staleness.
+    #[cfg(feature = "l1")]
+    fn l1_backfill(&self, full_key: &str, bytes: &[u8]) {
+        if let Some(ref l1) = self.l1 {
+            let l1_ttl = std::cmp::min(self.default_ttl, Duration::from_secs(L1_BACKFILL_TTL_SECS));
+            l1.set(full_key, bytes, l1_ttl);
+        }
+    }
+
+    /// Write-through to L1.
+    #[cfg(feature = "l1")]
+    fn l1_set(&self, full_key: &str, bytes: &[u8], ttl: Duration) {
+        if let Some(ref l1) = self.l1 {
+            l1.set(full_key, bytes, ttl);
+        }
+    }
+
+    /// Invalidate L1 entry.
+    #[cfg(feature = "l1")]
+    fn l1_delete(&self, full_key: &str) {
+        if let Some(ref l1) = self.l1 {
+            l1.delete(full_key);
+        }
+    }
+
+    /// Validate TTL is at least 1 second.
+    fn validate_ttl(ttl: Duration) -> Result<(), CachekitError> {
+        if ttl < Duration::from_secs(1) {
+            return Err(CachekitError::Config(format!(
+                "TTL must be at least 1 second; got {ttl:?}"
+            )));
+        }
+        Ok(())
+    }
+
     // ── Public operations ─────────────────────────────────────────────────────
 
     /// Retrieve and deserialize a value stored under `key`.
@@ -141,16 +190,13 @@ impl CacheKit {
     /// Returns `None` if the key does not exist.
     /// Checks L1 cache before hitting the backend.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, CachekitError> {
-        validate_key(key)?;
-        let full_key = self.namespaced_key(key);
+        let full_key = self.resolve_key(key)?;
 
         // L1 hit
         #[cfg(feature = "l1")]
-        if let Some(ref l1) = self.l1 {
-            if let Some(bytes) = l1.get(&full_key) {
-                self.check_payload_size(bytes.len())?;
-                return Ok(Some(serializer::deserialize(&bytes)?));
-            }
+        if let Some(bytes) = self.l1_get(&full_key) {
+            self.check_payload_size(bytes.len())?;
+            return Ok(Some(serializer::deserialize(&bytes)?));
         }
 
         // L2 backend
@@ -163,10 +209,7 @@ impl CacheKit {
 
         // Populate L1 on L2 hit (capped TTL to limit staleness)
         #[cfg(feature = "l1")]
-        if let Some(ref l1) = self.l1 {
-            let l1_ttl = std::cmp::min(self.default_ttl, Duration::from_secs(L1_BACKFILL_TTL_SECS));
-            l1.set(&full_key, &bytes, l1_ttl);
-        }
+        self.l1_backfill(&full_key, &bytes);
 
         Ok(Some(serializer::deserialize(&bytes)?))
     }
@@ -185,26 +228,23 @@ impl CacheKit {
         value: &T,
         ttl: Duration,
     ) -> Result<(), CachekitError> {
-        validate_key(key)?;
-
-        if ttl < Duration::from_secs(1) {
-            return Err(CachekitError::Config(format!(
-                "TTL must be at least 1 second; got {ttl:?}"
-            )));
-        }
+        Self::validate_ttl(ttl)?;
 
         let bytes = serializer::serialize(value)?;
         self.check_payload_size(bytes.len())?;
 
-        let full_key = self.namespaced_key(key);
-        self.backend
-            .set(&full_key, bytes.clone(), Some(ttl))
-            .await?;
+        let full_key = self.resolve_key(key)?;
 
-        // Write-through to L1
+        // Only clone bytes when L1 needs a copy after the backend consumes them.
         #[cfg(feature = "l1")]
-        if let Some(ref l1) = self.l1 {
-            l1.set(&full_key, &bytes, ttl);
+        {
+            let l1_bytes = bytes.clone();
+            self.backend.set(&full_key, bytes, Some(ttl)).await?;
+            self.l1_set(&full_key, &l1_bytes, ttl);
+        }
+        #[cfg(not(feature = "l1"))]
+        {
+            self.backend.set(&full_key, bytes, Some(ttl)).await?;
         }
 
         Ok(())
@@ -214,32 +254,27 @@ impl CacheKit {
     ///
     /// Invalidates the L1 entry regardless of the backend result.
     pub async fn delete(&self, key: &str) -> Result<bool, CachekitError> {
-        validate_key(key)?;
-        let full_key = self.namespaced_key(key);
+        let full_key = self.resolve_key(key)?;
 
         // Invalidate L1 first so callers never read a stale value even if the
         // backend delete fails partway through.
         #[cfg(feature = "l1")]
-        if let Some(ref l1) = self.l1 {
-            l1.delete(&full_key);
-        }
+        self.l1_delete(&full_key);
 
         Ok(self.backend.delete(&full_key).await?)
     }
 
     /// Return `true` if `key` exists without fetching the value.
     pub async fn exists(&self, key: &str) -> Result<bool, CachekitError> {
-        validate_key(key)?;
+        let full_key = self.resolve_key(key)?;
 
         // Check L1 first — avoids a network round-trip for warm entries.
         #[cfg(feature = "l1")]
-        if let Some(ref l1) = self.l1 {
-            if l1.get(&self.namespaced_key(key)).is_some() {
-                return Ok(true);
-            }
+        if self.l1_get(&full_key).is_some() {
+            return Ok(true);
         }
 
-        Ok(self.backend.exists(&self.namespaced_key(key)).await?)
+        Ok(self.backend.exists(&full_key).await?)
     }
 
     // ── Secure cache ─────────────────────────────────────────────────────────
@@ -301,7 +336,7 @@ impl std::fmt::Debug for SecureCache<'_> {
 }
 
 #[cfg(feature = "encryption")]
-impl<'a> SecureCache<'a> {
+impl SecureCache<'_> {
     /// Encrypt and store `value` under `key` using the client's default TTL.
     pub async fn set<T: Serialize>(&self, key: &str, value: &T) -> Result<(), CachekitError> {
         self.set_with_ttl(key, value, self.client.default_ttl).await
@@ -314,29 +349,31 @@ impl<'a> SecureCache<'a> {
         value: &T,
         ttl: Duration,
     ) -> Result<(), CachekitError> {
-        validate_key(key)?;
-
-        if ttl < Duration::from_secs(1) {
-            return Err(CachekitError::Config(format!(
-                "TTL must be at least 1 second; got {ttl:?}"
-            )));
-        }
+        CacheKit::validate_ttl(ttl)?;
 
         // Serialize then encrypt
         let plaintext = serializer::serialize(value)?;
         self.client.check_payload_size(plaintext.len())?;
         let ciphertext = self.encryption.encrypt(&plaintext, key)?;
 
-        let full_key = self.client.namespaced_key(key);
-        self.client
-            .backend
-            .set(&full_key, ciphertext.clone(), Some(ttl))
-            .await?;
+        let full_key = self.client.resolve_key(key)?;
 
-        // Write-through to L1 with ciphertext (preserves zero-knowledge)
+        // Only clone when L1 needs a copy after the backend consumes the data.
         #[cfg(feature = "l1")]
-        if let Some(ref l1) = self.client.l1 {
-            l1.set(&full_key, &ciphertext, ttl);
+        {
+            let l1_bytes = ciphertext.clone();
+            self.client
+                .backend
+                .set(&full_key, ciphertext, Some(ttl))
+                .await?;
+            self.client.l1_set(&full_key, &l1_bytes, ttl);
+        }
+        #[cfg(not(feature = "l1"))]
+        {
+            self.client
+                .backend
+                .set(&full_key, ciphertext, Some(ttl))
+                .await?;
         }
 
         Ok(())
@@ -346,17 +383,14 @@ impl<'a> SecureCache<'a> {
     ///
     /// Checks L1 (which holds ciphertext) before the backend.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, CachekitError> {
-        validate_key(key)?;
-        let full_key = self.client.namespaced_key(key);
+        let full_key = self.client.resolve_key(key)?;
 
         // L1 hit (ciphertext)
         #[cfg(feature = "l1")]
-        if let Some(ref l1) = self.client.l1 {
-            if let Some(ciphertext) = l1.get(&full_key) {
-                self.client.check_payload_size(ciphertext.len())?;
-                let plaintext = self.encryption.decrypt(&ciphertext, key)?;
-                return Ok(Some(serializer::deserialize(&plaintext)?));
-            }
+        if let Some(ciphertext) = self.client.l1_get(&full_key) {
+            self.client.check_payload_size(ciphertext.len())?;
+            let plaintext = self.encryption.decrypt(&ciphertext, key)?;
+            return Ok(Some(serializer::deserialize(&plaintext)?));
         }
 
         // L2 backend
@@ -369,13 +403,7 @@ impl<'a> SecureCache<'a> {
 
         // Populate L1 with ciphertext on L2 hit (capped TTL to limit staleness)
         #[cfg(feature = "l1")]
-        if let Some(ref l1) = self.client.l1 {
-            let l1_ttl = std::cmp::min(
-                self.client.default_ttl,
-                Duration::from_secs(L1_BACKFILL_TTL_SECS),
-            );
-            l1.set(&full_key, &ciphertext, l1_ttl);
-        }
+        self.client.l1_backfill(&full_key, &ciphertext);
 
         let plaintext = self.encryption.decrypt(&ciphertext, key)?;
         Ok(Some(serializer::deserialize(&plaintext)?))
@@ -396,6 +424,7 @@ impl<'a> SecureCache<'a> {
 
 /// Fluent builder for [`CacheKit`].
 #[derive(Default)]
+#[must_use]
 pub struct CacheKitBuilder {
     backend: Option<SharedBackend>,
     default_ttl: Option<Duration>,
