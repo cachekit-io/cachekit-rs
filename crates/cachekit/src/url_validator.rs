@@ -17,19 +17,15 @@ pub fn validate_cachekitio_url(
 
     // Check for private IPs using the parsed Host enum (handles IPv6 brackets correctly).
     match parsed.host() {
-        Some(url::Host::Ipv4(v4)) => {
-            if is_private_ip(std::net::IpAddr::V4(v4)) {
-                return Err(CachekitError::Config(
-                    "CachekitIO API URL must not point to a private IP address".to_string(),
-                ));
-            }
+        Some(url::Host::Ipv4(v4)) if is_private_ip(std::net::IpAddr::V4(v4)) => {
+            return Err(CachekitError::Config(
+                "CachekitIO API URL must not point to a private IP address".to_string(),
+            ));
         }
-        Some(url::Host::Ipv6(v6)) => {
-            if is_private_ip(std::net::IpAddr::V6(v6)) {
-                return Err(CachekitError::Config(
-                    "CachekitIO API URL must not point to a private IP address".to_string(),
-                ));
-            }
+        Some(url::Host::Ipv6(v6)) if is_private_ip(std::net::IpAddr::V6(v6)) => {
+            return Err(CachekitError::Config(
+                "CachekitIO API URL must not point to a private IP address".to_string(),
+            ));
         }
         _ => {}
     }
