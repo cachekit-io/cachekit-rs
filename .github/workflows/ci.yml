@@ -9,36 +9,28 @@ on:
 permissions:
   contents: read
 
+env:
+  # Rustup's temp dir must be on the same filesystem as RUSTUP_HOME to avoid
+  # cross-device link errors on container overlay filesystems.
+  RUSTUP_HOME: /tmp/rustup
+  CARGO_HOME: /tmp/cargo
+
 jobs:
   test:
-    name: ${{ matrix.rust }} / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.rust }}
+    runs-on: cachekit-lean
     continue-on-error: ${{ matrix.rust == 'beta' }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - rust: "1.85"
-            os: ubuntu-latest
-          - rust: stable
-            os: ubuntu-latest
-          - rust: stable
-            os: macos-latest
-          - rust: stable
-            os: windows-latest
-          - rust: beta
-            os: ubuntu-latest
+        rust: ["1.85", stable, beta]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
-        with:
-          toolchain: ${{ matrix.rust }}
-          components: rustfmt, clippy
-
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        run: |
+          rustup toolchain install ${{ matrix.rust }} --profile minimal --component rustfmt,clippy
+          rustup default ${{ matrix.rust }}
 
       - name: Check formatting
         if: matrix.rust != '1.85'
@@ -53,18 +45,15 @@ jobs:
 
   wasm:
     name: wasm32 compilation check
-    runs-on: ubuntu-latest
+    runs-on: cachekit-lean
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
-        with:
-          toolchain: stable
-          targets: wasm32-unknown-unknown
-
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
 
       - name: Check wasm32 build
         run: cargo check -p cachekit-rs --target wasm32-unknown-unknown --features workers,encryption --no-default-features
