@@ -1,7 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
   "release-type": "rust",
-  "group": "cachekit-rs",
   "changelog-sections": [
     {"type": "feat", "section": "Features"},
     {"type": "fix", "section": "Bug Fixes"},
@@ -14,6 +13,17 @@
     {"type": "test", "section": "Tests", "hidden": true},
     {"type": "ci", "section": "CI/CD", "hidden": true},
     {"type": "build", "section": "Build System", "hidden": true}
+  ],
+  "plugins": [
+    {
+      "type": "cargo-workspace",
+      "merge": false
+    },
+    {
+      "type": "linked-versions",
+      "groupName": "cachekit-rs",
+      "components": ["cachekit-rs", "cachekit-macros"]
+    }
   ],
   "packages": {
     "crates/cachekit": {
