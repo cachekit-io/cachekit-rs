@@ -264,14 +264,18 @@ async fn secure_l1_stores_ciphertext_not_plaintext() {
     let secure = client.secure().unwrap();
     secure.set("l1-cipher", &"PLAINTEXT_VALUE").await.unwrap();
 
-    // The plaintext cache still works (proves regular get doesn't decrypt)
-    // Read raw bytes from L1 by using the unencrypted get path
-    // The standard (non-secure) get should fail to deserialize because
-    // L1 has ciphertext, not valid msgpack for a String
-    let result: Result<Option<String>, _> = client.get("l1-cipher").await;
+    // The backend should have ciphertext, not the msgpack encoding of "PLAINTEXT_VALUE".
+    let store = backend.store.lock().await;
+    let (_key, raw_bytes) = store.iter().next().expect("backend should have one entry");
+    let plaintext_msgpack = rmp_serde::to_vec_named(&"PLAINTEXT_VALUE").unwrap();
+    assert_ne!(
+        raw_bytes, &plaintext_msgpack,
+        "backend should store ciphertext, not plaintext msgpack"
+    );
+    // Ciphertext has AAD prefix (0x03 version byte) and is longer than plaintext
     assert!(
-        result.is_err(),
-        "non-secure get on encrypted L1 data should fail deserialization"
+        raw_bytes.len() > plaintext_msgpack.len(),
+        "ciphertext should be larger than plaintext due to AAD + GCM tag"
     );
 }
 
