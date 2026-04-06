@@ -30,7 +30,7 @@ repos:
 
   # General file checks
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b  # v5.0.0  # pragma: allowlist secret
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
@@ -42,7 +42,7 @@ repos:
 
   # Secret scanning - prevent credential leaks
   - repo: https://github.com/Yelp/detect-secrets
-    rev: v1.5.0
+    rev: 01886c8a910c64595c47f186ca1ffc0b77fa5458  # v1.5.0  # pragma: allowlist secret
     hooks:
       - id: detect-secrets
         args:
