@@ -59,7 +59,7 @@ async fn secure_set_and_get() {
     let client = make_encrypted_client(backend);
 
     let secret = Secret {
-        api_key: "sk-live-abc123".to_owned(),
+        api_key: "sk-live-abc123".to_owned(), // pragma: allowlist secret
         user_id: 42,
     };
 
@@ -83,7 +83,7 @@ async fn secure_data_is_encrypted_in_backend() {
     let client = make_encrypted_client(backend.clone());
 
     let secret = Secret {
-        api_key: "sk-live-SUPERSECRET".to_owned(),
+        api_key: "sk-live-SUPERSECRET".to_owned(), // pragma: allowlist secret
         user_id: 999,
     };
 
