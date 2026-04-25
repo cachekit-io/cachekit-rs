@@ -5,6 +5,7 @@
 
 // Production code lints — these only fire in src/, not tests/
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![warn(missing_docs)]
 
 // Mutually exclusive feature guards
 #[cfg(all(feature = "workers", feature = "redis"))]
@@ -15,19 +16,30 @@ compile_error!(
 #[cfg(all(feature = "workers", feature = "l1"))]
 compile_error!("features `workers` and `l1` are mutually exclusive — moka requires std threads unavailable in wasm32");
 
+/// Pluggable cache backend trait and implementations (CachekitIO, Redis, Workers).
 pub mod backend;
+/// High-level cache client with dual-layer (L1/L2) support.
 pub mod client;
+/// Configuration types and environment variable parsing.
 pub mod config;
+/// Error types for cache operations and backend communication.
 pub mod error;
+/// Cache key generation using Blake2b hashing.
 pub mod key;
+/// L1 cache hit-rate metrics for CachekitIO request headers.
 pub mod metrics;
+/// Serialization and deserialization of cached values via MessagePack.
 pub mod serializer;
+/// SDK session tracking (session ID and start timestamp).
 pub mod session;
+/// SSRF-safe URL validation for CachekitIO endpoints.
 pub mod url_validator;
 
+/// Client-side AES-256-GCM encryption with HKDF key derivation.
 #[cfg(feature = "encryption")]
 pub mod encryption;
 
+/// In-process L1 cache backed by [`moka`] with per-entry TTL.
 #[cfg(feature = "l1")]
 pub mod l1;
 

@@ -4,6 +4,8 @@ use crate::error::CachekitError;
 
 type Blake2b256 = Blake2b<U32>;
 
+/// Generate a deterministic cache key by Blake2b-256 hashing the function name
+/// and serialized arguments, optionally prefixed with a namespace.
 pub fn generate_cache_key(
     namespace: &str,
     function_name: &str,

@@ -21,11 +21,15 @@ impl Expiry<String, L1Entry> for L1Expiry {
     }
 }
 
+/// In-process LRU cache with per-entry TTL, backed by [`moka`].
+///
+/// Used as the L1 layer in the dual-layer cache architecture.
 pub struct L1Cache {
     store: Cache<String, L1Entry>,
 }
 
 impl L1Cache {
+    /// Create a new L1 cache with the given maximum entry capacity.
     pub fn new(capacity: usize) -> Self {
         Self {
             store: Cache::builder()
@@ -35,10 +39,12 @@ impl L1Cache {
         }
     }
 
+    /// Retrieve cached bytes by key, or `None` if absent or expired.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         self.store.get(key).map(|entry| entry.data.clone())
     }
 
+    /// Insert or overwrite an entry with the given TTL.
     pub fn set(&self, key: &str, value: &[u8], ttl: Duration) {
         self.store.insert(
             key.to_string(),
@@ -49,6 +55,7 @@ impl L1Cache {
         );
     }
 
+    /// Remove an entry by key.
     pub fn delete(&self, key: &str) {
         self.store.invalidate(key);
     }

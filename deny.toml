@@ -1,8 +1,8 @@
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+# cargo-deny 0.19+: vulnerability/unmaintained/unsound/notice all deny by default.
+# Only yanked needs explicit config — warn instead of hard-fail so renovate can fix.
 yanked = "warn"
-notice = "warn"
+unmaintained = "workspace"
 
 [licenses]
 allow = [
@@ -10,11 +10,14 @@ allow = [
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
     "ISC",
+    "MPL-2.0",
+    "OpenSSL",
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
-    "OpenSSL",
 ]
 confidence-threshold = 0.8
 

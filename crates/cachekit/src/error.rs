@@ -2,6 +2,7 @@ use thiserror::Error;
 
 /// Top-level error type for all CacheKit operations.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CachekitError {
     /// An error originating from the cache backend.
     #[error("backend error: {0}")]
@@ -21,7 +22,12 @@ pub enum CachekitError {
 
     /// The payload exceeds the maximum allowed size.
     #[error("payload too large: {size} bytes (limit: {limit} bytes)")]
-    PayloadTooLarge { size: usize, limit: usize },
+    PayloadTooLarge {
+        /// Actual payload size in bytes.
+        size: usize,
+        /// Maximum allowed size in bytes.
+        limit: usize,
+    },
 
     /// The cache key is invalid (empty, too long, or contains illegal bytes).
     #[error("invalid cache key: {0}")]
@@ -32,6 +38,7 @@ pub enum CachekitError {
 
 /// Classifies backend errors to determine retry behaviour.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BackendErrorKind {
     /// Temporary failure — safe to retry (network blip, pool exhaustion).
     Transient,

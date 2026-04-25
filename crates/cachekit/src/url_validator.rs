@@ -2,6 +2,8 @@ use crate::error::CachekitError;
 
 const ALLOWED_HOSTS: &[&str] = &["api.cachekit.io", "api.staging.cachekit.io"];
 
+/// Validate that a CachekitIO API URL uses HTTPS, is not a private IP (SSRF
+/// protection), and matches the allow-list unless `allow_custom_host` is set.
 pub fn validate_cachekitio_url(
     url_str: &str,
     allow_custom_host: bool,
