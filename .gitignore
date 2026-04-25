@@ -1,1 +1,9 @@
 target/
+
+# AI agent configs — internal dev tooling, not part of the shipped product
+CLAUDE.md
+AGENTS.md
+.claude/
+.caliber/
+.cursor/
+CALIBER_LEARNINGS.md
