@@ -35,7 +35,7 @@ pub mod session;
 /// SSRF-safe URL validation for CachekitIO endpoints.
 pub mod url_validator;
 
-/// Intent-based cache presets (`CacheKit::minimal`, `::production`, `::secure`, `::io`).
+/// Intent-based cache presets (`CacheKit::minimal`, `::production`, `::encrypted`, `::io`).
 mod intents;
 
 /// Client-side AES-256-GCM encryption with HKDF key derivation.

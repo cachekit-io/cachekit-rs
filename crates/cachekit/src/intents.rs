@@ -19,34 +19,13 @@ use crate::error::CachekitError;
 
 // ── SharedBackend wrapping ───────────────────────────────────────────────────
 
-#[cfg(all(
-    feature = "redis",
-    not(any(target_arch = "wasm32", feature = "unsync"))
-))]
-fn wrap_redis(b: crate::backend::redis::RedisBackend) -> SharedBackend {
+#[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
+fn wrap(b: impl crate::backend::Backend + 'static) -> SharedBackend {
     std::sync::Arc::new(b)
 }
 
-#[cfg(all(feature = "redis", any(target_arch = "wasm32", feature = "unsync")))]
-fn wrap_redis(b: crate::backend::redis::RedisBackend) -> SharedBackend {
-    std::rc::Rc::new(b)
-}
-
-#[cfg(all(
-    feature = "cachekitio",
-    not(target_arch = "wasm32"),
-    not(feature = "unsync")
-))]
-fn wrap_cachekitio(b: crate::backend::cachekitio::CachekitIO) -> SharedBackend {
-    std::sync::Arc::new(b)
-}
-
-#[cfg(all(
-    feature = "cachekitio",
-    not(target_arch = "wasm32"),
-    feature = "unsync"
-))]
-fn wrap_cachekitio(b: crate::backend::cachekitio::CachekitIO) -> SharedBackend {
+#[cfg(any(target_arch = "wasm32", feature = "unsync"))]
+fn wrap(b: impl crate::backend::Backend + 'static) -> SharedBackend {
     std::rc::Rc::new(b)
 }
 
@@ -84,7 +63,7 @@ impl CacheKit {
         drop(backend.connect().await?);
 
         Ok(CacheKitBuilder::default()
-            .backend(wrap_redis(backend))
+            .backend(wrap(backend))
             .default_ttl(Duration::from_secs(300))
             .no_l1())
     }
@@ -120,7 +99,7 @@ impl CacheKit {
         drop(backend.connect().await?);
 
         Ok(CacheKitBuilder::default()
-            .backend(wrap_redis(backend))
+            .backend(wrap(backend))
             .default_ttl(Duration::from_secs(600))
             .l1_capacity(1000))
     }
@@ -136,7 +115,7 @@ impl CacheKit {
     ///
     /// Good for: PII, payments, GDPR/HIPAA-sensitive data.
     ///
-    /// `master_key` must be at least 16 raw bytes (32 recommended).
+    /// `master_key` must be at least 32 raw bytes.
     ///
     /// # Errors
     ///
@@ -165,7 +144,7 @@ impl CacheKit {
         drop(backend.connect().await?);
 
         CacheKitBuilder::default()
-            .backend(wrap_redis(backend))
+            .backend(wrap(backend))
             .default_ttl(Duration::from_secs(600))
             .l1_capacity(1000)
             .encryption_from_bytes(master_key, "default")
@@ -202,7 +181,7 @@ impl CacheKit {
             .build()?;
 
         Ok(CacheKitBuilder::default()
-            .backend(wrap_cachekitio(backend))
+            .backend(wrap(backend))
             .default_ttl(Duration::from_secs(3600))
             .l1_capacity(1000))
     }
