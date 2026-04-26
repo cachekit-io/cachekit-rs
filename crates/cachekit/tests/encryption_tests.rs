@@ -5,12 +5,12 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::common::MockBackend;
+use cachekit::client::SharedBackend;
 use cachekit::{CacheKit, CachekitError};
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
@@ -29,7 +29,7 @@ struct Secret {
     user_id: u64,
 }
 
-fn make_encrypted_client(backend: Arc<MockBackend>) -> CacheKit {
+fn make_encrypted_client(backend: SharedBackend) -> CacheKit {
     CacheKit::builder()
         .backend(backend)
         .default_ttl(Duration::from_secs(60))
@@ -40,7 +40,7 @@ fn make_encrypted_client(backend: Arc<MockBackend>) -> CacheKit {
         .expect("client builds")
 }
 
-fn make_encrypted_client_with_l1(backend: Arc<MockBackend>) -> CacheKit {
+fn make_encrypted_client_with_l1(backend: SharedBackend) -> CacheKit {
     CacheKit::builder()
         .backend(backend)
         .default_ttl(Duration::from_secs(60))
@@ -55,7 +55,7 @@ fn make_encrypted_client_with_l1(backend: Arc<MockBackend>) -> CacheKit {
 
 #[tokio::test]
 async fn secure_set_and_get() {
-    let backend = MockBackend::new();
+    let backend = MockBackend::shared();
     let client = make_encrypted_client(backend);
 
     let secret = Secret {
@@ -79,8 +79,8 @@ async fn secure_set_and_get() {
 
 #[tokio::test]
 async fn secure_data_is_encrypted_in_backend() {
-    let backend = MockBackend::new();
-    let client = make_encrypted_client(backend.clone());
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = make_encrypted_client(shared);
 
     let secret = Secret {
         api_key: "sk-live-SUPERSECRET".to_owned(), // pragma: allowlist secret
@@ -117,7 +117,7 @@ async fn secure_data_is_encrypted_in_backend() {
 #[tokio::test]
 async fn secure_without_master_key_fails() {
     let client = CacheKit::builder()
-        .backend(MockBackend::new())
+        .backend(MockBackend::shared())
         .no_l1()
         .build()
         .expect("client builds without encryption");
@@ -138,7 +138,7 @@ async fn secure_without_master_key_fails() {
 
 #[tokio::test]
 async fn secure_get_missing_returns_none() {
-    let client = make_encrypted_client(MockBackend::new());
+    let client = make_encrypted_client(MockBackend::shared());
     let secure = client.secure().unwrap();
 
     let result: Option<String> = secure.get("nonexistent").await.expect("get should succeed");
@@ -147,7 +147,7 @@ async fn secure_get_missing_returns_none() {
 
 #[tokio::test]
 async fn secure_delete() {
-    let client = make_encrypted_client(MockBackend::new());
+    let client = make_encrypted_client(MockBackend::shared());
     let secure = client.secure().unwrap();
 
     secure.set("to-delete", &"temporary").await.unwrap();
@@ -162,8 +162,8 @@ async fn secure_delete() {
 
 #[tokio::test]
 async fn secure_wrong_key_fails_decryption() {
-    let backend = MockBackend::new();
-    let client = make_encrypted_client(backend.clone());
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = make_encrypted_client(shared);
 
     let secure = client.secure().unwrap();
     secure.set("key-a", &"secret data").await.unwrap();
@@ -186,10 +186,11 @@ async fn secure_wrong_key_fails_decryption() {
 
 #[tokio::test]
 async fn secure_different_tenants_cant_decrypt() {
-    let backend = MockBackend::new();
+    let (shared_a, _backend) = MockBackend::new_with_handle();
+    let shared_b = shared_a.clone();
 
     let client_a = CacheKit::builder()
-        .backend(backend.clone())
+        .backend(shared_a)
         .no_l1()
         .encryption_from_bytes(TEST_MASTER_KEY, "tenant-a")
         .unwrap()
@@ -197,7 +198,7 @@ async fn secure_different_tenants_cant_decrypt() {
         .unwrap();
 
     let client_b = CacheKit::builder()
-        .backend(backend)
+        .backend(shared_b)
         .no_l1()
         .encryption_from_bytes(TEST_MASTER_KEY, "tenant-b")
         .unwrap()
@@ -222,7 +223,7 @@ async fn secure_different_tenants_cant_decrypt() {
 #[tokio::test]
 async fn secure_hex_builder() {
     let client = CacheKit::builder()
-        .backend(MockBackend::new())
+        .backend(MockBackend::shared())
         .no_l1()
         .encryption(&test_master_key_hex(), "hex-tenant")
         .expect("hex encryption setup")
@@ -238,8 +239,8 @@ async fn secure_hex_builder() {
 
 #[tokio::test]
 async fn secure_with_l1_roundtrip() {
-    let backend = MockBackend::new();
-    let client = make_encrypted_client_with_l1(backend.clone());
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = make_encrypted_client_with_l1(shared);
 
     let secure = client.secure().unwrap();
     secure.set("l1-test", &"encrypted in L1").await.unwrap();
@@ -258,8 +259,8 @@ async fn secure_with_l1_roundtrip() {
 
 #[tokio::test]
 async fn secure_l1_stores_ciphertext_not_plaintext() {
-    let backend = MockBackend::new();
-    let client = make_encrypted_client_with_l1(backend.clone());
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = make_encrypted_client_with_l1(shared);
 
     let secure = client.secure().unwrap();
     secure.set("l1-cipher", &"PLAINTEXT_VALUE").await.unwrap();
@@ -281,9 +282,9 @@ async fn secure_l1_stores_ciphertext_not_plaintext() {
 
 #[tokio::test]
 async fn secure_with_namespace() {
-    let backend = MockBackend::new();
+    let (shared, backend) = MockBackend::new_with_handle();
     let client = CacheKit::builder()
-        .backend(backend.clone())
+        .backend(shared)
         .namespace("ns")
         .no_l1()
         .encryption_from_bytes(TEST_MASTER_KEY, "test-tenant")

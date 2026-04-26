@@ -80,11 +80,11 @@ pub struct BackendError {
     /// Human-readable description.
     pub message: String,
     /// The underlying error that caused this backend error, if any.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
     #[source]
     pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
     /// The underlying error that caused this backend error, if any.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", feature = "unsync"))]
     #[source]
     pub source: Option<Box<dyn std::error::Error>>,
 }

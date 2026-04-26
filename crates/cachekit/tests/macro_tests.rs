@@ -8,7 +8,6 @@
 mod common;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,32 +15,50 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use cachekit::backend::{Backend, HealthStatus};
+use cachekit::client::SharedBackend;
 use cachekit::error::BackendError;
 use cachekit::{cachekit, CacheKit, CachekitError};
 
 // ── CountingBackend ──────────────────────────────────────────────────────────
 
-/// In-memory backend that also counts how many get/set calls it receives.
+/// Shared state for CountingBackend (Clone shares the same underlying data).
 #[derive(Debug, Default)]
-struct CountingBackend {
+struct CountingInner {
     store: Mutex<HashMap<String, Vec<u8>>>,
     set_count: std::sync::atomic::AtomicU32,
 }
 
+/// In-memory backend that also counts how many get/set calls it receives.
+#[derive(Debug, Default, Clone)]
+struct CountingBackend {
+    inner: std::sync::Arc<CountingInner>,
+}
+
 impl CountingBackend {
-    fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    fn new_with_handle() -> (SharedBackend, Self) {
+        let backend = Self {
+            inner: std::sync::Arc::new(CountingInner::default()),
+        };
+        let handle = backend.clone();
+        #[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
+        let shared: SharedBackend = std::sync::Arc::new(backend);
+        #[cfg(any(target_arch = "wasm32", feature = "unsync"))]
+        let shared: SharedBackend = std::rc::Rc::new(backend);
+        (shared, handle)
     }
 
     fn sets(&self) -> u32 {
-        self.set_count.load(std::sync::atomic::Ordering::SeqCst)
+        self.inner
+            .set_count
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(any(target_arch = "wasm32", feature = "unsync")), async_trait)]
+#[cfg_attr(any(target_arch = "wasm32", feature = "unsync"), async_trait(?Send))]
 impl Backend for CountingBackend {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
-        Ok(self.store.lock().await.get(key).cloned())
+        Ok(self.inner.store.lock().await.get(key).cloned())
     }
 
     async fn set(
@@ -50,18 +67,19 @@ impl Backend for CountingBackend {
         value: Vec<u8>,
         _ttl: Option<Duration>,
     ) -> Result<(), BackendError> {
-        self.set_count
+        self.inner
+            .set_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.store.lock().await.insert(key.to_owned(), value);
+        self.inner.store.lock().await.insert(key.to_owned(), value);
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
-        Ok(self.store.lock().await.remove(key).is_some())
+        Ok(self.inner.store.lock().await.remove(key).is_some())
     }
 
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
-        Ok(self.store.lock().await.contains_key(key))
+        Ok(self.inner.store.lock().await.contains_key(key))
     }
 
     async fn health(&self) -> Result<HealthStatus, BackendError> {
@@ -116,15 +134,15 @@ async fn get_no_extra_args(cache: &CacheKit) -> Result<String, CachekitError> {
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 /// Build a client with a CountingBackend and return both.
-fn mock_client_counting() -> (CacheKit, Arc<CountingBackend>) {
-    let backend = CountingBackend::new();
+fn mock_client_counting() -> (CacheKit, CountingBackend) {
+    let (shared, handle) = CountingBackend::new_with_handle();
     let client = CacheKit::builder()
-        .backend(backend.clone())
+        .backend(shared)
         .default_ttl(Duration::from_secs(300))
         .no_l1()
         .build()
         .expect("mock client builds");
-    (client, backend)
+    (client, handle)
 }
 
 #[tokio::test]

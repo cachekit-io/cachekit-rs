@@ -3,28 +3,56 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use cachekit::backend::{Backend, HealthStatus};
+use cachekit::client::SharedBackend;
 use cachekit::error::BackendError;
 
 /// In-memory mock backend backed by a `Mutex<HashMap>` for use in tests.
+///
+/// The internal store uses `Arc<Mutex>` so cloning the backend shares state,
+/// regardless of whether the outer wrapper is `Arc` or `Rc`.
 #[derive(Debug, Default, Clone)]
 pub struct MockBackend {
-    pub store: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    pub store: std::sync::Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 impl MockBackend {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    /// Create a new mock and immediately wrap it as a [`SharedBackend`].
+    ///
+    /// Use [`MockBackend::new_with_handle`] when tests need to inspect the
+    /// store directly (e.g., to verify ciphertext).
+    pub fn shared() -> SharedBackend {
+        let mock = Self::default();
+        Self::into_shared(mock)
+    }
+
+    /// Create a new mock, returning both a [`SharedBackend`] and a clone
+    /// for direct store inspection.
+    pub fn new_with_handle() -> (SharedBackend, Self) {
+        let mock = Self::default();
+        let handle = mock.clone();
+        (Self::into_shared(mock), handle)
+    }
+
+    fn into_shared(mock: Self) -> SharedBackend {
+        #[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
+        {
+            std::sync::Arc::new(mock)
+        }
+        #[cfg(any(target_arch = "wasm32", feature = "unsync"))]
+        {
+            std::rc::Rc::new(mock)
+        }
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(any(target_arch = "wasm32", feature = "unsync")), async_trait)]
+#[cfg_attr(any(target_arch = "wasm32", feature = "unsync"), async_trait(?Send))]
 impl Backend for MockBackend {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
         Ok(self.store.lock().await.get(key).cloned())

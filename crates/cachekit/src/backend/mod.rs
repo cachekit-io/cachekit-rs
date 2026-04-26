@@ -24,10 +24,10 @@ pub struct HealthStatus {
 
 /// Async cache backend abstraction.
 ///
-/// Implementors must be `Send + Sync` on native targets.
-/// On `wasm32` targets `Send` is relaxed (`?Send`) because the Workers runtime
-/// is single-threaded and `reqwest`/`worker::Fetch` futures are `!Send`.
-#[cfg(not(target_arch = "wasm32"))]
+/// Implementors must be `Send + Sync` on native targets (unless the `unsync`
+/// feature is enabled). On `wasm32` targets or with `unsync`, `Send` is relaxed
+/// (`?Send`) because the runtime is single-threaded.
+#[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Retrieve the raw bytes stored under `key`, or `None` if absent.
@@ -51,25 +51,38 @@ pub trait Backend: Send + Sync {
     async fn health(&self) -> Result<HealthStatus, BackendError>;
 }
 
-#[cfg(target_arch = "wasm32")]
+/// Async cache backend abstraction (`?Send` variant).
+///
+/// Active when compiling for `wasm32` or with the `unsync` feature.
+/// Identical API to the `Send + Sync` variant but without thread-safety bounds.
+#[cfg(any(target_arch = "wasm32", feature = "unsync"))]
 #[async_trait(?Send)]
 pub trait Backend {
+    /// Retrieve the raw bytes stored under `key`, or `None` if absent.
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError>;
+
+    /// Store `value` under `key`, optionally expiring after `ttl`.
     async fn set(
         &self,
         key: &str,
         value: Vec<u8>,
         ttl: Option<Duration>,
     ) -> Result<(), BackendError>;
+
+    /// Remove `key` and return `true` if it existed.
     async fn delete(&self, key: &str) -> Result<bool, BackendError>;
+
+    /// Return `true` if `key` exists without fetching the value.
     async fn exists(&self, key: &str) -> Result<bool, BackendError>;
+
+    /// Return health/status information for this backend.
     async fn health(&self) -> Result<HealthStatus, BackendError>;
 }
 
 // ── TtlInspectable ───────────────────────────────────────────────────────────
 
 /// Optional extension for backends that can report the remaining TTL of a key.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
 #[async_trait]
 pub trait TtlInspectable: Backend {
     /// Return the remaining TTL for `key`, or `None` if the key does not exist
@@ -84,11 +97,15 @@ pub trait TtlInspectable: Backend {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+/// Optional extension for backends that can report the remaining TTL of a key (`?Send` variant).
+#[cfg(any(target_arch = "wasm32", feature = "unsync"))]
 #[async_trait(?Send)]
 pub trait TtlInspectable: Backend {
+    /// Return the remaining TTL for `key`, or `None` if the key does not exist
+    /// or has no expiry.
     async fn ttl(&self, key: &str) -> Result<Option<Duration>, BackendError>;
 
+    /// Refresh the TTL on an existing key. Default: not supported.
     async fn refresh_ttl(&self, _key: &str, _ttl: Duration) -> Result<bool, BackendError> {
         Err(BackendError::permanent(
             "refresh_ttl not supported by this backend",
@@ -99,7 +116,7 @@ pub trait TtlInspectable: Backend {
 // ── LockableBackend ─────────────────────────────────────────────────────────
 
 /// Optional extension for backends that support distributed locking.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
 #[async_trait]
 pub trait LockableBackend: Backend {
     /// Acquire a distributed lock. Returns lock_id if acquired, None if contested.
@@ -112,14 +129,17 @@ pub trait LockableBackend: Backend {
     async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError>;
 }
 
-#[cfg(target_arch = "wasm32")]
+/// Optional extension for backends that support distributed locking (`?Send` variant).
+#[cfg(any(target_arch = "wasm32", feature = "unsync"))]
 #[async_trait(?Send)]
 pub trait LockableBackend: Backend {
+    /// Acquire a distributed lock. Returns lock_id if acquired, None if contested.
     async fn acquire_lock(
         &self,
         key: &str,
         timeout_ms: u64,
     ) -> Result<Option<String>, BackendError>;
+    /// Release a distributed lock. Returns true if released.
     async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError>;
 }
 

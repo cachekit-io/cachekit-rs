@@ -20,7 +20,8 @@ struct LockAcquireResponse {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[async_trait]
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
 impl LockableBackend for CachekitIO {
     async fn acquire_lock(
         &self,

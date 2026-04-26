@@ -75,7 +75,8 @@ impl RedisBackend {
 // ── Backend impl ──────────────────────────────────────────────────────────────
 
 #[cfg(not(target_arch = "wasm32"))]
-#[async_trait]
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
 impl Backend for RedisBackend {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
         let result: Option<bytes::Bytes> = self.client.get(key).await.map_err(redis_err)?;
@@ -127,7 +128,8 @@ impl Backend for RedisBackend {
 // ── TtlInspectable impl ───────────────────────────────────────────────────────
 
 #[cfg(not(target_arch = "wasm32"))]
-#[async_trait]
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
 impl TtlInspectable for RedisBackend {
     async fn ttl(&self, key: &str) -> Result<Option<Duration>, BackendError> {
         // Redis TTL return values:

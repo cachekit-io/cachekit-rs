@@ -22,7 +22,7 @@ struct User {
 
 fn mock_client() -> CacheKit {
     CacheKit::builder()
-        .backend(MockBackend::new())
+        .backend(MockBackend::shared())
         .default_ttl(Duration::from_secs(60))
         .no_l1()
         .build()
@@ -94,7 +94,7 @@ async fn client_delete() {
 #[tokio::test]
 async fn client_payload_too_large() {
     let client = CacheKit::builder()
-        .backend(MockBackend::new())
+        .backend(MockBackend::shared())
         .max_payload_bytes(10)
         .no_l1()
         .build()
@@ -161,7 +161,7 @@ async fn client_key_validation() {
 
     // Boundary case: exactly 1024 bytes should be accepted
     let client2 = CacheKit::builder()
-        .backend(MockBackend::new())
+        .backend(MockBackend::shared())
         .no_l1()
         .build()
         .expect("client builds");
