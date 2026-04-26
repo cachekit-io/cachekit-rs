@@ -125,6 +125,7 @@ pub trait LockableBackend: Backend {
 
 // ── Feature-gated backend modules ─────────────────────────────────────────────
 
+/// HTTP backend for the cachekit.io SaaS API.
 #[cfg(feature = "cachekitio")]
 pub mod cachekitio;
 #[cfg(feature = "cachekitio")]
@@ -132,8 +133,10 @@ mod cachekitio_lock;
 #[cfg(feature = "cachekitio")]
 mod cachekitio_ttl;
 
+/// Redis backend via the [`fred`](https://crates.io/crates/fred) client.
 #[cfg(feature = "redis")]
 pub mod redis;
 
+/// Cloudflare Workers backend using `worker::Fetch`.
 #[cfg(feature = "workers")]
 pub mod workers;

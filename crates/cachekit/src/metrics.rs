@@ -1,14 +1,21 @@
 use std::sync::Arc;
 
+/// Snapshot of L1/L2 cache hit statistics.
 pub struct L1Stats {
+    /// Number of requests served from the L1 in-process cache.
     pub l1_hits: u64,
+    /// Number of requests served from the L2 backend.
     pub l2_hits: u64,
+    /// Number of cache misses.
     pub misses: u64,
+    /// Whether the L1 cache is currently enabled.
     pub l1_enabled: bool,
 }
 
+/// Thread-safe closure that produces an optional [`L1Stats`] snapshot.
 pub type MetricsProvider = Arc<dyn Fn() -> Option<L1Stats> + Send + Sync>;
 
+/// Build `X-CacheKit-*` HTTP headers from the current L1 stats provider.
 pub fn metrics_headers(provider: Option<&MetricsProvider>) -> Vec<(&'static str, String)> {
     let disabled = vec![("X-CacheKit-L1-Status", "disabled".to_string())];
 
