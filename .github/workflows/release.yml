@@ -13,8 +13,9 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
+      release_created: ${{ steps.release.outputs['crates/cachekit--release_created'] }}
+      tag_name: ${{ steps.release.outputs['crates/cachekit--tag_name'] }}
+      macros_release_created: ${{ steps.release.outputs['crates/cachekit-macros--release_created'] }}
     steps:
       - uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3
         id: app-token
@@ -27,9 +28,12 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
 
+      - name: Debug release-please outputs
+        run: echo '${{ toJSON(steps.release.outputs) }}'
+
   publish:
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created }}
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
