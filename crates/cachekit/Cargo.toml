@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Production-ready Redis caching for Rust. Supports cachekit.io SaaS, Redis, and Cloudflare Workers."
+readme = "../../README.md"
+homepage = "https://cachekit.io"
+keywords = ["cache", "redis", "encryption", "moka", "cloudflare-workers"]
+categories = ["caching", "web-programming", "cryptography"]
 
 [lib]
 name = "cachekit"

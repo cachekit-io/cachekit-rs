@@ -5,11 +5,11 @@
 **Production-ready caching for Rust — dual-layer L1/L2, zero-knowledge encryption, multi-backend.**
 
 [![Crates.io](https://img.shields.io/crates/v/cachekit-rs.svg)](https://crates.io/crates/cachekit-rs)
-[![Documentation](https://docs.rs/cachekit-rs/badge.svg)](https://docs.rs/cachekit-rs)
+[![docs.rs](https://docs.rs/cachekit-rs/badge.svg)](https://docs.rs/cachekit-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
-[Features](#features) · [Quick Start](#quick-start) · [Backends](#backends) · [Encryption](#zero-knowledge-encryption) · [Architecture](#architecture)
+[Features](#features) · [Quick Start](#quick-start) · [Encryption](#zero-knowledge-encryption) · [Backends](#backends) · [Architecture](#architecture)
 
 </div>
 
@@ -28,7 +28,7 @@
 
 > [!TIP]
 > For the Python SDK with decorators, see [`cachekit`](https://github.com/cachekit-io/cachekit).
-> For the low-level compression/encryption primitives, see [`cachekit-core`](https://github.com/cachekit-io/cachekit-core).
+> For the low-level compression/encryption primitives, see [`cachekit-core`](https://crates.io/crates/cachekit-core).
 
 ---
 
@@ -36,25 +36,25 @@
 
 | Feature | Default | Description |
 |:--------|:-------:|:------------|
-| `cachekitio` | ✅ | HTTP backend for [api.cachekit.io](https://api.cachekit.io) via [`reqwest`](https://crates.io/crates/reqwest) + rustls |
-| `encryption` | ✅ | Zero-knowledge AES-256-GCM via [`cachekit-core`](https://crates.io/crates/cachekit-core) |
-| `l1` | ✅ | In-process L1 cache via [`moka`](https://crates.io/crates/moka) |
-| `redis` | ❌ | Redis backend via [`fred`](https://crates.io/crates/fred) (native only) |
-| `workers` | ❌ | Cloudflare Workers backend via [`worker`](https://crates.io/crates/worker) |
+| `cachekitio` | ✅ | HTTP backend for [api.cachekit.io](https://api.cachekit.io) via [reqwest](https://crates.io/crates/reqwest) + rustls |
+| `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core) |
+| `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka) |
+| `redis` | ❌ | Redis backend via [fred](https://crates.io/crates/fred) (native only) |
+| `workers` | ❌ | Cloudflare Workers backend via [worker](https://crates.io/crates/worker) |
 | `macros` | ❌ | `#[cachekit]` proc-macro decorator |
 
 ```toml
-# Cargo.toml — defaults (SaaS + encryption + L1)
+# Defaults: SaaS + encryption + L1
 [dependencies]
-cachekit-rs = "0.0.1-alpha.1"
+cachekit-rs = "0.2"
 
 # With Redis backend
 [dependencies]
-cachekit-rs = { version = "0.0.1-alpha.1", features = ["redis"] }
+cachekit-rs = { version = "0.2", features = ["redis"] }
 
 # For Cloudflare Workers (no L1, no Redis)
 [dependencies]
-cachekit-rs = { version = "0.0.1-alpha.1", default-features = false, features = ["workers", "cachekitio", "encryption"] }
+cachekit-rs = { version = "0.2", default-features = false, features = ["workers", "encryption"] }
 ```
 
 > [!WARNING]
@@ -104,7 +104,7 @@ let cache = CacheKit::builder()
 ```
 
 > [!IMPORTANT]
-> **Key Management**: Never hardcode API keys or master keys. Use environment variables or a secrets manager.
+> Never hardcode API keys or master keys. Use environment variables or a secrets manager.
 
 ---
 
@@ -113,8 +113,6 @@ let cache = CacheKit::builder()
 Call `.secure()` to get an encrypted cache handle. All values are encrypted client-side with AES-256-GCM before hitting any backend. The backend only ever sees ciphertext.
 
 ```rust
-use cachekit::prelude::*;
-
 let cache = CacheKit::from_env()?.build()?;
 let secure = cache.secure()?;
 
@@ -129,7 +127,7 @@ let ssn: String = secure.get("user:42:ssn").await?.unwrap();
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
 │  Your Code   │────>│  SecureCache  │────>│   Backend    │
 │              │     │  AES-256-GCM  │     │  (cachekit.io│
-│  plaintext   │     │  encrypt/     │     │   or Redis)  │
+│  plaintext   │     │  encrypt /    │     │   or Redis)  │
 │              │<────│  decrypt      │<────│              │
 └──────────────┘     └──────────────┘     └──────────────┘
                       L1 stores ciphertext
@@ -141,20 +139,20 @@ let ssn: String = secure.get("user:42:ssn").await?.unwrap();
 
 | Property | Implementation |
 |:---------|:---------------|
-| **Encryption** | AES-256-GCM (AEAD) via [`ring`](https://crates.io/crates/ring) |
+| **Encryption** | AES-256-GCM (AEAD) via [cachekit-core](https://crates.io/crates/cachekit-core) (`ring` on native, `aes-gcm` on wasm32) |
 | **Key Derivation** | HKDF-SHA256 — per-tenant cryptographic isolation |
 | **AAD Binding** | Cache key bound to ciphertext (prevents substitution attacks) |
-| **Memory Safety** | [`zeroize`](https://crates.io/crates/zeroize) on drop for all key material |
+| **Memory Safety** | [zeroize](https://crates.io/crates/zeroize) on drop for all key material |
 | **L1 Guarantee** | L1 stores ciphertext, never plaintext |
-| **Nonce Safety** | Counter-based + random IV (no reuse) |
 
-**AAD v0x03 Format:**
+**AAD v0x03 wire format:**
 
 ```text
 [version(0x03)][len(4)][tenant_id][len(4)][cache_key][len(4)][format][len(4)][compressed]
 ```
 
 Each field is length-prefixed with a 4-byte big-endian u32 to prevent boundary-confusion attacks.
+Cross-SDK compatible — ciphertext produced by the Python SDK decrypts with the Rust SDK and vice versa.
 
 </details>
 
@@ -164,31 +162,40 @@ Each field is length-prefixed with a 4-byte big-endian u32 to prevent boundary-c
 
 ### cachekit.io SaaS (default)
 
-HTTP backend targeting [api.cachekit.io](https://api.cachekit.io). Includes distributed locking and TTL inspection.
+HTTP backend targeting [api.cachekit.io](https://api.cachekit.io) with session tracking, L1 metrics headers, SSRF-safe URL validation, distributed locking, and TTL inspection.
 
 ```rust
 use cachekit::backend::cachekitio::CachekitIO;
 
 let backend = CachekitIO::builder()
     .api_key("ck_live_...")
-    .api_url("https://api.cachekit.io")
+    .api_url("https://api.cachekit.io")  // optional, this is the default
     .build()?;
 ```
 
 ### Redis
 
-Native Redis via [`fred`](https://crates.io/crates/fred). Requires the `redis` feature.
+Native Redis via [fred](https://crates.io/crates/fred) with cluster support. Requires the `redis` feature flag.
 
 ```toml
-cachekit-rs = { version = "0.0.1-alpha.1", features = ["redis"] }
+cachekit-rs = { version = "0.2", features = ["redis"] }
+```
+
+```rust
+use cachekit::backend::redis::RedisBackend;
+
+let backend = RedisBackend::builder()
+    .url("redis://localhost:6379")
+    .build()?;
+backend.connect().await?;  // explicit connect required
 ```
 
 ### Cloudflare Workers
 
-`wasm32-unknown-unknown` compatible backend using `worker::Fetch`. Requires the `workers` feature with `l1` and `redis` disabled.
+`wasm32-unknown-unknown` backend using `worker::Fetch`. Requires the `workers` feature with default features disabled.
 
 ```toml
-cachekit-rs = { version = "0.0.1-alpha.1", default-features = false, features = ["workers", "cachekitio", "encryption"] }
+cachekit-rs = { version = "0.2", default-features = false, features = ["workers", "encryption"] }
 ```
 
 <details>
@@ -222,7 +229,7 @@ Optional extension traits: `TtlInspectable` (TTL queries), `LockableBackend` (di
 
 ## Dual-Layer Caching
 
-When the `l1` feature is enabled, CacheKit automatically maintains an in-process cache in front of the backend:
+When the `l1` feature is enabled (default), CacheKit maintains an in-process [moka](https://crates.io/crates/moka) cache in front of the backend:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -251,7 +258,7 @@ When the `l1` feature is enabled, CacheKit automatically maintains an in-process
 | **Backfill on miss** | L2 hits populate L1 with a capped 30s TTL |
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
 | **Encrypted L1** | `SecureCache` stores ciphertext in L1 (never plaintext) |
-| **Default capacity** | 1,000 entries (configurable via builder) |
+| **Default capacity** | 1,000 entries (configurable via `.l1_capacity()`) |
 
 ---
 
@@ -265,7 +272,8 @@ When the `l1` feature is enabled, CacheKit automatically maintains an in-process
 | `CACHEKIT_DEFAULT_TTL` | ❌ | Default TTL in seconds (min 1, default: 300) |
 
 > [!CAUTION]
-> `CACHEKIT_API_URL` must use HTTPS. Plain HTTP is rejected at configuration time.
+> `CACHEKIT_API_URL` must use HTTPS and must not point to a private IP address.
+> Both constraints are enforced at configuration time.
 
 ---
 
@@ -281,9 +289,10 @@ cachekit-rs/
 │   │       ├── config.rs      # CachekitConfig + from_env()
 │   │       ├── encryption.rs  # AES-256-GCM + AAD v0x03
 │   │       ├── error.rs       # CachekitError, BackendError
-│   │       ├── key.rs         # Cache key types
-│   │       ├── metrics.rs     # Operation metrics
-│   │       ├── session.rs     # Session management
+│   │       ├── key.rs         # Blake2b-256 cache key generation
+│   │       ├── metrics.rs     # L1 hit-rate metrics headers
+│   │       ├── session.rs     # SDK session tracking
+│   │       ├── url_validator.rs # SSRF-safe URL validation
 │   │       ├── serializer/    # MessagePack serialization
 │   │       ├── l1/            # moka-based L1 cache (feature = "l1")
 │   │       └── backend/
@@ -312,22 +321,18 @@ make build         # cargo build --release
 make build-wasm    # wasm32-unknown-unknown (workers feature)
 ```
 
----
-
 ## Minimum Supported Rust Version
 
-This crate requires **Rust 1.85** or later (Edition 2021).
-
----
+**Rust 1.85** or later (Edition 2021).
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE) for details.
 
 ---
 
 <div align="center">
 
-**[Documentation](https://docs.rs/cachekit-rs)** · **[Crates.io](https://crates.io/crates/cachekit-rs)** · **[GitHub](https://github.com/cachekit-io/cachekit-rs)**
+**[Documentation](https://docs.rs/cachekit-rs)** · **[cachekit.io](https://cachekit.io)** · **[GitHub](https://github.com/cachekit-io/cachekit-rs)**
 
 </div>
