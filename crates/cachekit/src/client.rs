@@ -8,28 +8,34 @@ use crate::serializer;
 
 // ── SharedBackend type alias ──────────────────────────────────────────────────
 
-/// Thread-safe reference to a heap-allocated backend.
+/// Reference-counted pointer to a heap-allocated backend.
 ///
-/// On native targets we require `Send + Sync` for use across threads.
-/// On `wasm32` the Workers runtime is single-threaded so `Rc` is sufficient.
-#[cfg(not(target_arch = "wasm32"))]
+/// On native targets (without `unsync`) we require `Send + Sync` via `Arc`.
+/// On `wasm32` or with the `unsync` feature, `Rc` is used instead — the runtime
+/// is single-threaded so `Send` bounds are unnecessary.
+#[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
 pub type SharedBackend = std::sync::Arc<dyn Backend>;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "unsync"))]
 pub type SharedBackend = std::rc::Rc<dyn Backend>;
 
 // ── SharedEncryption type alias ──────────────────────────────────────────────
 
-/// Thread-safe reference to the encryption layer.
+/// Reference-counted pointer to the encryption layer.
 ///
-/// On native targets `Arc` is used (requires `Sync`).
-/// On `wasm32` the Workers runtime is single-threaded so `Rc` is sufficient
-/// and avoids the `!Sync` problem caused by `Cell<u64>` inside cachekit-core's
-/// nonce counter.
-#[cfg(all(feature = "encryption", not(target_arch = "wasm32")))]
+/// On native targets (without `unsync`) `Arc` is used (requires `Sync`).
+/// On `wasm32` or with `unsync`, `Rc` is used — avoids the `!Sync` problem
+/// caused by `Cell<u64>` inside cachekit-core's nonce counter.
+#[cfg(all(
+    feature = "encryption",
+    not(any(target_arch = "wasm32", feature = "unsync"))
+))]
 type SharedEncryption = std::sync::Arc<crate::encryption::EncryptionLayer>;
 
-#[cfg(all(feature = "encryption", target_arch = "wasm32"))]
+#[cfg(all(
+    feature = "encryption",
+    any(target_arch = "wasm32", feature = "unsync")
+))]
 type SharedEncryption = std::rc::Rc<crate::encryption::EncryptionLayer>;
 
 // ── Key validation ────────────────────────────────────────────────────────────
@@ -105,8 +111,13 @@ impl CacheKit {
             .build()
             .map_err(|e| CachekitError::Config(e.to_string()))?;
 
+        #[cfg(not(feature = "unsync"))]
+        let shared: SharedBackend = std::sync::Arc::new(backend);
+        #[cfg(feature = "unsync")]
+        let shared: SharedBackend = std::rc::Rc::new(backend);
+
         let mut builder = CacheKitBuilder::default()
-            .backend(std::sync::Arc::new(backend))
+            .backend(shared)
             .default_ttl(config.default_ttl)
             .max_payload_bytes(config.max_payload_bytes)
             .l1_capacity(config.l1_capacity);

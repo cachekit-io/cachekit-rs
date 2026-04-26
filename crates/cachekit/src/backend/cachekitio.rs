@@ -119,7 +119,8 @@ pub(crate) fn from_http_status_sanitized(status: u16, body: &[u8], api_key: &str
 // ── Backend impl ──────────────────────────────────────────────────────────────
 
 #[cfg(not(target_arch = "wasm32"))]
-#[async_trait]
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
 impl Backend for CachekitIO {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
         let req = self.with_standard_headers(

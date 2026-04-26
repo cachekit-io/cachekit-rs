@@ -24,6 +24,9 @@ workers = ["dep:worker", "dep:js-sys", "dep:getrandom"]
 encryption = ["cachekit-core/encryption"]
 l1 = ["dep:moka"]
 macros = ["dep:cachekit-macros"]
+# Opt into ?Send / Rc on native targets (for tokio::task::LocalSet, single-threaded
+# runtimes, etc.). Same code paths that wasm32 already uses.
+unsync = []
 
 [dependencies]
 cachekit-core = { version = "0.2", features = ["messagepack"] }

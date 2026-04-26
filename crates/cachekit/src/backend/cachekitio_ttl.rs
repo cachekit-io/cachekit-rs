@@ -21,7 +21,8 @@ struct RefreshTtlRequest {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[async_trait]
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
 impl TtlInspectable for CachekitIO {
     async fn ttl(&self, key: &str) -> Result<Option<Duration>, BackendError> {
         let url = format!(
