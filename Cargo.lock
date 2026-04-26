@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "cachekit-macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "cachekit-rs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "blake2",

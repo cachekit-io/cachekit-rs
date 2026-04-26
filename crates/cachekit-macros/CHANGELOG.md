@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.2.0...cachekit-macros-v0.3.0) (2026-04-26)
+
+
+### Miscellaneous
+
+* **cachekit-macros:** Synchronize cachekit-rs versions
+
 ## [0.2.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.1.0...cachekit-macros-v0.2.0) (2026-04-26)
 
 

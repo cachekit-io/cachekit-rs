@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.2.0...cachekit-rs-v0.3.0) (2026-04-26)
+
+
+### Features
+
+* unsync feature flag for ?Send contexts ([#16](https://github.com/cachekit-io/cachekit-rs/issues/16)) ([c52c3f2](https://github.com/cachekit-io/cachekit-rs/commit/c52c3f22317b589d9ee41d955868977ed3d0a27a))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.2.0 to 0.3.0
+
 ## [0.2.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.0.1-alpha.1...cachekit-rs-v0.2.0) (2026-04-26)
 
 
