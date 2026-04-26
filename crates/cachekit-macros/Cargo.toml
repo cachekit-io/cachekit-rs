@@ -5,7 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Proc-macro decorators for cachekit (e.g. #[cache])."
+description = "Proc-macro decorators for the cachekit-rs SDK (#[cachekit] attribute macro)."
+readme = "README.md"
+homepage = "https://cachekit.io"
+keywords = ["cache", "proc-macro", "cachekit"]
+categories = ["caching"]
 
 [lib]
 proc-macro = true
