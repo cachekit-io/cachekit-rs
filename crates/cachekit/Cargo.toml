@@ -1,6 +1,6 @@
 [package]
 name = "cachekit-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -58,7 +58,7 @@ js-sys = { version = "0.3", optional = true }
 getrandom = { version = "0.2", optional = true, features = ["js"] }
 
 # Optional: proc-macro decorator
-cachekit-macros = { version = "0.2.0", path = "../cachekit-macros", optional = true }
+cachekit-macros = { version = "0.3.0", path = "../cachekit-macros", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
