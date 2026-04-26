@@ -16,6 +16,7 @@ use crate::serializer;
 #[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
 pub type SharedBackend = std::sync::Arc<dyn Backend>;
 
+/// Reference-counted pointer to a heap-allocated backend (`?Send` variant).
 #[cfg(any(target_arch = "wasm32", feature = "unsync"))]
 pub type SharedBackend = std::rc::Rc<dyn Backend>;
 
