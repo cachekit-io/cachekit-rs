@@ -1,3 +1,7 @@
+# This configuration is a copy of the organization-canonical CodeRabbit config.
+# Source of truth: cachekit-io/.github/.coderabbit.yaml
+# Keep this file in sync when the canonical version updates.
+#
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 language: "en-AU"
 early_access: false
@@ -40,7 +44,7 @@ reviews:
     - path: ".github/workflows/**"
       instructions: |
         GitHub Actions workflows. All actions MUST be pinned to full 40-char SHA
-        with a version comment (e.g., @abc123 # v6). Never use tag refs.
+        with a version comment (e.g., `@a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0` # v6). Never use tag refs.
     - path: "**/Dockerfile*"
       instructions: |
         Dockerfiles. Check for missing cleanup (rm -rf /var/lib/apt/lists/*),
