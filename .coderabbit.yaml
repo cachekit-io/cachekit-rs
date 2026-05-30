@@ -1,7 +1,3 @@
-# This configuration is a copy of the organization-canonical CodeRabbit config.
-# Source of truth: cachekit-io/.github/.coderabbit.yaml
-# Keep this file in sync when the canonical version updates.
-#
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 language: "en-AU"
 early_access: false
