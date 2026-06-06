@@ -35,9 +35,13 @@ jobs:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: cachekit-lean
+    timeout-minutes: 30
     env:
       RUSTUP_HOME: /tmp/rustup
       CARGO_HOME: /tmp/cargo
+      # Same 6Gi cgroup OOM constraint as CI (issue #25): cap parallel jobs so
+      # the cold pre-publish build doesn't OOM-kill the linker on cachekit-lean.
+      CARGO_BUILD_JOBS: "4"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -48,6 +52,15 @@ jobs:
 
       - name: Run tests before publish
         run: cargo test --features "cachekitio,redis,encryption,l1,macros"
+
+      - name: Verify MSRV (1.85) before publish
+        # Gate: never ship a release that breaks the declared MSRV floor.
+        # release.yml previously built `stable` only, so a red MSRV job could
+        # publish silently (issue #25). `check --all-targets` catches any use
+        # of a newer-than-1.85 API across lib + tests without a heavy build.
+        run: |
+          rustup toolchain install 1.85 --profile minimal
+          cargo +1.85 check --all-targets --features "cachekitio,redis,encryption,l1,macros"
 
       - name: Publish cachekit-macros to crates.io
         run: cargo publish -p cachekit-macros
