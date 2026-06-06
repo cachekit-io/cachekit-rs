@@ -14,6 +14,10 @@ env:
   # cross-device link errors on container overlay filesystems.
   RUSTUP_HOME: /tmp/rustup
   CARGO_HOME: /tmp/cargo
+  # cargo reads the node's CPU count (32t), not the pod's cgroup quota, so it
+  # spawns ~32 parallel rustc in a 6Gi runner and OOM-kills the build (SIGKILL
+  # 137) mid-`cargo test`. Cap parallelism to fit the memory ceiling.
+  CARGO_BUILD_JOBS: "4"
 
 jobs:
   test:
