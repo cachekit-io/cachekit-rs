@@ -14,11 +14,23 @@ env:
   # cross-device link errors on container overlay filesystems.
   RUSTUP_HOME: /tmp/rustup
   CARGO_HOME: /tmp/cargo
+  # The cachekit-lean ARC runner has a hard 6Gi memory cgroup (lab ADR-0001).
+  # cargo defaults -j to the visible core count (~24 via the pod's CPU limit),
+  # and a cold `cargo test` build of this 246-crate async/TLS/crypto graph with
+  # full test-profile debuginfo peaks above 6Gi at that fan-out — the kernel
+  # OOM-kills the linker and the runner "loses communication" (issue #25,
+  # confirmed by a 6Gi-cgroup repro). Cap parallel compile/link jobs so peak
+  # RSS stays well under the cap on the cache-less lean pod.
+  CARGO_BUILD_JOBS: "4"
 
 jobs:
   test:
     name: ${{ matrix.rust }}
     runs-on: cachekit-lean
+    # Backstop: a wedged/killed runner otherwise hangs ~10min until GitHub's
+    # heartbeat reckoning (issue #25). Fail fast — a healthy cold -j4 build of
+    # this tree finishes well inside this window.
+    timeout-minutes: 20
     continue-on-error: ${{ matrix.rust == 'beta' }}
     strategy:
       fail-fast: false
@@ -46,6 +58,7 @@ jobs:
   wasm:
     name: wasm32 compilation check
     runs-on: cachekit-lean
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
