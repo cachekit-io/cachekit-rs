@@ -24,6 +24,8 @@ pub mod client;
 pub mod config;
 /// Error types for cache operations and backend communication.
 pub mod error;
+/// Interop mode (interop/v1): cross-SDK cache keys and plain-MessagePack values.
+pub mod interop;
 /// Cache key generation using Blake2b hashing.
 pub mod key;
 /// L1 cache hit-rate metrics for CachekitIO request headers.

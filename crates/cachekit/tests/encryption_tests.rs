@@ -306,3 +306,38 @@ async fn secure_with_namespace() {
     let val: String = secure.get("namespaced").await.unwrap().unwrap();
     assert_eq!(val, "value");
 }
+
+#[tokio::test]
+async fn secure_set_rejects_payload_whose_ciphertext_exceeds_limit() {
+    // The get paths size-check the STORED ciphertext (plaintext + 28 bytes of
+    // nonce + tag). If set only checked the plaintext, a value within 28 bytes
+    // of the limit would write successfully and then fail every read with
+    // PayloadTooLarge. set must therefore check the ciphertext length.
+    let client = CacheKit::builder()
+        .backend(MockBackend::shared())
+        .no_l1()
+        .max_payload_bytes(64)
+        .encryption_from_bytes(TEST_MASTER_KEY, "test-tenant")
+        .expect("encryption setup")
+        .build()
+        .expect("client builds");
+    let secure = client.secure().expect("secure handle");
+
+    // 50 serialized bytes: under the 64-byte limit as plaintext, over it as
+    // ciphertext (50 + 28 = 78). Must fail at write time, not become
+    // unreadable after a successful write.
+    let value = "x".repeat(48); // msgpack str8: 2 header bytes + 48
+    let err = secure
+        .set("boundary:key", &value)
+        .await
+        .expect_err("ciphertext over limit must fail at set time");
+    assert!(
+        matches!(err, CachekitError::PayloadTooLarge { .. }),
+        "expected PayloadTooLarge, got: {err:?}"
+    );
+
+    // Well under the limit still round-trips.
+    secure.set("small:key", &"ok").await.expect("small set");
+    let got: Option<String> = secure.get("small:key").await.expect("small get");
+    assert_eq!(got.as_deref(), Some("ok"));
+}
