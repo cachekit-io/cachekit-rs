@@ -1,8 +1,10 @@
 //! Tests for intent-based cache presets.
 //!
-//! The async intents (minimal, production, encrypted) require a Redis
-//! connection, so we test parameter validation through the underlying
-//! builders. The sync io() intent can be tested end-to-end.
+//! The async Redis intents (minimal, production, encrypted) connect eagerly,
+//! so their success paths need a live Redis and are not tested here. Their
+//! error paths (invalid URL, invalid key) are deterministic and local — those
+//! are exercised through the public factories directly. The sync io() intent
+//! can be tested end-to-end.
 //!
 //! Run with:
 //!   cargo test --test intent_tests --features redis,encryption,cachekitio,l1
@@ -11,12 +13,49 @@ mod common;
 
 use std::time::Duration;
 
-// ── minimal / production (Redis URL validation) ──────────────────────────────
+// ── minimal / production (factory URL validation, no network) ────────────────
 
 #[cfg(feature = "redis")]
 mod redis_intents {
+    use cachekit::error::CachekitError;
+    use cachekit::CacheKit;
+
+    #[tokio::test]
+    async fn minimal_rejects_empty_url() {
+        assert!(
+            matches!(CacheKit::minimal("").await, Err(CachekitError::Config(_))),
+            "empty URL must be a config error, raised before any connection attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn minimal_rejects_invalid_url() {
+        assert!(matches!(
+            CacheKit::minimal("not-a-redis-url").await,
+            Err(CachekitError::Config(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn production_rejects_empty_url() {
+        assert!(matches!(
+            CacheKit::production("").await,
+            Err(CachekitError::Config(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn production_rejects_invalid_url() {
+        assert!(matches!(
+            CacheKit::production("not-a-redis-url").await,
+            Err(CachekitError::Config(_))
+        ));
+    }
+
+    // Positive URL parsing stays at the builder level: the factories connect
+    // eagerly, so a valid-URL factory test would require a live Redis.
     #[test]
-    fn accepts_valid_url() {
+    fn builder_accepts_valid_url() {
         let backend = cachekit::backend::redis::RedisBackend::builder()
             .url("redis://localhost:6379")
             .build();
@@ -24,36 +63,31 @@ mod redis_intents {
     }
 
     #[test]
-    fn accepts_url_with_password() {
+    fn builder_accepts_url_with_password() {
         let backend = cachekit::backend::redis::RedisBackend::builder()
             .url("redis://:secret@host:6379/0")
             .build();
         assert!(backend.is_ok());
     }
-
-    #[test]
-    fn rejects_empty_url() {
-        let backend = cachekit::backend::redis::RedisBackend::builder()
-            .url("")
-            .build();
-        assert!(backend.is_err());
-    }
 }
 
-// ── encrypted (encryption key validation) ────────────────────────────────────
+// ── encrypted (factory key validation, no network) ───────────────────────────
 
 #[cfg(all(feature = "redis", feature = "encryption"))]
 mod encrypted_intent {
     use crate::common::MockBackend;
+    use cachekit::error::CachekitError;
+    use cachekit::CacheKit;
 
-    #[test]
-    fn rejects_short_master_key() {
-        let result = cachekit::CacheKitBuilder::default()
-            .backend(MockBackend::shared())
-            .encryption_from_bytes(b"too_short", "tenant");
+    #[tokio::test]
+    async fn rejects_short_master_key_before_connecting() {
+        // The URL points at an unreachable Redis on purpose: key validation
+        // must fire first, so we get the deterministic Encryption error —
+        // never a Backend (connection) error.
+        let result = CacheKit::encrypted("redis://127.0.0.1:1", b"too_short").await;
         assert!(
-            result.is_err(),
-            "master key under 16 bytes must be rejected"
+            matches!(result, Err(CachekitError::Encryption(_))),
+            "short master key must be rejected before any Redis I/O"
         );
     }
 

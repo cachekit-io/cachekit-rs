@@ -138,16 +138,19 @@ impl CacheKit {
         redis_url: &str,
         master_key: &[u8],
     ) -> Result<CacheKitBuilder, CachekitError> {
+        // Validate the master key first: a bad key is a deterministic local
+        // error and must not be masked by (or pay for) Redis I/O.
+        let builder = CacheKitBuilder::default()
+            .default_ttl(Duration::from_secs(600))
+            .l1_capacity(1000)
+            .encryption_from_bytes(master_key, "default")?;
+
         let backend = crate::backend::redis::RedisBackend::builder()
             .url(redis_url)
             .build()?;
         drop(backend.connect().await?);
 
-        CacheKitBuilder::default()
-            .backend(wrap(backend))
-            .default_ttl(Duration::from_secs(600))
-            .l1_capacity(1000)
-            .encryption_from_bytes(master_key, "default")
+        Ok(builder.backend(wrap(backend)))
     }
 
     /// **CachekitIO** — managed SaaS cache, zero infrastructure.
