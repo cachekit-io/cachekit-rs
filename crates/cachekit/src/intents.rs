@@ -5,12 +5,12 @@
 //! use case and returns a [`CacheKitBuilder`] so callers can override any
 //! setting before building.
 //!
-//! | Intent | Backend | L1 | Encryption | Default TTL |
-//! |------------|-----------|------|------------|-------------|
-//! | `minimal` | Redis | Off | No | 300 s |
-//! | `production` | Redis | On | No | 600 s |
-//! | `encrypted` | Redis | On | AES-256-GCM | 600 s |
-//! | `io` | cachekit.io | On | No | 3 600 s |
+//! | Intent | Backend | L1 | Encryption | Auto-reconnect | Default TTL |
+//! |------------|-----------|------|------------|----------------|-------------|
+//! | `minimal` | Redis | Off | No | No | 300 s |
+//! | `production` | Redis | On | No | Yes | 600 s |
+//! | `encrypted` | Redis | On | AES-256-GCM | Yes | 600 s |
+//! | `io` | cachekit.io | On | No | n/a (HTTP) | 3 600 s |
 
 use std::time::Duration;
 
@@ -34,7 +34,8 @@ fn wrap(b: impl crate::backend::Backend + 'static) -> SharedBackend {
 impl CacheKit {
     /// **Minimal** — speed-first Redis cache, no extras.
     ///
-    /// * Backend: Redis (connects eagerly)
+    /// * Backend: Redis (connects eagerly; **fails fast** — a dropped
+    ///   connection is not re-established)
     /// * L1 cache: **off**
     /// * Encryption: **no**
     /// * Default TTL: **300 s**
@@ -70,7 +71,8 @@ impl CacheKit {
 
     /// **Production** — reliability-first Redis cache with L1.
     ///
-    /// * Backend: Redis (connects eagerly)
+    /// * Backend: Redis (connects eagerly; **auto-reconnects** with
+    ///   exponential backoff after a dropped connection)
     /// * L1 cache: **on** (1 000 entries)
     /// * Encryption: **no**
     /// * Default TTL: **600 s**
@@ -95,6 +97,7 @@ impl CacheKit {
     pub async fn production(redis_url: &str) -> Result<CacheKitBuilder, CachekitError> {
         let backend = crate::backend::redis::RedisBackend::builder()
             .url(redis_url)
+            .auto_reconnect()
             .build()?;
         drop(backend.connect().await?);
 
@@ -106,7 +109,8 @@ impl CacheKit {
 
     /// **Encrypted** — zero-knowledge encrypted Redis cache.
     ///
-    /// * Backend: Redis (connects eagerly)
+    /// * Backend: Redis (connects eagerly; **auto-reconnects** with
+    ///   exponential backoff after a dropped connection)
     /// * L1 cache: **on** (1 000 entries, stores ciphertext)
     /// * Encryption: **AES-256-GCM** with HKDF-SHA256
     /// * Default TTL: **600 s**
@@ -147,6 +151,7 @@ impl CacheKit {
 
         let backend = crate::backend::redis::RedisBackend::builder()
             .url(redis_url)
+            .auto_reconnect()
             .build()?;
         drop(backend.connect().await?);
 
