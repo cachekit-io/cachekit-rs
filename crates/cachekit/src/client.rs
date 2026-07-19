@@ -485,29 +485,15 @@ impl SecureCache<'_> {
     }
 
     /// Fetch ciphertext (L1, then L2 with L1 backfill) and decrypt it.
+    ///
+    /// Ciphertext retrieval delegates to [`CacheKit::get_bytes`], which returns
+    /// the stored bytes untransformed — for a secure cache exactly the AES-GCM
+    /// ciphertext, so decrypt receives the same bytes the backend holds.
     async fn get_plaintext(&self, key: &str) -> Result<Option<Vec<u8>>, CachekitError> {
-        let full_key = self.client.resolve_key(key)?;
-
-        // L1 hit (ciphertext)
-        #[cfg(feature = "l1")]
-        if let Some(ciphertext) = self.client.l1_get(&full_key) {
-            self.client.check_payload_size(ciphertext.len())?;
-            return Ok(Some(self.encryption.decrypt(&ciphertext, key)?));
+        match self.client.get_bytes(key).await? {
+            Some(ciphertext) => Ok(Some(self.encryption.decrypt(&ciphertext, key)?)),
+            None => Ok(None),
         }
-
-        // L2 backend
-        let ciphertext = match self.client.backend.get(&full_key).await? {
-            Some(b) => b,
-            None => return Ok(None),
-        };
-
-        self.client.check_payload_size(ciphertext.len())?;
-
-        // Populate L1 with ciphertext on L2 hit (capped TTL to limit staleness)
-        #[cfg(feature = "l1")]
-        self.client.l1_backfill(&full_key, &ciphertext);
-
-        Ok(Some(self.encryption.decrypt(&ciphertext, key)?))
     }
 
     /// Delete an encrypted key. Behaves identically to [`CacheKit::delete`].
