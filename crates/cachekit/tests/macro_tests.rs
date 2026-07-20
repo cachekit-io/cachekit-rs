@@ -223,3 +223,23 @@ async fn macro_no_extra_args() {
     assert_eq!(v2, "constant");
     assert_eq!(backend.sets(), 1, "no-args function should still cache");
 }
+
+#[tokio::test]
+async fn macro_key_pinned_end_to_end() {
+    // Byte-stability guard for the FULL key pipeline the macro emits:
+    // rmp_serde::to_vec((&42u64,)) → __private::generate_cache_key("ns", ...).
+    // Unlike key_tests' pinned vector, this also covers the OUTER argument
+    // serialization — an rmp-serde encoding change would silently invalidate
+    // every #[cachekit] user's cache (billed as misses). Do not update this
+    // constant without an explicit migration decision.
+    let (cache, backend) = mock_client_counting();
+    get_user_namespaced(&cache, 42).await.unwrap();
+
+    let keys: Vec<String> = backend.inner.store.lock().await.keys().cloned().collect();
+    // Independently verified (Python): inner args msgpack (42,) = 0x912a;
+    // blake2b-256 over msgpack ("get_user_namespaced", [0x91, 0x2a] as ints).
+    assert_eq!(
+        keys,
+        vec!["ns:45e35d5bf83397015b73adf20ebff8cf6d2fe30fd0de315f2db195b526e11f51".to_owned()]
+    );
+}

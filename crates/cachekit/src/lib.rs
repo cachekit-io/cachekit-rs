@@ -61,6 +61,13 @@ pub use encryption::EncryptionLayer;
 pub use cachekit_macros::cachekit;
 
 /// Re-exports for proc-macro generated code. Not part of the public API.
+///
+/// The legacy key API must stay private (LAB-424) — this guard fails CI if a
+/// merge resolution ever re-publicizes `cachekit::key`:
+///
+/// ```compile_fail
+/// use cachekit::key::generate_cache_key;
+/// ```
 #[doc(hidden)]
 pub mod __private {
     pub use rmp_serde;
