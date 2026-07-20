@@ -151,6 +151,7 @@ impl TtlInspectable for RedisBackend {
 #[must_use]
 pub struct RedisBackendBuilder {
     url: Option<String>,
+    reconnect: Option<ReconnectPolicy>,
 }
 
 impl RedisBackendBuilder {
@@ -160,6 +161,18 @@ impl RedisBackendBuilder {
     /// `redis://:password@host:6379/0`.
     pub fn url(mut self, url: impl Into<String>) -> Self {
         self.url = Some(url.into());
+        self
+    }
+
+    /// Automatically re-establish dropped connections with exponential
+    /// backoff (100 ms → 30 s, retrying indefinitely).
+    ///
+    /// Initial connections still fail fast — fred's `fail_fast` default stays
+    /// on, so the policy only governs reconnecting a connection that was
+    /// previously established. Used by the reliability-first intent presets
+    /// (`CacheKit::production`, `CacheKit::encrypted`).
+    pub(crate) fn auto_reconnect(mut self) -> Self {
+        self.reconnect = Some(ReconnectPolicy::new_exponential(0, 100, 30_000, 2));
         self
     }
 
@@ -184,7 +197,7 @@ impl RedisBackendBuilder {
             ))
         })?;
 
-        let client = RedisClient::new(config, None, None, None);
+        let client = RedisClient::new(config, None, None, self.reconnect);
         Ok(RedisBackend { client })
     }
 }
