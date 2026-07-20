@@ -24,8 +24,6 @@ pub mod client;
 pub mod config;
 /// Error types for cache operations and backend communication.
 pub mod error;
-/// Cache key generation using Blake2b hashing.
-pub mod key;
 /// L1 cache hit-rate metrics for CachekitIO request headers.
 pub mod metrics;
 /// Serialization and deserialization of cached values via MessagePack.
@@ -37,6 +35,9 @@ pub mod url_validator;
 
 /// Intent-based cache presets (`CacheKit::minimal`, `::production`, `::encrypted`, `::io`).
 mod intents;
+
+/// Legacy cache-key derivation for `#[cachekit]` macro expansion. Not public API.
+mod key;
 
 /// Client-side AES-256-GCM encryption with HKDF key derivation.
 #[cfg(feature = "encryption")]
@@ -63,6 +64,8 @@ pub use cachekit_macros::cachekit;
 #[doc(hidden)]
 pub mod __private {
     pub use rmp_serde;
+
+    pub use crate::key::generate_cache_key;
 }
 
 /// Convenient glob import for the most common types.

@@ -215,7 +215,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             // Serialize non-client args for cache key generation
             let __ck_args = cachekit::__private::rmp_serde::to_vec(&#args_tuple)
                 .map_err(|e| cachekit::error::CachekitError::Serialization(e.to_string()))?;
-            let __ck_key = cachekit::key::generate_cache_key(#namespace, #fn_name, &__ck_args)?;
+            let __ck_key = cachekit::__private::generate_cache_key(#namespace, #fn_name, &__ck_args)?;
 
             // Try cache hit
             if let Some(__ck_cached) = #get_expr {

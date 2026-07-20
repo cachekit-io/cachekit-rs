@@ -289,7 +289,7 @@ cachekit-rs/
 │   │       ├── config.rs      # CachekitConfig + from_env()
 │   │       ├── encryption.rs  # AES-256-GCM + AAD v0x03
 │   │       ├── error.rs       # CachekitError, BackendError
-│   │       ├── key.rs         # Blake2b-256 cache key generation
+│   │       ├── key.rs         # Internal #[cachekit] key derivation (legacy format, not public API)
 │   │       ├── metrics.rs     # L1 hit-rate metrics headers
 │   │       ├── session.rs     # SDK session tracking
 │   │       ├── url_validator.rs # SSRF-safe URL validation
