@@ -187,9 +187,9 @@ dependencies = [
 
 [[package]]
 name = "cachekit-core"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9622b3c3e47fcf7abfde287c557e6171674e37842a2dd26fda03f63720542f17"
+checksum = "9ee6235f73aefb0dc66b9cd0d333b9da928c8192e4234357a739fe756c2f8f23"
 dependencies = [
  "aes",
  "aes-gcm",
