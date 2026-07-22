@@ -251,6 +251,10 @@ impl TryFrom<std::time::SystemTime> for InteropValue {
 /// Byte-wise iteration over the whole string makes this a full match by
 /// construction — a trailing `\n` (which Python's `re.match` + `$` would
 /// accept) fails here, as the `reject_trailing_newline` vector requires.
+///
+/// NOTE: `cachekit-macros` carries a compile-time mirror of this grammar
+/// (`segment_is_valid`) — proc-macro crates cannot depend on this crate.
+/// If you change the grammar here, change it there in the same diff.
 fn validate_segment(kind: &str, segment: &str) -> Result<(), CachekitError> {
     let bytes = segment.as_bytes();
     let valid = matches!(bytes.first(), Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit())

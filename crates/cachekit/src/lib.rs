@@ -26,8 +26,6 @@ pub mod config;
 pub mod error;
 /// Interop mode (interop/v1): cross-SDK cache keys and plain-MessagePack values.
 pub mod interop;
-/// Cache key generation using Blake2b hashing.
-pub mod key;
 /// L1 cache hit-rate metrics for CachekitIO request headers.
 pub mod metrics;
 /// Serialization and deserialization of cached values via MessagePack.
@@ -61,12 +59,6 @@ pub use encryption::EncryptionLayer;
 #[cfg(feature = "macros")]
 pub use cachekit_macros::cachekit;
 
-/// Re-exports for proc-macro generated code. Not part of the public API.
-#[doc(hidden)]
-pub mod __private {
-    pub use rmp_serde;
-}
-
 /// Convenient glob import for the most common types.
 pub mod prelude {
     pub use crate::{
@@ -75,4 +67,7 @@ pub mod prelude {
 
     #[cfg(feature = "encryption")]
     pub use crate::{EncryptionLayer, SecureCache};
+
+    #[cfg(feature = "macros")]
+    pub use crate::cachekit;
 }

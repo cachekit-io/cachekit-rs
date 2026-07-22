@@ -1,9 +1,11 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
+use quote::{quote, quote_spanned};
 use syn::{
     parse::{Parse, ParseStream},
-    parse_macro_input, Ident, ItemFn, LitInt, LitStr, ReturnType, Token, Type,
+    parse_macro_input,
+    spanned::Spanned,
+    Ident, ItemFn, LitInt, LitStr, ReturnType, Token, Type,
 };
 
 // ── Attribute argument parsing ───────────────────────────────────────────────
@@ -11,14 +13,48 @@ use syn::{
 struct MacroArgs {
     client: Ident,
     ttl: u64,
-    namespace: Option<String>,
+    interop: String,
+    namespace: String,
     secure: bool,
+}
+
+/// Compile-time mirror of the interop/v1 segment grammar
+/// (`^[a-z0-9][a-z0-9._-]{0,63}$` — see `cachekit::interop`'s
+/// `validate_segment`, the canonical implementation). Duplicated because a
+/// proc-macro crate cannot depend on the runtime crate; `interop_key`
+/// re-validates at runtime, so drift fails loudly, never silently.
+fn segment_is_valid(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    matches!(bytes.first(), Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes.len() <= 64
+        && bytes[1..].iter().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
+}
+
+/// Extract and validate an interop segment from a string literal, spanning
+/// the error to the literal.
+fn parse_segment(kind: &str, lit: &LitStr) -> syn::Result<String> {
+    let value = lit.value();
+    if segment_is_valid(&value) {
+        Ok(value)
+    } else {
+        Err(syn::Error::new(
+            lit.span(),
+            format!(
+                "`{kind}` {value:?} is not a valid interop/v1 key segment: must match \
+                 ^[a-z0-9][a-z0-9._-]{{0,63}}$ (lowercase ASCII letters, digits, '.', '_', \
+                 '-'; 1-64 chars)"
+            ),
+        ))
+    }
 }
 
 impl Parse for MacroArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut client: Option<Ident> = None;
         let mut ttl: Option<u64> = None;
+        let mut interop: Option<String> = None;
         let mut namespace: Option<String> = None;
         let mut secure = false;
 
@@ -34,10 +70,15 @@ impl Parse for MacroArgs {
                     let lit: LitInt = input.parse()?;
                     ttl = Some(lit.base10_parse()?);
                 }
+                "interop" => {
+                    input.parse::<Token![=]>()?;
+                    let lit: LitStr = input.parse()?;
+                    interop = Some(parse_segment("interop", &lit)?);
+                }
                 "namespace" => {
                     input.parse::<Token![=]>()?;
                     let lit: LitStr = input.parse()?;
-                    namespace = Some(lit.value());
+                    namespace = Some(parse_segment("namespace", &lit)?);
                 }
                 "secure" => {
                     secure = true;
@@ -61,10 +102,26 @@ impl Parse for MacroArgs {
         let ttl = ttl.ok_or_else(|| {
             input.error("`ttl` is required: #[cachekit(client = name, ttl = 60)]")
         })?;
+        let interop = interop.ok_or_else(|| {
+            input.error(
+                "`interop` is required: #[cachekit(client = name, ttl = 60, interop = \
+                 \"get_user\", namespace = \"users\")] — it names the operation segment of the \
+                 interop/v1 cache key `{namespace}:{operation}:{args_hash}`, and the spec \
+                 requires it to be explicit (protocol spec/interop-mode.md, SDK requirement 1)",
+            )
+        })?;
+        let namespace = namespace.ok_or_else(|| {
+            input.error(
+                "`namespace` is required: #[cachekit(client = name, ttl = 60, interop = \
+                 \"get_user\", namespace = \"users\")] — cache keys are interop/v1 \
+                 `{namespace}:{operation}:{args_hash}` and the namespace segment cannot be empty",
+            )
+        })?;
 
         Ok(MacroArgs {
             client,
             ttl,
+            interop,
             namespace,
             secure,
         })
@@ -110,19 +167,46 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 
 // ── Proc-macro entry point ──────────────────────────────────────────────────
 
-/// Cache the result of an async function.
+/// Cache the result of an async function under an interop/v1 cache key.
+///
+/// Keys are `{namespace}:{operation}:{args_hash}` per the protocol's
+/// interop-mode spec, so the same entry is addressable from the Python and
+/// TypeScript SDKs — Python's `@cache(interop="get_user",
+/// namespace="users")` computes the identical key for the same arguments.
 ///
 /// # Attributes
 ///
 /// - `client = <ident>` (required): Name of the `&CacheKit` parameter.
 /// - `ttl = <integer>` (required): TTL in seconds.
-/// - `namespace = "<string>"` (optional): Namespace prefix for the cache key.
+/// - `interop = "<string>"` (required): explicit, language-neutral operation
+///   segment (`^[a-z0-9][a-z0-9._-]{0,63}$`) — same meaning as Python's
+///   `interop=` / TypeScript's `interop:`.
+/// - `namespace = "<string>"` (required): interop/v1 namespace segment,
+///   same grammar.
 /// - `secure` (optional flag): Use encrypted cache via `cache.secure()`.
+///
+/// # Requirements
+///
+/// - Every non-client argument must be a plain identifier (no destructuring
+///   patterns, no `self`) and must convert into
+///   `cachekit::interop::InteropValue` via `From` (`bool`, `i32`/`i64`/
+///   `u32`/`u64`/`i128`, `f64`, `&str`/`String`, `Uuid`). Unsupported
+///   argument types fail at compile time.
+/// - In-model *values* outside the interop ranges fail at CALL time with
+///   `CachekitError::Serialization` before the body runs: non-finite floats
+///   (`NAN`, `±INFINITY`) and `i128` outside `[-2^63, 2^64-1]`. This
+///   fail-loud contract matches the Python and TypeScript SDKs — silently
+///   running uncached would mask cross-SDK key divergence.
+/// - The client must be built **without** `.namespace()` /
+///   `CACHEKIT_NAMESPACE` — interop keys carry their own namespace segment,
+///   and reads fail closed on a namespaced client.
+/// - A stored entry that cannot be decoded as the return type is treated as
+///   a miss and overwritten (self-healing), never an error loop.
 ///
 /// # Example
 ///
 /// ```ignore
-/// #[cachekit(client = cache, ttl = 60)]
+/// #[cachekit(client = cache, ttl = 60, interop = "get_user", namespace = "users")]
 /// async fn get_user(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
 ///     Ok(User { name: format!("User {id}") })
 /// }
@@ -141,36 +225,54 @@ pub fn cachekit(attr: TokenStream, item: TokenStream) -> TokenStream {
 fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     let client_ident = &args.client;
     let ttl_secs = args.ttl;
-    let namespace = args.namespace.as_deref().unwrap_or("");
-    let fn_name = func.sig.ident.to_string();
+    let namespace = args.namespace.as_str();
+    let operation = args.interop.as_str();
 
     // Extract the Ok type from Result<T, E>
     let ok_type = extract_ok_type(&func.sig.output)?;
 
-    // Collect non-client parameter idents for cache key serialization.
-    let non_client_idents: Vec<&Ident> = func
-        .sig
-        .inputs
-        .iter()
-        .filter_map(|arg| {
-            if let syn::FnArg::Typed(pat) = arg {
-                if let syn::Pat::Ident(pi) = pat.pat.as_ref() {
+    // Collect non-client parameter idents for cache key derivation. Every
+    // parameter MUST contribute to the key — a silently skipped parameter
+    // means two different calls share one cache entry (wrong-data collision),
+    // so anything we can't name is a compile error, never a skip.
+    let mut non_client_idents: Vec<&Ident> = Vec::new();
+    for arg in &func.sig.inputs {
+        match arg {
+            syn::FnArg::Receiver(recv) => {
+                return Err(syn::Error::new_spanned(
+                    recv,
+                    "#[cachekit] does not support methods: a `self` receiver cannot \
+                     contribute to the interop/v1 cache key — wrap a free function instead",
+                ));
+            }
+            syn::FnArg::Typed(pat) => match pat.pat.as_ref() {
+                syn::Pat::Ident(pi) => {
                     if pi.ident != *client_ident {
-                        return Some(&pi.ident);
+                        non_client_idents.push(&pi.ident);
                     }
                 }
-            }
-            None
-        })
-        .collect();
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        other,
+                        "#[cachekit] parameters must be plain identifiers: destructuring \
+                         patterns cannot contribute to the cache key, and skipping them \
+                         would make different calls share one cache entry",
+                    ));
+                }
+            },
+        }
+    }
 
-    // Build the tuple expression for serialization: (&arg1, &arg2, ...)
-    let args_tuple = if non_client_idents.is_empty() {
-        quote! { () }
-    } else {
-        let refs = non_client_idents.iter().map(|id| quote! { &#id });
-        quote! { (#(#refs,)*) }
-    };
+    // Convert each non-client argument to an InteropValue. `.clone()` keeps
+    // the original binding usable by the function body; for Copy types it
+    // compiles to a copy. Types outside the interop data model fail here at
+    // COMPILE time with a missing `From<T> for InteropValue` — that is the
+    // contract, not a bug: interop/v1 keys only hash modelable values.
+    // quote_spanned pins that error to the offending parameter, not the
+    // attribute.
+    let interop_args = non_client_idents.iter().map(|id| {
+        quote_spanned! {id.span()=> cachekit::interop::InteropValue::from(#id.clone()) }
+    });
 
     // Generate cache get/set calls depending on `secure` flag.
     let (get_expr, set_expr) = if args.secure {
@@ -178,7 +280,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             quote! {
                 {
                     let __ck_sec = #client_ident.secure()?;
-                    __ck_sec.get::<#ok_type>(&__ck_key).await?
+                    __ck_sec.interop_get::<#ok_type>(&__ck_key).await
                 }
             },
             quote! {
@@ -188,7 +290,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
         )
     } else {
         (
-            quote! { #client_ident.get::<#ok_type>(&__ck_key).await? },
+            quote! { #client_ident.interop_get::<#ok_type>(&__ck_key).await },
             quote! {
                 let _ = #client_ident.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await;
             },
@@ -212,14 +314,28 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     // Build the new function body.
     let new_body: syn::Block = syn::parse_quote! {
         {
-            // Serialize non-client args for cache key generation
-            let __ck_args = cachekit::__private::rmp_serde::to_vec(&#args_tuple)
-                .map_err(|e| cachekit::error::CachekitError::Serialization(e.to_string()))?;
-            let __ck_key = cachekit::key::generate_cache_key(#namespace, #fn_name, &__ck_args)?;
+            // interop/v1 key: {namespace}:{operation}:{args_hash} — the same
+            // key is computable from any SDK (protocol spec/interop-mode.md).
+            // The generated `.clone()` per argument keeps the binding usable
+            // by the body; for Copy types it is a copy — hence the allow.
+            #[allow(clippy::clone_on_copy)]
+            let __ck_key = cachekit::interop::interop_key(
+                #namespace,
+                #operation,
+                &[#(#interop_args),*],
+            )?;
 
-            // Try cache hit
-            if let Some(__ck_cached) = #get_expr {
-                return Ok(__ck_cached);
+            // Try cache hit. A Serialization error means the stored entry
+            // cannot be decoded as #ok_type (poisoned, foreign-shaped, or a
+            // Python-internal CK frame) — treat it as a miss so the fresh
+            // result OVERWRITES it, instead of hard-failing every call until
+            // TTL expiry. All other errors (namespaced-client Config, backend
+            // failures) propagate.
+            match #get_expr {
+                Ok(Some(__ck_cached)) => return Ok(__ck_cached),
+                Ok(None) => {}
+                Err(cachekit::error::CachekitError::Serialization(_)) => {}
+                Err(__ck_err) => return Err(__ck_err.into()),
             }
 
             // Execute original function body
@@ -236,4 +352,39 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
 
     *func.block = new_body;
     Ok(quote! { #func })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::segment_is_valid;
+
+    /// Mirror of interop.rs's validate_segment acceptance table — the two
+    /// implementations must not drift (see the NOTE on validate_segment).
+    #[test]
+    fn segment_grammar_table() {
+        for ok in [
+            "a",
+            "0",
+            "users",
+            "users.fetch_by_id",
+            "a-b_c.d",
+            &"a".repeat(64),
+        ] {
+            assert!(segment_is_valid(ok), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "",
+            ".users",
+            "-users",
+            "_users",
+            "Users",
+            "users\n",
+            "users:x",
+            "users/x",
+            "usérs",
+            &"a".repeat(65),
+        ] {
+            assert!(!segment_is_valid(bad), "{bad:?} should be rejected");
+        }
+    }
 }
