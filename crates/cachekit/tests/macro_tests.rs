@@ -227,7 +227,7 @@ async fn macro_key_pinned_end_to_end() {
     // keying. Independently verified (Python): canonical args msgpack [42]
     // = 0x912a; blake2b-256(0x912a) = 6159...8875.
     let key =
-        "ns:users.fetch_by_id:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875";
+        "ns:users.fetch_by_id:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875"; // pragma: allowlist secret
     let store = backend.inner.store.lock().await;
     let keys: Vec<&String> = store.keys().collect();
     assert_eq!(keys, vec![key]);
@@ -255,7 +255,7 @@ async fn macro_self_heals_undecodable_entry() {
     // miss and OVERWRITTEN — not brick the function until TTL expiry.
     let (cache, backend) = mock_client_counting();
     let key =
-        "ns:users.fetch_by_id:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875";
+        "ns:users.fetch_by_id:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875"; // pragma: allowlist secret
     backend
         .inner
         .store
