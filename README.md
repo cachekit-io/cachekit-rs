@@ -41,7 +41,7 @@
 | `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka) |
 | `redis` | ❌ | Redis backend via [fred](https://crates.io/crates/fred) (native only) |
 | `workers` | ❌ | Cloudflare Workers backend via [worker](https://crates.io/crates/worker) |
-| `macros` | ❌ | `#[cachekit]` proc-macro decorator |
+| `macros` | ❌ | `#[cachekit]` proc-macro decorator (mints [interop/v1](#cross-sdk-interop-mode) keys) |
 
 ```toml
 # Defaults: SaaS + encryption + L1
@@ -310,7 +310,7 @@ cachekit-rs/
 │   │       ├── config.rs      # CachekitConfig + from_env()
 │   │       ├── encryption.rs  # AES-256-GCM + AAD v0x03
 │   │       ├── error.rs       # CachekitError, BackendError
-│   │       ├── key.rs         # Internal #[cachekit] key derivation (legacy format, not public API)
+│   │       ├── interop.rs     # interop/v1 cross-SDK keys + strict reads
 │   │       ├── metrics.rs     # L1 hit-rate metrics headers
 │   │       ├── session.rs     # SDK session tracking
 │   │       ├── url_validator.rs # SSRF-safe URL validation

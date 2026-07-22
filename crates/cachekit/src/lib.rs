@@ -38,9 +38,6 @@ pub mod url_validator;
 /// Intent-based cache presets (`CacheKit::minimal`, `::production`, `::encrypted`, `::io`).
 mod intents;
 
-/// Legacy cache-key derivation for `#[cachekit]` macro expansion. Not public API.
-mod key;
-
 /// Client-side AES-256-GCM encryption with HKDF key derivation.
 #[cfg(feature = "encryption")]
 pub mod encryption;
@@ -61,21 +58,6 @@ pub use encryption::EncryptionLayer;
 
 #[cfg(feature = "macros")]
 pub use cachekit_macros::cachekit;
-
-/// Re-exports for proc-macro generated code. Not part of the public API.
-///
-/// The legacy key API must stay private (LAB-424) — this guard fails CI if a
-/// merge resolution ever re-publicizes `cachekit::key`:
-///
-/// ```compile_fail
-/// use cachekit::key::generate_cache_key;
-/// ```
-#[doc(hidden)]
-pub mod __private {
-    pub use rmp_serde;
-
-    pub use crate::key::generate_cache_key;
-}
 
 /// Convenient glob import for the most common types.
 pub mod prelude {

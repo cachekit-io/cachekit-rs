@@ -17,6 +17,7 @@ use tokio::sync::Mutex;
 use cachekit::backend::{Backend, HealthStatus};
 use cachekit::client::SharedBackend;
 use cachekit::error::BackendError;
+use cachekit::interop::{interop_key, InteropValue};
 use cachekit::{cachekit, CacheKit, CachekitError};
 
 // ── CountingBackend ──────────────────────────────────────────────────────────
@@ -101,21 +102,21 @@ struct User {
 
 // ── Decorated functions ──────────────────────────────────────────────────────
 
-#[cachekit(client = cache, ttl = 60)]
+#[cachekit(client = cache, ttl = 60, interop = "get_user", namespace = "users")]
 async fn get_user(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
     Ok(User {
         name: format!("User {id}"),
     })
 }
 
-#[cachekit(client = cache, ttl = 120, namespace = "ns")]
+#[cachekit(client = cache, ttl = 120, interop = "get_user_namespaced", namespace = "ns")]
 async fn get_user_namespaced(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
     Ok(User {
         name: format!("Namespaced {id}"),
     })
 }
 
-#[cachekit(client = cache, ttl = 60)]
+#[cachekit(client = cache, ttl = 60, interop = "get_user_multi_args", namespace = "orgs")]
 async fn get_user_multi_args(
     cache: &CacheKit,
     org: String,
@@ -126,7 +127,7 @@ async fn get_user_multi_args(
     })
 }
 
-#[cachekit(client = cache, ttl = 60)]
+#[cachekit(client = cache, ttl = 60, interop = "get_no_extra_args", namespace = "consts")]
 async fn get_no_extra_args(cache: &CacheKit) -> Result<String, CachekitError> {
     Ok("constant".to_owned())
 }
@@ -226,20 +227,42 @@ async fn macro_no_extra_args() {
 
 #[tokio::test]
 async fn macro_key_pinned_end_to_end() {
-    // Byte-stability guard for the FULL key pipeline the macro emits:
-    // rmp_serde::to_vec((&42u64,)) → __private::generate_cache_key("ns", ...).
-    // Unlike key_tests' pinned vector, this also covers the OUTER argument
-    // serialization — an rmp-serde encoding change would silently invalidate
-    // every #[cachekit] user's cache (billed as misses). Do not update this
-    // constant without an explicit migration decision.
+    // Byte-stability guard for the full key pipeline the macro emits.
+    // Changing it invalidates every #[cachekit] user's cache (billed as
+    // misses) AND breaks cross-SDK key identity — do not update this constant
+    // without an explicit migration decision.
     let (cache, backend) = mock_client_counting();
     get_user_namespaced(&cache, 42).await.unwrap();
 
     let keys: Vec<String> = backend.inner.store.lock().await.keys().cloned().collect();
-    // Independently verified (Python): inner args msgpack (42,) = 0x912a;
-    // blake2b-256 over msgpack ("get_user_namespaced", [0x91, 0x2a] as ints).
+    // Independently verified (Python): canonical args msgpack [42] = 0x912a;
+    // blake2b-256(0x912a) = 6159...8875.
     assert_eq!(
         keys,
-        vec!["ns:45e35d5bf83397015b73adf20ebff8cf6d2fe30fd0de315f2db195b526e11f51".to_owned()]
+        vec![
+            "ns:get_user_namespaced:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875"
+                .to_owned()
+        ]
     );
+}
+
+#[tokio::test]
+async fn macro_key_delegates_to_interop_key() {
+    // The macro must mint EXACTLY interop_key(namespace, fn_name, args) —
+    // this delegation is what makes the 48 protocol interop vectors
+    // (interop_vector_tests.rs) transitively cover #[cachekit] keys, and
+    // what makes the same entry addressable from the Python/TS SDKs.
+    let (cache, backend) = mock_client_counting();
+    get_user_multi_args(&cache, "acme".to_owned(), 7)
+        .await
+        .unwrap();
+
+    let expected = interop_key(
+        "orgs",
+        "get_user_multi_args",
+        &[InteropValue::from("acme"), InteropValue::from(7u64)],
+    )
+    .unwrap();
+    let keys: Vec<String> = backend.inner.store.lock().await.keys().cloned().collect();
+    assert_eq!(keys, vec![expected]);
 }

@@ -11,14 +11,48 @@ use syn::{
 struct MacroArgs {
     client: Ident,
     ttl: u64,
-    namespace: Option<String>,
+    interop: String,
+    namespace: String,
     secure: bool,
+}
+
+/// Compile-time mirror of the interop/v1 segment grammar
+/// (`^[a-z0-9][a-z0-9._-]{0,63}$` — see `cachekit::interop`'s
+/// `validate_segment`, the canonical implementation). Duplicated because a
+/// proc-macro crate cannot depend on the runtime crate; `interop_key`
+/// re-validates at runtime, so drift fails loudly, never silently.
+fn segment_is_valid(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    matches!(bytes.first(), Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes.len() <= 64
+        && bytes[1..].iter().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
+}
+
+/// Extract and validate an interop segment from a string literal, spanning
+/// the error to the literal.
+fn parse_segment(kind: &str, lit: &LitStr) -> syn::Result<String> {
+    let value = lit.value();
+    if segment_is_valid(&value) {
+        Ok(value)
+    } else {
+        Err(syn::Error::new(
+            lit.span(),
+            format!(
+                "`{kind}` {value:?} is not a valid interop/v1 key segment: must match \
+                 ^[a-z0-9][a-z0-9._-]{{0,63}}$ (lowercase ASCII letters, digits, '.', '_', \
+                 '-'; 1-64 chars)"
+            ),
+        ))
+    }
 }
 
 impl Parse for MacroArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut client: Option<Ident> = None;
         let mut ttl: Option<u64> = None;
+        let mut interop: Option<String> = None;
         let mut namespace: Option<String> = None;
         let mut secure = false;
 
@@ -34,10 +68,15 @@ impl Parse for MacroArgs {
                     let lit: LitInt = input.parse()?;
                     ttl = Some(lit.base10_parse()?);
                 }
+                "interop" => {
+                    input.parse::<Token![=]>()?;
+                    let lit: LitStr = input.parse()?;
+                    interop = Some(parse_segment("interop", &lit)?);
+                }
                 "namespace" => {
                     input.parse::<Token![=]>()?;
                     let lit: LitStr = input.parse()?;
-                    namespace = Some(lit.value());
+                    namespace = Some(parse_segment("namespace", &lit)?);
                 }
                 "secure" => {
                     secure = true;
@@ -61,10 +100,26 @@ impl Parse for MacroArgs {
         let ttl = ttl.ok_or_else(|| {
             input.error("`ttl` is required: #[cachekit(client = name, ttl = 60)]")
         })?;
+        let interop = interop.ok_or_else(|| {
+            input.error(
+                "`interop` is required: #[cachekit(client = name, ttl = 60, interop = \
+                 \"get_user\", namespace = \"users\")] — it names the operation segment of the \
+                 interop/v1 cache key `{namespace}:{operation}:{args_hash}`, and the spec \
+                 requires it to be explicit (protocol spec/interop-mode.md, SDK requirement 1)",
+            )
+        })?;
+        let namespace = namespace.ok_or_else(|| {
+            input.error(
+                "`namespace` is required: #[cachekit(client = name, ttl = 60, interop = \
+                 \"get_user\", namespace = \"users\")] — cache keys are interop/v1 \
+                 `{namespace}:{operation}:{args_hash}` and the namespace segment cannot be empty",
+            )
+        })?;
 
         Ok(MacroArgs {
             client,
             ttl,
+            interop,
             namespace,
             secure,
         })
@@ -110,19 +165,37 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 
 // ── Proc-macro entry point ──────────────────────────────────────────────────
 
-/// Cache the result of an async function.
+/// Cache the result of an async function under an interop/v1 cache key.
+///
+/// Keys are `{namespace}:{operation}:{args_hash}` per the protocol's
+/// interop-mode spec, so the same entry is addressable from the Python and
+/// TypeScript SDKs — Python's `@cache(interop="get_user",
+/// namespace="users")` computes the identical key for the same arguments.
 ///
 /// # Attributes
 ///
 /// - `client = <ident>` (required): Name of the `&CacheKit` parameter.
 /// - `ttl = <integer>` (required): TTL in seconds.
-/// - `namespace = "<string>"` (optional): Namespace prefix for the cache key.
+/// - `interop = "<string>"` (required): explicit, language-neutral operation
+///   segment (`^[a-z0-9][a-z0-9._-]{0,63}$`) — same meaning as Python's
+///   `interop=` / TypeScript's `interop:`.
+/// - `namespace = "<string>"` (required): interop/v1 namespace segment,
+///   same grammar.
 /// - `secure` (optional flag): Use encrypted cache via `cache.secure()`.
+///
+/// # Requirements
+///
+/// - Every non-client argument must convert into
+///   `cachekit::interop::InteropValue` (integers, floats, `bool`, strings,
+///   `Uuid`, …). Out-of-model argument types fail at compile time.
+/// - The client must be built **without** `.namespace()` /
+///   `CACHEKIT_NAMESPACE` — interop keys carry their own namespace segment,
+///   and reads fail closed on a namespaced client.
 ///
 /// # Example
 ///
 /// ```ignore
-/// #[cachekit(client = cache, ttl = 60)]
+/// #[cachekit(client = cache, ttl = 60, interop = "get_user", namespace = "users")]
 /// async fn get_user(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
 ///     Ok(User { name: format!("User {id}") })
 /// }
@@ -141,8 +214,8 @@ pub fn cachekit(attr: TokenStream, item: TokenStream) -> TokenStream {
 fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     let client_ident = &args.client;
     let ttl_secs = args.ttl;
-    let namespace = args.namespace.as_deref().unwrap_or("");
-    let fn_name = func.sig.ident.to_string();
+    let namespace = args.namespace.as_str();
+    let operation = args.interop.as_str();
 
     // Extract the Ok type from Result<T, E>
     let ok_type = extract_ok_type(&func.sig.output)?;
@@ -164,13 +237,14 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
         })
         .collect();
 
-    // Build the tuple expression for serialization: (&arg1, &arg2, ...)
-    let args_tuple = if non_client_idents.is_empty() {
-        quote! { () }
-    } else {
-        let refs = non_client_idents.iter().map(|id| quote! { &#id });
-        quote! { (#(#refs,)*) }
-    };
+    // Convert each non-client argument to an InteropValue. `.clone()` keeps
+    // the original binding usable by the function body; for Copy types it
+    // compiles to a copy. Types outside the interop data model fail here at
+    // COMPILE time with a missing `From<T> for InteropValue` — that is the
+    // contract, not a bug: interop/v1 keys only hash modelable values.
+    let interop_args = non_client_idents
+        .iter()
+        .map(|id| quote! { cachekit::interop::InteropValue::from(#id.clone()) });
 
     // Generate cache get/set calls depending on `secure` flag.
     let (get_expr, set_expr) = if args.secure {
@@ -178,7 +252,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             quote! {
                 {
                     let __ck_sec = #client_ident.secure()?;
-                    __ck_sec.get::<#ok_type>(&__ck_key).await?
+                    __ck_sec.interop_get::<#ok_type>(&__ck_key).await?
                 }
             },
             quote! {
@@ -188,7 +262,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
         )
     } else {
         (
-            quote! { #client_ident.get::<#ok_type>(&__ck_key).await? },
+            quote! { #client_ident.interop_get::<#ok_type>(&__ck_key).await? },
             quote! {
                 let _ = #client_ident.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await;
             },
@@ -212,10 +286,13 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     // Build the new function body.
     let new_body: syn::Block = syn::parse_quote! {
         {
-            // Serialize non-client args for cache key generation
-            let __ck_args = cachekit::__private::rmp_serde::to_vec(&#args_tuple)
-                .map_err(|e| cachekit::error::CachekitError::Serialization(e.to_string()))?;
-            let __ck_key = cachekit::__private::generate_cache_key(#namespace, #fn_name, &__ck_args)?;
+            // interop/v1 key: {namespace}:{operation}:{args_hash} — the same
+            // key is computable from any SDK (protocol spec/interop-mode.md).
+            let __ck_key = cachekit::interop::interop_key(
+                #namespace,
+                #operation,
+                &[#(#interop_args),*],
+            )?;
 
             // Try cache hit
             if let Some(__ck_cached) = #get_expr {
