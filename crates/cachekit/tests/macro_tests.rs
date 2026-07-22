@@ -109,7 +109,7 @@ async fn get_user(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
     })
 }
 
-#[cachekit(client = cache, ttl = 120, interop = "get_user_namespaced", namespace = "ns")]
+#[cachekit(client = cache, ttl = 120, interop = "users.fetch_by_id", namespace = "ns")]
 async fn get_user_namespaced(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
     Ok(User {
         name: format!("Namespaced {id}"),
@@ -178,18 +178,6 @@ async fn macro_different_args_different_keys() {
 }
 
 #[tokio::test]
-async fn macro_with_namespace() {
-    let (cache, backend) = mock_client_counting();
-
-    let user = get_user_namespaced(&cache, 7).await.unwrap();
-    assert_eq!(user.name, "Namespaced 7");
-
-    let user2 = get_user_namespaced(&cache, 7).await.unwrap();
-    assert_eq!(user2, user);
-    assert_eq!(backend.sets(), 1, "second call should be cached");
-}
-
-#[tokio::test]
 async fn macro_multi_args() {
     let (cache, backend) = mock_client_counting();
 
@@ -234,22 +222,65 @@ async fn macro_key_pinned_end_to_end() {
     let (cache, backend) = mock_client_counting();
     get_user_namespaced(&cache, 42).await.unwrap();
 
-    let keys: Vec<String> = backend.inner.store.lock().await.keys().cloned().collect();
-    // Independently verified (Python): canonical args msgpack [42] = 0x912a;
-    // blake2b-256(0x912a) = 6159...8875.
+    // Key: operation comes from the `interop` attr ("users.fetch_by_id"),
+    // NOT the fn name — this constant also trips a regression to fn-ident
+    // keying. Independently verified (Python): canonical args msgpack [42]
+    // = 0x912a; blake2b-256(0x912a) = 6159...8875.
+    let key =
+        "ns:users.fetch_by_id:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875";
+    let store = backend.inner.store.lock().await;
+    let keys: Vec<&String> = store.keys().collect();
+    assert_eq!(keys, vec![key]);
+
+    // Value: plain MessagePack map, no envelope — the interop value format
+    // other SDKs read. Independently verified (Python):
+    // msgpack.packb({"name": "Namespaced 42"}).
     assert_eq!(
-        keys,
-        vec![
-            "ns:get_user_namespaced:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875"
-                .to_owned()
-        ]
+        store.get(key).unwrap(),
+        &hex_bytes("81a46e616d65ad4e616d65737061636564203432") // pragma: allowlist secret
     );
+}
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn macro_self_heals_undecodable_entry() {
+    // A stored entry that cannot decode as the return type (poisoned,
+    // foreign-shaped, or a Python-internal CK frame) must be treated as a
+    // miss and OVERWRITTEN — not brick the function until TTL expiry.
+    let (cache, backend) = mock_client_counting();
+    let key =
+        "ns:users.fetch_by_id:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875";
+    backend
+        .inner
+        .store
+        .lock()
+        .await
+        .insert(key.to_owned(), b"CK\x03garbage".to_vec());
+
+    let user = get_user_namespaced(&cache, 42).await.unwrap();
+    assert_eq!(user.name, "Namespaced 42");
+    assert_eq!(
+        backend.sets(),
+        1,
+        "fresh result must overwrite the poisoned entry"
+    );
+
+    let healed = get_user_namespaced(&cache, 42).await.unwrap();
+    assert_eq!(healed, user);
+    assert_eq!(backend.sets(), 1, "second call hits the healed entry");
 }
 
 #[tokio::test]
 async fn macro_key_delegates_to_interop_key() {
-    // The macro must mint EXACTLY interop_key(namespace, fn_name, args) —
-    // this delegation is what makes the 48 protocol interop vectors
+    // The macro must mint EXACTLY interop_key(namespace, operation, args),
+    // operation being the `interop` attribute — this delegation is what
+    // makes the 48 protocol interop vectors
     // (interop_vector_tests.rs) transitively cover #[cachekit] keys, and
     // what makes the same entry addressable from the Python/TS SDKs.
     let (cache, backend) = mock_client_counting();

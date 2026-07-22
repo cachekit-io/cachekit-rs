@@ -67,4 +67,7 @@ pub mod prelude {
 
     #[cfg(feature = "encryption")]
     pub use crate::{EncryptionLayer, SecureCache};
+
+    #[cfg(feature = "macros")]
+    pub use crate::cachekit;
 }
