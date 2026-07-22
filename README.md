@@ -158,6 +158,27 @@ Cross-SDK compatible — ciphertext produced by the Python SDK decrypts with the
 
 ---
 
+## Cross-SDK Interop Mode
+
+Interop mode ([interop/v1](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md)) lets the Python, TypeScript, and Rust SDKs share cache entries: keys are `{namespace}:{operation}:{args_hash}` with an explicit operation name (no language-specific function path), and values are plain MessagePack — no envelope, readable by any MessagePack library.
+
+```rust
+use cachekit::interop::{interop_key, InteropValue};
+
+// Every SDK computes this exact key for get_user(42)
+let key = interop_key("users", "get_user", &[InteropValue::from(42i64)])?;
+
+cache.set_with_ttl(&key, &user, ttl).await?;          // plain MessagePack — already interop
+let user: Option<User> = cache.interop_get(&key).await?; // strict read: exactly one document
+```
+
+Argument hashing is byte-identical across SDKs (canonical MessagePack + Blake2b-256), verified against the shared [protocol test vectors](https://github.com/cachekit-io/protocol/blob/main/test-vectors/interop-mode.json) in this repo's test suite. `interop_get` (also on `SecureCache`) rejects trailing bytes and Python-internal CK frames instead of silently misreading them. Encryption works unchanged — interop keys are identical across SDKs, so the AAD verifies cross-SDK.
+
+> [!IMPORTANT]
+> Use interop keys on a client **without** `.namespace()` / `CACHEKIT_NAMESPACE` — a client prefix would rewrite the storage key to `{prefix}:{interop_key}`, which no other SDK computes. `interop_get` fails closed with a config error rather than silently missing; interop keys already carry their own namespace segment.
+
+---
+
 ## Backends
 
 ### cachekit.io SaaS (default)

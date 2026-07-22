@@ -202,13 +202,68 @@ impl CacheKit {
     /// Returns `None` if the key does not exist.
     /// Checks L1 cache before hitting the backend.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, CachekitError> {
+        match self.get_bytes(key).await? {
+            Some(bytes) => Ok(Some(serializer::deserialize(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Retrieve and deserialize an interop-mode value stored under `key`.
+    ///
+    /// Identical to [`Self::get`] except the payload is decoded with
+    /// [`crate::interop::deserialize`], which consumes exactly one MessagePack
+    /// document and rejects trailing bytes (interop/v1 spec MUST). A
+    /// Python-SDK-internal CK frame is rejected with a specific diagnostic
+    /// instead of silently decoding as the integer 67.
+    ///
+    /// Use with keys from [`crate::interop::interop_key`] on a client
+    /// **without** a namespace prefix. There is no interop-specific write
+    /// method: [`Self::set`] already writes plain MessagePack (no ByteStorage
+    /// envelope), which is the interop value format.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CachekitError::Config`] if the client was built with
+    /// [`CacheKitBuilder::namespace`] (or `CACHEKIT_NAMESPACE`): the prefix
+    /// would rewrite the storage key to `{prefix}:{interop_key}`, which no
+    /// other SDK computes — every cross-SDK entry would silently miss. Interop
+    /// keys carry their own namespace segment; failing loudly here beats a
+    /// 100% miss rate that looks like a cold cache.
+    pub async fn interop_get<T: DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, CachekitError> {
+        self.reject_namespaced_interop()?;
+        match self.get_bytes(key).await? {
+            Some(bytes) => Ok(Some(crate::interop::deserialize(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Interop keys must reach the backend verbatim; a client namespace prefix
+    /// would silently produce storage keys no other SDK computes.
+    fn reject_namespaced_interop(&self) -> Result<(), CachekitError> {
+        match self.namespace {
+            None => Ok(()),
+            Some(_) => Err(CachekitError::Config(
+                "interop reads require a client without a namespace prefix: .namespace() / \
+                 CACHEKIT_NAMESPACE would store interop entries under {prefix}:{interop_key}, \
+                 which other SDKs never compute (interop keys already carry a namespace \
+                 segment) — use a dedicated non-namespaced client for interop entries"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    /// Fetch raw payload bytes for `key` (L1, then L2 with L1 backfill).
+    async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, CachekitError> {
         let full_key = self.resolve_key(key)?;
 
         // L1 hit
         #[cfg(feature = "l1")]
         if let Some(bytes) = self.l1_get(&full_key) {
             self.check_payload_size(bytes.len())?;
-            return Ok(Some(serializer::deserialize(&bytes)?));
+            return Ok(Some(bytes));
         }
 
         // L2 backend
@@ -223,7 +278,7 @@ impl CacheKit {
         #[cfg(feature = "l1")]
         self.l1_backfill(&full_key, &bytes);
 
-        Ok(Some(serializer::deserialize(&bytes)?))
+        Ok(Some(bytes))
     }
 
     /// Serialize and store `value` under `key` using the client's default TTL.
@@ -365,8 +420,12 @@ impl SecureCache<'_> {
 
         // Serialize then encrypt
         let plaintext = serializer::serialize(value)?;
-        self.client.check_payload_size(plaintext.len())?;
         let ciphertext = self.encryption.encrypt(&plaintext, key)?;
+        // Size-check what is actually persisted (nonce + ciphertext + tag).
+        // The get paths check the stored ciphertext length, so checking the
+        // plaintext here would let a value within 28 bytes of the limit write
+        // successfully and then fail EVERY subsequent read with PayloadTooLarge.
+        self.client.check_payload_size(ciphertext.len())?;
 
         let full_key = self.client.resolve_key(key)?;
 
@@ -395,30 +454,46 @@ impl SecureCache<'_> {
     ///
     /// Checks L1 (which holds ciphertext) before the backend.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, CachekitError> {
-        let full_key = self.client.resolve_key(key)?;
-
-        // L1 hit (ciphertext)
-        #[cfg(feature = "l1")]
-        if let Some(ciphertext) = self.client.l1_get(&full_key) {
-            self.client.check_payload_size(ciphertext.len())?;
-            let plaintext = self.encryption.decrypt(&ciphertext, key)?;
-            return Ok(Some(serializer::deserialize(&plaintext)?));
+        match self.get_plaintext(key).await? {
+            Some(plaintext) => Ok(Some(serializer::deserialize(&plaintext)?)),
+            None => Ok(None),
         }
+    }
 
-        // L2 backend
-        let ciphertext = match self.client.backend.get(&full_key).await? {
-            Some(b) => b,
-            None => return Ok(None),
-        };
+    /// Retrieve, decrypt, and deserialize an interop-mode value stored under `key`.
+    ///
+    /// Identical to [`Self::get`] except the decrypted plaintext is decoded
+    /// with [`crate::interop::deserialize`] — exactly one MessagePack document,
+    /// trailing bytes rejected (interop/v1 spec MUST). In interop mode the
+    /// AES-GCM plaintext is the plain MessagePack value bytes, so the AAD
+    /// (v0x03, `format="msgpack"`, `compressed="False"`) verifies cross-SDK
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CachekitError::Config`] on a namespace-prefixed client — see
+    /// [`CacheKit::interop_get`].
+    pub async fn interop_get<T: DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, CachekitError> {
+        self.client.reject_namespaced_interop()?;
+        match self.get_plaintext(key).await? {
+            Some(plaintext) => Ok(Some(crate::interop::deserialize(&plaintext)?)),
+            None => Ok(None),
+        }
+    }
 
-        self.client.check_payload_size(ciphertext.len())?;
-
-        // Populate L1 with ciphertext on L2 hit (capped TTL to limit staleness)
-        #[cfg(feature = "l1")]
-        self.client.l1_backfill(&full_key, &ciphertext);
-
-        let plaintext = self.encryption.decrypt(&ciphertext, key)?;
-        Ok(Some(serializer::deserialize(&plaintext)?))
+    /// Fetch ciphertext (L1, then L2 with L1 backfill) and decrypt it.
+    ///
+    /// Ciphertext retrieval delegates to [`CacheKit::get_bytes`], which returns
+    /// the stored bytes untransformed — for a secure cache exactly the AES-GCM
+    /// ciphertext, so decrypt receives the same bytes the backend holds.
+    async fn get_plaintext(&self, key: &str) -> Result<Option<Vec<u8>>, CachekitError> {
+        match self.client.get_bytes(key).await? {
+            Some(ciphertext) => Ok(Some(self.encryption.decrypt(&ciphertext, key)?)),
+            None => Ok(None),
+        }
     }
 
     /// Delete an encrypted key. Behaves identically to [`CacheKit::delete`].

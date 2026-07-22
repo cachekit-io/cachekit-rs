@@ -24,6 +24,8 @@ pub mod client;
 pub mod config;
 /// Error types for cache operations and backend communication.
 pub mod error;
+/// Interop mode (interop/v1): cross-SDK cache keys and plain-MessagePack values.
+pub mod interop;
 /// L1 cache hit-rate metrics for CachekitIO request headers.
 pub mod metrics;
 /// Serialization and deserialization of cached values via MessagePack.
