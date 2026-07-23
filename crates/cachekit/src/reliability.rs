@@ -302,6 +302,17 @@ impl CircuitBreaker {
                         inner.failures.clear();
                         inner.half_open_successes = 0;
                         inner.half_open_calls = 0;
+                    } else {
+                        // Release this probe's slot. `half_open_calls` caps the
+                        // number of *in-flight* probes, so a success that does
+                        // not yet close the breaker must free its slot (exactly
+                        // as `Neutral` does). Without this, a config with
+                        // success_threshold > half_open_max_calls wedges the
+                        // breaker half-open forever: the slots fill, successes
+                        // stall below the threshold, and every subsequent call
+                        // fails fast with CircuitOpen even against a healthy
+                        // backend.
+                        inner.half_open_calls = inner.half_open_calls.saturating_sub(1);
                     }
                 }
             }
@@ -515,6 +526,32 @@ mod tests {
         // ...and the breaker still admits probes instead of wedging.
         cb.try_acquire()
             .expect("neutral outcomes release their probe slots");
+    }
+
+    #[test]
+    fn breaker_half_open_closes_when_success_threshold_exceeds_probe_cap() {
+        // success_threshold (3) deliberately exceeds half_open_max_calls (1):
+        // with a single in-flight probe slot, the breaker can only ever reach
+        // three successes if each non-closing success RELEASES its slot. Before
+        // the fix this wedged half-open forever — the slot filled after the
+        // first success (which stalled at 1 < 3), so no further probe was
+        // admitted and the breaker never re-closed.
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 3,
+            open_timeout: Duration::from_millis(0),
+            half_open_max_calls: 1,
+            rolling_window: Duration::from_secs(60),
+        });
+        cb.try_acquire().expect("closed breaker admits calls");
+        cb.record(&Outcome::Failure);
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        for _ in 0..3 {
+            cb.try_acquire()
+                .expect("a non-closing success must release its probe slot");
+            cb.record(&Outcome::Success);
+        }
+        assert_eq!(cb.state(), CircuitState::Closed);
     }
 
     #[test]
