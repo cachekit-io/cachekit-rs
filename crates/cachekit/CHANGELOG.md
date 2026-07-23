@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.4.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.3.0...cachekit-rs-v0.4.0) (2026-07-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* the public module cachekit::key (and cachekit::key::generate_cache_key) is removed. It was never protocol-conformant and had no supported use. For cross-SDK, spec-conformant keys use the interop/v1 keygen (interop_key(), arriving with cachekit-rs#33 / LAB-246). The #[cachekit] macro's derived keys are unchanged.
+
+### Features
+
+* #[cachekit] mints interop/v1 keys — retire legacy non-conformant keygen (LAB-424) ([#35](https://github.com/cachekit-io/cachekit-rs/issues/35)) ([ff1d490](https://github.com/cachekit-io/cachekit-rs/commit/ff1d4902da40c9a99dae8e8e8179a6b83f4771c3))
+* intent-based cache API ([#19](https://github.com/cachekit-io/cachekit-rs/issues/19)) ([e86172b](https://github.com/cachekit-io/cachekit-rs/commit/e86172b9440cb11105856bf13563a5d4d1425a47))
+* interop mode (interop/v1) — first in-SDK keygen + Rust vector verification [LAB-246] ([#33](https://github.com/cachekit-io/cachekit-rs/issues/33)) ([188c170](https://github.com/cachekit-io/cachekit-rs/commit/188c1709e3bf0e7e741ffa9a6ee357f6ee7d1487))
+
+
+### Security
+
+* send lock_id via X-CacheKit-Lock-Id header, not query string ([#24](https://github.com/cachekit-io/cachekit-rs/issues/24)) ([#29](https://github.com/cachekit-io/cachekit-rs/issues/29)) ([f381e41](https://github.com/cachekit-io/cachekit-rs/commit/f381e41662c2f9d131fd2cb40c9a1790132c51be))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.3.0 to 0.4.0
+
 ## [0.3.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.2.0...cachekit-rs-v0.3.0) (2026-04-26)
 
 

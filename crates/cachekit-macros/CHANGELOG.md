@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.3.0...cachekit-macros-v0.4.0) (2026-07-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* the public module cachekit::key (and cachekit::key::generate_cache_key) is removed. It was never protocol-conformant and had no supported use. For cross-SDK, spec-conformant keys use the interop/v1 keygen (interop_key(), arriving with cachekit-rs#33 / LAB-246). The #[cachekit] macro's derived keys are unchanged.
+
+### Features
+
+* #[cachekit] mints interop/v1 keys — retire legacy non-conformant keygen (LAB-424) ([#35](https://github.com/cachekit-io/cachekit-rs/issues/35)) ([ff1d490](https://github.com/cachekit-io/cachekit-rs/commit/ff1d4902da40c9a99dae8e8e8179a6b83f4771c3))
+
 ## [0.3.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.2.0...cachekit-macros-v0.3.0) (2026-04-26)
 
 
