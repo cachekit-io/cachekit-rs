@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use zeroize::Zeroizing;
 
-use crate::backend::{Backend, HealthStatus};
+use crate::backend::{Backend, HealthStatus, LockableBackend};
 use crate::error::{BackendError, BackendErrorKind};
 use crate::metrics::{metrics_headers, MetricsProvider};
 use crate::session::session_headers;
@@ -246,6 +246,10 @@ impl Backend for CachekitIO {
         } else {
             Err(self.error_from_response(resp).await)
         }
+    }
+
+    fn as_lockable(&self) -> Option<&dyn LockableBackend> {
+        Some(self)
     }
 }
 

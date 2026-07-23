@@ -124,6 +124,10 @@ impl Backend for RedisBackend {
             details,
         })
     }
+
+    fn as_lockable(&self) -> Option<&dyn LockableBackend> {
+        Some(self)
+    }
 }
 
 // ── TtlInspectable impl ───────────────────────────────────────────────────────

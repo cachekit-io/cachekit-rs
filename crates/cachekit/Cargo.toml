@@ -15,7 +15,7 @@ categories = ["caching", "web-programming", "cryptography"]
 name = "cachekit"
 
 [features]
-default = ["cachekitio", "encryption", "l1"]
+default = ["cachekitio", "encryption", "l1", "reliability"]
 cachekitio = ["dep:reqwest", "dep:serde_json"]
 redis = ["dep:fred"]
 workers = ["dep:worker", "dep:js-sys", "dep:getrandom", "dep:serde_json"]
@@ -24,6 +24,9 @@ workers = ["dep:worker", "dep:js-sys", "dep:getrandom", "dep:serde_json"]
 encryption = ["cachekit-core/encryption"]
 l1 = ["dep:moka"]
 macros = ["dep:cachekit-macros"]
+# Retry with backoff + circuit breaker around backend ops, and cross-process
+# cold-miss suppression via LockableBackend. Native only (needs tokio timers).
+reliability = ["tokio/time"]
 # Opt into ?Send / Rc on native targets (for tokio::task::LocalSet, single-threaded
 # runtimes, etc.). Same code paths that wasm32 already uses.
 unsync = []
@@ -41,6 +44,9 @@ urlencoding = "2"
 hex = "0.4"
 url = "2"
 uuid = { version = "1", features = ["v4", "js"] }
+# `sync` only: runtime-independent primitives for cold-miss single-flight.
+# Compiles on wasm32; the `reliability` feature adds `time` (native only).
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 # Optional: HTTP backend (native)
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "json"] }
@@ -62,7 +68,7 @@ getrandom = { version = "0.2", optional = true, features = ["js"] }
 cachekit-macros = { version = "0.4.0", path = "../cachekit-macros", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 serde_json = "1"
 serial_test = "3"
 

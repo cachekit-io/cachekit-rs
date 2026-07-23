@@ -39,6 +39,7 @@
 | `cachekitio` | ✅ | HTTP backend for [api.cachekit.io](https://api.cachekit.io) via [reqwest](https://crates.io/crates/reqwest) + rustls |
 | `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core) |
 | `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka) |
+| `reliability` | ✅ | Retry with backoff + jitter, circuit breaker, distributed fill locks (native only) |
 | `redis` | ❌ | Redis backend via [fred](https://crates.io/crates/fred) (native only) |
 | `workers` | ❌ | Cloudflare Workers backend via [worker](https://crates.io/crates/worker) |
 | `macros` | ❌ | `#[cachekit]` proc-macro decorator (mints [interop/v1](#cross-sdk-interop-mode) keys) |
@@ -61,6 +62,7 @@ cachekit-rs = { version = "0.2", default-features = false, features = ["workers"
 > **Mutually exclusive features:**
 > - `workers` + `redis` — Workers runtime cannot use fred
 > - `workers` + `l1` — moka requires std threads unavailable in wasm32
+> - `workers` + `reliability` — retry/breaker timers need tokio `time`, unavailable in wasm32
 
 ---
 
@@ -280,6 +282,40 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
 | **Encrypted L1** | `SecureCache` stores ciphertext in L1 (never plaintext) |
 | **Default capacity** | 1,000 entries (configurable via `.l1_capacity()`) |
+
+---
+
+## Reliability
+
+With the `reliability` feature (default, native only), the `production`, `encrypted`, and `io` presets wrap every backend operation in a reliability stack; `minimal` stays bare for maximum throughput:
+
+| Layer | What it does | Defaults |
+|:------|:-------------|:---------|
+| **Retry** | Truncated exponential backoff + jitter on transient/timeout errors (`BackendErrorKind::is_retryable`); permanent and auth errors propagate immediately | 3 attempts, 100 ms base, 5 s cap, jitter ×[0.5, 1.5) |
+| **Circuit breaker** | closed → open after N retryable failures in a rolling window; fails fast (`BackendErrorKind::CircuitOpen`) while open; half-open probes recovery | threshold 5, window 60 s, open 5 s, 3 probes, close after 3 successes |
+| **Graceful degradation** | On backend failure, `#[cachekit]`-wrapped functions run uncached (fail-open). `secure` paths fail **closed** — encrypted workloads never silently degrade | built into the macro |
+| **Single-flight** | Concurrent misses of one key collapse to a single execution: per-key in-process lock, plus a distributed fill lock across processes on lock-capable backends (cachekit.io, Redis) | in-process always on; cross-process 5 s lock, 100 ms polls |
+
+Retry sits *inside* the breaker (one exhausted retry sequence = one breaker failure), degradation and single-flight sit in the `#[cachekit]` macro around the miss path — the same composition as the TypeScript SDK's `ReliabilityExecutor` and the Python decorator.
+
+```rust,ignore
+use std::time::Duration;
+use cachekit::{CacheKit, ReliabilityConfig, RetryConfig};
+
+// Presets enable it — override or disable per client:
+let cache = CacheKit::production("redis://localhost:6379").await?
+    .reliability(ReliabilityConfig {
+        retry: Some(RetryConfig { max_attempts: 5, ..RetryConfig::default() }),
+        ..ReliabilityConfig::default()
+    })
+    .build()?;
+
+let bare = CacheKit::production("redis://localhost:6379").await?
+    .no_reliability()
+    .build()?;
+```
+
+Requires a tokio runtime for backoff timers (the `redis` and `cachekitio` backends already do).
 
 ---
 

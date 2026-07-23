@@ -203,6 +203,19 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 /// - A stored entry that cannot be decoded as the return type is treated as
 ///   a miss and overwritten (self-healing), never an error loop.
 ///
+/// # Reliability behaviour
+///
+/// - **Graceful degradation**: on a backend failure the plain path fails
+///   *open* — the function executes uncached and its result is returned
+///   (matching cachekit-py). With `secure`, backend and decryption errors
+///   fail *closed* and propagate to the caller: an encrypted workload never
+///   silently degrades.
+/// - **Cold-miss single-flight**: concurrent calls that miss on the same
+///   key are collapsed to one execution per process (and per fleet, when
+///   the backend supports distributed fill locks — CachekitIO and Redis do,
+///   with the `reliability` feature). Waiters re-read the filled entry
+///   instead of recomputing. See `cachekit::flight`.
+///
 /// # Example
 ///
 /// ```ignore
@@ -297,6 +310,17 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
         )
     };
 
+    // Graceful degradation (LAB-518): on a backend failure the plain path
+    // fails OPEN — the wrapped function runs uncached, mirroring cachekit-py's
+    // BackendError → execute-without-caching posture. The `secure` path stays
+    // fail-CLOSED: backend and decryption errors reach the caller, so an
+    // encrypted workload never silently degrades.
+    let fail_open_arm = if args.secure {
+        quote! {}
+    } else {
+        quote! { Err(cachekit::error::CachekitError::Backend(_)) => {} }
+    };
+
     // Capture the original function body.
     let original_body = &func.block;
 
@@ -329,13 +353,35 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             // cannot be decoded as #ok_type (poisoned, foreign-shaped, or a
             // Python-internal CK frame) — treat it as a miss so the fresh
             // result OVERWRITES it, instead of hard-failing every call until
-            // TTL expiry. All other errors (namespaced-client Config, backend
-            // failures) propagate.
+            // TTL expiry. Backend errors fail open on the plain path (run
+            // the function uncached) and fail closed on the secure path.
+            // Other errors (namespaced-client Config, decryption) propagate.
             match #get_expr {
                 Ok(Some(__ck_cached)) => return Ok(__ck_cached),
                 Ok(None) => {}
                 Err(cachekit::error::CachekitError::Serialization(_)) => {}
+                #fail_open_arm
                 Err(__ck_err) => return Err(__ck_err.into()),
+            }
+
+            // Cold-miss single-flight: collapse concurrent fills of this key
+            // to one execution (misses are billable). While another worker is
+            // filling, re-check the cache instead of recomputing.
+            let mut __ck_flight = #client_ident.single_flight(&__ck_key).await;
+            while __ck_flight.awaiting_fill().await {
+                match #get_expr {
+                    Ok(Some(__ck_cached)) => {
+                        __ck_flight.release().await;
+                        return Ok(__ck_cached);
+                    }
+                    Ok(None) => {}
+                    Err(cachekit::error::CachekitError::Serialization(_)) => {}
+                    #fail_open_arm
+                    Err(__ck_err) => {
+                        __ck_flight.release().await;
+                        return Err(__ck_err.into());
+                    }
+                }
             }
 
             // Execute original function body
@@ -346,6 +392,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                 #set_expr
             }
 
+            __ck_flight.release().await;
             __ck_result
         }
     };

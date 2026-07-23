@@ -48,6 +48,10 @@ pub enum BackendErrorKind {
     Timeout,
     /// Credentials are invalid or missing — retrying will not help.
     Authentication,
+    /// The circuit breaker is open — the call failed fast without reaching
+    /// the backend. Not retryable *now*; the breaker re-probes on its own
+    /// schedule (see `reliability::CircuitBreakerConfig::open_timeout`).
+    CircuitOpen,
 }
 
 impl BackendErrorKind {
@@ -65,6 +69,7 @@ impl std::fmt::Display for BackendErrorKind {
             Self::Permanent => write!(f, "permanent"),
             Self::Timeout => write!(f, "timeout"),
             Self::Authentication => write!(f, "authentication"),
+            Self::CircuitOpen => write!(f, "circuit-open"),
         }
     }
 }
@@ -121,6 +126,15 @@ impl BackendError {
     pub fn auth(message: impl Into<String>) -> Self {
         Self {
             kind: BackendErrorKind::Authentication,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Create a circuit-open backend error (call failed fast, backend not reached).
+    pub fn circuit_open(message: impl Into<String>) -> Self {
+        Self {
+            kind: BackendErrorKind::CircuitOpen,
             message: message.into(),
             source: None,
         }

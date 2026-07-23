@@ -16,6 +16,9 @@ compile_error!(
 #[cfg(all(feature = "workers", feature = "l1"))]
 compile_error!("features `workers` and `l1` are mutually exclusive — moka requires std threads unavailable in wasm32");
 
+#[cfg(all(feature = "workers", feature = "reliability"))]
+compile_error!("features `workers` and `reliability` are mutually exclusive — retry/breaker timers need tokio `time`, unavailable in wasm32");
+
 /// Pluggable cache backend trait and implementations (CachekitIO, Redis, Workers).
 pub mod backend;
 /// High-level cache client with dual-layer (L1/L2) support.
@@ -24,6 +27,8 @@ pub mod client;
 pub mod config;
 /// Error types for cache operations and backend communication.
 pub mod error;
+/// Cold-miss single-flight: dedup concurrent fills of the same key.
+pub mod flight;
 /// Interop mode (interop/v1): cross-SDK cache keys and plain-MessagePack values.
 pub mod interop;
 /// L1 cache hit-rate metrics for CachekitIO request headers.
@@ -46,6 +51,10 @@ pub mod encryption;
 #[cfg(feature = "l1")]
 pub mod l1;
 
+/// Reliability tier: retry with backoff + jitter, circuit breaker.
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+pub mod reliability;
+
 // Re-exports
 pub use client::{CacheKit, CacheKitBuilder, SharedBackend};
 pub use config::CachekitConfig;
@@ -58,6 +67,11 @@ pub use encryption::EncryptionLayer;
 
 #[cfg(feature = "macros")]
 pub use cachekit_macros::cachekit;
+
+pub use flight::SingleFlight;
+
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+pub use reliability::{CircuitBreakerConfig, ReliabilityConfig, RetryConfig};
 
 /// Convenient glob import for the most common types.
 pub mod prelude {
