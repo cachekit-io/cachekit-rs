@@ -23,7 +23,7 @@
 |:----------|:-------------|
 | **CacheKit** | `get` / `set` / `delete` / `exists` with automatic L1 → L2 layering |
 | **SecureCache** | Transparent AES-256-GCM encryption before storage (zero-knowledge) |
-| **Backend** | Pluggable trait — cachekit.io SaaS, Redis, Cloudflare Workers |
+| **Backend** | Pluggable trait — cachekit.io SaaS, Redis, Memcached, local File, Cloudflare Workers |
 | **L1 Cache** | In-process [moka](https://crates.io/crates/moka) cache with write-through + backfill |
 
 > [!TIP]
@@ -40,6 +40,8 @@
 | `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core) |
 | `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka) |
 | `redis` | ❌ | Redis backend via [fred](https://crates.io/crates/fred) (native only) |
+| `memcached` | ❌ | Memcached backend via [async-memcached](https://crates.io/crates/async-memcached) (native only) |
+| `file` | ❌ | Local filesystem backend, byte-compatible with cachekit-py's File backend (native only) |
 | `workers` | ❌ | Cloudflare Workers backend via [worker](https://crates.io/crates/worker) |
 | `macros` | ❌ | `#[cachekit]` proc-macro decorator (mints [interop/v1](#cross-sdk-interop-mode) keys) |
 
@@ -61,6 +63,8 @@ cachekit-rs = { version = "0.2", default-features = false, features = ["workers"
 > **Mutually exclusive features:**
 > - `workers` + `redis` — Workers runtime cannot use fred
 > - `workers` + `l1` — moka requires std threads unavailable in wasm32
+> - `workers` + `memcached` — Workers runtime has no TCP sockets
+> - `workers` + `file` — Workers runtime has no filesystem
 
 ---
 
@@ -209,6 +213,39 @@ let backend = RedisBackend::builder()
     .url("redis://localhost:6379")
     .build()?;
 backend.connect().await?;  // explicit connect required
+```
+
+### Memcached
+
+Memcached via [async-memcached](https://crates.io/crates/async-memcached) (single server, TCP or unix socket). Base contract only — no TTL inspection, matching cachekit-py's deliberate choice (the classic memcached protocol cannot read a key's remaining TTL, so shipping it here would make TTL-driven behaviour diverge between SDKs on the same cluster). TTLs above memcached's 30-day ceiling are clamped; values above the item-size limit (default 1 MiB) fail loudly client-side instead of being silently dropped by the server. Requires the `memcached` feature flag.
+
+```toml
+cachekit-rs = { version = "0.4", features = ["memcached"] }
+```
+
+```rust
+use cachekit::backend::memcached::MemcachedBackend;
+
+let backend = MemcachedBackend::builder()
+    .url("tcp://localhost:11211")
+    .connect()          // connects eagerly, unlike Redis's lazy build
+    .await?;
+```
+
+### File (local filesystem)
+
+Local disk cache, **byte-compatible with cachekit-py's File backend** — a py and an rs process pointed at the same directory read each other's entries (Blake2b-128 hashed filenames, shared 14-byte header, atomic write-then-rename, lazy expiry). Implements `TtlInspectable` (TTL read off the on-disk header, in-place refresh). Not yet ported from py: LRU eviction and size caps — the directory grows until entries expire or you clear it. Requires the `file` feature flag and a tokio runtime (I/O runs via `spawn_blocking`).
+
+```toml
+cachekit-rs = { version = "0.4", features = ["file"] }
+```
+
+```rust
+use cachekit::backend::file::FileBackend;
+
+let backend = FileBackend::builder()
+    .cache_dir("/var/cache/myapp")  // default: <system temp dir>/cachekit
+    .build()?;
 ```
 
 ### Cloudflare Workers

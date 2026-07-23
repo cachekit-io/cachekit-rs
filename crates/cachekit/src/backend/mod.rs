@@ -163,6 +163,14 @@ mod cachekitio_ttl;
 #[cfg(feature = "redis")]
 pub mod redis;
 
+/// Memcached backend via the [`async-memcached`](https://crates.io/crates/async-memcached) client.
+#[cfg(feature = "memcached")]
+pub mod memcached;
+
+/// Local filesystem backend, byte-compatible with cachekit-py's File backend.
+#[cfg(feature = "file")]
+pub mod file;
+
 /// Cloudflare Workers backend using `worker::Fetch`.
 #[cfg(feature = "workers")]
 pub mod workers;

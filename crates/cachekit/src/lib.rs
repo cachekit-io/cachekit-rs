@@ -1,7 +1,8 @@
 //! CacheKit — production-ready caching for Rust.
 //!
-//! Supports cachekit.io SaaS, Redis, and Cloudflare Workers backends.
-//! Zero-knowledge encryption via AES-256-GCM with HKDF key derivation.
+//! Supports cachekit.io SaaS, Redis, Memcached, local File, and Cloudflare
+//! Workers backends. Zero-knowledge encryption via AES-256-GCM with HKDF key
+//! derivation.
 
 // Production code lints — these only fire in src/, not tests/
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -16,7 +17,16 @@ compile_error!(
 #[cfg(all(feature = "workers", feature = "l1"))]
 compile_error!("features `workers` and `l1` are mutually exclusive — moka requires std threads unavailable in wasm32");
 
-/// Pluggable cache backend trait and implementations (CachekitIO, Redis, Workers).
+#[cfg(all(feature = "workers", feature = "memcached"))]
+compile_error!("features `workers` and `memcached` are mutually exclusive — Workers runtime has no TCP sockets");
+
+#[cfg(all(feature = "workers", feature = "file"))]
+compile_error!(
+    "features `workers` and `file` are mutually exclusive — Workers runtime has no filesystem"
+);
+
+/// Pluggable cache backend trait and implementations (CachekitIO, Redis,
+/// Memcached, File, Workers).
 pub mod backend;
 /// High-level cache client with dual-layer (L1/L2) support.
 pub mod client;
