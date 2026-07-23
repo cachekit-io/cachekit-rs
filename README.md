@@ -196,7 +196,7 @@ let backend = CachekitIO::builder()
 
 ### Redis
 
-Native Redis via [fred](https://crates.io/crates/fred) with cluster support. Requires the `redis` feature flag.
+Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Requires the `redis` feature flag.
 
 ```toml
 cachekit-rs = { version = "0.2", features = ["redis"] }
@@ -213,7 +213,7 @@ backend.connect().await?;  // explicit connect required
 
 ### Cloudflare Workers
 
-`wasm32-unknown-unknown` backend using `worker::Fetch`. Requires the `workers` feature with default features disabled.
+`wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. Requires the `workers` feature with default features disabled.
 
 ```toml
 cachekit-rs = { version = "0.2", default-features = false, features = ["workers", "encryption"] }
@@ -321,6 +321,7 @@ cachekit-rs/
 │   │           ├── cachekitio.rs      # cachekit.io HTTP backend
 │   │           ├── cachekitio_lock.rs # Distributed locking
 │   │           ├── cachekitio_ttl.rs  # TTL inspection
+│   │           ├── saas_wire.rs       # SaaS lock/TTL JSON wire bodies
 │   │           ├── redis.rs           # Redis backend (feature = "redis")
 │   │           └── workers.rs         # Workers backend (feature = "workers")
 │   │

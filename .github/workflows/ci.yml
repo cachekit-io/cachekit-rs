@@ -55,6 +55,57 @@ jobs:
       - name: Run tests
         run: cargo test --features "cachekitio,redis,encryption,l1,macros"
 
+  redis-lock:
+    name: redis lock integration
+    # `services:` containers require Docker. cachekit-lean is a no-dind
+    # scaleset (lab ADR-0001), so a redis service can only run on the
+    # with-dind `cachekit` scaleset. Without a live redis the lock
+    # acquire/release path has zero automated coverage — the
+    # redis_lock_live_semantics test skips when CACHEKIT_TEST_REDIS_URL is
+    # unset (LAB-426: the AC requires locking exercised against a container).
+    runs-on: cachekit
+    timeout-minutes: 20
+    services:
+      redis:
+        # Digest-pinned like the SHA-pinned actions in this file — a bare
+        # tag is mutable. redis:7 resolved 2026-07-23.
+        image: redis:7@sha256:a8f08480e1f88f2647fed492d1178c06abb0d0c1fbf02c682a61e2f483fb3954
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # This job never pushes; don't leave the token on a self-hosted
+          # runner workspace (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run redis lock integration test
+        env:
+          # The job runs directly on the runner, which shares the pod network
+          # namespace with the dind sidecar, so the mapped service port is
+          # reachable on localhost. redis-only, no default features — leanest
+          # build for the memory-tight (5Gi) with-dind pod.
+          CACHEKIT_TEST_REDIS_URL: redis://localhost:6379
+        run: |
+          cargo test --no-default-features --features redis --test redis_tests -- --nocapture 2>&1 | tee redis-test.log
+          # False-green guard: this job exists so the live lock test actually
+          # runs. If it silently skipped (env not seen), fail loudly instead of
+          # reporting a hollow green — the exact defect LAB-426 is fixing.
+          if grep -q "skipping redis_lock_live_semantics" redis-test.log; then
+            echo "::error::redis lock test skipped — CACHEKIT_TEST_REDIS_URL not seen by the test"
+            exit 1
+          fi
+
   wasm:
     name: wasm32 compilation check
     runs-on: cachekit-lean

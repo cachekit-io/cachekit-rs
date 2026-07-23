@@ -18,7 +18,7 @@ name = "cachekit"
 default = ["cachekitio", "encryption", "l1"]
 cachekitio = ["dep:reqwest", "dep:serde_json"]
 redis = ["dep:fred"]
-workers = ["dep:worker", "dep:js-sys", "dep:getrandom"]
+workers = ["dep:worker", "dep:js-sys", "dep:getrandom", "dep:serde_json"]
 # cachekit-core 0.2 folds aes-gcm into the `encryption` feature automatically on wasm32.
 # No separate `cachekit-core/wasm` activation needed.
 encryption = ["cachekit-core/encryption"]
@@ -46,8 +46,9 @@ uuid = { version = "1", features = ["v4", "js"] }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "json"] }
 serde_json = { version = "1", optional = true }
 
-# Optional: Redis backend
-fred = { version = "9", optional = true }
+# Optional: Redis backend. `i-scripts` exposes EVAL for the atomic
+# compare-and-delete lock release (LockableBackend).
+fred = { version = "9", optional = true, features = ["i-scripts"] }
 
 # Optional: L1 in-process cache
 moka = { version = "0.12", optional = true, features = ["sync"] }
