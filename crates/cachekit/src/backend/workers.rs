@@ -184,14 +184,7 @@ impl Backend for WorkersCachekitIO {
                 Ok(Some(bytes))
             }
             404 => Ok(None),
-            status => {
-                let body = resp.bytes().await.unwrap_or_default();
-                let sanitized = BackendError::sanitize_message(
-                    std::str::from_utf8(&body).unwrap_or(""),
-                    self.api_key.as_str(),
-                );
-                Err(BackendError::from_http_status(status, sanitized.as_bytes()))
-            }
+            _ => Err(self.error_from_response(resp).await),
         }
     }
 
@@ -214,12 +207,7 @@ impl Backend for WorkersCachekitIO {
         if (200..300).contains(&status) {
             Ok(())
         } else {
-            let body = resp.bytes().await.unwrap_or_default();
-            let sanitized = BackendError::sanitize_message(
-                std::str::from_utf8(&body).unwrap_or(""),
-                self.api_key.as_str(),
-            );
-            Err(BackendError::from_http_status(status, sanitized.as_bytes()))
+            Err(self.error_from_response(resp).await)
         }
     }
 
@@ -229,14 +217,7 @@ impl Backend for WorkersCachekitIO {
         match resp.status_code() {
             200 | 204 => Ok(true),
             404 => Ok(false),
-            status => {
-                let body = resp.bytes().await.unwrap_or_default();
-                let sanitized = BackendError::sanitize_message(
-                    std::str::from_utf8(&body).unwrap_or(""),
-                    self.api_key.as_str(),
-                );
-                Err(BackendError::from_http_status(status, sanitized.as_bytes()))
-            }
+            _ => Err(self.error_from_response(resp).await),
         }
     }
 
@@ -264,12 +245,7 @@ impl Backend for WorkersCachekitIO {
                 details,
             })
         } else {
-            let body = resp.bytes().await.unwrap_or_default();
-            let sanitized = BackendError::sanitize_message(
-                std::str::from_utf8(&body).unwrap_or(""),
-                self.api_key.as_str(),
-            );
-            Err(BackendError::from_http_status(status, sanitized.as_bytes()))
+            Err(self.error_from_response(resp).await)
         }
     }
 }
