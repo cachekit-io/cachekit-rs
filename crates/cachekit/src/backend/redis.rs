@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use fred::interfaces::LuaInterface;
 use fred::prelude::*;
 use fred::types::ConnectHandle;
 
-use crate::backend::{Backend, HealthStatus, TtlInspectable};
+use crate::backend::{Backend, HealthStatus, LockableBackend, TtlInspectable};
 use crate::error::{BackendError, BackendErrorKind};
 
 // ── Error mapping ─────────────────────────────────────────────────────────────
@@ -144,6 +145,59 @@ impl TtlInspectable for RedisBackend {
     }
 }
 
+// ── LockableBackend impl ──────────────────────────────────────────────────────
+
+/// Callers pass the bare cache key; the backend derives the lock key on the
+/// wire. `<key>:lock` matches cachekit-py's Redis lock namespace so py and rs
+/// workloads contend on the same lock.
+fn lock_key(key: &str) -> String {
+    format!("{key}:lock")
+}
+
+/// Compare-and-delete: only the holder of the lock_id token may release.
+/// Atomic via Lua — a GET-then-DEL from the client would race with expiry
+/// and delete a lock some other client has since acquired.
+const RELEASE_LOCK_SCRIPT: &str = r#"if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end"#;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
+impl LockableBackend for RedisBackend {
+    async fn acquire_lock(
+        &self,
+        key: &str,
+        timeout_ms: u64,
+    ) -> Result<Option<String>, BackendError> {
+        let lock_id = uuid::Uuid::new_v4().to_string();
+        // PX must be >= 1 (Redis rejects 0); clamp like Backend::set does for EX.
+        let px = i64::try_from(timeout_ms.max(1)).unwrap_or(i64::MAX);
+
+        // SET NX PX: returns OK when the lock was free, nil when contested.
+        let result: Option<String> = self
+            .client
+            .set(
+                lock_key(key),
+                lock_id.as_str(),
+                Some(Expiration::PX(px)),
+                Some(SetOptions::NX),
+                false,
+            )
+            .await
+            .map_err(redis_err)?;
+
+        Ok(result.map(|_| lock_id))
+    }
+
+    async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError> {
+        let deleted: i64 = self
+            .client
+            .eval(RELEASE_LOCK_SCRIPT, vec![lock_key(key)], vec![lock_id])
+            .await
+            .map_err(redis_err)?;
+        Ok(deleted == 1)
+    }
+}
+
 // ── Builder ───────────────────────────────────────────────────────────────────
 
 /// Builder for [`RedisBackend`].
@@ -199,5 +253,30 @@ impl RedisBackendBuilder {
 
         let client = RedisClient::new(config, None, None, self.reconnect);
         Ok(RedisBackend { client })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compile-time proof that RedisBackend implements LockableBackend.
+    fn _assert_lockable(_b: &dyn LockableBackend) {}
+
+    #[test]
+    fn redis_is_lockable() {
+        fn _check(backend: &RedisBackend) {
+            _assert_lockable(backend);
+        }
+    }
+
+    #[test]
+    fn lock_key_derives_py_compatible_namespace() {
+        // Bare-key contract: callers never build ":lock" themselves; the
+        // backend appends it, byte-identical to cachekit-py's Redis lock.
+        assert_eq!(
+            lock_key("ns:app:func:m.f:args:abc:v1"),
+            "ns:app:func:m.f:args:abc:v1:lock"
+        );
     }
 }

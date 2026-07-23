@@ -10,7 +10,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use zeroize::Zeroizing;
 
-use crate::backend::{Backend, HealthStatus};
+use crate::backend::saas_wire::{
+    LockAcquireRequest, LockAcquireResponse, RefreshTtlRequest, TtlResponse,
+};
+use crate::backend::{Backend, HealthStatus, LockableBackend, TtlInspectable};
 use crate::error::BackendError;
 use crate::metrics::{metrics_headers, MetricsProvider};
 use crate::session::session_headers;
@@ -58,6 +61,28 @@ impl WorkersCachekitIO {
     /// Build the health-check URL.
     fn health_url(&self) -> String {
         format!("{}/v1/cache/health", self.api_url)
+    }
+
+    /// Build the lock URL for a cache key. Callers pass the bare cache key;
+    /// the SaaS lock endpoint owns the lock namespace server-side.
+    fn lock_url(&self, key: &str) -> String {
+        format!("{}/lock", self.url(key))
+    }
+
+    /// Build the TTL URL for a cache key.
+    fn ttl_url(&self, key: &str) -> String {
+        format!("{}/ttl", self.url(key))
+    }
+
+    /// Convert a non-success response into a classified, sanitized error.
+    async fn error_from_response(&self, mut resp: worker::Response) -> BackendError {
+        let status = resp.status_code();
+        let body = resp.bytes().await.unwrap_or_default();
+        let sanitized = BackendError::sanitize_message(
+            std::str::from_utf8(&body).unwrap_or(""),
+            self.api_key.as_str(),
+        );
+        BackendError::from_http_status(status, sanitized.as_bytes())
     }
 
     /// Execute a fetch request with the given method, URL, optional body, and extra headers.
@@ -108,6 +133,8 @@ impl WorkersCachekitIO {
         init.with_method(match method {
             "GET" => worker::Method::Get,
             "PUT" => worker::Method::Put,
+            "POST" => worker::Method::Post,
+            "PATCH" => worker::Method::Patch,
             "DELETE" => worker::Method::Delete,
             "HEAD" => worker::Method::Head,
             _ => {
@@ -243,6 +270,126 @@ impl Backend for WorkersCachekitIO {
                 self.api_key.as_str(),
             );
             Err(BackendError::from_http_status(status, sanitized.as_bytes()))
+        }
+    }
+}
+
+// ── LockableBackend impl (wasm32 only) ───────────────────────────────────────
+
+/// Lock capability token travels in this request header, never the query
+/// string (CWE-532): a `?lock_id=` query leaks the token into access/proxy
+/// logs and OpenTelemetry `http.url` spans. Same contract as the native
+/// `CachekitIO` impl. See protocol `spec/saas-api.md`.
+const LOCK_ID_HEADER: &str = "X-CacheKit-Lock-Id";
+
+#[async_trait(?Send)]
+impl LockableBackend for WorkersCachekitIO {
+    async fn acquire_lock(
+        &self,
+        key: &str,
+        timeout_ms: u64,
+    ) -> Result<Option<String>, BackendError> {
+        let body = serde_json::to_vec(&LockAcquireRequest { timeout_ms }).map_err(|e| {
+            BackendError::permanent(format!("failed to serialize lock request: {e}"))
+        })?;
+
+        let mut resp = self
+            .fetch(
+                "POST",
+                &self.lock_url(key),
+                Some(body),
+                vec![("Content-Type", "application/json".to_owned())],
+            )
+            .await?;
+
+        if !(200..300).contains(&resp.status_code()) {
+            return Err(self.error_from_response(resp).await);
+        }
+
+        // Contested acquire is `200 {"lock_id": null}` — branch on the body,
+        // never on a 409 status (protocol#22 / LAB-240).
+        let bytes = resp.bytes().await.map_err(|e| {
+            BackendError::transient(BackendError::sanitize_message(
+                &format!("failed to read lock response: {e}"),
+                self.api_key.as_str(),
+            ))
+        })?;
+        let response: LockAcquireResponse = serde_json::from_slice(&bytes)
+            .map_err(|e| BackendError::transient(format!("failed to parse lock response: {e}")))?;
+
+        Ok(response.lock_id)
+    }
+
+    async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError> {
+        // lock_id is a capability token → X-CacheKit-Lock-Id header, not the
+        // query string (CWE-532).
+        let resp = self
+            .fetch(
+                "DELETE",
+                &self.lock_url(key),
+                None,
+                vec![(LOCK_ID_HEADER, lock_id.to_owned())],
+            )
+            .await?;
+
+        match resp.status_code() {
+            200 | 204 => Ok(true),
+            404 => Ok(false),
+            _ => Err(self.error_from_response(resp).await),
+        }
+    }
+}
+
+// ── TtlInspectable impl (wasm32 only) ────────────────────────────────────────
+
+#[async_trait(?Send)]
+impl TtlInspectable for WorkersCachekitIO {
+    async fn ttl(&self, key: &str) -> Result<Option<Duration>, BackendError> {
+        let mut resp = self.fetch("GET", &self.ttl_url(key), None, vec![]).await?;
+
+        match resp.status_code() {
+            200 => {
+                let bytes = resp.bytes().await.map_err(|e| {
+                    BackendError::transient(BackendError::sanitize_message(
+                        &format!("failed to read TTL response: {e}"),
+                        self.api_key.as_str(),
+                    ))
+                })?;
+                let body: TtlResponse = serde_json::from_slice(&bytes).map_err(|e| {
+                    BackendError::transient(format!("failed to parse TTL response: {e}"))
+                })?;
+                Ok(body.ttl.map(Duration::from_secs))
+            }
+            404 => Ok(None),
+            _ => Err(self.error_from_response(resp).await),
+        }
+    }
+
+    async fn refresh_ttl(&self, key: &str, ttl: Duration) -> Result<bool, BackendError> {
+        let secs = ttl.as_secs();
+        if secs == 0 {
+            return Err(BackendError::permanent(
+                "refresh_ttl requires at least 1 second".to_string(),
+            ));
+        }
+
+        let body = serde_json::to_vec(&RefreshTtlRequest { ttl: secs }).map_err(|e| {
+            BackendError::permanent(format!("failed to serialize refresh_ttl request: {e}"))
+        })?;
+
+        let resp = self
+            .fetch(
+                "PATCH",
+                &self.ttl_url(key),
+                Some(body),
+                vec![("Content-Type", "application/json".to_owned())],
+            )
+            .await?;
+
+        match resp.status_code() {
+            200 | 204 => Ok(true),
+            404 => Ok(false),
+            _ => Err(self.error_from_response(resp).await),
         }
     }
 }

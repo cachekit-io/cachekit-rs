@@ -145,6 +145,12 @@ pub trait LockableBackend: Backend {
 
 // ── Feature-gated backend modules ─────────────────────────────────────────────
 
+/// JSON wire bodies for the SaaS lock/TTL endpoints. Compiled under `test`
+/// unconditionally so the wire-contract round-trip tests always run in CI,
+/// even though only the `workers` backend consumes the structs at runtime.
+#[cfg(any(feature = "workers", test))]
+mod saas_wire;
+
 /// HTTP backend for the cachekit.io SaaS API.
 #[cfg(feature = "cachekitio")]
 pub mod cachekitio;
