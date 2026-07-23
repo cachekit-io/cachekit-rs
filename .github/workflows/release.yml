@@ -28,9 +28,6 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Debug release-please outputs
-        run: echo '${{ toJSON(steps.release.outputs) }}'
-
       - name: Assign release PR to 27Bslash6
         # REST instead of `gh pr edit --add-assignee`: gh's assignee edit goes
         # through GraphQL mutations that 403 with app installation tokens
