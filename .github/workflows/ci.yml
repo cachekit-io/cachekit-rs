@@ -67,7 +67,9 @@ jobs:
     timeout-minutes: 20
     services:
       redis:
-        image: redis:7
+        # Digest-pinned like the SHA-pinned actions in this file — a bare
+        # tag is mutable. redis:7 resolved 2026-07-23.
+        image: redis:7@sha256:a8f08480e1f88f2647fed492d1178c06abb0d0c1fbf02c682a61e2f483fb3954
         ports:
           - 6379:6379
         options: >-
@@ -77,6 +79,10 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # This job never pushes; don't leave the token on a self-hosted
+          # runner workspace (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: |

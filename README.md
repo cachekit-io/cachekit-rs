@@ -213,7 +213,7 @@ backend.connect().await?;  // explicit connect required
 
 ### Cloudflare Workers
 
-`wasm32-unknown-unknown` backend using `worker::Fetch`, with the same distributed locking and TTL inspection as the native SaaS backend. Requires the `workers` feature with default features disabled.
+`wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. Requires the `workers` feature with default features disabled.
 
 ```toml
 cachekit-rs = { version = "0.2", default-features = false, features = ["workers", "encryption"] }
