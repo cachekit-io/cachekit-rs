@@ -320,7 +320,7 @@ async fn single_flight_leader_never_waits() {
 
     let mut flight = client.single_flight("cold").await;
     assert!(
-        !flight.awaiting_fill().await,
+        !flight.wait_for_fill().await,
         "an uncontested leader computes immediately — a re-check would be a second billable miss"
     );
     flight.release().await;
@@ -342,7 +342,7 @@ async fn single_flight_follower_rechecks_once() {
     let follower = tokio::spawn(async move {
         let mut flight = follower_client.single_flight("cold").await;
         let mut rechecks = 0;
-        while flight.awaiting_fill().await {
+        while flight.wait_for_fill().await {
             rechecks += 1;
         }
         flight.release().await;
@@ -465,7 +465,7 @@ async fn single_flight_leader_takes_and_releases_distributed_lock() {
         .expect("client builds");
 
     let mut flight = client.single_flight("cold").await;
-    assert!(!flight.awaiting_fill().await, "lock granted → leader");
+    assert!(!flight.wait_for_fill().await, "lock granted → leader");
     assert_eq!(handle.inner.acquires.load(Ordering::SeqCst), 1);
 
     flight.release().await;
@@ -495,7 +495,7 @@ async fn single_flight_contested_lock_polls_and_finds_remote_fill() {
 
     let mut flight = client.single_flight("cold").await;
     assert!(
-        flight.awaiting_fill().await,
+        flight.wait_for_fill().await,
         "contested lock → poll for the other process's fill"
     );
     let value: Option<u32> = client.get("cold").await.expect("get succeeds");
@@ -505,5 +505,108 @@ async fn single_flight_contested_lock_polls_and_finds_remote_fill() {
         handle.inner.releases.load(Ordering::SeqCst),
         0,
         "no lock held, nothing to release"
+    );
+}
+
+// ── Cancel-safety (panel CRIT: probe slot must survive cancellation) ─────────
+
+/// Scripted per call index: fail (opens the breaker), hang (the probe that
+/// gets cancelled), then succeed.
+#[derive(Debug, Clone, Default)]
+struct HangOnceBackend {
+    calls: Arc<AtomicU32>,
+}
+
+impl HangOnceBackend {
+    fn shared() -> SharedBackend {
+        #[cfg(not(feature = "unsync"))]
+        {
+            Arc::new(Self::default())
+        }
+        #[cfg(feature = "unsync")]
+        {
+            std::rc::Rc::new(Self::default())
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
+impl Backend for HangOnceBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Err(BackendError::transient("opening failure")),
+            1 => std::future::pending().await,
+            _ => Ok(Some(rmp_encoded_seven())),
+        }
+    }
+
+    async fn set(
+        &self,
+        _key: &str,
+        _value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
+    async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Ok(HealthStatus {
+            is_healthy: true,
+            latency_ms: 0.0,
+            backend_type: "hang-once".to_owned(),
+            details: HashMap::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn cancelled_probe_does_not_wedge_the_breaker() {
+    // One probe slot, one success to close. The half-open probe hangs and the
+    // caller times out — cancelling the guarded future mid-await. Without the
+    // RAII permit releasing the slot on drop, that single slot leaks and the
+    // breaker fast-fails CircuitOpen forever, even after the backend recovers.
+    let client = client_with(
+        HangOnceBackend::shared(),
+        ReliabilityConfig {
+            retry: None,
+            circuit_breaker: Some(CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold: 1,
+                open_timeout: Duration::from_millis(5),
+                half_open_max_calls: 1,
+                rolling_window: Duration::from_secs(60),
+            }),
+        },
+    );
+
+    client
+        .get::<u32>("k")
+        .await
+        .expect_err("first call opens the breaker");
+    tokio::time::sleep(Duration::from_millis(10)).await; // → half-open
+
+    let cancelled = tokio::time::timeout(Duration::from_millis(20), client.get::<u32>("k")).await;
+    assert!(
+        cancelled.is_err(),
+        "the hanging probe must be cancelled by the timeout"
+    );
+
+    let value: Option<u32> = client
+        .get("k")
+        .await
+        .expect("a fresh probe is admitted after the cancelled one released its slot");
+    assert_eq!(
+        value,
+        Some(7),
+        "breaker recovered instead of wedging half-open"
     );
 }

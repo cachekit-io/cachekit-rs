@@ -605,18 +605,11 @@ impl CacheKitBuilder {
     ///
     /// Enabled by default with production settings by the `production`,
     /// `encrypted`, and `io` intent presets; off for `minimal` and for
-    /// manually-built clients.
+    /// manually-built clients. To opt a preset out, pass a config with both
+    /// layers `None` — an empty config applies no wrapping at all.
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
     pub fn reliability(mut self, config: crate::reliability::ReliabilityConfig) -> Self {
         self.reliability = Some(config);
-        self
-    }
-
-    /// Remove any reliability configuration (backend errors propagate on
-    /// first failure, no circuit breaker). Overrides a preset's default.
-    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-    pub fn no_reliability(mut self) -> Self {
-        self.reliability = None;
         self
     }
 
@@ -693,10 +686,14 @@ impl CacheKitBuilder {
         };
 
         // Apply the reliability stack last so it decorates the final backend.
+        // A config with neither layer set is the documented opt-out: skip the
+        // (no-op) decorator entirely.
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         let backend = match self.reliability {
-            Some(config) => crate::reliability::wrap_reliable(backend, config),
-            None => backend,
+            Some(config) if config.retry.is_some() || config.circuit_breaker.is_some() => {
+                crate::reliability::wrap_reliable(backend, config)
+            }
+            _ => backend,
         };
 
         Ok(CacheKit {

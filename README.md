@@ -293,7 +293,7 @@ With the `reliability` feature (default, native only), the `production`, `encryp
 |:------|:-------------|:---------|
 | **Retry** | Truncated exponential backoff + jitter on transient/timeout errors (`BackendErrorKind::is_retryable`); permanent and auth errors propagate immediately | 3 attempts, 100 ms base, 5 s cap, jitter ×[0.5, 1.5) |
 | **Circuit breaker** | closed → open after N retryable failures in a rolling window; fails fast (`BackendErrorKind::CircuitOpen`) while open; half-open probes recovery | threshold 5, window 60 s, open 5 s, 3 probes, close after 3 successes |
-| **Graceful degradation** | On backend failure, `#[cachekit]`-wrapped functions run uncached (fail-open). `secure` paths fail **closed** — encrypted workloads never silently degrade | built into the macro |
+| **Graceful degradation** | On outage-class backend failure (transient, timeout, open breaker), `#[cachekit]`-wrapped functions run uncached (fail-open); permanent/auth errors propagate — a wrong API key fails loudly. `secure` paths fail **closed** on everything — encrypted workloads never silently degrade | built into the macro |
 | **Single-flight** | Concurrent misses of one key collapse to a single execution: per-key in-process lock, plus a distributed fill lock across processes on lock-capable backends (cachekit.io, Redis) | in-process always on; cross-process 5 s lock, 100 ms polls |
 
 Retry sits *inside* the breaker (one exhausted retry sequence = one breaker failure), degradation and single-flight sit in the `#[cachekit]` macro around the miss path — the same composition as the TypeScript SDK's `ReliabilityExecutor` and the Python decorator.
@@ -310,8 +310,9 @@ let cache = CacheKit::production("redis://localhost:6379").await?
     })
     .build()?;
 
+// Opt a preset out: a config with both layers `None` applies no wrapping.
 let bare = CacheKit::production("redis://localhost:6379").await?
-    .no_reliability()
+    .reliability(ReliabilityConfig { retry: None, circuit_breaker: None })
     .build()?;
 ```
 

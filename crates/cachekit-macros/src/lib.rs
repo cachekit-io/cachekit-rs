@@ -205,11 +205,14 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///
 /// # Reliability behaviour
 ///
-/// - **Graceful degradation**: on a backend failure the plain path fails
-///   *open* — the function executes uncached and its result is returned
-///   (matching cachekit-py). With `secure`, backend and decryption errors
-///   fail *closed* and propagate to the caller: an encrypted workload never
-///   silently degrades.
+/// - **Graceful degradation**: on an outage-class backend failure —
+///   transient, timeout, or an open circuit breaker — the plain path fails
+///   *open*: the function executes uncached and its result is returned.
+///   Permanent and authentication errors propagate even on the plain path
+///   (a wrong API key must fail loudly, not silently disable caching
+///   forever). With `secure`, *every* backend and decryption error fails
+///   *closed* and propagates: an encrypted workload never silently
+///   degrades.
 /// - **Cold-miss single-flight**: concurrent calls that miss on the same
 ///   key are collapsed to one execution per process (and per fleet, when
 ///   the backend supports distributed fill locks — CachekitIO and Redis do,
@@ -310,15 +313,26 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
         )
     };
 
-    // Graceful degradation (LAB-518): on a backend failure the plain path
-    // fails OPEN — the wrapped function runs uncached, mirroring cachekit-py's
-    // BackendError → execute-without-caching posture. The `secure` path stays
-    // fail-CLOSED: backend and decryption errors reach the caller, so an
-    // encrypted workload never silently degrades.
+    // Graceful degradation (LAB-518): on an OUTAGE-class backend failure —
+    // retryable (transient/timeout) or a fast-failing open circuit breaker —
+    // the plain path fails OPEN: the wrapped function runs uncached, so a
+    // cache outage costs performance, not availability. Permanent and
+    // authentication errors PROPAGATE even on the plain path: a wrong API
+    // key that silently fell open would run uncached forever with zero
+    // signal while looking healthy (expert-panel finding). The `secure`
+    // path stays fail-CLOSED on everything: backend and decryption errors
+    // reach the caller, so an encrypted workload never silently degrades.
     let fail_open_arm = if args.secure {
         quote! {}
     } else {
-        quote! { Err(cachekit::error::CachekitError::Backend(_)) => {} }
+        quote! {
+            Err(cachekit::error::CachekitError::Backend(__ck_be))
+                if __ck_be.kind.is_retryable()
+                    || matches!(
+                        __ck_be.kind,
+                        cachekit::error::BackendErrorKind::CircuitOpen
+                    ) => {}
+        }
     };
 
     // Capture the original function body.
@@ -368,7 +382,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             // to one execution (misses are billable). While another worker is
             // filling, re-check the cache instead of recomputing.
             let mut __ck_flight = #client_ident.single_flight(&__ck_key).await;
-            while __ck_flight.awaiting_fill().await {
+            while __ck_flight.wait_for_fill().await {
                 match #get_expr {
                     Ok(Some(__ck_cached)) => {
                         __ck_flight.release().await;

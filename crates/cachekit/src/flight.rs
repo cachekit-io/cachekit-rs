@@ -24,7 +24,7 @@
 //!     return Ok(());
 //! }
 //! let mut flight = cache.single_flight("expensive").await;
-//! while flight.awaiting_fill().await {
+//! while flight.wait_for_fill().await {
 //!     if let Some(_v) = cache.get::<String>("expensive").await? {
 //!         flight.release().await; // another worker filled it
 //!         return Ok(());
@@ -127,7 +127,7 @@ impl SingleFlight {
     /// - Queued behind a local leader: `true` exactly once.
     /// - Contested cross-process: sleeps one poll interval per call, `true`
     ///   until the poll budget is spent.
-    pub async fn awaiting_fill(&mut self) -> bool {
+    pub async fn wait_for_fill(&mut self) -> bool {
         match &mut self.role {
             Role::Leader => false,
             Role::LocalFollower { rechecked } => {

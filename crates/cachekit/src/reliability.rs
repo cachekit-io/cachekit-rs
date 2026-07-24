@@ -179,9 +179,12 @@ impl RetryPolicy {
 
 // ── CircuitBreaker ───────────────────────────────────────────────────────────
 
-/// Circuit breaker states, exposed for observability and tests.
+/// Circuit breaker states. Test-only until the observability tier (LAB-101)
+/// exposes breaker state at runtime — a public type with no producer is API
+/// noise (expert-panel cut).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CircuitState {
+pub(crate) enum CircuitState {
     /// Normal operation; calls pass through.
     Closed,
     /// Failing fast; calls return a [`crate::error::BackendErrorKind::CircuitOpen`] error
@@ -270,11 +273,21 @@ impl CircuitBreaker {
     }
 
     /// Admit a call, or fail fast with a circuit-open error.
-    fn try_acquire(&self) -> Result<(), BackendError> {
+    ///
+    /// Returns an RAII [`ProbePermit`]: if the guarded future is cancelled
+    /// (caller timeout/`select!`) or panics before an outcome is recorded,
+    /// the permit's `Drop` releases any half-open probe slot it took —
+    /// otherwise `half_open_max_calls` cancelled probes would wedge the
+    /// breaker half-open forever, fast-failing every call even against a
+    /// recovered backend.
+    fn try_acquire(&self) -> Result<ProbePermit<'_>, BackendError> {
         let mut inner = self.lock();
         self.maybe_half_open(&mut inner);
         match inner.state {
-            State::Closed => Ok(()),
+            State::Closed => Ok(ProbePermit {
+                breaker: self,
+                took_slot: false,
+            }),
             State::Open { .. } => Err(BackendError::circuit_open(
                 "circuit breaker is open: backend calls are failing fast",
             )),
@@ -285,7 +298,10 @@ impl CircuitBreaker {
                     ))
                 } else {
                     inner.half_open_calls += 1;
-                    Ok(())
+                    Ok(ProbePermit {
+                        breaker: self,
+                        took_slot: true,
+                    })
                 }
             }
         }
@@ -347,6 +363,46 @@ impl CircuitBreaker {
     }
 }
 
+// ── ProbePermit ──────────────────────────────────────────────────────────────
+
+/// RAII token for a breaker-admitted call.
+///
+/// Slot accounting lives in exactly one of two places: [`Self::complete`]
+/// (normal return — the outcome arms of `record` own the bookkeeping from
+/// there) or `Drop` (cancel/panic — release the slot like `Neutral`, no
+/// transition). Manual increment/decrement pairs leaked twice before this
+/// guard existed; do not reintroduce them.
+#[derive(Debug)]
+struct ProbePermit<'a> {
+    breaker: &'a CircuitBreaker,
+    /// Whether this admission consumed a half-open probe slot.
+    took_slot: bool,
+}
+
+impl ProbePermit<'_> {
+    /// Report the call's outcome and disarm the drop-release.
+    fn complete(mut self, outcome: &Outcome) {
+        self.took_slot = false;
+        self.breaker.record(outcome);
+    }
+}
+
+impl Drop for ProbePermit<'_> {
+    fn drop(&mut self) {
+        if !self.took_slot {
+            return;
+        }
+        // No outcome was recorded: the guarded future was cancelled mid-await
+        // or panicked. Free the probe slot so the half-open window can keep
+        // probing; if the breaker transitioned meanwhile (counters reset),
+        // the saturating decrement is a no-op.
+        let mut inner = self.breaker.lock();
+        if matches!(inner.state, State::HalfOpen) {
+            inner.half_open_calls = inner.half_open_calls.saturating_sub(1);
+        }
+    }
+}
+
 // ── ReliableBackend ──────────────────────────────────────────────────────────
 
 /// Decorator that applies the reliability stack to every cache operation of
@@ -378,20 +434,21 @@ impl ReliableBackend {
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T, BackendError>>,
     {
-        if let Some(cb) = &self.breaker {
-            cb.try_acquire()?;
-        }
+        let permit = match &self.breaker {
+            Some(cb) => Some(cb.try_acquire()?),
+            None => None,
+        };
         let result = match &self.retry {
             Some(retry) => retry.execute(f).await,
             None => f().await,
         };
-        if let Some(cb) = &self.breaker {
+        if let Some(permit) = permit {
             let outcome = match &result {
                 Ok(_) => Outcome::Success,
                 Err(e) if e.kind.is_retryable() => Outcome::Failure,
                 Err(_) => Outcome::Neutral,
             };
-            cb.record(&outcome);
+            permit.complete(&outcome);
         }
         result
     }
@@ -462,12 +519,17 @@ mod tests {
         })
     }
 
+    /// Admit a call and immediately report its outcome.
+    fn admit_and(cb: &CircuitBreaker, outcome: &Outcome) {
+        let permit = cb.try_acquire().expect("breaker admits the call");
+        permit.complete(outcome);
+    }
+
     #[test]
     fn breaker_opens_after_threshold_and_fails_fast() {
         let cb = breaker(3, Duration::from_secs(60));
         for _ in 0..3 {
-            cb.try_acquire().expect("closed breaker admits calls");
-            cb.record(&Outcome::Failure);
+            admit_and(&cb, &Outcome::Failure);
         }
         assert_eq!(cb.state(), CircuitState::Open);
         let err = cb.try_acquire().expect_err("open breaker fails fast");
@@ -479,8 +541,7 @@ mod tests {
     fn breaker_ignores_permanent_errors() {
         let cb = breaker(2, Duration::from_secs(60));
         for _ in 0..10 {
-            cb.try_acquire().expect("closed breaker admits calls");
-            cb.record(&Outcome::Neutral);
+            admit_and(&cb, &Outcome::Neutral);
         }
         assert_eq!(cb.state(), CircuitState::Closed);
     }
@@ -488,13 +549,11 @@ mod tests {
     #[test]
     fn breaker_half_open_recovers_on_successes() {
         let cb = breaker(1, Duration::from_millis(0));
-        cb.try_acquire().expect("closed breaker admits calls");
-        cb.record(&Outcome::Failure);
+        admit_and(&cb, &Outcome::Failure);
         // open_timeout of zero → immediately half-open on next inspection
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         for _ in 0..2 {
-            cb.try_acquire().expect("half-open admits probes");
-            cb.record(&Outcome::Success);
+            admit_and(&cb, &Outcome::Success);
         }
         assert_eq!(cb.state(), CircuitState::Closed);
     }
@@ -502,11 +561,9 @@ mod tests {
     #[test]
     fn breaker_half_open_reopens_on_failure() {
         let cb = breaker(1, Duration::from_millis(0));
-        cb.try_acquire().expect("closed breaker admits calls");
-        cb.record(&Outcome::Failure);
+        admit_and(&cb, &Outcome::Failure);
         assert_eq!(cb.state(), CircuitState::HalfOpen);
-        cb.try_acquire().expect("half-open admits a probe");
-        cb.record(&Outcome::Failure);
+        admit_and(&cb, &Outcome::Failure);
         // Freshly re-opened with a zero timeout flips half-open again on
         // inspection, so assert via the internal state before inspecting.
         assert!(matches!(cb.lock().state, State::Open { .. }));
@@ -515,17 +572,16 @@ mod tests {
     #[test]
     fn breaker_half_open_slot_released_by_neutral_outcome() {
         let cb = breaker(1, Duration::from_millis(0));
-        cb.try_acquire().expect("closed breaker admits calls");
-        cb.record(&Outcome::Failure);
+        admit_and(&cb, &Outcome::Failure);
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         // Exhaust both probe slots with permanent errors...
-        cb.try_acquire().expect("probe slot 1");
-        cb.record(&Outcome::Neutral);
-        cb.try_acquire().expect("probe slot 2");
-        cb.record(&Outcome::Neutral);
+        admit_and(&cb, &Outcome::Neutral);
+        admit_and(&cb, &Outcome::Neutral);
         // ...and the breaker still admits probes instead of wedging.
-        cb.try_acquire()
+        let permit = cb
+            .try_acquire()
             .expect("neutral outcomes release their probe slots");
+        permit.complete(&Outcome::Neutral);
     }
 
     #[test]
@@ -543,14 +599,56 @@ mod tests {
             half_open_max_calls: 1,
             rolling_window: Duration::from_secs(60),
         });
-        cb.try_acquire().expect("closed breaker admits calls");
-        cb.record(&Outcome::Failure);
+        admit_and(&cb, &Outcome::Failure);
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         for _ in 0..3 {
-            cb.try_acquire()
+            let permit = cb
+                .try_acquire()
                 .expect("a non-closing success must release its probe slot");
-            cb.record(&Outcome::Success);
+            permit.complete(&Outcome::Success);
         }
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn breaker_dropped_permit_releases_probe_slot() {
+        // A probe future cancelled (caller timeout / select!) or panicked
+        // before recording an outcome must not consume its slot forever:
+        // exhaust every half-open slot with plain drops and the breaker must
+        // still admit probes instead of wedging half-open until restart.
+        let cb = breaker(1, Duration::from_millis(0));
+        admit_and(&cb, &Outcome::Failure);
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        for _ in 0..2 {
+            let permit = cb.try_acquire().expect("half-open admits a probe");
+            drop(permit); // cancelled before any outcome
+        }
+        let permit = cb
+            .try_acquire()
+            .expect("dropped permits release their probe slots");
+        permit.complete(&Outcome::Success);
+    }
+
+    #[test]
+    fn breaker_closed_permit_drop_does_not_touch_half_open_accounting() {
+        // A call admitted while CLOSED holds no probe slot; cancelling it
+        // must not free (or corrupt) slots in a half-open window that opened
+        // after its admission.
+        let cb = breaker(1, Duration::from_millis(0));
+        let closed_permit = cb.try_acquire().expect("closed breaker admits calls");
+        // Another call's failure opens the breaker, then zero timeout flips
+        // it half-open with a fresh probe window.
+        admit_and(&cb, &Outcome::Failure);
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        let p1 = cb.try_acquire().expect("probe slot 1");
+        let p2 = cb.try_acquire().expect("probe slot 2");
+        drop(closed_permit); // must be a no-op: it never took a slot
+        assert!(
+            cb.try_acquire().is_err(),
+            "probe cap must still be enforced after a closed-state permit drops"
+        );
+        p1.complete(&Outcome::Success);
+        p2.complete(&Outcome::Success);
         assert_eq!(cb.state(), CircuitState::Closed);
     }
 

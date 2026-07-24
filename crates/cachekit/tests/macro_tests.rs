@@ -456,3 +456,82 @@ async fn macro_single_flight_collapses_concurrent_misses() {
     );
     assert_eq!(backend.sets(), 1, "and write the cache exactly once");
 }
+
+/// Backend where every operation fails with an authentication error —
+/// non-retryable, NOT outage-class.
+#[derive(Debug, Default, Clone)]
+struct AuthFailBackend;
+
+impl AuthFailBackend {
+    fn shared() -> SharedBackend {
+        #[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
+        {
+            std::sync::Arc::new(Self)
+        }
+        #[cfg(any(target_arch = "wasm32", feature = "unsync"))]
+        {
+            std::rc::Rc::new(Self)
+        }
+    }
+}
+
+#[cfg_attr(not(any(target_arch = "wasm32", feature = "unsync")), async_trait)]
+#[cfg_attr(any(target_arch = "wasm32", feature = "unsync"), async_trait(?Send))]
+impl Backend for AuthFailBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        Err(BackendError::auth("invalid API key"))
+    }
+
+    async fn set(
+        &self,
+        _key: &str,
+        _value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::auth("invalid API key"))
+    }
+
+    async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+        Err(BackendError::auth("invalid API key"))
+    }
+
+    async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+        Err(BackendError::auth("invalid API key"))
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Err(BackendError::auth("invalid API key"))
+    }
+}
+
+static AUTH_FAIL_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cachekit(client = cache, ttl = 60, interop = "auth_fail_op", namespace = "reliab")]
+async fn auth_fail_op(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
+    AUTH_FAIL_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(User {
+        name: format!("never {id}"),
+    })
+}
+
+#[tokio::test]
+async fn macro_propagates_permanent_backend_errors_on_plain_path() {
+    // Fail-open covers OUTAGES (transient/timeout/circuit-open). A wrong API
+    // key is not an outage: silently falling open would run uncached forever
+    // with zero signal while looking healthy (expert-panel finding).
+    let cache = CacheKit::builder()
+        .backend(AuthFailBackend::shared())
+        .no_l1()
+        .build()
+        .expect("client builds");
+
+    let err = auth_fail_op(&cache, 1)
+        .await
+        .expect_err("authentication errors must propagate, not fail open");
+    assert!(matches!(err, CachekitError::Backend(_)), "got: {err:?}");
+    assert_eq!(
+        AUTH_FAIL_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the function must not run when the error is not outage-class"
+    );
+}
