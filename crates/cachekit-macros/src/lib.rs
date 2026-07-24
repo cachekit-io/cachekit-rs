@@ -203,8 +203,28 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 /// - A stored entry that cannot be decoded as the return type is treated as
 ///   a miss and overwritten (self-healing), never an error loop.
 ///
+/// # Requirements (continued)
+///
+/// - The function must be `async` — the generated body awaits the cache
+///   read, the cold-miss single-flight, and SWR refresh scheduling. A sync
+///   function is a clear compile-time error, never a silent no-op.
+///
 /// # Reliability behaviour
 ///
+/// - **Stale-while-revalidate** (client SWR enabled — the default with the
+///   `l1` feature on native targets): an L1 hit past the client's freshness
+///   threshold (`swr_threshold_ratio` × entry TTL, ±10% jitter) but before
+///   hard expiry is returned **immediately** — the caller never blocks on a
+///   merely-stale entry — while one background task re-executes the function
+///   and rewrites both cache layers. Refresh dedup rides
+///   [`CacheKit::single_flight`]: N concurrent stale readers trigger exactly
+///   one re-execution per process (and, on lock-capable backends, per
+///   fleet). Hard-expired entries always take the normal blocking miss path.
+///   The refresh task needs a tokio runtime (skipped otherwise — the stale
+///   value was already served) and captures arguments by owned copy
+///   (`Clone`/`ToOwned` — already required for key derivation); the future
+///   must be `Send`. Refresh failures are absorbed: the stale value keeps
+///   serving until hard expiry, where the blocking path surfaces errors.
 /// - **Graceful degradation**: on an outage-class backend failure —
 ///   transient, timeout, or an open circuit breaker — the plain path fails
 ///   *open*: the function executes uncached and its result is returned.
@@ -244,14 +264,28 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     let namespace = args.namespace.as_str();
     let operation = args.interop.as_str();
 
+    // The generated body awaits (cache reads, single-flight, SWR refresh
+    // scheduling); a sync function cannot drive any of it. Fail with a clear
+    // decoration-time error instead of a cascade of "await is only allowed
+    // inside async functions" — no silent no-op (the sibling SDK posture).
+    if func.sig.asyncness.is_none() {
+        return Err(syn::Error::new_spanned(
+            func.sig.fn_token,
+            "#[cachekit] requires an `async fn`: the cache read, cold-miss single-flight, \
+             and stale-while-revalidate background refresh all await — annotate the \
+             function `async` (a sync function cannot be cached by this macro)",
+        ));
+    }
+
     // Extract the Ok type from Result<T, E>
     let ok_type = extract_ok_type(&func.sig.output)?;
 
-    // Collect non-client parameter idents for cache key derivation. Every
-    // parameter MUST contribute to the key — a silently skipped parameter
-    // means two different calls share one cache entry (wrong-data collision),
-    // so anything we can't name is a compile error, never a skip.
-    let mut non_client_idents: Vec<&Ident> = Vec::new();
+    // Collect non-client parameters (ident + type) for cache key derivation
+    // and SWR refresh capture. Every parameter MUST contribute to the key — a
+    // silently skipped parameter means two different calls share one cache
+    // entry (wrong-data collision), so anything we can't name is a compile
+    // error, never a skip.
+    let mut non_client_params: Vec<(&Ident, &Type)> = Vec::new();
     for arg in &func.sig.inputs {
         match arg {
             syn::FnArg::Receiver(recv) => {
@@ -264,7 +298,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             syn::FnArg::Typed(pat) => match pat.pat.as_ref() {
                 syn::Pat::Ident(pi) => {
                     if pi.ident != *client_ident {
-                        non_client_idents.push(&pi.ident);
+                        non_client_params.push((&pi.ident, pat.ty.as_ref()));
                     }
                 }
                 other => {
@@ -278,6 +312,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             },
         }
     }
+    let non_client_idents: Vec<&Ident> = non_client_params.iter().map(|(id, _)| *id).collect();
 
     // Convert each non-client argument to an InteropValue. `.clone()` keeps
     // the original binding usable by the function body; for Copy types it
@@ -291,12 +326,18 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     });
 
     // Generate cache get/set calls depending on `secure` flag.
-    let (get_expr, set_expr) = if args.secure {
+    let (get_expr, get_swr_expr, set_expr) = if args.secure {
         (
             quote! {
                 {
                     let __ck_sec = #client_ident.secure()?;
                     __ck_sec.interop_get::<#ok_type>(&__ck_key).await
+                }
+            },
+            quote! {
+                {
+                    let __ck_sec = #client_ident.secure()?;
+                    __ck_sec.interop_get_swr::<#ok_type>(&__ck_key).await
                 }
             },
             quote! {
@@ -307,11 +348,59 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     } else {
         (
             quote! { #client_ident.interop_get::<#ok_type>(&__ck_key).await },
+            quote! { #client_ident.interop_get_swr::<#ok_type>(&__ck_key).await },
             quote! {
                 let _ = #client_ident.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await;
             },
         )
     };
+
+    // SWR refresh capture: the background task is `'static`, so every
+    // argument is re-materialised as an owned value before the spawn and
+    // rebound under its original name (and, for references, its original
+    // shape) inside the task — the function body runs unchanged:
+    //   - `&str`     → captured as `String`, rebound via `.as_str()` (exact)
+    //   - other `&T` → captured as `T` via `ToOwned`, rebound as `&owned`
+    //   - owned `T`  → captured via `Clone`, rebound by value
+    let mut swr_captures = TokenStream2::new();
+    let mut swr_rebinds = TokenStream2::new();
+    for (i, (id, ty)) in non_client_params.iter().enumerate() {
+        let holder = quote::format_ident!("__ck_swr_arg_{i}");
+        match ty {
+            Type::Reference(r) => {
+                // The refresh task re-executes the body from an owned
+                // snapshot rebound as an immutable borrow — mutation through
+                // a `&mut` argument cannot be preserved, so reject it up
+                // front instead of surfacing a confusing downstream error.
+                if r.mutability.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        ty,
+                        "#[cachekit] does not support `&mut` parameters: the SWR background \
+                         refresh re-executes the function from an owned snapshot, so mutation \
+                         through the reference cannot be preserved — take the argument by \
+                         owned value instead",
+                    ));
+                }
+                swr_captures.extend(quote_spanned! {id.span()=>
+                    let #holder = ::std::borrow::ToOwned::to_owned(#id);
+                });
+                let is_str = matches!(r.elem.as_ref(),
+                    Type::Path(p) if p.path.is_ident("str"));
+                if is_str {
+                    swr_rebinds.extend(quote! { let #id = #holder.as_str(); });
+                } else {
+                    swr_rebinds.extend(quote! { let #id = &#holder; });
+                }
+            }
+            _ => {
+                swr_captures.extend(quote_spanned! {id.span()=>
+                    #[allow(clippy::clone_on_copy)]
+                    let #holder = #id.clone();
+                });
+                swr_rebinds.extend(quote! { let #id = #holder; });
+            }
+        }
+    }
 
     // Graceful degradation (LAB-518): on an OUTAGE-class backend failure —
     // retryable (transient/timeout) or a fast-failing open circuit breaker —
@@ -355,24 +444,65 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             // interop/v1 key: {namespace}:{operation}:{args_hash} — the same
             // key is computable from any SDK (protocol spec/interop-mode.md).
             // The generated `.clone()` per argument keeps the binding usable
-            // by the body; for Copy types it is a copy — hence the allow.
-            #[allow(clippy::clone_on_copy)]
+            // by the body; for Copy types it is a copy and for `&str` it is
+            // a deliberate reference copy — hence the allows.
+            #[allow(clippy::clone_on_copy, noop_method_call)]
             let __ck_key = cachekit::interop::interop_key(
                 #namespace,
                 #operation,
                 &[#(#interop_args),*],
             )?;
 
-            // Try cache hit. A Serialization error means the stored entry
+            // Try cache hit, classified against the stale-while-revalidate
+            // freshness window. A Serialization error means the stored entry
             // cannot be decoded as #ok_type (poisoned, foreign-shaped, or a
             // Python-internal CK frame) — treat it as a miss so the fresh
             // result OVERWRITES it, instead of hard-failing every call until
             // TTL expiry. Backend errors fail open on the plain path (run
             // the function uncached) and fail closed on the secure path.
             // Other errors (namespaced-client Config, decryption) propagate.
-            match #get_expr {
-                Ok(Some(__ck_cached)) => return Ok(__ck_cached),
-                Ok(None) => {}
+            match #get_swr_expr {
+                Ok(cachekit::SwrRead::Fresh(__ck_cached)) => return Ok(__ck_cached),
+                // Stale (past the freshness threshold, before hard expiry):
+                // serve the cached value immediately and schedule ONE
+                // background refresh. Dedup rides the same single-flight as
+                // the cold-miss path: the first refresh task leads and
+                // re-executes the function; concurrent tasks queue, see the
+                // (still-present) entry, and exit without computing. Refresh
+                // failures are deliberately absorbed — the stale value keeps
+                // being served, a later stale read retries, and hard expiry
+                // falls through to the blocking path where errors surface.
+                Ok(cachekit::SwrRead::Stale(__ck_cached)) => {
+                    let __ck_swr_client = ::std::clone::Clone::clone(#client_ident);
+                    let __ck_swr_key = __ck_key.clone();
+                    #swr_captures
+                    cachekit::__swr_spawn(async move {
+                        let #client_ident = &__ck_swr_client;
+                        let __ck_key = __ck_swr_key;
+                        #swr_rebinds
+                        let _: ::std::result::Result<(), cachekit::error::CachekitError> = async {
+                            let mut __ck_flight = #client_ident.single_flight(&__ck_key).await;
+                            while __ck_flight.wait_for_fill().await {
+                                if matches!(#get_expr, Ok(Some(_))) {
+                                    // Another worker is already on it (the
+                                    // stale entry is still present, or the
+                                    // leader has refreshed) — stand down.
+                                    __ck_flight.release().await;
+                                    return Ok(());
+                                }
+                            }
+                            let __ck_result: #ret_ty = (async #original_body).await;
+                            if let Ok(ref __ck_val) = __ck_result {
+                                #set_expr
+                            }
+                            __ck_flight.release().await;
+                            __ck_result.map(|_| ())
+                        }
+                        .await;
+                    });
+                    return Ok(__ck_cached);
+                }
+                Ok(cachekit::SwrRead::Miss) => {}
                 Err(cachekit::error::CachekitError::Serialization(_)) => {}
                 #fail_open_arm
                 Err(__ck_err) => return Err(__ck_err.into()),
@@ -417,7 +547,72 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
 
 #[cfg(test)]
 mod tests {
-    use super::segment_is_valid;
+    use super::{expand, segment_is_valid, MacroArgs};
+
+    /// A sync fn must fail at decoration time with a clear, actionable error
+    /// — never a cascade of "await is only allowed inside async" diagnostics,
+    /// and never a silent no-op (LAB-728 acceptance criterion).
+    #[test]
+    fn sync_fn_is_a_clear_decoration_time_error() {
+        let args: MacroArgs = syn::parse_quote!(
+            client = cache,
+            ttl = 60,
+            interop = "get_user",
+            namespace = "users"
+        );
+        let func: syn::ItemFn = syn::parse_quote! {
+            fn get_user(cache: &CacheKit, id: u64) -> Result<String, CachekitError> {
+                Ok(format!("User {id}"))
+            }
+        };
+        let err = expand(&args, func).expect_err("sync fn must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires an `async fn`"),
+            "error must name the fix, got: {msg}"
+        );
+    }
+
+    /// `&mut` parameters are rejected at decoration time: the SWR refresh
+    /// task rebinds references as immutable borrows of an owned snapshot,
+    /// so mutation through the argument cannot be modelled.
+    #[test]
+    fn mut_ref_param_is_a_clear_decoration_time_error() {
+        let args: MacroArgs = syn::parse_quote!(
+            client = cache,
+            ttl = 60,
+            interop = "get_user",
+            namespace = "users"
+        );
+        let func: syn::ItemFn = syn::parse_quote! {
+            async fn get_user(cache: &CacheKit, id: &mut u64) -> Result<String, CachekitError> {
+                Ok(format!("User {id}"))
+            }
+        };
+        let err = expand(&args, func).expect_err("&mut param must be rejected");
+        assert!(
+            err.to_string().contains("`&mut` parameters"),
+            "error must name the constraint, got: {err}"
+        );
+    }
+
+    /// The same function with `async` added expands cleanly — proving the
+    /// rejection above is precisely about asyncness.
+    #[test]
+    fn async_fn_expands() {
+        let args: MacroArgs = syn::parse_quote!(
+            client = cache,
+            ttl = 60,
+            interop = "get_user",
+            namespace = "users"
+        );
+        let func: syn::ItemFn = syn::parse_quote! {
+            async fn get_user(cache: &CacheKit, id: u64) -> Result<String, CachekitError> {
+                Ok(format!("User {id}"))
+            }
+        };
+        expand(&args, func).expect("async fn must expand");
+    }
 
     /// Mirror of interop.rs's validate_segment acceptance table — the two
     /// implementations must not drift (see the NOTE on validate_segment).
