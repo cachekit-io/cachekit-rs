@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.5.0...cachekit-rs-v0.6.0) (2026-07-24)
+
+
+### Features
+
+* **reliability:** retry, circuit breaker, graceful degradation, single-flight (LAB-518) ([#43](https://github.com/cachekit-io/cachekit-rs/issues/43)) ([e9b9a1e](https://github.com/cachekit-io/cachekit-rs/commit/e9b9a1e7ddf42225a81bc5247ad90e011a690937))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.5.0 to 0.6.0
+
 ## [0.5.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.4.0...cachekit-rs-v0.5.0) (2026-07-24)
 
 

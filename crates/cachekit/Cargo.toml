@@ -1,6 +1,6 @@
 [package]
 name = "cachekit-rs"
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -82,7 +82,7 @@ js-sys = { version = "0.3", optional = true }
 getrandom = { version = "0.2", optional = true, features = ["js"] }
 
 # Optional: proc-macro decorator
-cachekit-macros = { version = "0.5.0", path = "../cachekit-macros", optional = true }
+cachekit-macros = { version = "0.6.0", path = "../cachekit-macros", optional = true }
 
 # Optional (file backend, unix only): libc for the O_NOFOLLOW/ELOOP constants
 # (std has no portable spelling); rustix for safe flock/geteuid wrappers —
