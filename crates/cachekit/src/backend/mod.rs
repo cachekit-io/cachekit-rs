@@ -143,6 +143,28 @@ pub trait LockableBackend: Backend {
     async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError>;
 }
 
+// ── Blocking-pool bridge (file + memcached backends) ─────────────────────────
+
+/// Run sync I/O on tokio's blocking pool so the async executor never stalls.
+#[cfg(all(any(feature = "file", feature = "memcached"), not(feature = "unsync")))]
+pub(crate) async fn run_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, crate::error::BackendError> + Send + 'static,
+) -> Result<T, crate::error::BackendError> {
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        crate::error::BackendError::permanent(format!("backend blocking task failed: {e}"))
+    })?
+}
+
+/// `unsync` opts into single-threaded runtimes and drops `Send` from
+/// `BackendError`, so results cannot cross `spawn_blocking`. Run the I/O
+/// inline instead — the same sync-in-async trade-off cachekit-py documents.
+#[cfg(all(any(feature = "file", feature = "memcached"), feature = "unsync"))]
+pub(crate) async fn run_blocking<T>(
+    f: impl FnOnce() -> Result<T, crate::error::BackendError>,
+) -> Result<T, crate::error::BackendError> {
+    f()
+}
+
 // ── Feature-gated backend modules ─────────────────────────────────────────────
 
 /// JSON wire bodies for the SaaS lock/TTL endpoints. Compiled under `test`
@@ -163,7 +185,7 @@ mod cachekitio_ttl;
 #[cfg(feature = "redis")]
 pub mod redis;
 
-/// Memcached backend via the [`async-memcached`](https://crates.io/crates/async-memcached) client.
+/// Memcached backend via the [`rust-memcache`](https://crates.io/crates/memcache) client.
 #[cfg(feature = "memcached")]
 pub mod memcached;
 

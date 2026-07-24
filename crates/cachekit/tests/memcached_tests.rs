@@ -14,6 +14,50 @@ mod memcached_tests {
         assert!(err.contains("url is required"), "unexpected error: {err}");
     }
 
+    #[tokio::test]
+    async fn connect_is_eager_and_fails_fast_on_bad_address() {
+        // connect() promises a live server — a dead port must error here,
+        // not on the first cache operation.
+        let result = MemcachedBackend::builder()
+            .url("tcp://127.0.0.1:1") // reserved port, nothing listens
+            .connect_timeout(Duration::from_millis(200))
+            .connect()
+            .await;
+        assert!(result.is_err(), "connect to a dead port must fail eagerly");
+    }
+
+    #[tokio::test]
+    async fn wedged_server_fails_fast_instead_of_hanging() {
+        // Panel round 2 (#5): an accepting-but-silent server must surface as
+        // a bounded error, never wedge callers. The listener accepts TCP
+        // connects and never writes a byte; connect()'s eager version ping
+        // must fail via the per-connection socket timeout pinned on the URL,
+        // inside the async connect budget.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept() {
+                held.push(sock); // hold open, stay silent
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let result = MemcachedBackend::builder()
+            .url(format!("tcp://{addr}"))
+            .timeout(Duration::from_millis(300))
+            .connect_timeout(Duration::from_millis(300))
+            .connect()
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "a silent server must not connect()");
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "wedged server must fail fast, took {elapsed:?}"
+        );
+    }
+
     /// Live semantics against a real memcached.
     ///
     /// Requires `CACHEKIT_TEST_MEMCACHED_URL` (e.g. `tcp://127.0.0.1:11211`);
@@ -83,6 +127,54 @@ mod memcached_tests {
             None,
             "entry must expire"
         );
+
+        // refresh_ttl (bare touch wrapper, py parity): extends a live key,
+        // reports a missing key as false.
+        backend
+            .set(&key, b"touched".to_vec(), Some(Duration::from_secs(1)))
+            .await
+            .expect("set");
+        assert!(backend
+            .refresh_ttl(&key, Some(Duration::from_secs(60)))
+            .await
+            .expect("refresh"));
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        assert_eq!(
+            backend.get(&key).await.expect("get").as_deref(),
+            Some(b"touched".as_slice()),
+            "touched entry must outlive its original 1s TTL"
+        );
+        assert!(backend.delete(&key).await.expect("cleanup"));
+        assert!(!backend
+            .refresh_ttl(&key, Some(Duration::from_secs(60)))
+            .await
+            .expect("refresh missing"));
+
+        // Key injection guard (CWE-93): protocol metacharacters are rejected
+        // client-side, never sent on the wire.
+        for bad in ["evil\r\nflush_all\r\n", "evil key", "evil\nkey", ""] {
+            let err = backend
+                .get(bad)
+                .await
+                .expect_err("protocol-unsafe key must be rejected");
+            assert!(
+                !err.kind.is_retryable(),
+                "key rejection must be permanent: {err}"
+            );
+        }
+        // The guard must not have executed an injected flush_all: a canary
+        // written before the attempts is still present.
+        backend
+            .set(&key, b"canary".to_vec(), None)
+            .await
+            .expect("set canary");
+        let _ = backend.get("evil\r\nflush_all\r\n").await;
+        assert_eq!(
+            backend.get(&key).await.expect("get").as_deref(),
+            Some(b"canary".as_slice()),
+            "cache must survive an injection attempt"
+        );
+        backend.delete(&key).await.expect("cleanup");
 
         // Oversized values fail loudly client-side (default 1 MiB guard).
         let oversized = vec![0u8; 2 * 1024 * 1024];

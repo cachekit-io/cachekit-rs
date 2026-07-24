@@ -6,6 +6,14 @@ mod file_tests {
     use cachekit::backend::{Backend, TtlInspectable};
 
     fn backend_in(dir: &tempfile::TempDir) -> FileBackend {
+        // tempfile dirs follow the umask (e.g. 0775) — the builder's
+        // ownership/mode gate would rightly reject that; make it 0700.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("chmod");
+        }
         FileBackend::builder()
             .cache_dir(dir.path())
             .build()
