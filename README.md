@@ -48,15 +48,15 @@
 ```toml
 # Defaults: SaaS + encryption + L1
 [dependencies]
-cachekit-rs = "0.2"
+cachekit-rs = "0.5"
 
 # With Redis backend
 [dependencies]
-cachekit-rs = { version = "0.2", features = ["redis"] }
+cachekit-rs = { version = "0.5", features = ["redis"] }
 
 # For Cloudflare Workers (no L1, no Redis)
 [dependencies]
-cachekit-rs = { version = "0.2", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.5", default-features = false, features = ["workers", "encryption"] }
 ```
 
 > [!WARNING]
@@ -203,7 +203,7 @@ let backend = CachekitIO::builder()
 Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Requires the `redis` feature flag.
 
 ```toml
-cachekit-rs = { version = "0.2", features = ["redis"] }
+cachekit-rs = { version = "0.5", features = ["redis"] }
 ```
 
 ```rust
@@ -224,7 +224,7 @@ Memcached via [rust-memcache](https://crates.io/crates/memcache) (single server,
 TTLs above memcached's 30-day ceiling are clamped (larger values would be misread as absolute timestamps); values above the item-size limit (default 1 MiB) fail loudly client-side, and a server-side "object too large" classifies as permanent (never retried). Requires the `memcached` feature flag.
 
 ```toml
-cachekit-rs = { version = "0.4", features = ["memcached"] }
+cachekit-rs = { version = "0.5", features = ["memcached"] }
 ```
 
 ```rust
@@ -241,7 +241,7 @@ let backend = MemcachedBackend::builder()
 Local disk cache, **byte-compatible with cachekit-py's File backend** — a py and an rs process pointed at the same directory read each other's entries (Blake2b-128 hashed filenames, shared 14-byte header, atomic write-then-rename, lazy expiry). Implements `TtlInspectable` (TTL read off the on-disk header, in-place refresh). Concurrency matches py: same-process operations serialize on a backend-wide lock (py's `RLock`); on unix, reads and in-place TTL rewrites take advisory `flock` while writes stay lock-free via atomic rename; and expired-entry unlinks are inode-validated so a stale read decision doesn't delete a concurrent writer's fresh entry. On unix the cache directory must be owned by you and not group/other-writable. Not yet ported from py: LRU eviction and size caps — the directory grows until entries expire or you clear it. Requires the `file` feature flag and a tokio runtime (I/O runs via `spawn_blocking`).
 
 ```toml
-cachekit-rs = { version = "0.4", features = ["file"] }
+cachekit-rs = { version = "0.5", features = ["file"] }
 ```
 
 ```rust
@@ -257,7 +257,7 @@ let backend = FileBackend::builder()
 `wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. Requires the `workers` feature with default features disabled.
 
 ```toml
-cachekit-rs = { version = "0.2", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.5", default-features = false, features = ["workers", "encryption"] }
 ```
 
 <details>
