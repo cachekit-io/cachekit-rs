@@ -24,6 +24,15 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# This SDK is rustls-only: openssl/native-tls must never re-enter the graph.
+# (async-memcached 0.6 once dragged them in via a toxiproxy_rust runtime dep —
+# expert panel, LAB-429. toxiproxy is a fault-injection *test* proxy; banned
+# outright so no future dependency smuggles it back as a runtime edge.)
+deny = [
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+    { name = "toxiproxy_rust" },
+]
 
 [sources]
 unknown-registry = "deny"

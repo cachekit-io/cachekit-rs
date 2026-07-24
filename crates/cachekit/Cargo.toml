@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Production-ready Redis caching for Rust. Supports cachekit.io SaaS, Redis, and Cloudflare Workers."
+description = "Production-ready caching for Rust. Supports cachekit.io SaaS, Redis, Memcached, local File, and Cloudflare Workers."
 readme = "../../README.md"
 homepage = "https://cachekit.io"
 keywords = ["cache", "redis", "encryption", "moka", "cloudflare-workers"]
@@ -18,6 +18,14 @@ name = "cachekit"
 default = ["cachekitio", "encryption", "l1"]
 cachekitio = ["dep:reqwest", "dep:serde_json"]
 redis = ["dep:fred"]
+# Memcached backend (native only). rust-memcache is sync (r2d2-pooled, socket
+# read/write timeouts); ops run on tokio's blocking pool via spawn_blocking,
+# each under a tokio/time budget so a wedged server can't hang callers.
+memcached = ["dep:memcache", "dep:tokio", "tokio/rt", "tokio/time"]
+# Local filesystem backend (native only). tokio/rt provides spawn_blocking so
+# disk I/O never blocks the async executor; libc provides O_NOFOLLOW/ELOOP
+# constants and rustix provides safe flock/geteuid on unix.
+file = ["dep:tokio", "tokio/rt", "tokio/sync", "dep:libc", "dep:rustix"]
 workers = ["dep:worker", "dep:js-sys", "dep:getrandom", "dep:serde_json"]
 # cachekit-core 0.2 folds aes-gcm into the `encryption` feature automatically on wasm32.
 # No separate `cachekit-core/wasm` activation needed.
@@ -50,6 +58,17 @@ serde_json = { version = "1", optional = true }
 # compare-and-delete lock release (LockableBackend).
 fred = { version = "9", optional = true, features = ["i-scripts"] }
 
+# Optional: Memcached backend. rust-memcache with no default features — the
+# `tls` feature would pull openssl into a rustls-only SDK (and the previously
+# used async-memcached 0.6 shipped toxiproxy_rust/openssl as runtime deps,
+# which is why it was dropped — expert panel, LAB-429). Held at 0.19: 0.20.0
+# uses `is_multiple_of`/let-chains and breaks this workspace's 1.85 MSRV.
+memcache = { version = "0.19", optional = true, default-features = false }
+
+# Optional: shared by the memcached and file backends for spawn_blocking.
+# Feature lists live on the `memcached`/`file` feature declarations above.
+tokio = { version = "1", optional = true, default-features = false }
+
 # Optional: L1 in-process cache
 moka = { version = "0.12", optional = true, features = ["sync"] }
 
@@ -61,10 +80,18 @@ getrandom = { version = "0.2", optional = true, features = ["js"] }
 # Optional: proc-macro decorator
 cachekit-macros = { version = "0.4.0", path = "../cachekit-macros", optional = true }
 
+# Optional (file backend, unix only): libc for the O_NOFOLLOW/ELOOP constants
+# (std has no portable spelling); rustix for safe flock/geteuid wrappers —
+# this workspace forbids `unsafe`, so raw libc calls are off the table.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+rustix = { version = "1", optional = true, default-features = false, features = ["fs", "process", "std"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 serial_test = "3"
+tempfile = "3"
 
 [lints]
 workspace = true
