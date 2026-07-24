@@ -4,10 +4,30 @@ on:
   push:
     branches:
       - main
+  # Break-glass republish: dispatch when a release got tagged but the crates.io
+  # publish never ran (the v0.4.0 run died before the publish job — LAB-742).
+  # The required tag input pins WHAT gets published: main can drift past an
+  # unpublished tag within hours (it did for v0.4.0), and publishing main HEAD
+  # would package that drift under the tagged version. cargo publish fails
+  # loudly on already-uploaded versions, so a redundant dispatch cannot
+  # double-publish.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to republish (e.g. cachekit-rs-v0.4.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
   pull-requests: write
+
+# Serialise release runs so a manual dispatch can't race a push-triggered
+# publish into two concurrent cargo publish attempts. Never cancel an
+# in-flight publish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release-please:
@@ -29,6 +49,10 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Debug release-please outputs
+        # env indirection, never inline ${{ }} in run: the outputs embed
+        # changelog prose, and one apostrophe in it terminates a single-quoted
+        # shell string — that exit 127 killed the job before `publish` on
+        # every push since 2026-07-22, orphaning the v0.4.0 release.
         env:
           RELEASE_OUTPUTS: ${{ toJSON(steps.release.outputs) }}
         run: echo "$RELEASE_OUTPUTS"
@@ -48,7 +72,11 @@ jobs:
 
   publish:
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    # Run on an automated release, OR on a manual dispatch. The dispatch must
+    # target main (workflow_dispatch can fire from any ref; requiring main
+    # stops a feature branch from driving a publish) — the required tag input
+    # alone decides what content ships.
+    if: ${{ needs.release-please.outputs.release_created == 'true' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
     runs-on: cachekit-lean
     timeout-minutes: 30
     env:
@@ -59,6 +87,11 @@ jobs:
       CARGO_BUILD_JOBS: "4"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # On dispatch, build and publish the tag's content — never main HEAD.
+          # inputs.tag is empty on push events, so github.sha keeps the default
+          # checkout behaviour there.
+          ref: ${{ inputs.tag || github.sha }}
 
       - name: Install Rust toolchain
         run: |
@@ -78,6 +111,9 @@ jobs:
           cargo +1.85 check --all-targets --features "cachekitio,redis,encryption,l1,macros"
 
       - name: Publish cachekit-macros to crates.io
+        # Known gap: after a PARTIAL failure (macros uploaded, cachekit-rs not),
+        # a redundant dispatch still dies here on the macros duplicate — publish
+        # the missing crate manually in that case.
         run: cargo publish -p cachekit-macros
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
