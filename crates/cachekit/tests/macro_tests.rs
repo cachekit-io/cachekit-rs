@@ -297,3 +297,305 @@ async fn macro_key_delegates_to_interop_key() {
     let keys: Vec<String> = backend.inner.store.lock().await.keys().cloned().collect();
     assert_eq!(keys, vec![expected]);
 }
+
+// ── Reliability behaviour (LAB-518) ──────────────────────────────────────────
+
+/// Backend where every data operation fails with a transient error.
+#[derive(Debug, Default, Clone)]
+struct DownBackend;
+
+impl DownBackend {
+    fn shared() -> SharedBackend {
+        #[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
+        {
+            std::sync::Arc::new(Self)
+        }
+        #[cfg(any(target_arch = "wasm32", feature = "unsync"))]
+        {
+            std::rc::Rc::new(Self)
+        }
+    }
+}
+
+#[cfg_attr(not(any(target_arch = "wasm32", feature = "unsync")), async_trait)]
+#[cfg_attr(any(target_arch = "wasm32", feature = "unsync"), async_trait(?Send))]
+impl Backend for DownBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        Err(BackendError::transient("backend down"))
+    }
+
+    async fn set(
+        &self,
+        _key: &str,
+        _value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::transient("backend down"))
+    }
+
+    async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+        Err(BackendError::transient("backend down"))
+    }
+
+    async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+        Err(BackendError::transient("backend down"))
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Err(BackendError::transient("backend down"))
+    }
+}
+
+static FAIL_OPEN_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cachekit(client = cache, ttl = 60, interop = "fail_open_op", namespace = "reliab")]
+async fn fail_open_op(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
+    FAIL_OPEN_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(User {
+        name: format!("degraded {id}"),
+    })
+}
+
+#[tokio::test]
+async fn macro_fails_open_when_backend_down() {
+    let cache = CacheKit::builder()
+        .backend(DownBackend::shared())
+        .no_l1()
+        .build()
+        .expect("client builds");
+
+    // Every call runs the function uncached — graceful degradation, matching
+    // cachekit-py's BackendError → execute-without-caching posture.
+    let user = fail_open_op(&cache, 1)
+        .await
+        .expect("fail-open: function runs uncached");
+    assert_eq!(user.name, "degraded 1");
+    let _ = fail_open_op(&cache, 1).await.expect("still degrading");
+    assert_eq!(
+        FAIL_OPEN_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "nothing was cached while the backend was down"
+    );
+}
+
+#[cfg(feature = "encryption")]
+static SECURE_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(feature = "encryption")]
+#[cachekit(client = cache, ttl = 60, interop = "secure_op", namespace = "reliab", secure)]
+async fn secure_op(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
+    SECURE_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(User {
+        name: format!("secret {id}"),
+    })
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn macro_secure_fails_closed_when_backend_down() {
+    let cache = CacheKit::builder()
+        .backend(DownBackend::shared())
+        .encryption_from_bytes(&[7u8; 32], "default")
+        .expect("encryption configures")
+        .no_l1()
+        .build()
+        .expect("client builds");
+
+    // Encrypted paths never silently degrade: the backend error reaches the
+    // caller and the wrapped function does NOT run.
+    let err = secure_op(&cache, 1)
+        .await
+        .expect_err("fail-closed: error propagates");
+    assert!(matches!(err, CachekitError::Backend(_)), "got: {err:?}");
+    assert_eq!(
+        SECURE_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "secure path must not fail open into uncached execution"
+    );
+}
+
+static SLOW_OP_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cachekit(client = cache, ttl = 60, interop = "slow_op", namespace = "flight")]
+async fn slow_op(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
+    SLOW_OP_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    Ok(User {
+        name: format!("slow {id}"),
+    })
+}
+
+#[tokio::test]
+async fn macro_single_flight_collapses_concurrent_misses() {
+    let (cache, backend) = mock_client_counting();
+    let cache = std::sync::Arc::new(cache);
+
+    // Barrier-align the tasks so their initial cache checks all miss before
+    // the leader finishes computing.
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(5));
+    let tasks: Vec<_> = (0..5)
+        .map(|_| {
+            let cache = std::sync::Arc::clone(&cache);
+            let barrier = std::sync::Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                slow_op(&cache, 9).await
+            })
+        })
+        .collect();
+
+    for task in tasks {
+        let user = task.await.expect("task completes").expect("call succeeds");
+        assert_eq!(user.name, "slow 9");
+    }
+
+    assert_eq!(
+        SLOW_OP_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "five concurrent misses must execute the function exactly once"
+    );
+    assert_eq!(backend.sets(), 1, "and write the cache exactly once");
+}
+
+/// Backend where every operation fails with an authentication error —
+/// non-retryable, NOT outage-class.
+#[derive(Debug, Default, Clone)]
+struct AuthFailBackend;
+
+impl AuthFailBackend {
+    fn shared() -> SharedBackend {
+        #[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
+        {
+            std::sync::Arc::new(Self)
+        }
+        #[cfg(any(target_arch = "wasm32", feature = "unsync"))]
+        {
+            std::rc::Rc::new(Self)
+        }
+    }
+}
+
+#[cfg_attr(not(any(target_arch = "wasm32", feature = "unsync")), async_trait)]
+#[cfg_attr(any(target_arch = "wasm32", feature = "unsync"), async_trait(?Send))]
+impl Backend for AuthFailBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        Err(BackendError::auth("invalid API key"))
+    }
+
+    async fn set(
+        &self,
+        _key: &str,
+        _value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::auth("invalid API key"))
+    }
+
+    async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+        Err(BackendError::auth("invalid API key"))
+    }
+
+    async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+        Err(BackendError::auth("invalid API key"))
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Err(BackendError::auth("invalid API key"))
+    }
+}
+
+static AUTH_FAIL_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cachekit(client = cache, ttl = 60, interop = "auth_fail_op", namespace = "reliab")]
+async fn auth_fail_op(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
+    AUTH_FAIL_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(User {
+        name: format!("never {id}"),
+    })
+}
+
+#[tokio::test]
+async fn macro_propagates_permanent_backend_errors_on_plain_path() {
+    // Fail-open covers OUTAGES (transient/timeout/circuit-open). A wrong API
+    // key is not an outage: silently falling open would run uncached forever
+    // with zero signal while looking healthy (expert-panel finding).
+    let cache = CacheKit::builder()
+        .backend(AuthFailBackend::shared())
+        .no_l1()
+        .build()
+        .expect("client builds");
+
+    let err = auth_fail_op(&cache, 1)
+        .await
+        .expect_err("authentication errors must propagate, not fail open");
+    assert!(matches!(err, CachekitError::Backend(_)), "got: {err:?}");
+    assert_eq!(
+        AUTH_FAIL_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the function must not run when the error is not outage-class"
+    );
+}
+
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+static CIRCUIT_OPEN_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+#[cachekit(client = cache, ttl = 60, interop = "circuit_open_op", namespace = "reliab")]
+async fn circuit_open_op(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
+    CIRCUIT_OPEN_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(User {
+        name: format!("breaker-open {id}"),
+    })
+}
+
+/// The fail-open arm's other branch: a fast-failing OPEN circuit breaker
+/// (`BackendErrorKind::CircuitOpen`) must also fall open on the plain path.
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+#[tokio::test]
+async fn macro_fails_open_when_circuit_is_open() {
+    use cachekit::error::BackendErrorKind;
+    use cachekit::reliability::{CircuitBreakerConfig, ReliabilityConfig};
+
+    let cache = CacheKit::builder()
+        .backend(DownBackend::shared())
+        .reliability(ReliabilityConfig {
+            retry: None,
+            circuit_breaker: Some(CircuitBreakerConfig {
+                failure_threshold: 1,
+                open_timeout: Duration::from_secs(60),
+                ..CircuitBreakerConfig::default()
+            }),
+        })
+        .no_l1()
+        .build()
+        .expect("client builds");
+
+    // First call: the transient get counts a breaker failure (threshold 1 →
+    // the circuit opens) and falls open — the body runs uncached.
+    let user = circuit_open_op(&cache, 1)
+        .await
+        .expect("transient fail-open");
+    assert_eq!(user.name, "breaker-open 1");
+
+    // The circuit is now open: direct calls fail fast without the backend.
+    let err = cache
+        .get::<User>("probe")
+        .await
+        .expect_err("circuit is open");
+    match err {
+        CachekitError::Backend(be) => assert_eq!(be.kind, BackendErrorKind::CircuitOpen),
+        other => panic!("expected a circuit-open backend error, got: {other:?}"),
+    }
+
+    // Macro call against the OPEN circuit: the CircuitOpen branch of the
+    // fail-open arm must run the body uncached, not surface the error.
+    let user = circuit_open_op(&cache, 1)
+        .await
+        .expect("circuit-open fail-open");
+    assert_eq!(user.name, "breaker-open 1");
+    assert_eq!(
+        CIRCUIT_OPEN_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "both outage classes (transient, circuit-open) fall open to the body"
+    );
+}

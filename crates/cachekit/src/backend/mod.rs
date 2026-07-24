@@ -49,6 +49,16 @@ pub trait Backend: Send + Sync {
 
     /// Return health/status information for this backend.
     async fn health(&self) -> Result<HealthStatus, BackendError>;
+
+    /// Expose this backend's [`LockableBackend`] capability, if it has one.
+    ///
+    /// Trait objects (`dyn Backend`) cannot be cross-cast to a sibling trait,
+    /// so backends that support distributed locking opt in by overriding this
+    /// to return `Some(self)`. Used by the client's cold-miss single-flight
+    /// for cross-process fill suppression. Default: `None`.
+    fn as_lockable(&self) -> Option<&dyn LockableBackend> {
+        None
+    }
 }
 
 /// Async cache backend abstraction (`?Send` variant).
@@ -77,6 +87,16 @@ pub trait Backend {
 
     /// Return health/status information for this backend.
     async fn health(&self) -> Result<HealthStatus, BackendError>;
+
+    /// Expose this backend's [`LockableBackend`] capability, if it has one.
+    ///
+    /// Trait objects (`dyn Backend`) cannot be cross-cast to a sibling trait,
+    /// so backends that support distributed locking opt in by overriding this
+    /// to return `Some(self)`. Used by the client's cold-miss single-flight
+    /// for cross-process fill suppression. Default: `None`.
+    fn as_lockable(&self) -> Option<&dyn LockableBackend> {
+        None
+    }
 }
 
 // ── TtlInspectable ───────────────────────────────────────────────────────────

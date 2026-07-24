@@ -77,6 +77,7 @@ pub struct CacheKit {
     default_ttl: Duration,
     namespace: Option<String>,
     max_payload_bytes: usize,
+    flight: crate::flight::FlightMap,
 
     #[cfg(feature = "l1")]
     l1: Option<crate::l1::L1Cache>,
@@ -344,6 +345,24 @@ impl CacheKit {
         Ok(self.backend.exists(&full_key).await?)
     }
 
+    // ── Single-flight ─────────────────────────────────────────────────────────
+
+    /// Begin a cold-miss single-flight for `key` (see [`crate::flight`]).
+    ///
+    /// Call after a cache miss, before computing the value. Concurrent
+    /// in-process fills of the same key are collapsed to one; with the
+    /// `reliability` feature and a lock-capable backend (CachekitIO, Redis),
+    /// fills are also suppressed across processes via a distributed fill
+    /// lock. The `#[cachekit]` macro does this automatically.
+    ///
+    /// The key is namespaced like every cache operation but not validated —
+    /// this call is infallible; an invalid key simply fails later at the
+    /// actual cache operation.
+    pub async fn single_flight(&self, key: &str) -> crate::flight::SingleFlight {
+        let full_key = self.namespaced_key(key);
+        crate::flight::SingleFlight::acquire(&self.flight, &self.backend, &full_key).await
+    }
+
     // ── Secure cache ─────────────────────────────────────────────────────────
 
     /// Return a [`SecureCache`] handle that encrypts all values before storage.
@@ -526,6 +545,9 @@ pub struct CacheKitBuilder {
 
     #[cfg(feature = "encryption")]
     encryption: Option<SharedEncryption>,
+
+    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+    reliability: Option<crate::reliability::ReliabilityConfig>,
 }
 
 impl CacheKitBuilder {
@@ -575,6 +597,19 @@ impl CacheKitBuilder {
 
     #[cfg(not(feature = "l1"))]
     pub fn no_l1(self) -> Self {
+        self
+    }
+
+    /// Wrap the backend in the reliability stack (retry with exponential
+    /// backoff + jitter, circuit breaker) — see [`crate::reliability`].
+    ///
+    /// Enabled by default with production settings by the `production`,
+    /// `encrypted`, and `io` intent presets; off for `minimal` and for
+    /// manually-built clients. To opt a preset out, pass a config with both
+    /// layers `None` — an empty config applies no wrapping at all.
+    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+    pub fn reliability(mut self, config: crate::reliability::ReliabilityConfig) -> Self {
+        self.reliability = Some(config);
         self
     }
 
@@ -650,11 +685,23 @@ impl CacheKitBuilder {
             Some(crate::l1::L1Cache::new(capacity))
         };
 
+        // Apply the reliability stack last so it decorates the final backend.
+        // A config with neither layer set is the documented opt-out: skip the
+        // (no-op) decorator entirely.
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        let backend = match self.reliability {
+            Some(config) if config.retry.is_some() || config.circuit_breaker.is_some() => {
+                crate::reliability::wrap_reliable(backend, config)
+            }
+            _ => backend,
+        };
+
         Ok(CacheKit {
             backend,
             default_ttl: self.default_ttl.unwrap_or(Duration::from_secs(300)),
             namespace: self.namespace,
             max_payload_bytes: self.max_payload_bytes.unwrap_or(5 * 1024 * 1024),
+            flight: crate::flight::FlightMap::default(),
 
             #[cfg(feature = "l1")]
             l1,

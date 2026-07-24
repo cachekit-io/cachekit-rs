@@ -15,23 +15,26 @@ categories = ["caching", "web-programming", "cryptography"]
 name = "cachekit"
 
 [features]
-default = ["cachekitio", "encryption", "l1"]
+default = ["cachekitio", "encryption", "l1", "reliability"]
 cachekitio = ["dep:reqwest", "dep:serde_json"]
 redis = ["dep:fred"]
 # Memcached backend (native only). rust-memcache is sync (r2d2-pooled, socket
 # read/write timeouts); ops run on tokio's blocking pool via spawn_blocking,
 # each under a tokio/time budget so a wedged server can't hang callers.
-memcached = ["dep:memcache", "dep:tokio", "tokio/rt", "tokio/time"]
+memcached = ["dep:memcache", "tokio/rt", "tokio/time"]
 # Local filesystem backend (native only). tokio/rt provides spawn_blocking so
 # disk I/O never blocks the async executor; libc provides O_NOFOLLOW/ELOOP
 # constants and rustix provides safe flock/geteuid on unix.
-file = ["dep:tokio", "tokio/rt", "tokio/sync", "dep:libc", "dep:rustix"]
+file = ["tokio/rt", "tokio/sync", "dep:libc", "dep:rustix"]
 workers = ["dep:worker", "dep:js-sys", "dep:getrandom", "dep:serde_json"]
 # cachekit-core 0.2 folds aes-gcm into the `encryption` feature automatically on wasm32.
 # No separate `cachekit-core/wasm` activation needed.
 encryption = ["cachekit-core/encryption"]
 l1 = ["dep:moka"]
 macros = ["dep:cachekit-macros"]
+# Retry with backoff + circuit breaker around backend ops, and cross-process
+# cold-miss suppression via LockableBackend. Native only (needs tokio timers).
+reliability = ["tokio/time"]
 # Opt into ?Send / Rc on native targets (for tokio::task::LocalSet, single-threaded
 # runtimes, etc.). Same code paths that wasm32 already uses.
 unsync = []
@@ -49,6 +52,11 @@ urlencoding = "2"
 hex = "0.4"
 url = "2"
 uuid = { version = "1", features = ["v4", "js"] }
+# `sync` only: runtime-independent primitives for cold-miss single-flight.
+# Compiles on wasm32. Features stack per consumer: `reliability` adds `time`
+# (native only); the `memcached`/`file` backends add `rt` (spawn_blocking) —
+# see the feature declarations above.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 # Optional: HTTP backend (native)
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "json"] }
@@ -64,10 +72,6 @@ fred = { version = "9", optional = true, features = ["i-scripts"] }
 # which is why it was dropped — expert panel, LAB-429). Held at 0.19: 0.20.0
 # uses `is_multiple_of`/let-chains and breaks this workspace's 1.85 MSRV.
 memcache = { version = "0.19", optional = true, default-features = false }
-
-# Optional: shared by the memcached and file backends for spawn_blocking.
-# Feature lists live on the `memcached`/`file` feature declarations above.
-tokio = { version = "1", optional = true, default-features = false }
 
 # Optional: L1 in-process cache
 moka = { version = "0.12", optional = true, features = ["sync"] }
@@ -88,7 +92,7 @@ libc = { version = "0.2", optional = true }
 rustix = { version = "1", optional = true, default-features = false, features = ["fs", "process", "std"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 serde_json = "1"
 serial_test = "3"
 tempfile = "3"
