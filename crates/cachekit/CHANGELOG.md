@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.4.0...cachekit-rs-v0.5.0) (2026-07-24)
+
+
+### Features
+
+* **backend:** add Memcached and File backends (LAB-429) ([#44](https://github.com/cachekit-io/cachekit-rs/issues/44)) ([3afe8e7](https://github.com/cachekit-io/cachekit-rs/commit/3afe8e7c0138f770eb66f2a9975d70aa5b953f01))
+* **backend:** Redis lock + Workers lock/TTL capability parity (LAB-426) ([#37](https://github.com/cachekit-io/cachekit-rs/issues/37)) ([f6cf7b7](https://github.com/cachekit-io/cachekit-rs/commit/f6cf7b7f6c00d24afc9e4d5978639595f08c426b))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.4.0 to 0.5.0
+
 ## [0.4.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.3.0...cachekit-rs-v0.4.0) (2026-07-23)
 
 

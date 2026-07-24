@@ -23,7 +23,7 @@
 |:----------|:-------------|
 | **CacheKit** | `get` / `set` / `delete` / `exists` with automatic L1 → L2 layering |
 | **SecureCache** | Transparent AES-256-GCM encryption before storage (zero-knowledge) |
-| **Backend** | Pluggable trait — cachekit.io SaaS, Redis, Cloudflare Workers |
+| **Backend** | Pluggable trait — cachekit.io SaaS, Redis, Memcached, local File, Cloudflare Workers |
 | **L1 Cache** | In-process [moka](https://crates.io/crates/moka) cache with write-through + backfill |
 
 > [!TIP]
@@ -40,6 +40,8 @@
 | `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core) |
 | `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka) |
 | `redis` | ❌ | Redis backend via [fred](https://crates.io/crates/fred) (native only) |
+| `memcached` | ❌ | Memcached backend via [rust-memcache](https://crates.io/crates/memcache) (native only) |
+| `file` | ❌ | Local filesystem backend, byte-compatible with cachekit-py's File backend (native only) |
 | `workers` | ❌ | Cloudflare Workers backend via [worker](https://crates.io/crates/worker) |
 | `macros` | ❌ | `#[cachekit]` proc-macro decorator (mints [interop/v1](#cross-sdk-interop-mode) keys) |
 
@@ -61,6 +63,8 @@ cachekit-rs = { version = "0.2", default-features = false, features = ["workers"
 > **Mutually exclusive features:**
 > - `workers` + `redis` — Workers runtime cannot use fred
 > - `workers` + `l1` — moka requires std threads unavailable in wasm32
+> - `workers` + `memcached` — Workers runtime has no TCP sockets
+> - `workers` + `file` — Workers runtime has no filesystem
 
 ---
 
@@ -196,7 +200,7 @@ let backend = CachekitIO::builder()
 
 ### Redis
 
-Native Redis via [fred](https://crates.io/crates/fred) with cluster support. Requires the `redis` feature flag.
+Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Requires the `redis` feature flag.
 
 ```toml
 cachekit-rs = { version = "0.2", features = ["redis"] }
@@ -211,9 +215,46 @@ let backend = RedisBackend::builder()
 backend.connect().await?;  // explicit connect required
 ```
 
+### Memcached
+
+Memcached via [rust-memcache](https://crates.io/crates/memcache) (single server, connection-pooled, per-socket timeouts — a hung server errors one operation instead of wedging the backend). Keys are validated against protocol metacharacters (whitespace/control bytes) before anything reaches the wire, keeping the key space identical to cachekit-py's.
+
+**TTL capability, precisely:** memcached's protocol cannot *read* a key's remaining TTL, so this backend does not implement `TtlInspectable` — matching cachekit-py, where Memcached is likewise not TTL-inspectable. Both SDKs do ship a bare `refresh_ttl` (wrapping the memcached `touch` command) callable directly on the backend, outside the capability trait — so TTL-refresh works, but TTL-*driven* features that need to read TTLs never engage on memcached in any SDK.
+
+TTLs above memcached's 30-day ceiling are clamped (larger values would be misread as absolute timestamps); values above the item-size limit (default 1 MiB) fail loudly client-side, and a server-side "object too large" classifies as permanent (never retried). Requires the `memcached` feature flag.
+
+```toml
+cachekit-rs = { version = "0.4", features = ["memcached"] }
+```
+
+```rust
+use cachekit::backend::memcached::MemcachedBackend;
+
+let backend = MemcachedBackend::builder()
+    .url("tcp://localhost:11211")
+    .connect()          // eager: verifies the server is reachable
+    .await?;
+```
+
+### File (local filesystem)
+
+Local disk cache, **byte-compatible with cachekit-py's File backend** — a py and an rs process pointed at the same directory read each other's entries (Blake2b-128 hashed filenames, shared 14-byte header, atomic write-then-rename, lazy expiry). Implements `TtlInspectable` (TTL read off the on-disk header, in-place refresh). Concurrency matches py: same-process operations serialize on a backend-wide lock (py's `RLock`); on unix, reads and in-place TTL rewrites take advisory `flock` while writes stay lock-free via atomic rename; and expired-entry unlinks are inode-validated so a stale read decision doesn't delete a concurrent writer's fresh entry. On unix the cache directory must be owned by you and not group/other-writable. Not yet ported from py: LRU eviction and size caps — the directory grows until entries expire or you clear it. Requires the `file` feature flag and a tokio runtime (I/O runs via `spawn_blocking`).
+
+```toml
+cachekit-rs = { version = "0.4", features = ["file"] }
+```
+
+```rust
+use cachekit::backend::file::FileBackend;
+
+let backend = FileBackend::builder()
+    .cache_dir("/var/cache/myapp")  // default: <system temp dir>/cachekit
+    .build()?;
+```
+
 ### Cloudflare Workers
 
-`wasm32-unknown-unknown` backend using `worker::Fetch`. Requires the `workers` feature with default features disabled.
+`wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. Requires the `workers` feature with default features disabled.
 
 ```toml
 cachekit-rs = { version = "0.2", default-features = false, features = ["workers", "encryption"] }
@@ -321,6 +362,7 @@ cachekit-rs/
 │   │           ├── cachekitio.rs      # cachekit.io HTTP backend
 │   │           ├── cachekitio_lock.rs # Distributed locking
 │   │           ├── cachekitio_ttl.rs  # TTL inspection
+│   │           ├── saas_wire.rs       # SaaS lock/TTL JSON wire bodies
 │   │           ├── redis.rs           # Redis backend (feature = "redis")
 │   │           └── workers.rs         # Workers backend (feature = "workers")
 │   │
