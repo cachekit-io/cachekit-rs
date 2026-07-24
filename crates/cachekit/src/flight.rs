@@ -46,6 +46,14 @@ use crate::client::SharedBackend;
 const SWEEP_THRESHOLD: usize = 128;
 
 /// How long a distributed fill lock is held server-side before auto-expiry.
+///
+/// Also the cross-process suppression ceiling: a fill that runs longer than
+/// this loses its lock mid-compute and another process may recompute
+/// concurrently (fail-open by design — release is owner-checked, so an
+/// expired lock is never wrongfully deleted). Workloads whose fills
+/// routinely approach 5 s keep in-process dedup but should not rely on
+/// cross-process suppression.
+/// ponytail: fixed TTL, no heartbeat — add lock renewal if slow fills matter.
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
 const FILL_LOCK_TIMEOUT_MS: u64 = 5_000;
 

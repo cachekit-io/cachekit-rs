@@ -535,3 +535,67 @@ async fn macro_propagates_permanent_backend_errors_on_plain_path() {
         "the function must not run when the error is not outage-class"
     );
 }
+
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+static CIRCUIT_OPEN_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+#[cachekit(client = cache, ttl = 60, interop = "circuit_open_op", namespace = "reliab")]
+async fn circuit_open_op(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
+    CIRCUIT_OPEN_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(User {
+        name: format!("breaker-open {id}"),
+    })
+}
+
+/// The fail-open arm's other branch: a fast-failing OPEN circuit breaker
+/// (`BackendErrorKind::CircuitOpen`) must also fall open on the plain path.
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+#[tokio::test]
+async fn macro_fails_open_when_circuit_is_open() {
+    use cachekit::error::BackendErrorKind;
+    use cachekit::reliability::{CircuitBreakerConfig, ReliabilityConfig};
+
+    let cache = CacheKit::builder()
+        .backend(DownBackend::shared())
+        .reliability(ReliabilityConfig {
+            retry: None,
+            circuit_breaker: Some(CircuitBreakerConfig {
+                failure_threshold: 1,
+                open_timeout: Duration::from_secs(60),
+                ..CircuitBreakerConfig::default()
+            }),
+        })
+        .no_l1()
+        .build()
+        .expect("client builds");
+
+    // First call: the transient get counts a breaker failure (threshold 1 →
+    // the circuit opens) and falls open — the body runs uncached.
+    let user = circuit_open_op(&cache, 1)
+        .await
+        .expect("transient fail-open");
+    assert_eq!(user.name, "breaker-open 1");
+
+    // The circuit is now open: direct calls fail fast without the backend.
+    let err = cache
+        .get::<User>("probe")
+        .await
+        .expect_err("circuit is open");
+    match err {
+        CachekitError::Backend(be) => assert_eq!(be.kind, BackendErrorKind::CircuitOpen),
+        other => panic!("expected a circuit-open backend error, got: {other:?}"),
+    }
+
+    // Macro call against the OPEN circuit: the CircuitOpen branch of the
+    // fail-open arm must run the body uncached, not surface the error.
+    let user = circuit_open_op(&cache, 1)
+        .await
+        .expect("circuit-open fail-open");
+    assert_eq!(user.name, "breaker-open 1");
+    assert_eq!(
+        CIRCUIT_OPEN_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "both outage classes (transient, circuit-open) fall open to the body"
+    );
+}
