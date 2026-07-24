@@ -23,6 +23,7 @@ impl Expiry<String, L1Entry> for L1Expiry {
 }
 
 /// Outcome of an SWR-aware L1 read — see [`L1Cache::get_with_swr`].
+#[derive(Debug, Clone, PartialEq)]
 pub enum L1SwrRead {
     /// Entry present and within its freshness window: serve as-is.
     Fresh(Vec<u8>),

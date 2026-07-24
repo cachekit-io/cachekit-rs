@@ -96,6 +96,7 @@ fn validate_key(key: &str) -> Result<(), CachekitError> {
 // `SwrRead::Stale` is never produced.
 
 /// Outcome of an SWR-aware typed read — see [`CacheKit::interop_get_swr`].
+#[derive(Debug, Clone, PartialEq)]
 pub enum SwrRead<T> {
     /// Cache hit within the freshness window (or an L2 hit): use directly.
     Fresh(T),

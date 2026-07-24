@@ -9,7 +9,12 @@
 //! hard expiry 4 s, origin delay 400 ms, and every latency assertion leaves
 //! two orders of magnitude of slack over an L1 read.
 
-#![cfg(all(feature = "macros", feature = "l1", not(feature = "unsync")))]
+#![cfg(all(
+    feature = "macros",
+    feature = "l1",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
 
 mod common;
 
@@ -167,7 +172,7 @@ async fn fresh_read_does_not_schedule_a_refresh() {
 
 static OFF_CALLS: AtomicU32 = AtomicU32::new(0);
 
-#[cachekit(client = cache, ttl = 2, interop = "swr_off", namespace = "swrtest")]
+#[cachekit(client = cache, ttl = 4, interop = "swr_off", namespace = "swrtest")]
 async fn swr_off_probe(cache: &CacheKit, id: u64) -> Result<String, CachekitError> {
     let n = OFF_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
     Ok(format!("o{id}-c{n}"))
@@ -180,6 +185,9 @@ async fn disabled_swr_serves_until_hard_expiry_without_refreshing() {
     let cache = CacheKit::builder()
         .backend(MockBackend::shared())
         .swr_enabled(false)
+        // Would put the stale window at ~1 s of the 4 s TTL if SWR were on —
+        // the probe below lands deep inside it, 2.5 s clear of hard expiry.
+        .swr_threshold_ratio(0.25)
         .build()
         .unwrap();
 

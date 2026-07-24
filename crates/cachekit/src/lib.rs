@@ -134,6 +134,7 @@ where
 pub mod prelude {
     pub use crate::{
         BackendError, BackendErrorKind, CacheKit, CacheKitBuilder, CachekitConfig, CachekitError,
+        SwrRead,
     };
 
     #[cfg(feature = "encryption")]

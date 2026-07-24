@@ -368,6 +368,19 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
         let holder = quote::format_ident!("__ck_swr_arg_{i}");
         match ty {
             Type::Reference(r) => {
+                // The refresh task re-executes the body from an owned
+                // snapshot rebound as an immutable borrow — mutation through
+                // a `&mut` argument cannot be preserved, so reject it up
+                // front instead of surfacing a confusing downstream error.
+                if r.mutability.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        ty,
+                        "#[cachekit] does not support `&mut` parameters: the SWR background \
+                         refresh re-executes the function from an owned snapshot, so mutation \
+                         through the reference cannot be preserved — take the argument by \
+                         owned value instead",
+                    ));
+                }
                 swr_captures.extend(quote_spanned! {id.span()=>
                     let #holder = ::std::borrow::ToOwned::to_owned(#id);
                 });
@@ -557,6 +570,29 @@ mod tests {
         assert!(
             msg.contains("requires an `async fn`"),
             "error must name the fix, got: {msg}"
+        );
+    }
+
+    /// `&mut` parameters are rejected at decoration time: the SWR refresh
+    /// task rebinds references as immutable borrows of an owned snapshot,
+    /// so mutation through the argument cannot be modelled.
+    #[test]
+    fn mut_ref_param_is_a_clear_decoration_time_error() {
+        let args: MacroArgs = syn::parse_quote!(
+            client = cache,
+            ttl = 60,
+            interop = "get_user",
+            namespace = "users"
+        );
+        let func: syn::ItemFn = syn::parse_quote! {
+            async fn get_user(cache: &CacheKit, id: &mut u64) -> Result<String, CachekitError> {
+                Ok(format!("User {id}"))
+            }
+        };
+        let err = expand(&args, func).expect_err("&mut param must be rejected");
+        assert!(
+            err.to_string().contains("`&mut` parameters"),
+            "error must name the constraint, got: {err}"
         );
     }
 
