@@ -20,6 +20,16 @@ pub type SharedBackend = std::sync::Arc<dyn Backend>;
 #[cfg(any(target_arch = "wasm32", feature = "unsync"))]
 pub type SharedBackend = std::rc::Rc<dyn Backend>;
 
+// ── SharedFlight type alias ──────────────────────────────────────────────────
+
+/// Reference-counted pointer to the single-flight map, so client clones share
+/// fill-dedup state (two clones racing a cold miss must collapse to one fill).
+#[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
+type SharedFlight = std::sync::Arc<crate::flight::FlightMap>;
+
+#[cfg(any(target_arch = "wasm32", feature = "unsync"))]
+type SharedFlight = std::rc::Rc<crate::flight::FlightMap>;
+
 // ── SharedEncryption type alias ──────────────────────────────────────────────
 
 /// Reference-counted pointer to the encryption layer.
@@ -45,6 +55,15 @@ const MAX_KEY_BYTES: usize = 1024;
 
 /// Maximum TTL for L1 entries populated from L2 cache hits.
 /// Uses a short ceiling to limit staleness when the original TTL is unknown.
+///
+/// Reconciliation with stale-while-revalidate: a backfilled entry's SWR
+/// freshness window derives from this capped TTL (window = ratio × entry
+/// TTL), **not** from the write-path TTL — the cap is the staleness bound
+/// for L2-derived data, deliberately kept. SWR removes the cap's expiry
+/// cliff instead: past ~ratio × 30 s the entry is served stale while one
+/// background refresh re-executes the origin, and that refresh writes both
+/// layers with the caller's full TTL. Without SWR the entry simply
+/// hard-expires at the cap and the next read blocks on L2, as before.
 const L1_BACKFILL_TTL_SECS: u64 = 30;
 
 fn validate_key(key: &str) -> Result<(), CachekitError> {
@@ -69,18 +88,49 @@ fn validate_key(key: &str) -> Result<(), CachekitError> {
     Ok(())
 }
 
+// ── Stale-while-revalidate ───────────────────────────────────────────────────
+//
+// SWR needs an L1 to age entries in and a spawnable (`Send`) runtime for the
+// background refresh — native, non-`unsync` targets with the `l1` feature.
+// Everywhere else the SWR read path degrades to the plain read path and
+// `SwrRead::Stale` is never produced.
+
+/// Outcome of an SWR-aware typed read — see [`CacheKit::interop_get_swr`].
+pub enum SwrRead<T> {
+    /// Cache hit within the freshness window (or an L2 hit): use directly.
+    Fresh(T),
+    /// L1 hit past the freshness threshold but before hard expiry: use the
+    /// value now, and schedule a background refresh (the `#[cachekit]` macro
+    /// does this via [`CacheKit::single_flight`] + re-execution).
+    Stale(T),
+    /// No usable entry: fall through to a normal blocking miss + fill.
+    Miss,
+}
+
 // ── CacheKit ─────────────────────────────────────────────────────────────────
 
 /// Production-ready cache client with optional L1 in-process cache layer.
+///
+/// `Clone` is cheap and shares everything: backend, L1 cache, single-flight
+/// state, and encryption layer. Clones exist so `'static` background work
+/// (e.g. the SWR refresh spawned by `#[cachekit]`) can hold the client
+/// without borrowing it.
+#[derive(Clone)]
 pub struct CacheKit {
     backend: SharedBackend,
     default_ttl: Duration,
     namespace: Option<String>,
     max_payload_bytes: usize,
-    flight: crate::flight::FlightMap,
+    flight: SharedFlight,
 
     #[cfg(feature = "l1")]
     l1: Option<crate::l1::L1Cache>,
+
+    #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+    swr_enabled: bool,
+
+    #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+    swr_threshold_ratio: f64,
 
     #[cfg(feature = "encryption")]
     encryption: Option<SharedEncryption>,
@@ -254,6 +304,76 @@ impl CacheKit {
                     .to_owned(),
             )),
         }
+    }
+
+    /// Retrieve and deserialize an interop-mode value with SWR classification.
+    ///
+    /// Identical to [`Self::interop_get`] except an L1 hit is classified
+    /// against the client's stale-while-revalidate freshness window:
+    ///
+    /// - [`SwrRead::Fresh`] — L1 hit within `swr_threshold_ratio` of the
+    ///   entry's TTL (±10% jitter), or any L2 hit. Use directly.
+    /// - [`SwrRead::Stale`] — L1 hit past the threshold but **before hard
+    ///   expiry**: the value is returned without touching the backend or
+    ///   origin, and the caller should schedule exactly one background
+    ///   refresh (dedup via [`Self::single_flight`] — this is what the
+    ///   `#[cachekit]` macro generates).
+    /// - [`SwrRead::Miss`] — nothing usable anywhere: normal blocking miss.
+    ///
+    /// A hard-expired L1 entry is a [`SwrRead::Miss`], never `Stale` — moka
+    /// drops entries at their TTL, so SWR cannot serve past hard expiry.
+    ///
+    /// With SWR disabled ([`CacheKitBuilder::swr_enabled`]`(false)`), without
+    /// the `l1` feature, on wasm32, or under `unsync`, this behaves exactly
+    /// like [`Self::interop_get`]: hits are `Fresh`, `Stale` is never
+    /// produced.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::interop_get`] (including the namespaced-client
+    /// rejection).
+    pub async fn interop_get_swr<T: DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<SwrRead<T>, CachekitError> {
+        self.reject_namespaced_interop()?;
+        match self.get_bytes_swr(key).await? {
+            SwrRead::Fresh(b) => Ok(SwrRead::Fresh(crate::interop::deserialize(&b)?)),
+            SwrRead::Stale(b) => Ok(SwrRead::Stale(crate::interop::deserialize(&b)?)),
+            SwrRead::Miss => Ok(SwrRead::Miss),
+        }
+    }
+
+    /// Fetch raw payload bytes with SWR classification: an L1 hit is split
+    /// into fresh vs stale against the configured freshness window; on L1
+    /// miss this defers to [`Self::get_bytes`] (L2 + backfill), whose hit is
+    /// always fresh.
+    async fn get_bytes_swr(&self, key: &str) -> Result<SwrRead<Vec<u8>>, CachekitError> {
+        #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+        if self.swr_enabled {
+            if let Some(ref l1) = self.l1 {
+                let full_key = self.resolve_key(key)?;
+                match l1.get_with_swr(&full_key, self.swr_threshold_ratio) {
+                    crate::l1::L1SwrRead::Fresh(bytes) => {
+                        self.check_payload_size(bytes.len())?;
+                        return Ok(SwrRead::Fresh(bytes));
+                    }
+                    crate::l1::L1SwrRead::Stale(bytes) => {
+                        self.check_payload_size(bytes.len())?;
+                        return Ok(SwrRead::Stale(bytes));
+                    }
+                    // Absent or hard-expired: fall through to the normal
+                    // read path (the redundant L1 re-check there is a cheap
+                    // in-process miss).
+                    crate::l1::L1SwrRead::Miss => {}
+                }
+            }
+        }
+
+        Ok(match self.get_bytes(key).await? {
+            Some(bytes) => SwrRead::Fresh(bytes),
+            None => SwrRead::Miss,
+        })
     }
 
     /// Fetch raw payload bytes for `key` (L1, then L2 with L1 backfill).
@@ -503,6 +623,32 @@ impl SecureCache<'_> {
         }
     }
 
+    /// Retrieve, decrypt, and deserialize an interop-mode value with SWR
+    /// classification. The secure twin of [`CacheKit::interop_get_swr`]:
+    /// staleness is judged on the L1 **ciphertext** entry (zero-knowledge is
+    /// preserved — freshness metadata never exposes plaintext), then the
+    /// value is decrypted and decoded per [`Self::interop_get`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::interop_get`] — the secure path fails closed on every
+    /// backend and decryption error.
+    pub async fn interop_get_swr<T: DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<SwrRead<T>, CachekitError> {
+        self.client.reject_namespaced_interop()?;
+        match self.client.get_bytes_swr(key).await? {
+            SwrRead::Fresh(ct) => Ok(SwrRead::Fresh(crate::interop::deserialize(
+                &self.encryption.decrypt(&ct, key)?,
+            )?)),
+            SwrRead::Stale(ct) => Ok(SwrRead::Stale(crate::interop::deserialize(
+                &self.encryption.decrypt(&ct, key)?,
+            )?)),
+            SwrRead::Miss => Ok(SwrRead::Miss),
+        }
+    }
+
     /// Fetch ciphertext (L1, then L2 with L1 backfill) and decrypt it.
     ///
     /// Ciphertext retrieval delegates to [`CacheKit::get_bytes`], which returns
@@ -542,6 +688,12 @@ pub struct CacheKitBuilder {
 
     #[cfg(feature = "l1")]
     no_l1: bool,
+
+    #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+    swr_enabled: Option<bool>,
+
+    #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+    swr_threshold_ratio: Option<f64>,
 
     #[cfg(feature = "encryption")]
     encryption: Option<SharedEncryption>,
@@ -586,6 +738,39 @@ impl CacheKitBuilder {
     #[cfg(feature = "l1")]
     pub fn no_l1(mut self) -> Self {
         self.no_l1 = true;
+        self
+    }
+
+    /// Enable or disable L1 stale-while-revalidate (default: **enabled**,
+    /// matching the Python and TypeScript SDKs).
+    ///
+    /// With SWR on, an L1 hit older than `swr_threshold_ratio` of its TTL is
+    /// still served immediately, and the `#[cachekit]` macro schedules
+    /// exactly one background refresh (deduplicated through
+    /// [`CacheKit::single_flight`], in-process and — on lock-capable
+    /// backends — across processes). A hard-expired entry is never served:
+    /// it falls through to a normal blocking miss.
+    ///
+    /// Native targets only: this knob does not exist on wasm32, under the
+    /// `unsync` feature, or without `l1` — calling it there is a compile
+    /// error rather than a silent no-op.
+    #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+    pub fn swr_enabled(mut self, enabled: bool) -> Self {
+        self.swr_enabled = Some(enabled);
+        self
+    }
+
+    /// Set the SWR freshness threshold as a fraction of each L1 entry's TTL
+    /// (default: **0.5**, matching the Python and TypeScript SDKs).
+    ///
+    /// An entry is *fresh* until it has lived `ratio × TTL` (±10% jitter to
+    /// de-synchronise refreshes across processes), then *stale* — served
+    /// immediately with a background refresh — until hard expiry. Mirrors
+    /// cachekit-py's `swr_threshold_ratio` semantics (elapsed-lifetime
+    /// fraction). Must be in `(0.0, 1.0]`; validated at [`Self::build`].
+    #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+    pub fn swr_threshold_ratio(mut self, ratio: f64) -> Self {
+        self.swr_threshold_ratio = Some(ratio);
         self
     }
 
@@ -685,6 +870,19 @@ impl CacheKitBuilder {
             Some(crate::l1::L1Cache::new(capacity))
         };
 
+        // SWR defaults mirror the sibling SDKs: enabled, threshold ratio 0.5,
+        // ratio validated in (0.0, 1.0] exactly like py's L1CacheConfig.
+        #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+        let swr_threshold_ratio = {
+            let ratio = self.swr_threshold_ratio.unwrap_or(0.5);
+            if !(ratio > 0.0 && ratio <= 1.0) {
+                return Err(CachekitError::Config(format!(
+                    "swr_threshold_ratio must be in (0.0, 1.0]; got {ratio}"
+                )));
+            }
+            ratio
+        };
+
         // Apply the reliability stack last so it decorates the final backend.
         // A config with neither layer set is the documented opt-out: skip the
         // (no-op) decorator entirely.
@@ -701,10 +899,16 @@ impl CacheKitBuilder {
             default_ttl: self.default_ttl.unwrap_or(Duration::from_secs(300)),
             namespace: self.namespace,
             max_payload_bytes: self.max_payload_bytes.unwrap_or(5 * 1024 * 1024),
-            flight: crate::flight::FlightMap::default(),
+            flight: SharedFlight::default(),
 
             #[cfg(feature = "l1")]
             l1,
+
+            #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+            swr_enabled: self.swr_enabled.unwrap_or(true),
+
+            #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+            swr_threshold_ratio,
 
             #[cfg(feature = "encryption")]
             encryption: self.encryption,

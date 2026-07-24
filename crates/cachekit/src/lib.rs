@@ -66,7 +66,7 @@ pub mod l1;
 pub mod reliability;
 
 // Re-exports
-pub use client::{CacheKit, CacheKitBuilder, SharedBackend};
+pub use client::{CacheKit, CacheKitBuilder, SharedBackend, SwrRead};
 pub use config::CachekitConfig;
 pub use error::{BackendError, BackendErrorKind, CachekitError};
 
@@ -82,6 +82,53 @@ pub use flight::SingleFlight;
 
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
 pub use reliability::{CircuitBreakerConfig, ReliabilityConfig, RetryConfig};
+
+// ── Shared jitter source ─────────────────────────────────────────────────────
+
+/// Uniform random in `[0, 1)`. uuid v4 is the crate's existing entropy source
+/// (getrandom-backed); jitter needs decorrelation across clients, not crypto
+/// quality — 53 bits is plenty. Used by retry backoff (`reliability`) and the
+/// L1 SWR freshness threshold (`l1`).
+#[cfg(any(
+    feature = "l1",
+    all(feature = "reliability", not(target_arch = "wasm32"))
+))]
+pub(crate) fn random_unit() -> f64 {
+    let bits = uuid::Uuid::new_v4().as_u128() & ((1u128 << 53) - 1);
+    (bits as f64) / ((1u64 << 53) as f64)
+}
+
+// ── SWR background-refresh spawn (macro plumbing) ───────────────────────────
+
+/// Spawn a stale-while-revalidate background refresh onto the ambient tokio
+/// runtime. Macro plumbing for `#[cachekit]` — not public API.
+///
+/// Without a tokio runtime on the current thread the refresh is skipped: the
+/// caller has already been served the stale value, and a later stale read
+/// simply retries. Panicking here would turn a cache optimisation into an
+/// availability bug on non-tokio executors.
+#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+#[doc(hidden)]
+pub fn __swr_spawn<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        drop(handle.spawn(fut));
+    }
+}
+
+/// No-op variant: under `unsync`, on wasm32, or without the `l1` feature the
+/// client never classifies a hit as stale (`SwrRead::Stale` is unreachable),
+/// so the refresh future handed here is dead code by construction. The stub
+/// exists so `#[cachekit]`-generated code compiles under every configuration.
+#[cfg(not(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32"))))]
+#[doc(hidden)]
+pub fn __swr_spawn<F>(_fut: F)
+where
+    F: std::future::Future<Output = ()> + 'static,
+{
+}
 
 /// Convenient glob import for the most common types.
 pub mod prelude {

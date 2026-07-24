@@ -38,7 +38,7 @@
 |:--------|:-------:|:------------|
 | `cachekitio` | ✅ | HTTP backend for [api.cachekit.io](https://api.cachekit.io) via [reqwest](https://crates.io/crates/reqwest) + rustls |
 | `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core) |
-| `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka) |
+| `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka), with stale-while-revalidate (native) |
 | `reliability` | ✅ | Retry with backoff + jitter, circuit breaker, distributed fill locks (native only) |
 | `redis` | ❌ | Redis backend via [fred](https://crates.io/crates/fred) (native only) |
 | `memcached` | ❌ | Memcached backend via [rust-memcache](https://crates.io/crates/memcache) (native only) |
@@ -301,7 +301,8 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
 │  GET path:                                              │
-│  L1 hit (~50ns) ──► return immediately                  │
+│  L1 fresh hit (~50ns) ──► return immediately            │
+│  L1 stale hit ──► return + background refresh (SWR)     │
 │  L1 miss ──► L2 backend ──► backfill L1 (30s cap)      │
 │                                                         │
 │  SET path:                                              │
@@ -323,6 +324,48 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
 | **Encrypted L1** | `SecureCache` stores ciphertext in L1 (never plaintext) |
 | **Default capacity** | 1,000 entries (configurable via `.l1_capacity()`) |
+| **Stale-while-revalidate** | On by default (native): `#[cachekit]` serves an L1 hit past `swr_threshold_ratio` × entry TTL (default 0.5, ±10% jitter) immediately and refreshes it in the background — see below |
+
+### Stale-while-revalidate (SWR)
+
+With SWR (default when `l1` is on, native targets), an L1 entry has two phases
+before it disappears: *fresh* until `swr_threshold_ratio` of its TTL has
+elapsed, then *stale* until hard expiry. A `#[cachekit]`-wrapped call that
+hits a stale entry returns it **immediately** — no caller ever blocks on a
+merely-stale value — while exactly one background task re-executes the
+function and rewrites both cache layers with a full TTL. Refresh dedup rides
+the same single-flight as the cold-miss path (in-process, plus distributed
+fill locks on lock-capable backends), so N concurrent stale readers cost one
+origin execution — misses are billable; stampedes are not acceptable. A
+hard-expired entry always takes the normal blocking miss path: SWR never
+serves past hard expiry.
+
+```rust,ignore
+let cache = CacheKit::builder()
+    .backend(backend)
+    .swr_threshold_ratio(0.25) // stale after 25% of entry TTL (default 0.5)
+    // .swr_enabled(false)     // restore strict expire-or-serve behaviour
+    .build()?;
+```
+
+Semantics mirror cachekit-py (`swr_threshold_ratio` = elapsed-lifetime
+fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
+
+- **The freshness window derives from each entry's own TTL.** A backfilled
+  entry (L2 hit → L1, 30 s cap) goes stale at ~`ratio × 30 s` — the cap still
+  bounds staleness of L2-derived data, but SWR replaces its expiry cliff with
+  a background refresh that restores the full write-path TTL. The configured
+  ratio is never silently clamped; the window follows the entry.
+- **The background refresh needs a tokio runtime** (`Handle::try_current`).
+  On other executors the stale value is still served and the refresh is
+  skipped — behaviourally SWR-off, never a panic.
+- **Refresh failures are absorbed**: the stale value keeps serving, a later
+  stale read retries, and once the entry hard-expires the blocking path
+  surfaces errors normally.
+- **Native only**: on wasm32 (`workers` excludes `l1`) and under `unsync`
+  there is no SWR; the builder knobs don't exist there, so misuse is a
+  compile error rather than a silent no-op. A sync function under
+  `#[cachekit]` is likewise a clear compile-time error.
 
 ---
 
@@ -336,8 +379,9 @@ With the `reliability` feature (default, native only), the `production`, `encryp
 | **Circuit breaker** | closed → open after N retryable failures in a rolling window; fails fast (`BackendErrorKind::CircuitOpen`) while open; half-open probes recovery | threshold 5, window 60 s, open 5 s, 3 probes, close after 3 successes |
 | **Graceful degradation** | On outage-class backend failure (transient, timeout, open breaker), `#[cachekit]`-wrapped functions run uncached (fail-open); permanent/auth errors propagate — a wrong API key fails loudly. `secure` paths fail **closed** on everything — encrypted workloads never silently degrade | built into the macro |
 | **Single-flight** | Concurrent misses of one key collapse to a single execution: per-key in-process lock, plus a distributed fill lock across processes on lock-capable backends (cachekit.io, Redis) | in-process always on; cross-process 5 s lock, 100 ms polls |
+| **Stale-while-revalidate** | Stale-but-unexpired L1 hits are served immediately while one single-flight-deduplicated background task re-executes the function ([details](#stale-while-revalidate-swr)) | on by default with `l1` (native); threshold 0.5 × entry TTL ±10% jitter |
 
-Retry sits *inside* the breaker (one exhausted retry sequence = one breaker failure), degradation and single-flight sit in the `#[cachekit]` macro around the miss path — the same composition as the TypeScript SDK's `ReliabilityExecutor` and the Python decorator.
+Retry sits *inside* the breaker (one exhausted retry sequence = one breaker failure), degradation, single-flight, and SWR sit in the `#[cachekit]` macro around the read path — the same composition as the TypeScript SDK's `ReliabilityExecutor` and the Python decorator.
 
 ```rust,ignore
 use std::time::Duration;
