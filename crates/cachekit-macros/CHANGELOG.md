@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.5.0...cachekit-macros-v0.6.0) (2026-07-24)
+
+
+### Features
+
+* **reliability:** retry, circuit breaker, graceful degradation, single-flight (LAB-518) ([#43](https://github.com/cachekit-io/cachekit-rs/issues/43)) ([e9b9a1e](https://github.com/cachekit-io/cachekit-rs/commit/e9b9a1e7ddf42225a81bc5247ad90e011a690937))
+
 ## [0.5.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.4.0...cachekit-macros-v0.5.0) (2026-07-24)
 
 
