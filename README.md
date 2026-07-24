@@ -48,15 +48,15 @@
 ```toml
 # Defaults: SaaS + encryption + L1
 [dependencies]
-cachekit-rs = "0.4"
+cachekit-rs = "0.5"
 
 # With Redis backend
 [dependencies]
-cachekit-rs = { version = "0.4", features = ["redis"] }
+cachekit-rs = { version = "0.5", features = ["redis"] }
 
 # For Cloudflare Workers (no L1, no Redis)
 [dependencies]
-cachekit-rs = { version = "0.4", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.5", default-features = false, features = ["workers", "encryption"] }
 ```
 
 > [!WARNING]
@@ -203,7 +203,7 @@ let backend = CachekitIO::builder()
 Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Requires the `redis` feature flag.
 
 ```toml
-cachekit-rs = { version = "0.4", features = ["redis"] }
+cachekit-rs = { version = "0.5", features = ["redis"] }
 ```
 
 ```rust
@@ -257,7 +257,7 @@ let backend = FileBackend::builder()
 `wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. Requires the `workers` feature with default features disabled.
 
 ```toml
-cachekit-rs = { version = "0.4", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.5", default-features = false, features = ["workers", "encryption"] }
 ```
 
 <details>
