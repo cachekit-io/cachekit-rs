@@ -50,10 +50,10 @@ jobs:
 
       - name: Clippy
         if: matrix.rust != '1.85'
-        run: cargo clippy --all-targets --features "cachekitio,redis,encryption,l1,macros" -- -D warnings
+        run: cargo clippy --all-targets --features "cachekitio,redis,encryption,l1,macros,memcached,file" -- -D warnings
 
       - name: Run tests
-        run: cargo test --features "cachekitio,redis,encryption,l1,macros"
+        run: cargo test --features "cachekitio,redis,encryption,l1,macros,memcached,file"
 
   redis-lock:
     name: redis lock integration
@@ -103,6 +103,56 @@ jobs:
           # reporting a hollow green — the exact defect LAB-426 is fixing.
           if grep -q "skipping redis_lock_live_semantics" redis-test.log; then
             echo "::error::redis lock test skipped — CACHEKIT_TEST_REDIS_URL not seen by the test"
+            exit 1
+          fi
+
+  memcached:
+    name: memcached integration
+    # Same reasoning as redis-lock: `services:` needs Docker, so this runs on
+    # the with-dind `cachekit` scaleset. Without a live memcached the
+    # get/set/delete/ttl path has zero automated coverage — the
+    # memcached_live_semantics test skips when CACHEKIT_TEST_MEMCACHED_URL is
+    # unset (LAB-429: the AC requires memcached exercised against a container).
+    runs-on: cachekit
+    timeout-minutes: 20
+    services:
+      memcached:
+        # Digest-pinned like the redis service above — a bare tag is mutable.
+        # memcached:1.6-alpine resolved 2026-07-24.
+        image: memcached:1.6-alpine@sha256:c29847751abb41f4c268c84fb3087fee05d4edcbda44409ccb5086e26148e8a7
+        ports:
+          - 11211:11211
+        options: >-
+          --health-cmd "nc -z 127.0.0.1 11211"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # This job never pushes; don't leave the token on a self-hosted
+          # runner workspace (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run memcached integration test
+        env:
+          # The job runs directly on the runner, which shares the pod network
+          # namespace with the dind sidecar, so the mapped service port is
+          # reachable on localhost. memcached-only, no default features —
+          # leanest build for the memory-tight (5Gi) with-dind pod.
+          CACHEKIT_TEST_MEMCACHED_URL: tcp://localhost:11211
+        run: |
+          cargo test --no-default-features --features memcached --test memcached_tests -- --nocapture 2>&1 | tee memcached-test.log
+          # False-green guard: this job exists so the live test actually runs.
+          # If it silently skipped (env not seen), fail loudly instead of
+          # reporting a hollow green.
+          if grep -q "skipping memcached_live_semantics" memcached-test.log; then
+            echo "::error::memcached live test skipped — CACHEKIT_TEST_MEMCACHED_URL not seen by the test"
             exit 1
           fi
 
