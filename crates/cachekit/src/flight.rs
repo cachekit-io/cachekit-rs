@@ -40,6 +40,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
+#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::client::SharedBackend;
 
 /// Above this many live entries, dead map slots are swept opportunistically.
@@ -88,6 +91,83 @@ impl FlightMap {
         let fresh = Arc::new(tokio::sync::Mutex::new(()));
         map.insert(key.to_owned(), Arc::downgrade(&fresh));
         fresh
+    }
+}
+
+// ── SWR mutation ordering ────────────────────────────────────────────────────
+
+/// State shared by a stale-read token and same-key mutations while that token
+/// is alive. The weak map can discard idle keys without losing correctness:
+/// an outstanding token itself keeps this state alive.
+#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+pub(crate) struct MutationState {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    version: AtomicU64,
+}
+
+#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+impl MutationState {
+    fn new() -> Self {
+        Self {
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            version: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+}
+
+/// Per-key mutation versions for conditional SWR commits. Cloned clients
+/// share this map. Each entry is weak so unrelated keys do not accumulate.
+#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+#[derive(Default)]
+pub(crate) struct MutationMap {
+    entries: Mutex<HashMap<String, Weak<MutationState>>>,
+}
+
+#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+impl MutationMap {
+    pub(crate) fn state(&self, key: &str) -> Arc<MutationState> {
+        let mut map = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if map.len() > SWEEP_THRESHOLD {
+            map.retain(|_, weak| weak.strong_count() > 0);
+        }
+        if let Some(existing) = map.get(key).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let fresh = Arc::new(MutationState::new());
+        map.insert(key.to_owned(), Arc::downgrade(&fresh));
+        fresh
+    }
+
+    pub(crate) async fn lock(&self, key: &str) -> MutationGuard {
+        let state = self.state(key);
+        let lock = Arc::clone(&state.lock).lock_owned().await;
+        MutationGuard { state, _lock: lock }
+    }
+}
+
+/// Holds same-key ordering across an L2 mutation and its L1 update.
+#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+pub(crate) struct MutationGuard {
+    state: Arc<MutationState>,
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+}
+
+#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+impl MutationGuard {
+    pub(crate) fn snapshot(&self) -> (Arc<MutationState>, u64) {
+        (Arc::clone(&self.state), self.state.version())
+    }
+
+    pub(crate) fn is_current(&self, state: &Arc<MutationState>, version: u64) -> bool {
+        Arc::ptr_eq(&self.state, state) && self.state.version() == version
+    }
+
+    pub(crate) fn advance(&self) {
+        self.state.version.fetch_add(1, Ordering::Release);
     }
 }
 

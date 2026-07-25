@@ -38,6 +38,24 @@ mod tests {
     }
 
     #[test]
+    fn l1_update_renews_hard_expiry_from_the_update() {
+        let cache = L1Cache::new(16);
+        cache.set("refresh", b"old", Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(75));
+
+        // Updating an existing moka entry used to retain the original
+        // create deadline. The replacement must receive its full TTL.
+        cache.set("refresh", b"new", Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(100));
+        cache.run_pending_tasks();
+        assert_eq!(cache.get("refresh"), Some(b"new".to_vec()));
+
+        std::thread::sleep(Duration::from_millis(250));
+        cache.run_pending_tasks();
+        assert_eq!(cache.get("refresh"), None);
+    }
+
+    #[test]
     fn l1_capacity_eviction() {
         let cache = L1Cache::new(2);
         cache.set("a", b"1", Duration::from_secs(60));

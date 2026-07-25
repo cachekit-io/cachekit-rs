@@ -7,6 +7,7 @@ struct L1Entry {
     data: Vec<u8>,
     ttl: Duration,
     created_at: Instant,
+    freshness_jitter: f64,
 }
 
 struct L1Expiry;
@@ -18,6 +19,19 @@ impl Expiry<String, L1Entry> for L1Expiry {
         value: &L1Entry,
         _created_at: std::time::Instant,
     ) -> Option<Duration> {
+        Some(value.ttl)
+    }
+
+    fn expire_after_update(
+        &self,
+        _key: &String,
+        value: &L1Entry,
+        _updated_at: std::time::Instant,
+        _duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        // A successful SWR refresh is an update of the existing moka entry.
+        // Returning the replacement value's TTL renews hard expiry from the
+        // refresh commit instead of retaining the original create deadline.
         Some(value.ttl)
     }
 }
@@ -63,9 +77,9 @@ impl L1Cache {
     /// Retrieve cached bytes with stale-while-revalidate classification.
     ///
     /// An entry is *fresh* until it has lived `threshold_ratio` of its own
-    /// TTL (±10% jitter, so refreshes de-synchronise across processes —
-    /// same jitter as the Python and TypeScript SDKs), *stale* from then
-    /// until hard expiry, and a *miss* after that. The freshness window
+    /// TTL (±10% jitter, drawn once when the entry is inserted so a hot read
+    /// never touches the entropy source), *stale* from then until hard
+    /// expiry, and a *miss* after that. The freshness window
     /// derives from the TTL the entry was **inserted** with: a direct write
     /// carries the caller's full TTL, an L2 backfill carries the capped
     /// backfill TTL — see `CacheKit`'s L1 documentation.
@@ -81,8 +95,7 @@ impl L1Cache {
         let Some(entry) = self.store.get(key) else {
             return L1SwrRead::Miss;
         };
-        let jitter = 0.9 + crate::random_unit() * 0.2;
-        let threshold = entry.ttl.as_secs_f64() * threshold_ratio * jitter;
+        let threshold = entry.ttl.as_secs_f64() * threshold_ratio * entry.freshness_jitter;
         if entry.created_at.elapsed().as_secs_f64() > threshold {
             L1SwrRead::Stale(entry.data.clone())
         } else {
@@ -98,6 +111,7 @@ impl L1Cache {
                 data: value.to_vec(),
                 ttl,
                 created_at: Instant::now(),
+                freshness_jitter: 0.9 + crate::random_unit() * 0.2,
             },
         );
     }

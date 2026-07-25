@@ -333,12 +333,17 @@ before it disappears: *fresh* until `swr_threshold_ratio` of its TTL has
 elapsed, then *stale* until hard expiry. A `#[cachekit]`-wrapped call that
 hits a stale entry returns it **immediately** — no caller ever blocks on a
 merely-stale value — while exactly one background task re-executes the
-function and rewrites both cache layers with a full TTL. Refresh dedup rides
-the same single-flight as the cold-miss path (in-process, plus distributed
-fill locks on lock-capable backends), so N concurrent stale readers cost one
-origin execution — misses are billable; stampedes are not acceptable. A
-hard-expired entry always takes the normal blocking miss path: SWR never
-serves past hard expiry.
+function. If the same-key mutation token is still current, the task rewrites
+both cache layers and renews L1 hard expiry with the full write-path TTL; if a
+newer `set()` or `delete()` landed through the same client (or one of its
+clones) while the origin ran, that explicit mutation wins and the older
+refresh result is discarded before it can touch L2. Entry expiry and capacity
+eviction do not invalidate the token, so a valid slow refresh can still
+repopulate both layers. Refresh dedup rides the same single-flight as the cold-miss path
+(in-process, plus distributed fill locks on lock-capable backends), so N
+concurrent stale readers cost one origin execution — misses are billable;
+stampedes are not acceptable. A hard-expired entry always takes the normal
+blocking miss path: SWR never serves past hard expiry.
 
 ```rust,ignore
 let cache = CacheKit::builder()
@@ -356,6 +361,15 @@ fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
   bounds staleness of L2-derived data, but SWR replaces its expiry cliff with
   a background refresh that restores the full write-path TTL. The configured
   ratio is never silently clamped; the window follows the entry.
+- **Refresh completion is version-guarded and same-key ordered.** Each L1
+  stale read receives a mutation token. A concurrent explicit write or delete
+  through that client or a clone invalidates the token, so an older origin
+  result cannot clobber the new value or resurrect the deletion in either
+  layer. The guard is intentionally process-local; cross-instance invalidation
+  is outside SWR's serving-policy scope.
+- **Jitter is fixed per entry.** The ±10% threshold jitter is drawn when an
+  entry is inserted, not on every hit; hot L1 reads do not perform entropy
+  work and the entry's freshness boundary stays stable for its lifetime.
 - **The background refresh needs a tokio runtime** (`Handle::try_current`).
   On other executors the stale value is still served and the refresh is
   skipped — behaviourally SWR-off, never a panic.
