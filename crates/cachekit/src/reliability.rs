@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use crate::backend::{Backend, HealthStatus, LockableBackend};
 use crate::client::SharedBackend;
 use crate::error::BackendError;
+use crate::random_unit;
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -118,16 +119,6 @@ impl Default for ReliabilityConfig {
             circuit_breaker: Some(CircuitBreakerConfig::default()),
         }
     }
-}
-
-// ── Jitter ───────────────────────────────────────────────────────────────────
-
-/// Uniform random in `[0, 1)`. uuid v4 is the crate's existing entropy source
-/// (getrandom-backed); jitter needs decorrelation across clients, not crypto
-/// quality — 53 bits is plenty.
-fn random_unit() -> f64 {
-    let bits = uuid::Uuid::new_v4().as_u128() & ((1u128 << 53) - 1);
-    (bits as f64) / ((1u64 << 53) as f64)
 }
 
 // ── RetryPolicy ──────────────────────────────────────────────────────────────

@@ -30,7 +30,10 @@ workers = ["dep:worker", "dep:js-sys", "dep:getrandom", "dep:serde_json"]
 # cachekit-core 0.2 folds aes-gcm into the `encryption` feature automatically on wasm32.
 # No separate `cachekit-core/wasm` activation needed.
 encryption = ["cachekit-core/encryption"]
-l1 = ["dep:moka"]
+# tokio/rt provides Handle::try_current + spawn for the L1 stale-while-
+# revalidate background refresh (native only — `workers`+`l1` is a compile
+# error, so this never reaches wasm32).
+l1 = ["dep:moka", "tokio/rt"]
 macros = ["dep:cachekit-macros"]
 # Retry with backoff + circuit breaker around backend ops, and cross-process
 # cold-miss suppression via LockableBackend. Native only (needs tokio timers).
