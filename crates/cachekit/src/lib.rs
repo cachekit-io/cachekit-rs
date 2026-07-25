@@ -66,7 +66,7 @@ pub mod l1;
 pub mod reliability;
 
 // Re-exports
-pub use client::{CacheKit, CacheKitBuilder, SharedBackend, SwrRead};
+pub use client::{CacheKit, CacheKitBuilder, SharedBackend, SwrRead, SwrToken};
 pub use config::CachekitConfig;
 pub use error::{BackendError, BackendErrorKind, CachekitError};
 
@@ -88,7 +88,7 @@ pub use reliability::{CircuitBreakerConfig, ReliabilityConfig, RetryConfig};
 /// Uniform random in `[0, 1)`. uuid v4 is the crate's existing entropy source
 /// (getrandom-backed); jitter needs decorrelation across clients, not crypto
 /// quality — 53 bits is plenty. Used by retry backoff (`reliability`) and the
-/// L1 SWR freshness threshold (`l1`).
+/// L1 SWR freshness threshold at entry insertion (`l1`).
 #[cfg(any(
     feature = "l1",
     all(feature = "reliability", not(target_arch = "wasm32"))
@@ -134,7 +134,7 @@ where
 pub mod prelude {
     pub use crate::{
         BackendError, BackendErrorKind, CacheKit, CacheKitBuilder, CachekitConfig, CachekitError,
-        SwrRead,
+        SwrRead, SwrToken,
     };
 
     #[cfg(feature = "encryption")]

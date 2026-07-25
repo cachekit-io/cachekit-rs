@@ -30,6 +30,12 @@ type SharedFlight = std::sync::Arc<crate::flight::FlightMap>;
 #[cfg(any(target_arch = "wasm32", feature = "unsync"))]
 type SharedFlight = std::rc::Rc<crate::flight::FlightMap>;
 
+/// Separate same-key ordering from single-flight: a refresh holds the flight
+/// lock while computing, then takes this lock only for its version-checked
+/// commit. Direct reads/writes/deletes take the same mutation lock.
+#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+type SharedMutations = std::sync::Arc<crate::flight::MutationMap>;
+
 // ── SharedEncryption type alias ──────────────────────────────────────────────
 
 /// Reference-counted pointer to the encryption layer.
@@ -61,9 +67,10 @@ const MAX_KEY_BYTES: usize = 1024;
 /// TTL), **not** from the write-path TTL — the cap is the staleness bound
 /// for L2-derived data, deliberately kept. SWR removes the cap's expiry
 /// cliff instead: past ~ratio × 30 s the entry is served stale while one
-/// background refresh re-executes the origin, and that refresh writes both
-/// layers with the caller's full TTL. Without SWR the entry simply
-/// hard-expires at the cap and the next read blocks on L2, as before.
+/// background refresh re-executes the origin. If no newer mutation replaced
+/// the entry, that refresh writes both layers and renews L1 hard expiry with
+/// the caller's full TTL. Without SWR the entry simply hard-expires at the cap
+/// and the next read blocks on L2, as before.
 const L1_BACKFILL_TTL_SECS: u64 = 30;
 
 fn validate_key(key: &str) -> Result<(), CachekitError> {
@@ -102,11 +109,47 @@ pub enum SwrRead<T> {
     Fresh(T),
     /// L1 hit past the freshness threshold but before hard expiry: use the
     /// value now, and schedule a background refresh (the `#[cachekit]` macro
-    /// does this via [`CacheKit::single_flight`] + re-execution).
-    Stale(T),
+    /// does this via [`CacheKit::single_flight`] + re-execution). The token
+    /// makes refresh completion conditional: a newer set or delete wins.
+    Stale(T, SwrToken),
     /// No usable entry: fall through to a normal blocking miss + fill.
     Miss,
 }
+
+/// Mutation version captured by an SWR stale read.
+///
+/// Pass this back only through the `#[cachekit]`-generated refresh path. It
+/// prevents an older background computation from overwriting a newer write
+/// or resurrecting a deleted entry on this client or any of its clones.
+#[derive(Clone)]
+pub struct SwrToken {
+    #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+    state: std::sync::Arc<crate::flight::MutationState>,
+    version: u64,
+}
+
+impl std::fmt::Debug for SwrToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwrToken")
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for SwrToken {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+        {
+            self.version == other.version && std::sync::Arc::ptr_eq(&self.state, &other.state)
+        }
+        #[cfg(not(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32"))))]
+        {
+            self.version == other.version
+        }
+    }
+}
+
+impl Eq for SwrToken {}
 
 // ── CacheKit ─────────────────────────────────────────────────────────────────
 
@@ -123,6 +166,9 @@ pub struct CacheKit {
     namespace: Option<String>,
     max_payload_bytes: usize,
     flight: SharedFlight,
+
+    #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+    mutations: SharedMutations,
 
     #[cfg(feature = "l1")]
     l1: Option<crate::l1::L1Cache>,
@@ -237,6 +283,56 @@ impl CacheKit {
         }
     }
 
+    #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+    async fn lock_l1_mutation(&self, full_key: &str) -> Option<crate::flight::MutationGuard> {
+        if self.l1.is_some() {
+            Some(self.mutations.lock(full_key).await)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+    async fn complete_swr_bytes(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        ttl: Duration,
+        token: SwrToken,
+    ) -> Result<bool, CachekitError> {
+        Self::validate_ttl(ttl)?;
+        self.check_payload_size(bytes.len())?;
+        let full_key = self.resolve_key(key)?;
+        let Some(mutation) = self.lock_l1_mutation(&full_key).await else {
+            return Ok(false);
+        };
+
+        // Check before touching L2. The mutation state lives independently of
+        // the moka entry, so hard expiry or capacity eviction does not look
+        // like an explicit set/delete and waste a valid origin result.
+        if !mutation.is_current(&token.state, token.version) {
+            return Ok(false);
+        }
+        let l1_bytes = bytes.clone();
+        self.backend.set(&full_key, bytes, Some(ttl)).await?;
+        self.l1_set(&full_key, &l1_bytes, ttl);
+        mutation.advance();
+        Ok(true)
+    }
+
+    #[cfg(not(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32"))))]
+    async fn complete_swr_bytes(
+        &self,
+        _key: &str,
+        _bytes: Vec<u8>,
+        _ttl: Duration,
+        _token: SwrToken,
+    ) -> Result<bool, CachekitError> {
+        // `SwrRead::Stale` is unreachable on this build, so there is no
+        // versioned entry a caller could legitimately complete.
+        Ok(false)
+    }
+
     /// Validate TTL is at least 1 second.
     fn validate_ttl(ttl: Duration) -> Result<(), CachekitError> {
         if ttl < Duration::from_secs(1) {
@@ -318,7 +414,8 @@ impl CacheKit {
     ///   expiry**: the value is returned without touching the backend or
     ///   origin, and the caller should schedule exactly one background
     ///   refresh (dedup via [`Self::single_flight`] — this is what the
-    ///   `#[cachekit]` macro generates).
+    ///   `#[cachekit]` macro generates). The accompanying [`SwrToken`] makes
+    ///   completion conditional, so a newer set/delete always wins.
     /// - [`SwrRead::Miss`] — nothing usable anywhere: normal blocking miss.
     ///
     /// A hard-expired L1 entry is a [`SwrRead::Miss`], never `Stale` — moka
@@ -340,7 +437,7 @@ impl CacheKit {
         self.reject_namespaced_interop()?;
         match self.get_bytes_swr(key).await? {
             SwrRead::Fresh(b) => Ok(SwrRead::Fresh(crate::interop::deserialize(&b)?)),
-            SwrRead::Stale(b) => Ok(SwrRead::Stale(crate::interop::deserialize(&b)?)),
+            SwrRead::Stale(b, token) => Ok(SwrRead::Stale(crate::interop::deserialize(&b)?, token)),
             SwrRead::Miss => Ok(SwrRead::Miss),
         }
     }
@@ -359,9 +456,24 @@ impl CacheKit {
                         self.check_payload_size(bytes.len())?;
                         return Ok(SwrRead::Fresh(bytes));
                     }
-                    crate::l1::L1SwrRead::Stale(bytes) => {
-                        self.check_payload_size(bytes.len())?;
-                        return Ok(SwrRead::Stale(bytes));
+                    crate::l1::L1SwrRead::Stale(_) => {
+                        // Token capture and the stale snapshot must be atomic
+                        // relative to explicit mutations. Re-check after
+                        // taking the per-key guard; a write may have landed
+                        // between the optimistic classification and here.
+                        let mutation = self.mutations.lock(&full_key).await;
+                        match l1.get_with_swr(&full_key, self.swr_threshold_ratio) {
+                            crate::l1::L1SwrRead::Fresh(bytes) => {
+                                self.check_payload_size(bytes.len())?;
+                                return Ok(SwrRead::Fresh(bytes));
+                            }
+                            crate::l1::L1SwrRead::Stale(bytes) => {
+                                self.check_payload_size(bytes.len())?;
+                                let (state, version) = mutation.snapshot();
+                                return Ok(SwrRead::Stale(bytes, SwrToken { state, version }));
+                            }
+                            crate::l1::L1SwrRead::Miss => {}
+                        }
                     }
                     // Absent or hard-expired: fall through to the normal
                     // read path (the redundant L1 re-check there is a cheap
@@ -383,6 +495,18 @@ impl CacheKit {
 
         // L1 hit
         #[cfg(feature = "l1")]
+        if let Some(bytes) = self.l1_get(&full_key) {
+            self.check_payload_size(bytes.len())?;
+            return Ok(Some(bytes));
+        }
+
+        // Serialize an L2 read/backfill with same-key writes. Re-check L1
+        // after taking the lock because another operation may have filled it
+        // between the optimistic read above and lock acquisition.
+        #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+        let _mutation = self.lock_l1_mutation(&full_key).await;
+
+        #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
         if let Some(bytes) = self.l1_get(&full_key) {
             self.check_payload_size(bytes.len())?;
             return Ok(Some(bytes));
@@ -424,6 +548,17 @@ impl CacheKit {
 
         let full_key = self.resolve_key(key)?;
 
+        #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+        let mutation = self.lock_l1_mutation(&full_key).await;
+
+        // Invalidate older refresh tokens before the first backend await, so
+        // cancellation cannot leave an applied/attempted write vulnerable to
+        // a stale background result.
+        #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+        if let Some(ref mutation) = mutation {
+            mutation.advance();
+        }
+
         // Only clone bytes when L1 needs a copy after the backend consumes them.
         #[cfg(feature = "l1")]
         {
@@ -439,11 +574,35 @@ impl CacheKit {
         Ok(())
     }
 
+    /// Commit an unencrypted SWR refresh only if its stale-read token is
+    /// still current. Macro plumbing; ordinary writes use [`Self::set_with_ttl`].
+    #[doc(hidden)]
+    pub async fn __complete_swr_refresh<T: Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+        ttl: Duration,
+        token: SwrToken,
+    ) -> Result<bool, CachekitError> {
+        let bytes = serializer::serialize(value)?;
+        self.complete_swr_bytes(key, bytes, ttl, token).await
+    }
+
     /// Delete `key` and return `true` if it existed.
     ///
     /// Invalidates the L1 entry regardless of the backend result.
     pub async fn delete(&self, key: &str) -> Result<bool, CachekitError> {
         let full_key = self.resolve_key(key)?;
+
+        #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+        let mutation = self.lock_l1_mutation(&full_key).await;
+
+        // Invalidate before L1 changes or backend I/O so task cancellation
+        // cannot let an older refresh resurrect this key.
+        #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+        if let Some(ref mutation) = mutation {
+            mutation.advance();
+        }
 
         // Invalidate L1 first so callers never read a stale value even if the
         // backend delete fails partway through.
@@ -569,6 +728,16 @@ impl SecureCache<'_> {
 
         let full_key = self.client.resolve_key(key)?;
 
+        #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+        let mutation = self.client.lock_l1_mutation(&full_key).await;
+
+        // Match the plain write path: invalidate older refresh tokens before
+        // the first backend await, including on cancellation or failure.
+        #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+        if let Some(ref mutation) = mutation {
+            mutation.advance();
+        }
+
         // Only clone when L1 needs a copy after the backend consumes the data.
         #[cfg(feature = "l1")]
         {
@@ -588,6 +757,23 @@ impl SecureCache<'_> {
         }
 
         Ok(())
+    }
+
+    /// Commit an encrypted SWR refresh only if its stale-read token is still
+    /// current. Macro plumbing; ordinary writes use [`Self::set_with_ttl`].
+    #[doc(hidden)]
+    pub async fn __complete_swr_refresh<T: Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+        ttl: Duration,
+        token: SwrToken,
+    ) -> Result<bool, CachekitError> {
+        let plaintext = serializer::serialize(value)?;
+        let ciphertext = self.encryption.encrypt(&plaintext, key)?;
+        self.client
+            .complete_swr_bytes(key, ciphertext, ttl, token)
+            .await
     }
 
     /// Retrieve, decrypt, and deserialize a value stored under `key`.
@@ -643,9 +829,10 @@ impl SecureCache<'_> {
             SwrRead::Fresh(ct) => Ok(SwrRead::Fresh(crate::interop::deserialize(
                 &self.encryption.decrypt(&ct, key)?,
             )?)),
-            SwrRead::Stale(ct) => Ok(SwrRead::Stale(crate::interop::deserialize(
-                &self.encryption.decrypt(&ct, key)?,
-            )?)),
+            SwrRead::Stale(ct, token) => Ok(SwrRead::Stale(
+                crate::interop::deserialize(&self.encryption.decrypt(&ct, key)?)?,
+                token,
+            )),
             SwrRead::Miss => Ok(SwrRead::Miss),
         }
     }
@@ -764,11 +951,12 @@ impl CacheKitBuilder {
     /// Set the SWR freshness threshold as a fraction of each L1 entry's TTL
     /// (default: **0.5**, matching the Python and TypeScript SDKs).
     ///
-    /// An entry is *fresh* until it has lived `ratio × TTL` (±10% jitter to
-    /// de-synchronise refreshes across processes), then *stale* — served
-    /// immediately with a background refresh — until hard expiry. Mirrors
-    /// cachekit-py's `swr_threshold_ratio` semantics (elapsed-lifetime
-    /// fraction). Must be in `(0.0, 1.0]`; validated at [`Self::build`].
+    /// An entry is *fresh* until it has lived `ratio × TTL` (±10% jitter,
+    /// drawn once when the entry is inserted, to de-synchronise refreshes
+    /// across processes), then *stale* — served immediately with a background
+    /// refresh — until hard expiry. Mirrors cachekit-py's
+    /// `swr_threshold_ratio` semantics (elapsed-lifetime fraction). Must be in
+    /// `(0.0, 1.0]`; validated at [`Self::build`].
     #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
     pub fn swr_threshold_ratio(mut self, ratio: f64) -> Self {
         self.swr_threshold_ratio = Some(ratio);
@@ -901,6 +1089,9 @@ impl CacheKitBuilder {
             namespace: self.namespace,
             max_payload_bytes: self.max_payload_bytes.unwrap_or(5 * 1024 * 1024),
             flight: SharedFlight::default(),
+
+            #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+            mutations: SharedMutations::default(),
 
             #[cfg(feature = "l1")]
             l1,

@@ -215,8 +215,10 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   `l1` feature on native targets): an L1 hit past the client's freshness
 ///   threshold (`swr_threshold_ratio` × entry TTL, ±10% jitter) but before
 ///   hard expiry is returned **immediately** — the caller never blocks on a
-///   merely-stale entry — while one background task re-executes the function
-///   and rewrites both cache layers. Refresh dedup rides
+///   merely-stale entry — while one background task re-executes the function.
+///   Its version-checked commit rewrites both layers only if no newer set or
+///   delete replaced the stale entry; a successful commit renews the L1 hard
+///   expiry with the full write-path TTL. Refresh dedup rides
 ///   [`CacheKit::single_flight`]: N concurrent stale readers trigger exactly
 ///   one re-execution per process (and, on lock-capable backends, per
 ///   fleet). Hard-expired entries always take the normal blocking miss path.
@@ -326,7 +328,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     });
 
     // Generate cache get/set calls depending on `secure` flag.
-    let (get_expr, get_swr_expr, set_expr) = if args.secure {
+    let (get_expr, get_swr_expr, set_expr, complete_refresh_expr) = if args.secure {
         (
             quote! {
                 {
@@ -344,6 +346,15 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                 let __ck_sec = #client_ident.secure()?;
                 let _ = __ck_sec.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await;
             },
+            quote! {
+                let __ck_sec = #client_ident.secure()?;
+                let _ = __ck_sec.__complete_swr_refresh(
+                    &__ck_key,
+                    __ck_val,
+                    std::time::Duration::from_secs(#ttl_secs),
+                    __ck_swr_token,
+                ).await;
+            },
         )
     } else {
         (
@@ -351,6 +362,14 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             quote! { #client_ident.interop_get_swr::<#ok_type>(&__ck_key).await },
             quote! {
                 let _ = #client_ident.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await;
+            },
+            quote! {
+                let _ = #client_ident.__complete_swr_refresh(
+                    &__ck_key,
+                    __ck_val,
+                    std::time::Duration::from_secs(#ttl_secs),
+                    __ck_swr_token,
+                ).await;
             },
         )
     };
@@ -472,7 +491,9 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                 // failures are deliberately absorbed — the stale value keeps
                 // being served, a later stale read retries, and hard expiry
                 // falls through to the blocking path where errors surface.
-                Ok(cachekit::SwrRead::Stale(__ck_cached)) => {
+                // Completion is version-checked, so a newer explicit set or
+                // delete always wins over this older origin computation.
+                Ok(cachekit::SwrRead::Stale(__ck_cached, __ck_swr_token)) => {
                     let __ck_swr_client = ::std::clone::Clone::clone(#client_ident);
                     let __ck_swr_key = __ck_key.clone();
                     #swr_captures
@@ -493,7 +514,9 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                             }
                             let __ck_result: #ret_ty = (async #original_body).await;
                             if let Ok(ref __ck_val) = __ck_result {
-                                #set_expr
+                                // Commit only if no newer set/delete replaced
+                                // the stale entry while the origin ran.
+                                #complete_refresh_expr
                             }
                             __ck_flight.release().await;
                             __ck_result.map(|_| ())
