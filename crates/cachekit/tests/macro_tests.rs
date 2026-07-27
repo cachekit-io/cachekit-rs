@@ -565,6 +565,7 @@ async fn macro_fails_open_when_circuit_is_open() {
                 open_timeout: Duration::from_secs(60),
                 ..CircuitBreakerConfig::default()
             }),
+            backpressure: None,
         })
         .no_l1()
         .build()

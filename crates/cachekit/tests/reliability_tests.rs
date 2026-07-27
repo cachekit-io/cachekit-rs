@@ -19,7 +19,9 @@ use crate::common::MockBackend;
 use cachekit::backend::{Backend, HealthStatus, LockableBackend};
 use cachekit::client::SharedBackend;
 use cachekit::error::{BackendError, BackendErrorKind};
-use cachekit::reliability::{CircuitBreakerConfig, ReliabilityConfig, RetryConfig};
+use cachekit::reliability::{
+    BackpressureConfig, CircuitBreakerConfig, ReliabilityConfig, RetryConfig,
+};
 use cachekit::{CacheKit, CachekitError};
 
 // ── ScriptedBackend ──────────────────────────────────────────────────────────
@@ -154,6 +156,7 @@ async fn retry_recovers_from_transient_failures() {
         ReliabilityConfig {
             retry: Some(fast_retry(3)),
             circuit_breaker: None,
+            backpressure: None,
         },
     );
 
@@ -174,6 +177,7 @@ async fn retry_recovers_from_timeouts() {
         ReliabilityConfig {
             retry: Some(fast_retry(3)),
             circuit_breaker: None,
+            backpressure: None,
         },
     );
 
@@ -190,6 +194,7 @@ async fn retry_does_not_touch_permanent_errors() {
         ReliabilityConfig {
             retry: Some(fast_retry(3)),
             circuit_breaker: None,
+            backpressure: None,
         },
     );
 
@@ -209,6 +214,7 @@ async fn retry_exhausts_attempts_then_propagates() {
         ReliabilityConfig {
             retry: Some(fast_retry(3)),
             circuit_breaker: None,
+            backpressure: None,
         },
     );
 
@@ -231,6 +237,7 @@ async fn breaker_opens_and_fails_fast_without_touching_backend() {
                 open_timeout: Duration::from_secs(60),
                 ..CircuitBreakerConfig::default()
             }),
+            backpressure: None,
         },
     );
 
@@ -261,6 +268,7 @@ async fn breaker_half_open_probe_recovers() {
                 half_open_max_calls: 3,
                 rolling_window: Duration::from_secs(60),
             }),
+            backpressure: None,
         },
     );
 
@@ -295,6 +303,7 @@ async fn breaker_counts_one_failure_per_exhausted_retry_sequence() {
                 open_timeout: Duration::from_secs(60),
                 ..CircuitBreakerConfig::default()
             }),
+            backpressure: None,
         },
     );
 
@@ -585,6 +594,7 @@ async fn cancelled_probe_does_not_wedge_the_breaker() {
                 half_open_max_calls: 1,
                 rolling_window: Duration::from_secs(60),
             }),
+            backpressure: None,
         },
     );
 
@@ -609,4 +619,379 @@ async fn cancelled_probe_does_not_wedge_the_breaker() {
         Some(7),
         "breaker recovered instead of wedging half-open"
     );
+}
+
+// ── Backpressure (LAB-729) ───────────────────────────────────────────────────
+
+fn bp(max_concurrent: usize, max_queue: usize, acquire_timeout: Duration) -> BackpressureConfig {
+    BackpressureConfig {
+        max_concurrent,
+        max_queue,
+        acquire_timeout,
+    }
+}
+
+/// Backend that records how many `get`s are in flight at once.
+#[derive(Debug, Default)]
+struct ProbeInner {
+    current: AtomicU32,
+    max_seen: AtomicU32,
+    calls: AtomicU32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConcurrencyProbeBackend {
+    inner: Arc<ProbeInner>,
+}
+
+impl ConcurrencyProbeBackend {
+    fn new_with_handle() -> (SharedBackend, Self) {
+        let backend = Self::default();
+        let handle = backend.clone();
+        #[cfg(not(feature = "unsync"))]
+        let shared: SharedBackend = Arc::new(backend);
+        #[cfg(feature = "unsync")]
+        let shared: SharedBackend = std::rc::Rc::new(backend);
+        (shared, handle)
+    }
+}
+
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
+impl Backend for ConcurrencyProbeBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        let now = self.inner.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.inner.max_seen.fetch_max(now, Ordering::SeqCst);
+        self.inner.calls.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        self.inner.current.fetch_sub(1, Ordering::SeqCst);
+        Ok(Some(rmp_encoded_seven()))
+    }
+
+    async fn set(
+        &self,
+        _key: &str,
+        _value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
+    async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Ok(HealthStatus {
+            is_healthy: true,
+            latency_ms: 0.0,
+            backend_type: "concurrency-probe".to_owned(),
+            details: HashMap::new(),
+        })
+    }
+}
+
+/// Backend whose `get` blocks until the test releases it (one release = one
+/// completed call). Counts calls that actually reach the backend.
+#[derive(Debug)]
+struct GateInner {
+    gate: tokio::sync::Semaphore,
+    calls: AtomicU32,
+}
+
+#[derive(Debug, Clone)]
+struct GateBackend {
+    inner: Arc<GateInner>,
+}
+
+impl GateBackend {
+    fn new_with_handle() -> (SharedBackend, Self) {
+        let backend = Self {
+            inner: Arc::new(GateInner {
+                gate: tokio::sync::Semaphore::new(0),
+                calls: AtomicU32::new(0),
+            }),
+        };
+        let handle = backend.clone();
+        #[cfg(not(feature = "unsync"))]
+        let shared: SharedBackend = Arc::new(backend);
+        #[cfg(feature = "unsync")]
+        let shared: SharedBackend = std::rc::Rc::new(backend);
+        (shared, handle)
+    }
+
+    fn release(&self, n: usize) {
+        self.inner.gate.add_permits(n);
+    }
+
+    fn calls(&self) -> u32 {
+        self.inner.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
+impl Backend for GateBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        self.inner.calls.fetch_add(1, Ordering::SeqCst);
+        match self.inner.gate.acquire().await {
+            Ok(permit) => {
+                permit.forget();
+                Ok(Some(rmp_encoded_seven()))
+            }
+            Err(_) => Err(BackendError::permanent("gate closed")),
+        }
+    }
+
+    async fn set(
+        &self,
+        _key: &str,
+        _value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
+    async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Ok(HealthStatus {
+            is_healthy: true,
+            latency_ms: 0.0,
+            backend_type: "gate".to_owned(),
+            details: HashMap::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn backpressure_caps_concurrent_backend_ops() {
+    // AC (LAB-729): with the cap at K, no more than K backend ops are ever in
+    // flight under a burst of ≫K concurrent callers — and nobody is shed as
+    // long as the waiting queue and timeout absorb the burst.
+    let (shared, handle) = ConcurrencyProbeBackend::new_with_handle();
+    let client = Arc::new(client_with(
+        shared,
+        ReliabilityConfig {
+            retry: None,
+            circuit_breaker: None,
+            backpressure: Some(bp(4, 1000, Duration::from_secs(5))),
+        },
+    ));
+
+    let tasks: Vec<_> = (0..32)
+        .map(|_| {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.get::<u32>("k").await })
+        })
+        .collect();
+    for task in tasks {
+        let value = task.await.expect("task").expect("get succeeds");
+        assert_eq!(value, Some(7));
+    }
+
+    assert_eq!(handle.inner.calls.load(Ordering::SeqCst), 32);
+    let max_seen = handle.inner.max_seen.load(Ordering::SeqCst);
+    assert!(max_seen <= 4, "cap 4 exceeded: {max_seen} ops in flight");
+}
+
+#[tokio::test]
+async fn backpressure_sheds_immediately_when_queue_disabled() {
+    // max_queue: 0 → a saturated limiter sheds on the spot with the typed
+    // Backpressure error, without waiting out acquire_timeout and without
+    // the call ever reaching the backend. Also the regression test for the
+    // builder gating: a backpressure-ONLY config must still wrap the backend.
+    let (shared, handle) = GateBackend::new_with_handle();
+    let client = Arc::new(client_with(
+        shared,
+        ReliabilityConfig {
+            retry: None,
+            circuit_breaker: None,
+            backpressure: Some(bp(1, 0, Duration::from_secs(5))),
+        },
+    ));
+
+    let holder = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.get::<u32>("k").await })
+    };
+    // Let the holder reach the backend and park on the gate.
+    while handle.calls() == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let start = std::time::Instant::now();
+    let err = client
+        .get::<u32>("k")
+        .await
+        .expect_err("saturated limiter with no queue sheds");
+    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Backpressure));
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "queue-full sheds immediately, not after the 5 s acquire_timeout"
+    );
+    assert_eq!(handle.calls(), 1, "the shed call never reached the backend");
+
+    handle.release(1);
+    let value = holder.await.expect("task").expect("holder completes");
+    assert_eq!(value, Some(7));
+}
+
+#[tokio::test]
+async fn backpressure_times_out_waiting_then_sheds() {
+    // A queued caller waits acquire_timeout for a permit, then is shed with
+    // the typed Backpressure error (bounded wait, never an unbounded queue).
+    let (shared, handle) = GateBackend::new_with_handle();
+    let client = Arc::new(client_with(
+        shared,
+        ReliabilityConfig {
+            retry: None,
+            circuit_breaker: None,
+            backpressure: Some(bp(1, 10, Duration::from_millis(50))),
+        },
+    ));
+
+    let holder = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.get::<u32>("k").await })
+    };
+    while handle.calls() == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let start = std::time::Instant::now();
+    let err = client
+        .get::<u32>("k")
+        .await
+        .expect_err("no permit frees up within acquire_timeout");
+    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Backpressure));
+    assert!(
+        start.elapsed() >= Duration::from_millis(40),
+        "the caller joins the queue and waits out acquire_timeout"
+    );
+    assert_eq!(handle.calls(), 1, "the shed call never reached the backend");
+
+    handle.release(1);
+    holder.await.expect("task").expect("holder completes");
+}
+
+#[tokio::test]
+async fn backpressure_rejections_do_not_open_the_breaker() {
+    // Shed calls are caller-side overload, not backend-health signals: with
+    // failure_threshold: 1, a single counted failure would open the circuit —
+    // so the success after the sheds proves they never touched the breaker.
+    let (shared, handle) = GateBackend::new_with_handle();
+    let client = Arc::new(client_with(
+        shared,
+        ReliabilityConfig {
+            retry: None,
+            circuit_breaker: Some(CircuitBreakerConfig {
+                failure_threshold: 1,
+                open_timeout: Duration::from_secs(60),
+                ..CircuitBreakerConfig::default()
+            }),
+            backpressure: Some(bp(1, 0, Duration::from_secs(5))),
+        },
+    ));
+
+    let holder = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.get::<u32>("k").await })
+    };
+    while handle.calls() == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    for _ in 0..3 {
+        let err = client
+            .get::<u32>("k")
+            .await
+            .expect_err("shed while saturated");
+        assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Backpressure));
+    }
+
+    handle.release(1);
+    holder.await.expect("task").expect("holder completes");
+
+    // Were sheds counted as breaker failures, this would be CircuitOpen.
+    handle.release(1);
+    let value = client
+        .get::<u32>("k")
+        .await
+        .expect("breaker stayed closed through the sheds");
+    assert_eq!(value, Some(7));
+    assert_eq!(handle.calls(), 2, "sheds never reached the backend");
+}
+
+#[tokio::test]
+async fn backpressure_composes_with_retry_without_deadlock() {
+    // The permit is held across the whole retry sequence (backoff included).
+    // With the cap at 1 and two concurrent callers, the second caller queues
+    // behind the first's full retry sequence and both complete — permits
+    // held across backoff cannot deadlock because a permit holder never
+    // re-enters the limiter.
+    let (shared, handle) = ScriptedBackend::new_with_handle(2, BackendErrorKind::Transient);
+    let client = Arc::new(client_with(
+        shared,
+        ReliabilityConfig {
+            retry: Some(fast_retry(3)),
+            circuit_breaker: None,
+            backpressure: Some(bp(1, 10, Duration::from_secs(5))),
+        },
+    ));
+
+    let a = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.get::<u32>("k").await })
+    };
+    let b = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.get::<u32>("k").await })
+    };
+
+    let a = a.await.expect("task a").expect("a succeeds");
+    let b = b.await.expect("task b").expect("b succeeds");
+    assert_eq!(a, Some(7));
+    assert_eq!(b, Some(7));
+    assert_eq!(
+        handle.calls(),
+        4,
+        "one caller retries through 2 failures (3 attempts), the other hits once"
+    );
+}
+
+#[tokio::test]
+async fn backpressure_permit_released_after_error() {
+    // A failed operation must release its permit: with the cap at 1, the
+    // second sequential call would otherwise be shed instead of reaching the
+    // backend for its own (transient) failure.
+    let (shared, handle) = ScriptedBackend::new_with_handle(u32::MAX, BackendErrorKind::Transient);
+    let client = client_with(
+        shared,
+        ReliabilityConfig {
+            retry: None,
+            circuit_breaker: None,
+            backpressure: Some(bp(1, 0, Duration::from_millis(50))),
+        },
+    );
+
+    for _ in 0..2 {
+        let err = client.get::<u32>("k").await.expect_err("backend failing");
+        assert_eq!(
+            backend_kind(&err),
+            Some(&BackendErrorKind::Transient),
+            "a Backpressure kind here would mean the first call leaked its permit"
+        );
+    }
+    assert_eq!(handle.calls(), 2);
 }

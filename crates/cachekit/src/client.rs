@@ -975,11 +975,12 @@ impl CacheKitBuilder {
     }
 
     /// Wrap the backend in the reliability stack (retry with exponential
-    /// backoff + jitter, circuit breaker) — see [`crate::reliability`].
+    /// backoff + jitter, circuit breaker, backpressure) — see
+    /// [`crate::reliability`].
     ///
     /// Enabled by default with production settings by the `production`,
     /// `encrypted`, and `io` intent presets; off for `minimal` and for
-    /// manually-built clients. To opt a preset out, pass a config with both
+    /// manually-built clients. To opt a preset out, pass a config with all
     /// layers `None` — an empty config applies no wrapping at all.
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
     pub fn reliability(mut self, config: crate::reliability::ReliabilityConfig) -> Self {
@@ -1073,11 +1074,15 @@ impl CacheKitBuilder {
         };
 
         // Apply the reliability stack last so it decorates the final backend.
-        // A config with neither layer set is the documented opt-out: skip the
+        // A config with no layer set is the documented opt-out: skip the
         // (no-op) decorator entirely.
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         let backend = match self.reliability {
-            Some(config) if config.retry.is_some() || config.circuit_breaker.is_some() => {
+            Some(config)
+                if config.retry.is_some()
+                    || config.circuit_breaker.is_some()
+                    || config.backpressure.is_some() =>
+            {
                 crate::reliability::wrap_reliable(backend, config)
             }
             _ => backend,

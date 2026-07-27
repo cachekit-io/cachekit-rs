@@ -81,7 +81,7 @@ pub use cachekit_macros::cachekit;
 pub use flight::SingleFlight;
 
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-pub use reliability::{CircuitBreakerConfig, ReliabilityConfig, RetryConfig};
+pub use reliability::{BackpressureConfig, CircuitBreakerConfig, ReliabilityConfig, RetryConfig};
 
 // ── Shared jitter source ─────────────────────────────────────────────────────
 
