@@ -115,7 +115,11 @@ impl Default for CircuitBreakerConfig {
 /// [`crate::error::BackendErrorKind::Backpressure`] error — never queued
 /// unboundedly. Shed calls do not reach the backend and do not count toward
 /// opening the circuit breaker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// On the `#[cachekit]` macro's plain path a shed is outage-class — exactly
+/// like `CircuitOpen`, the wrapped function runs uncached (fail-open);
+/// `secure` paths fail closed on a shed like on every other backend error.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BackpressureConfig {
     /// Maximum backend data operations in flight at once (default: 100).
     /// `0` behaves as `1`.
@@ -853,6 +857,35 @@ mod tests {
             "must join the queue and wait out acquire_timeout — an instant \
              queue-full shed means the cancelled waiter leaked its slot"
         );
+    }
+
+    #[tokio::test]
+    async fn limiter_sheds_queue_full_at_nonzero_boundary() {
+        // cap 1, queue 1: with the permit held and one waiter parked, a
+        // third caller must shed instantly as queue-full — pinning the
+        // fetch_add boundary arithmetic at a nonzero max_queue.
+        let limiter = ConcurrencyLimiter::new(BackpressureConfig {
+            max_concurrent: 1,
+            max_queue: 1,
+            acquire_timeout: Duration::from_millis(200),
+        });
+        let _held = limiter.acquire().await.expect("first permit");
+        let waiter = async {
+            // Parks in the queue immediately and times out after 200 ms.
+            limiter.acquire().await
+        };
+        let third = async {
+            tokio::time::sleep(Duration::from_millis(50)).await; // waiter parked
+            let start = Instant::now();
+            let err = limiter.acquire().await.expect_err("queue of 1 is full");
+            assert_eq!(err.kind, BackendErrorKind::Backpressure);
+            assert!(
+                start.elapsed() < Duration::from_millis(100),
+                "queue-full sheds instantly, not after the wait timeout"
+            );
+        };
+        let (waited, ()) = tokio::join!(waiter, third);
+        waited.expect_err("the parked waiter itself times out");
     }
 
     #[test]
