@@ -410,9 +410,9 @@ let cache = CacheKit::production("redis://localhost:6379").await?
     })
     .build()?;
 
-// Opt a preset out: a config with all layers `None` applies no wrapping.
+// Opt a preset out: a disabled config applies no wrapping.
 let bare = CacheKit::production("redis://localhost:6379").await?
-    .reliability(ReliabilityConfig { retry: None, circuit_breaker: None, backpressure: None })
+    .reliability(ReliabilityConfig::disabled())
     .build()?;
 ```
 
