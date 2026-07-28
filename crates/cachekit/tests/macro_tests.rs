@@ -565,6 +565,7 @@ async fn macro_fails_open_when_circuit_is_open() {
                 open_timeout: Duration::from_secs(60),
                 ..CircuitBreakerConfig::default()
             }),
+            backpressure: None,
         })
         .no_l1()
         .build()
@@ -598,4 +599,146 @@ async fn macro_fails_open_when_circuit_is_open() {
         2,
         "both outage classes (transient, circuit-open) fall open to the body"
     );
+}
+
+// ── Backpressure fail-open (LAB-729) ─────────────────────────────────────────
+
+/// Backend whose `get` never completes — parks a caller on the single
+/// backpressure permit so every subsequent data op is shed.
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+#[derive(Debug, Default)]
+struct HangingInner {
+    calls: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+#[derive(Debug, Default, Clone)]
+struct HangingBackend {
+    inner: std::sync::Arc<HangingInner>,
+}
+
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+impl HangingBackend {
+    fn new_with_handle() -> (SharedBackend, Self) {
+        let backend = Self::default();
+        let handle = backend.clone();
+        #[cfg(not(feature = "unsync"))]
+        let shared: SharedBackend = std::sync::Arc::new(backend);
+        #[cfg(feature = "unsync")]
+        let shared: SharedBackend = std::rc::Rc::new(backend);
+        (shared, handle)
+    }
+}
+
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
+impl Backend for HangingBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        self.inner
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::future::pending().await
+    }
+
+    async fn set(
+        &self,
+        _key: &str,
+        _value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
+    async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Ok(HealthStatus {
+            is_healthy: true,
+            latency_ms: 0.0,
+            backend_type: "hanging".to_owned(),
+            details: HashMap::new(),
+        })
+    }
+}
+
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+static SHED_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+#[cachekit(client = cache, ttl = 60, interop = "shed_op", namespace = "reliab")]
+async fn shed_op(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
+    SHED_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(User {
+        name: format!("shed {id}"),
+    })
+}
+
+/// A backpressure shed is outage-class (LAB-729): like `CircuitOpen`, the
+/// call never reached the backend, so the plain path must run the body
+/// uncached instead of surfacing the `Backpressure` error.
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+#[tokio::test]
+async fn macro_fails_open_when_backpressure_sheds() {
+    use cachekit::reliability::{BackpressureConfig, ReliabilityConfig};
+
+    let (shared, handle) = HangingBackend::new_with_handle();
+    let cache = std::sync::Arc::new(
+        CacheKit::builder()
+            .backend(shared)
+            .reliability(ReliabilityConfig {
+                retry: None,
+                circuit_breaker: None,
+                backpressure: Some(BackpressureConfig {
+                    max_concurrent: 1,
+                    max_queue: 0,
+                    acquire_timeout: Duration::from_secs(5),
+                }),
+            })
+            .no_l1()
+            .build()
+            .expect("client builds"),
+    );
+
+    // Park one caller on the never-completing backend: it holds the single
+    // permit for the duration of the test.
+    let holder = {
+        let cache = std::sync::Arc::clone(&cache);
+        tokio::spawn(async move {
+            let _ = cache.get::<User>("holder").await;
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while handle.inner.calls.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "holder never reached the backend"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The macro's read is shed with Backpressure → the body must run
+    // uncached (the follow-up cache fill is shed too, and swallowed).
+    let user = shed_op(&cache, 7)
+        .await
+        .expect("a backpressure shed falls open like CircuitOpen");
+    assert_eq!(user.name, "shed 7");
+    assert_eq!(
+        SHED_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the body ran uncached"
+    );
+    assert_eq!(
+        handle.inner.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "shed calls never reached the backend"
+    );
+
+    holder.abort();
 }

@@ -12,10 +12,11 @@
 //! | `encrypted` | Redis | On | AES-256-GCM | Yes | On | 600 s |
 //! | `io` | cachekit.io | On | No | n/a (HTTP) | On | 3 600 s |
 //!
-//! ¹ Retry with backoff + jitter and a circuit breaker around backend ops
-//! (requires the `reliability` feature, on by default — see
-//! [`crate::reliability`]). Override via [`CacheKitBuilder::reliability`];
-//! a config with both layers `None` disables the stack entirely.
+//! ¹ Retry with backoff + jitter, a circuit breaker, and backpressure
+//! (bounded backend concurrency) around backend ops (requires the
+//! `reliability` feature, on by default — see [`crate::reliability`]).
+//! Override via [`CacheKitBuilder::reliability`]; a config with all layers
+//! `None` disables the stack entirely.
 
 use std::time::Duration;
 
@@ -43,8 +44,9 @@ impl CacheKit {
     ///   connection is not re-established)
     /// * L1 cache: **off**
     /// * Encryption: **no**
-    /// * Reliability: **off** — no retry, no circuit breaker; every backend
-    ///   error propagates on first failure
+    /// * Reliability: **off** — no retry, no circuit breaker, no
+    ///   backpressure; every backend error propagates on first failure and
+    ///   backend concurrency is unbounded
     /// * Default TTL: **300 s**
     ///
     /// Good for: product catalogs, public data, development.
@@ -82,7 +84,8 @@ impl CacheKit {
     ///   exponential backoff after a dropped connection)
     /// * L1 cache: **on** (1 000 entries)
     /// * Encryption: **no**
-    /// * Reliability: **on** — retry with backoff + jitter, circuit breaker
+    /// * Reliability: **on** — retry with backoff + jitter, circuit
+    ///   breaker, backpressure (max 100 concurrent backend ops)
     /// * Default TTL: **600 s**
     ///
     /// Good for: user sessions, API responses, production services.
@@ -124,7 +127,8 @@ impl CacheKit {
     ///   exponential backoff after a dropped connection)
     /// * L1 cache: **on** (1 000 entries, stores ciphertext)
     /// * Encryption: **AES-256-GCM** with HKDF-SHA256
-    /// * Reliability: **on** — retry with backoff + jitter, circuit breaker
+    /// * Reliability: **on** — retry with backoff + jitter, circuit
+    ///   breaker, backpressure (max 100 concurrent backend ops)
     /// * Default TTL: **600 s**
     /// * Tenant ID: `"default"` (override via
     ///   [`.encryption_from_bytes()`](CacheKitBuilder::encryption_from_bytes))
@@ -178,7 +182,8 @@ impl CacheKit {
     /// * L1 cache: **on** (1 000 entries)
     /// * Encryption: **no** (add via
     ///   [`.encryption()`](CacheKitBuilder::encryption))
-    /// * Reliability: **on** — retry with backoff + jitter, circuit breaker
+    /// * Reliability: **on** — retry with backoff + jitter, circuit
+    ///   breaker, backpressure (max 100 concurrent backend ops)
     /// * Default TTL: **3 600 s**
     ///
     /// Good for: serverless, edge compute, managed caching without Redis.

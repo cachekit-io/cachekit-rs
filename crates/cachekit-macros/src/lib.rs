@@ -228,8 +228,9 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   must be `Send`. Refresh failures are absorbed: the stale value keeps
 ///   serving until hard expiry, where the blocking path surfaces errors.
 /// - **Graceful degradation**: on an outage-class backend failure —
-///   transient, timeout, or an open circuit breaker — the plain path fails
-///   *open*: the function executes uncached and its result is returned.
+///   transient, timeout, an open circuit breaker, or a backpressure shed —
+///   the plain path fails *open*: the function executes uncached and its
+///   result is returned.
 ///   Permanent and authentication errors propagate even on the plain path
 ///   (a wrong API key must fail loudly, not silently disable caching
 ///   forever). With `secure`, *every* backend and decryption error fails
@@ -422,14 +423,19 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     }
 
     // Graceful degradation (LAB-518): on an OUTAGE-class backend failure —
-    // retryable (transient/timeout) or a fast-failing open circuit breaker —
-    // the plain path fails OPEN: the wrapped function runs uncached, so a
-    // cache outage costs performance, not availability. Permanent and
-    // authentication errors PROPAGATE even on the plain path: a wrong API
-    // key that silently fell open would run uncached forever with zero
-    // signal while looking healthy (expert-panel finding). The `secure`
-    // path stays fail-CLOSED on everything: backend and decryption errors
-    // reach the caller, so an encrypted workload never silently degrades.
+    // retryable (transient/timeout), a fast-failing open circuit breaker,
+    // or a backpressure shed (LAB-729) — the plain path fails OPEN: the
+    // wrapped function runs uncached, so a cache outage costs performance,
+    // not availability. A shed is the same class as CircuitOpen (the call
+    // never reached the backend), and failing open adds no work a cold-miss
+    // storm doesn't already create: the limiter bounds backend cache ops,
+    // not origin executions, and single-flight still dedupes those.
+    // Permanent and authentication errors PROPAGATE even on the plain path:
+    // a wrong API key that silently fell open would run uncached forever
+    // with zero signal while looking healthy (expert-panel finding). The
+    // `secure` path stays fail-CLOSED on everything: backend and decryption
+    // errors reach the caller, so an encrypted workload never silently
+    // degrades.
     let fail_open_arm = if args.secure {
         quote! {}
     } else {
@@ -439,6 +445,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                     || matches!(
                         __ck_be.kind,
                         cachekit::error::BackendErrorKind::CircuitOpen
+                            | cachekit::error::BackendErrorKind::Backpressure
                     ) => {}
         }
     };

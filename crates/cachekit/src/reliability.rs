@@ -1,16 +1,28 @@
-//! Reliability tier: retry with exponential backoff + jitter, and a
-//! closed/open/half-open circuit breaker around backend operations.
+//! Reliability tier: backpressure (bounded backend concurrency), retry with
+//! exponential backoff + jitter, and a closed/open/half-open circuit breaker
+//! around backend operations.
 //!
-//! Both are composed by a private `ReliableBackend` decorator around any
+//! All three are composed by a private `ReliableBackend` decorator around any
 //! [`crate::backend::Backend`], applied by the builder when a [`ReliabilityConfig`] is set
 //! (see [`crate::CacheKitBuilder::reliability`]). The intent presets
 //! `production`, `encrypted`, and `io` enable it by default; `minimal` does
 //! not — mirroring the TypeScript SDK's preset posture.
 //!
-//! Composition order matches the TypeScript SDK's `ReliabilityExecutor`:
-//! the retry loop is *inside* the breaker, so one exhausted retry sequence
-//! counts as a single breaker failure, and a fast-failing open breaker never
-//! spends time retrying.
+//! Composition order is `backpressure(breaker(retry(op)))`:
+//!
+//! - The retry loop is *inside* the breaker (matching the TypeScript SDK's
+//!   `ReliabilityExecutor`), so one exhausted retry sequence counts as a
+//!   single breaker failure, and a fast-failing open breaker never spends
+//!   time retrying.
+//! - The concurrency limiter is *outermost*: one permit per logical cache
+//!   operation, held across the entire breaker/retry sequence. That bounds
+//!   in-flight work including retry amplification (K callers mid-backoff are
+//!   still K permits — new work queues behind them instead of piling onto a
+//!   struggling backend), and a shed call never touches breaker counters or
+//!   half-open probe slots, so the breaker keeps measuring backend health,
+//!   not caller-side overload. A permit holder never re-enters the limiter
+//!   (backend ops don't nest), so holding permits across retry backoff
+//!   cannot deadlock.
 //!
 //! Unlike the TypeScript breaker (which counts every error), only errors
 //! classified retryable by [`crate::error::BackendErrorKind::is_retryable`] (`Transient`,
@@ -90,9 +102,50 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
+/// Backpressure configuration: bound how many backend data operations may be
+/// in flight at once, so a slow or failing backend cannot exhaust the
+/// caller's connection pool or memory.
+///
+/// Defaults mirror the Python SDK's `BackpressureConfig`
+/// (`max_concurrent_requests: 100`, `queue_size: 1000`, `timeout: 0.1s`).
+///
+/// Over-limit calls first join a bounded waiting queue; a caller that finds
+/// the queue full, or that waits longer than [`Self::acquire_timeout`]
+/// without a permit freeing up, is shed with a
+/// [`crate::error::BackendErrorKind::Backpressure`] error — never queued
+/// unboundedly. Shed calls do not reach the backend and do not count toward
+/// opening the circuit breaker.
+///
+/// On the `#[cachekit]` macro's plain path a shed is outage-class — exactly
+/// like `CircuitOpen`, the wrapped function runs uncached (fail-open);
+/// `secure` paths fail closed on a shed like on every other backend error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackpressureConfig {
+    /// Maximum backend data operations in flight at once (default: 100).
+    /// `0` behaves as `1`.
+    pub max_concurrent: usize,
+    /// Maximum callers waiting for a permit before further calls are shed
+    /// immediately (default: 1000). `0` disables waiting entirely: a call
+    /// that cannot take a permit on the spot is shed.
+    pub max_queue: usize,
+    /// How long a queued caller waits for a permit before it is shed
+    /// (default: 100 ms).
+    pub acquire_timeout: Duration,
+}
+
+impl Default for BackpressureConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 100,
+            max_queue: 1000,
+            acquire_timeout: Duration::from_millis(100),
+        }
+    }
+}
+
 /// Reliability stack configuration: which layers to apply around backend ops.
 ///
-/// The `Default` enables both layers with production defaults. Disable a
+/// The `Default` enables all layers with production defaults. Disable a
 /// layer by setting its field to `None`:
 ///
 /// ```
@@ -100,6 +153,7 @@ impl Default for CircuitBreakerConfig {
 ///
 /// let retry_only = ReliabilityConfig {
 ///     circuit_breaker: None,
+///     backpressure: None,
 ///     ..ReliabilityConfig::default()
 /// };
 /// assert!(retry_only.retry.is_some());
@@ -110,6 +164,8 @@ pub struct ReliabilityConfig {
     pub retry: Option<RetryConfig>,
     /// Circuit breaker, or `None` to never fail fast.
     pub circuit_breaker: Option<CircuitBreakerConfig>,
+    /// Concurrency limiter, or `None` for unbounded backend concurrency.
+    pub backpressure: Option<BackpressureConfig>,
 }
 
 impl Default for ReliabilityConfig {
@@ -117,6 +173,7 @@ impl Default for ReliabilityConfig {
         Self {
             retry: Some(RetryConfig::default()),
             circuit_breaker: Some(CircuitBreakerConfig::default()),
+            backpressure: Some(BackpressureConfig::default()),
         }
     }
 }
@@ -394,21 +451,101 @@ impl Drop for ProbePermit<'_> {
     }
 }
 
+// ── ConcurrencyLimiter ───────────────────────────────────────────────────────
+
+/// Bounds concurrent backend data operations with a semaphore and a bounded
+/// waiting queue (two-phase, like the Python SDK's `BackpressureController`):
+/// a saturated limiter admits up to `max_queue` waiters for at most
+/// `acquire_timeout` each; everyone else is shed with a
+/// [`crate::error::BackendErrorKind::Backpressure`] error.
+#[derive(Debug)]
+pub(crate) struct ConcurrencyLimiter {
+    semaphore: tokio::sync::Semaphore,
+    /// Callers currently waiting for a permit (phase-2 queue depth).
+    waiting: std::sync::atomic::AtomicUsize,
+    config: BackpressureConfig,
+}
+
+/// RAII guard for a slot in the waiting queue: decrements `waiting` on every
+/// exit path, including cancellation mid-`acquire` (same lesson as
+/// [`ProbePermit`] — manual increment/decrement pairs leak on cancel).
+struct QueueSlot<'a> {
+    waiting: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl Drop for QueueSlot<'_> {
+    fn drop(&mut self) {
+        self.waiting
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl ConcurrencyLimiter {
+    pub(crate) fn new(config: BackpressureConfig) -> Self {
+        Self {
+            // `Semaphore::new(0)` would shed every call after acquire_timeout
+            // with nothing ever admitted — clamp like RetryConfig's "0
+            // behaves as 1".
+            semaphore: tokio::sync::Semaphore::new(config.max_concurrent.max(1)),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+            config,
+        }
+    }
+
+    /// Take a permit, or shed the call.
+    ///
+    /// Phase 1: a free permit is taken on the spot — no queue accounting.
+    /// Phase 2 (saturated): join the bounded waiting queue and wait up to
+    /// `acquire_timeout` for a permit; queue-full and wait-timeout both shed
+    /// with a `Backpressure` error. The returned permit releases on drop, so
+    /// a cancelled or panicking caller can never leak capacity.
+    async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, BackendError> {
+        use std::sync::atomic::Ordering;
+
+        if let Ok(permit) = self.semaphore.try_acquire() {
+            return Ok(permit);
+        }
+        if self.waiting.fetch_add(1, Ordering::AcqRel) >= self.config.max_queue {
+            self.waiting.fetch_sub(1, Ordering::AcqRel);
+            return Err(BackendError::backpressure(format!(
+                "backpressure: waiting queue is full (max_queue={}), call shed without reaching the backend",
+                self.config.max_queue
+            )));
+        }
+        let _slot = QueueSlot {
+            waiting: &self.waiting,
+        };
+        match tokio::time::timeout(self.config.acquire_timeout, self.semaphore.acquire()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            // The semaphore is never closed; treat a close defensively as shed.
+            Ok(Err(_closed)) => Err(BackendError::backpressure(
+                "backpressure: limiter unavailable, call shed without reaching the backend",
+            )),
+            Err(_elapsed) => Err(BackendError::backpressure(format!(
+                "backpressure: timed out waiting for a permit after {:?}, call shed without reaching the backend",
+                self.config.acquire_timeout
+            ))),
+        }
+    }
+}
+
 // ── ReliableBackend ──────────────────────────────────────────────────────────
 
 /// Decorator that applies the reliability stack to every cache operation of
-/// an inner [`Backend`]: `breaker(retry(op))`.
+/// an inner [`Backend`]: `backpressure(breaker(retry(op)))`.
 ///
-/// - `get`/`set`/`delete`/`exists` are retried on retryable errors and gated
-///   by the circuit breaker.
+/// - `get`/`set`/`delete`/`exists` take a concurrency-limiter permit, are
+///   retried on retryable errors, and gated by the circuit breaker.
 /// - `health` passes through unguarded — it is a diagnostic and must keep
-///   reporting truthfully while the breaker fails data calls fast.
+///   reporting truthfully while the breaker fails data calls fast (or the
+///   limiter sheds them).
 /// - [`Backend::as_lockable`] forwards to the inner backend so distributed
-///   fill locks bypass retry/breaker (locks are best-effort advisory).
+///   fill locks bypass the stack (locks are best-effort advisory).
 pub(crate) struct ReliableBackend {
     inner: SharedBackend,
     retry: Option<RetryPolicy>,
     breaker: Option<CircuitBreaker>,
+    limiter: Option<ConcurrencyLimiter>,
 }
 
 impl ReliableBackend {
@@ -417,6 +554,7 @@ impl ReliableBackend {
             inner,
             retry: config.retry.map(RetryPolicy::new),
             breaker: config.circuit_breaker.map(CircuitBreaker::new),
+            limiter: config.backpressure.map(ConcurrencyLimiter::new),
         }
     }
 
@@ -425,6 +563,13 @@ impl ReliableBackend {
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T, BackendError>>,
     {
+        // Outermost layer: one permit per logical operation, held across the
+        // whole breaker/retry sequence (see the module docs for why). A shed
+        // call returns here — before touching breaker state.
+        let _permit = match &self.limiter {
+            Some(limiter) => Some(limiter.acquire().await?),
+            None => None,
+        };
         let permit = match &self.breaker {
             Some(cb) => Some(cb.try_acquire()?),
             None => None,
@@ -641,6 +786,108 @@ mod tests {
         p1.complete(&Outcome::Success);
         p2.complete(&Outcome::Success);
         assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn reliability_default_enables_backpressure_with_python_parity_defaults() {
+        let config = ReliabilityConfig::default();
+        let bp = config.backpressure.expect("backpressure is on by default");
+        assert_eq!(bp.max_concurrent, 100);
+        assert_eq!(bp.max_queue, 1000);
+        assert_eq!(bp.acquire_timeout, Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn limiter_clamps_zero_max_concurrent_to_one() {
+        let limiter = ConcurrencyLimiter::new(BackpressureConfig {
+            max_concurrent: 0,
+            max_queue: 0,
+            acquire_timeout: Duration::from_millis(10),
+        });
+        let permit = limiter
+            .acquire()
+            .await
+            .expect("0 behaves as 1 — one permit exists");
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn limiter_sheds_immediately_when_queue_disabled() {
+        let limiter = ConcurrencyLimiter::new(BackpressureConfig {
+            max_concurrent: 1,
+            max_queue: 0,
+            acquire_timeout: Duration::from_secs(5),
+        });
+        let _held = limiter.acquire().await.expect("first permit");
+        let start = Instant::now();
+        let err = limiter
+            .acquire()
+            .await
+            .expect_err("saturated with no waiting queue");
+        assert_eq!(err.kind, BackendErrorKind::Backpressure);
+        assert!(!err.kind.is_retryable());
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "queue-full sheds immediately, not after acquire_timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn limiter_waiting_slot_released_on_cancelled_wait() {
+        // A waiter cancelled mid-acquire (caller timeout / select!) must free
+        // its queue slot via the QueueSlot drop guard. With max_queue: 1, a
+        // leaked slot would shed the next waiter instantly as queue-full;
+        // joining the queue (observable as waiting out the acquire_timeout)
+        // proves the slot was released.
+        let limiter = ConcurrencyLimiter::new(BackpressureConfig {
+            max_concurrent: 1,
+            max_queue: 1,
+            acquire_timeout: Duration::from_millis(100),
+        });
+        let _held = limiter.acquire().await.expect("first permit");
+        let cancelled = tokio::time::timeout(Duration::from_millis(20), limiter.acquire()).await;
+        assert!(cancelled.is_err(), "waiter cancelled from outside");
+
+        let start = Instant::now();
+        let err = limiter
+            .acquire()
+            .await
+            .expect_err("permit never frees, waiter times out");
+        assert_eq!(err.kind, BackendErrorKind::Backpressure);
+        assert!(
+            start.elapsed() >= Duration::from_millis(80),
+            "must join the queue and wait out acquire_timeout — an instant \
+             queue-full shed means the cancelled waiter leaked its slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn limiter_sheds_queue_full_at_nonzero_boundary() {
+        // cap 1, queue 1: with the permit held and one waiter parked, a
+        // third caller must shed instantly as queue-full — pinning the
+        // fetch_add boundary arithmetic at a nonzero max_queue.
+        let limiter = ConcurrencyLimiter::new(BackpressureConfig {
+            max_concurrent: 1,
+            max_queue: 1,
+            acquire_timeout: Duration::from_millis(200),
+        });
+        let _held = limiter.acquire().await.expect("first permit");
+        let waiter = async {
+            // Parks in the queue immediately and times out after 200 ms.
+            limiter.acquire().await
+        };
+        let third = async {
+            tokio::time::sleep(Duration::from_millis(50)).await; // waiter parked
+            let start = Instant::now();
+            let err = limiter.acquire().await.expect_err("queue of 1 is full");
+            assert_eq!(err.kind, BackendErrorKind::Backpressure);
+            assert!(
+                start.elapsed() < Duration::from_millis(100),
+                "queue-full sheds instantly, not after the wait timeout"
+            );
+        };
+        let (waited, ()) = tokio::join!(waiter, third);
+        waited.expect_err("the parked waiter itself times out");
     }
 
     #[test]
