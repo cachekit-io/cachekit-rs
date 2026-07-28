@@ -507,9 +507,10 @@ impl ConcurrencyLimiter {
         }
         if self.waiting.fetch_add(1, Ordering::AcqRel) >= self.config.max_queue {
             self.waiting.fetch_sub(1, Ordering::AcqRel);
-            return Err(BackendError::backpressure(
-                "backpressure: waiting queue is full, call shed without reaching the backend",
-            ));
+            return Err(BackendError::backpressure(format!(
+                "backpressure: waiting queue is full (max_queue={}), call shed without reaching the backend",
+                self.config.max_queue
+            )));
         }
         let _slot = QueueSlot {
             waiting: &self.waiting,
@@ -520,9 +521,10 @@ impl ConcurrencyLimiter {
             Ok(Err(_closed)) => Err(BackendError::backpressure(
                 "backpressure: limiter unavailable, call shed without reaching the backend",
             )),
-            Err(_elapsed) => Err(BackendError::backpressure(
-                "backpressure: timed out waiting for a permit, call shed without reaching the backend",
-            )),
+            Err(_elapsed) => Err(BackendError::backpressure(format!(
+                "backpressure: timed out waiting for a permit after {:?}, call shed without reaching the backend",
+                self.config.acquire_timeout
+            ))),
         }
     }
 }

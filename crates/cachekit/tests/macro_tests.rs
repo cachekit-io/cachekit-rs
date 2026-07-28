@@ -714,7 +714,12 @@ async fn macro_fails_open_when_backpressure_sheds() {
             let _ = cache.get::<User>("holder").await;
         })
     };
-    while handle.inner.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while handle.inner.calls.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "holder never reached the backend"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 

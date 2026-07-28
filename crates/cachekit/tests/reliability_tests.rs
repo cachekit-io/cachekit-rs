@@ -774,6 +774,20 @@ impl Backend for GateBackend {
     }
 }
 
+/// Poll until the gated backend has admitted at least one call. Bounded and
+/// relational (`< 1`, deadline) so a regression fails the test fast instead
+/// of hanging CI on an equality-terminated spin.
+async fn wait_for_backend_entry(handle: &GateBackend) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while handle.calls() < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "holder never reached the backend"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 #[tokio::test]
 async fn backpressure_caps_concurrent_backend_ops() {
     // AC (LAB-729): with the cap at K, no more than K backend ops are ever in
@@ -826,9 +840,7 @@ async fn backpressure_sheds_immediately_when_queue_disabled() {
         tokio::spawn(async move { client.get::<u32>("k").await })
     };
     // Let the holder reach the backend and park on the gate.
-    while handle.calls() == 0 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for_backend_entry(&handle).await;
 
     let start = std::time::Instant::now();
     let err = client
@@ -865,9 +877,7 @@ async fn backpressure_times_out_waiting_then_sheds() {
         let client = Arc::clone(&client);
         tokio::spawn(async move { client.get::<u32>("k").await })
     };
-    while handle.calls() == 0 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for_backend_entry(&handle).await;
 
     let start = std::time::Instant::now();
     let err = client
@@ -908,9 +918,7 @@ async fn backpressure_rejections_do_not_open_the_breaker() {
         let client = Arc::clone(&client);
         tokio::spawn(async move { client.get::<u32>("k").await })
     };
-    while handle.calls() == 0 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for_backend_entry(&handle).await;
 
     for _ in 0..3 {
         let err = client
