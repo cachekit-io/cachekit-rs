@@ -15,8 +15,9 @@
 //! ¹ Retry with backoff + jitter, a circuit breaker, and backpressure
 //! (bounded backend concurrency) around backend ops (requires the
 //! `reliability` feature, on by default — see [`crate::reliability`]).
-//! Override via [`CacheKitBuilder::reliability`]; a config with all layers
-//! `None` disables the stack entirely.
+//! Override via [`CacheKitBuilder::reliability`];
+//! [`ReliabilityConfig::disabled()`](crate::reliability::ReliabilityConfig::disabled)
+//! turns the stack off entirely.
 
 use std::time::Duration;
 
