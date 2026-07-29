@@ -487,14 +487,19 @@ make build-wasm    # wasm32-unknown-unknown (workers feature)
 the RustSec advisory database — which is why it is not folded into
 `quick-check`.
 
-Both tools are required, because they answer different questions:
+Both tools are required, because they answer different questions. "Fails" below
+means it turns the check red — anything else is reported but not enforced:
 
-| | `cargo deny` | `cargo audit` |
+| | `cargo deny --locked --all-features check` | `cargo audit` |
 | :--- | :--- | :--- |
 | Reads | feature-resolved dependency graph | `Cargo.lock` verbatim |
-| Licence allowlist, banned crates, registry/source policy (`deny.toml`) | ✅ | ❌ |
-| Advisories against crates no feature activates | ❌ (pruned) | ✅ |
-| Unsound/unmaintained advisories on *transitive* deps | ❌ (defaults to `workspace` scope) | ✅ |
+| Licence allowlist, banned crates, registry/source policy | **fails** | not checked |
+| Vulnerabilities in crates no enabled feature activates | not seen (pruned) | **fails** |
+| Unsound / unmaintained advisories on *transitive* deps | not seen — `deny.toml` narrows both to `workspace` scope | reports only, does **not** fail |
+
+`--all-features` is load-bearing: the default feature set excludes the
+`memcached`, `redis`, `file` and `macros` backends, so a banned crate
+reintroduced behind an optional feature passes a bare `cargo deny check`.
 
 `deny.toml` is the policy — notably a hard ban on `openssl-sys`, `native-tls`
 and `toxiproxy_rust`, because this SDK is rustls-only. Run `make deny` before

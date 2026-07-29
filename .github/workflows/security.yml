@@ -1,10 +1,7 @@
 name: Security
 
-# Runner for the policy in `deny.toml`. That file has encoded a real, expert-panel
-# decision since LAB-429 (rustls-only: openssl-sys / native-tls / toxiproxy_rust
-# banned) but nothing ever executed it — its presence implied an invariant CI did
-# not enforce, so the regression it exists to catch would have shipped green
-# (LAB-1128). The policy is unchanged here; only the runner is new.
+# Runner for deny.toml, which shipped with no runner at all until LAB-1128 — its
+# presence implied an invariant CI did not enforce. The policy is unchanged.
 
 on:
   push:
@@ -12,9 +9,9 @@ on:
   pull_request:
     branches: [main]
   # Advisories land against a lockfile that has not changed, so a PR-only gate
-  # never sees them. Weekly re-scan turns "no new commits" into a signal instead
-  # of silence; Renovate (renovate.json) is live to act on what it finds.
-  # Off-minute avoids the cron pile-up GitHub schedules at :00.
+  # never sees them. This is the one gap Renovate structurally cannot cover: it
+  # reacts to upstream releases, not to RustSec publications against pinned
+  # versions. Off-minute avoids the pile-up GitHub schedules at :00.
   schedule:
     - cron: '23 5 * * 1'
 
@@ -23,44 +20,40 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # PRs only. `schedule` and `push: main` share a github.ref, so a blanket
+  # cancel lets routine merge traffic silently kill the weekly advisory
+  # re-scan — the one run that exists to catch what no PR touches.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # Rustup's temp dir must be on the same filesystem as RUSTUP_HOME to avoid
-  # cross-device link errors on container overlay filesystems (see ci.yml).
+  # Same rationale as ci.yml: rustup's temp dir must share a filesystem with
+  # RUSTUP_HOME, and -j must be capped or cargo reads the node's core count
+  # instead of the 6Gi pod cgroup and OOM-kills the linker (lab ADR-0001).
   RUSTUP_HOME: /tmp/rustup
   CARGO_HOME: /tmp/cargo
-  # cachekit-lean has a hard 6Gi memory cgroup, and cargo defaults -j to the
-  # pod's visible core count (~24) — enough fan-out to OOM-kill the linker
-  # (lab ADR-0001, LAB-836, cachekit-core#51). Same cap as ci.yml.
   CARGO_BUILD_JOBS: "4"
-  CARGO_TERM_COLOR: always
-  # Pinned so the gate cannot silently change meaning without a diff. Renovate
-  # bumps these like any other pin.
+  # Pinned so the gate cannot change meaning without a diff. Renovate bumps
+  # these like any other pin; the cache key below is derived from them.
   CARGO_DENY_VERSION: "0.19.4"
   CARGO_AUDIT_VERSION: "0.22.1"
-  # Deliberately NOT $CARGO_HOME/bin: rustup owns that directory's shims, and a
+  # Deliberately not $CARGO_HOME/bin: rustup owns that directory's shims, and a
   # restored cache landing on top of them is a subtle way to break the toolchain.
   TOOL_ROOT: /tmp/security-tools
 
 jobs:
   supply-chain:
-    name: supply-chain
-    # cachekit-lean (no-dind): neither tool needs Docker — cargo-deny resolves
-    # `cargo metadata`, cargo-audit reads Cargo.lock. No reason to occupy the
-    # scarcer with-dind `cachekit` scaleset. `gh` is absent on ARC runners
-    # (LAB-899); nothing here shells out to it.
+    # cachekit-lean: neither tool needs Docker — cargo-deny resolves `cargo
+    # metadata`, cargo-audit reads Cargo.lock — so there is no reason to occupy
+    # the scarcer with-dind scaleset.
     runs-on: cachekit-lean
-    # Generous only for a cold tool cache (both tools compile from source below).
-    # A warm run is ~1min.
-    timeout-minutes: 40
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          # This job never pushes; don't leave the token on a self-hosted
-          # runner workspace (zizmor: artipacked).
-          persist-credentials: false
-
+      # Checkout is deliberately LAST. cargo honours a `.cargo/config.toml`
+      # found in the working directory, so building the enforcement binaries
+      # with an untrusted PR tree on disk would let that PR set `rustc-wrapper`
+      # or `[source.crates-io] replace-with` and substitute the very tools that
+      # then vouch for it. Nothing attacker-controlled exists until the tools
+      # are already built.
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
@@ -69,62 +62,67 @@ jobs:
       - name: Restore pinned security tools
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
-          # Only the two tool binaries + cargo's install ledger. No project build
-          # artifacts and no advisory database — the DB must be fetched fresh on
-          # every run or the gate reports yesterday's threat model.
+          # Tool binaries and cargo's install ledger only. No project build
+          # artifacts, and deliberately no advisory database — that must be
+          # fetched fresh or the gate reports yesterday's threat model.
           path: |
-            /tmp/security-tools/bin
-            /tmp/security-tools/.crates.toml
-            /tmp/security-tools/.crates2.json
+            ${{ env.TOOL_ROOT }}/bin
+            ${{ env.TOOL_ROOT }}/.crates.toml
+            ${{ env.TOOL_ROOT }}/.crates2.json
           key: ${{ runner.os }}-sectools-deny${{ env.CARGO_DENY_VERSION }}-audit${{ env.CARGO_AUDIT_VERSION }}
 
       - name: Install cargo-deny and cargo-audit (pinned)
-        # Compiled from pinned crates.io sources rather than pulled as prebuilt
-        # binaries by a marketplace installer: a prebuilt-binary action would be
-        # faster, but it adds a third-party action to the trust surface of the
-        # supply-chain gate itself. This matches cachekit-core's security.yml,
-        # with the version pins that one lacks. `cargo install` is a no-op (exit
-        # 0) when the cached root already holds the exact version.
+        # Compiled from pinned crates.io sources rather than fetched as prebuilt
+        # binaries by a marketplace installer: the faster option would add a
+        # third-party action to the trust surface of the supply-chain gate
+        # itself. Matches cachekit-core's security.yml, with version pins.
+        #
+        # The existence guard is not an optimisation. `cargo install` aborts
+        # with exit 101 ("binary already exists in destination") if the cache
+        # restores bin/ without the ledger, and the key is immutable, so every
+        # re-run would restore the same broken state — a permanently red
+        # required check with no self-heal. The key pins exact versions, so a
+        # present binary is by construction the right one.
         run: |
-          cargo install cargo-deny  --locked --version "$CARGO_DENY_VERSION"  --root "$TOOL_ROOT"
-          cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION" --root "$TOOL_ROOT"
+          [ -x "$TOOL_ROOT/bin/cargo-deny" ]  || cargo install cargo-deny  --locked --version "$CARGO_DENY_VERSION"  --root "$TOOL_ROOT"
+          [ -x "$TOOL_ROOT/bin/cargo-audit" ] || cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION" --root "$TOOL_ROOT"
           echo "$TOOL_ROOT/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # This job never pushes; don't leave the token on a self-hosted
+          # runner workspace (zizmor: artipacked).
+          persist-credentials: false
 
       - name: cargo deny (advisories + bans + licenses + sources)
         # --all-features is load-bearing, not tidiness. cargo-deny builds a
-        # feature-aware graph, and cachekit-rs's default features exclude the
-        # memcached, redis, file and macros backends. Verified on this tree
-        # (2026-07-29, cargo-deny 0.19.4) by planting `native-tls` behind the
-        # `memcached` feature — the exact shape of the LAB-429 regression:
-        #     cargo deny check bans                 -> exit 0, "bans ok"
-        #     cargo deny --all-features check bans  -> exit 2, native-tls +
-        #                                              openssl-sys banned
-        # A bare `cargo deny check` here would be a second fail-open gate. The
-        # flag is on the command line, not in deny.toml, per cargo-deny's own
-        # guidance for conditionally enabling all-features.
-        run: cargo deny --all-features check
+        # feature-aware graph and this crate's default features exclude the
+        # memcached, redis, file and macros backends — so a banned crate
+        # reintroduced behind an optional feature, which is exactly the LAB-429
+        # regression shape, passes a bare `cargo deny check` while failing this
+        # one. Verified by planting native-tls behind `memcached`. The flag
+        # lives here rather than in deny.toml per cargo-deny's own guidance.
+        #
+        # --locked: cargo-deny shells out to `cargo metadata`, which will
+        # silently regenerate Cargo.lock when Cargo.toml has drifted. Without
+        # this, deny grades an uncommitted graph while audit grades the
+        # committed one.
+        run: cargo deny --locked --all-features check
 
       - name: cargo audit (lockfile advisories)
-        # Not redundant with cargo deny — they answer different questions, and
-        # on this tree they disagree twice:
+        # Complements cargo deny rather than duplicating it — see the table in
+        # README.md for the full split. The short version: cargo-deny prunes
+        # crates that no enabled feature activates, and cachekit-rs is a
+        # published library, so its lockfile is a lower bound on what a
+        # consumer's feature unification can reach. This step is what fails the
+        # build on a vulnerability in that pruned remainder.
         #
-        #  1. Graph vs lockfile. cargo-deny prunes crates no feature activates;
-        #     cargo-audit reads Cargo.lock verbatim. `quinn-proto` sits in the
-        #     lock via reqwest, but reqwest is declared default-features = false
-        #     with only rustls-tls + json — no `http3` — so `cargo tree -i
-        #     quinn-proto` matches nothing. deny stayed green on
-        #     RUSTSEC-2026-0185; audit caught it.
-        #  2. Scope. cargo-deny's `unsound`/`unmaintained` default to "workspace"
-        #     — only *direct* workspace dependencies fail. Transitive ones (e.g.
-        #     rand 0.8.5 / RUSTSEC-2026-0097 via fred and memcache) are silent
-        #     there and reported here.
+        # Informational (unsound / unmaintained) advisories are reported here,
+        # not enforced — cargo-audit exits 0 on them. Enforcing would mean any
+        # newly published advisory against any transitive crate blocks every
+        # open PR regardless of its diff; that treadmill is a known cost in
+        # this org. Vulnerabilities do fail, which is the coverage deny lacks.
         #
-        # cachekit-rs is a published library, so the lockfile is a lower bound on
-        # what a downstream consumer's feature unification can activate: audit's
-        # broader net is the correct conservative default, and deny enforces the
-        # licence/ban/source policy audit cannot express. Neither replaces the
-        # other; GitHub-native alerting replaces neither.
-        #
-        # Runs even when the step above failed so one PR shows both verdicts.
+        # Runs even when the step above failed so one run shows both verdicts.
         if: ${{ !cancelled() }}
         run: cargo audit

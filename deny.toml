@@ -1,14 +1,16 @@
 [advisories]
-# cargo-deny 0.19: vulnerability advisories deny unconditionally, but
-# `unmaintained` and `unsound` are SCOPES, not booleans — both default to
-# "workspace", meaning they only fail for *direct* workspace dependencies. A
-# transitive unsound advisory therefore passes silently here (verified on this
-# tree, LAB-1128: rand 0.8.5 / RUSTSEC-2026-0097, reached via fred and memcache,
-# is not reported). CI pairs this file with `cargo audit`, which reads the
-# lockfile verbatim, to cover that blind spot — .github/workflows/security.yml.
+# cargo-deny 0.19: vulnerability advisories always deny. `unmaintained` and
+# `unsound` are SCOPES, not booleans, and their defaults differ — unmaintained
+# defaults to "all", unsound to "workspace" (direct workspace deps only).
+# So the line below NARROWS unmaintained from its default. It is not a
+# redundant restatement, and deleting it would tighten this gate.
+# Consequence: transitive unsound/unmaintained advisories are not reported here
+# (e.g. rand 0.8.5 / RUSTSEC-2026-0097, reached via fred and memcache).
+# `cargo audit` in .github/workflows/security.yml lists them, but does not fail
+# on them either — widening both scopes to "all" is open work, not covered.
 # yanked: warn instead of hard-fail so renovate can fix.
 yanked = "warn"
-unmaintained = "workspace"  # explicit, though it is also the default
+unmaintained = "workspace"
 
 [licenses]
 allow = [
