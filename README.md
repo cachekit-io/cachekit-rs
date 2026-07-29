@@ -475,10 +475,30 @@ cachekit-rs/
 
 ```bash
 make quick-check   # fmt + clippy + test (run before every commit)
+make security      # cargo deny + cargo audit (the CI supply-chain gate)
 make test          # cargo test --all-features
 make build         # cargo build --release
 make build-wasm    # wasm32-unknown-unknown (workers feature)
 ```
+
+`make security` runs the same two commands as the `supply-chain` job in
+`.github/workflows/security.yml`, so a local pass means a CI pass. It needs
+`cargo-deny` and `cargo-audit` installed, and it reaches the network to refresh
+the RustSec advisory database — which is why it is not folded into
+`quick-check`.
+
+Both tools are required, because they answer different questions:
+
+| | `cargo deny` | `cargo audit` |
+| :--- | :--- | :--- |
+| Reads | feature-resolved dependency graph | `Cargo.lock` verbatim |
+| Licence allowlist, banned crates, registry/source policy (`deny.toml`) | ✅ | ❌ |
+| Advisories against crates no feature activates | ❌ (pruned) | ✅ |
+| Unsound/unmaintained advisories on *transitive* deps | ❌ (defaults to `workspace` scope) | ✅ |
+
+`deny.toml` is the policy — notably a hard ban on `openssl-sys`, `native-tls`
+and `toxiproxy_rust`, because this SDK is rustls-only. Run `make deny` before
+adding or bumping a dependency.
 
 ## Minimum Supported Rust Version
 
