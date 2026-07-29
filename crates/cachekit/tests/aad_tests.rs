@@ -53,9 +53,11 @@ fn aad_v03_compressed_true() {
     let layer = test_layer("test");
     let aad = layer.build_aad("mykey", true);
 
-    // b"True" is a frozen byte-level protocol constant (protocol#12) — not a rendering
-    // of any language's boolean type. Production never passes compressed=true (see
-    // build_aad's invariant note); this test pins the constant the spec mandates.
+    // b"True" (54 72 75 65) is a frozen byte-level protocol constant — not a rendering
+    // of any language's boolean type. Normative byte table: protocol/spec/encryption.md,
+    // section "`compressed` tokens"; frozen by protocol#12 (resolved 2026-07-19).
+    // Production never passes compressed=true (see build_aad's invariant note); this
+    // test is what keeps those bytes pinned.
     assert!(
         aad.ends_with(b"True"),
         "compressed=true AAD must end with b\"True\"; got: {:?}",
