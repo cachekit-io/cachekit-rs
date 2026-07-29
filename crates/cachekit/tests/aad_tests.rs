@@ -53,7 +53,9 @@ fn aad_v03_compressed_true() {
     let layer = test_layer("test");
     let aad = layer.build_aad("mykey", true);
 
-    // Python format: compressed flag is "True" (capital T, Python-style bool repr)
+    // b"True" is a frozen byte-level protocol constant (protocol#12) — not a rendering
+    // of any language's boolean type. Production never passes compressed=true (see
+    // build_aad's invariant note); this test pins the constant the spec mandates.
     assert!(
         aad.ends_with(b"True"),
         "compressed=true AAD must end with b\"True\"; got: {:?}",

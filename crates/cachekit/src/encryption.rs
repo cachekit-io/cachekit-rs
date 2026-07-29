@@ -85,6 +85,7 @@ impl EncryptionLayer {
     ///
     /// Output format: `[nonce(12)][ciphertext + auth_tag(16)]`
     pub fn encrypt(&self, plaintext: &[u8], cache_key: &str) -> Result<Vec<u8>, CachekitError> {
+        // compressed=false is normative, not a stub — see build_aad's invariant note.
         let aad = self.build_aad(cache_key, false);
         self.encryptor
             .encrypt_aes_gcm(plaintext, &*self.derived_key, &aad)
@@ -96,6 +97,7 @@ impl EncryptionLayer {
     /// Returns the original plaintext. Fails if the cache key does not match
     /// the one used during encryption (ciphertext substitution protection).
     pub fn decrypt(&self, ciphertext: &[u8], cache_key: &str) -> Result<Vec<u8>, CachekitError> {
+        // compressed=false is normative, not a stub — see build_aad's invariant note.
         let aad = self.build_aad(cache_key, false);
         self.encryptor
             .decrypt_aes_gcm(ciphertext, &*self.derived_key, &aad)
@@ -112,6 +114,23 @@ impl EncryptionLayer {
     /// Format: `[0x03][len][tenant_id][len][cache_key][len]["msgpack"][len]["True"/"False"]`
     ///
     /// All lengths are 4-byte big-endian u32 to prevent boundary-confusion attacks.
+    ///
+    /// # Invariant: `compressed` is always `false` in production
+    ///
+    /// `encrypt` and `decrypt` pass the literal `false`, and that is normative, not a
+    /// gap: this SDK's only cross-SDK encrypted surface is interop mode, and the
+    /// protocol spec (`spec/interop-mode.md`, "Encryption in Interop Mode") mandates
+    /// the AAD components `format = "msgpack"`, `compressed = "False"` — there is no
+    /// compression in interop mode. Passing `true` here would emit an AAD no
+    /// conformant peer can reconstruct (readers rebuild AAD from the key alone and
+    /// MUST NOT retry with alternative inputs per `spec/encryption.md`), so AES-GCM
+    /// authentication would fail cross-SDK. Do not thread a live compression flag
+    /// through `encrypt`/`decrypt`; a compressed cross-SDK profile is a versioned
+    /// protocol change (tracked as interop/v2, Multica LAB-1135), not an SDK flag.
+    ///
+    /// The `"True"`/`"False"` tokens are frozen byte-level protocol constants
+    /// ([protocol#12](https://github.com/cachekit-io/protocol/issues/12)); the `true`
+    /// branch stays, exercised by conformance tests, so those bytes remain pinned.
     pub fn build_aad(&self, cache_key: &str, compressed: bool) -> Vec<u8> {
         let format_str = b"msgpack";
         let compressed_str = if compressed {
