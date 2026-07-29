@@ -27,8 +27,10 @@ memcached = ["dep:memcache", "tokio/rt", "tokio/time"]
 # constants and rustix provides safe flock/geteuid on unix.
 file = ["tokio/rt", "tokio/sync", "dep:libc", "dep:rustix"]
 workers = ["dep:worker", "dep:js-sys", "dep:getrandom", "dep:serde_json"]
-# cachekit-core 0.2 folds aes-gcm into the `encryption` feature automatically on wasm32.
-# No separate `cachekit-core/wasm` activation needed.
+# cachekit-core's `encryption` feature folds aes-gcm in automatically on wasm32
+# (`wasm` is a pure alias for `encryption`). No separate `cachekit-core/wasm`
+# activation needed. Deliberately version-free: the fact is version-independent,
+# and a pinned version in prose is the only part that rots (LAB-866 precedent).
 encryption = ["cachekit-core/encryption"]
 # tokio/rt provides Handle::try_current + spawn for the L1 stale-while-
 # revalidate background refresh (native only — `workers`+`l1` is a compile
@@ -43,7 +45,7 @@ reliability = ["tokio/time"]
 unsync = []
 
 [dependencies]
-cachekit-core = { version = "0.3", features = ["messagepack"] }
+cachekit-core = { version = "0.4", features = ["messagepack"] }
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
 thiserror = "2.0"
