@@ -1,0 +1,128 @@
+name: Security
+
+# Runner for deny.toml, which shipped with no runner at all until LAB-1128 — its
+# presence implied an invariant CI did not enforce. The policy is unchanged.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Advisories land against a lockfile that has not changed, so a PR-only gate
+  # never sees them. This is the one gap Renovate structurally cannot cover: it
+  # reacts to upstream releases, not to RustSec publications against pinned
+  # versions. Off-minute avoids the pile-up GitHub schedules at :00.
+  schedule:
+    - cron: '23 5 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # PRs only. `schedule` and `push: main` share a github.ref, so a blanket
+  # cancel lets routine merge traffic silently kill the weekly advisory
+  # re-scan — the one run that exists to catch what no PR touches.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Same rationale as ci.yml: rustup's temp dir must share a filesystem with
+  # RUSTUP_HOME, and -j must be capped or cargo reads the node's core count
+  # instead of the 6Gi pod cgroup and OOM-kills the linker (lab ADR-0001).
+  RUSTUP_HOME: /tmp/rustup
+  CARGO_HOME: /tmp/cargo
+  CARGO_BUILD_JOBS: "4"
+  # Pinned so the gate cannot change meaning without a diff. Renovate bumps
+  # these like any other pin; the cache key below is derived from them.
+  CARGO_DENY_VERSION: "0.19.4"
+  CARGO_AUDIT_VERSION: "0.22.1"
+  # Deliberately not $CARGO_HOME/bin: rustup owns that directory's shims, and a
+  # restored cache landing on top of them is a subtle way to break the toolchain.
+  TOOL_ROOT: /tmp/security-tools
+
+jobs:
+  supply-chain:
+    # cachekit-lean: neither tool needs Docker — cargo-deny resolves `cargo
+    # metadata`, cargo-audit reads Cargo.lock — so there is no reason to occupy
+    # the scarcer with-dind scaleset.
+    runs-on: cachekit-lean
+    timeout-minutes: 20
+    steps:
+      # Checkout is deliberately LAST. cargo honours a `.cargo/config.toml`
+      # found in the working directory, so building the enforcement binaries
+      # with an untrusted PR tree on disk would let that PR set `rustc-wrapper`
+      # or `[source.crates-io] replace-with` and substitute the very tools that
+      # then vouch for it. Nothing attacker-controlled exists until the tools
+      # are already built.
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Restore pinned security tools
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          # Tool binaries and cargo's install ledger only. No project build
+          # artifacts, and deliberately no advisory database — that must be
+          # fetched fresh or the gate reports yesterday's threat model.
+          path: |
+            ${{ env.TOOL_ROOT }}/bin
+            ${{ env.TOOL_ROOT }}/.crates.toml
+            ${{ env.TOOL_ROOT }}/.crates2.json
+          key: ${{ runner.os }}-sectools-deny${{ env.CARGO_DENY_VERSION }}-audit${{ env.CARGO_AUDIT_VERSION }}
+
+      - name: Install cargo-deny and cargo-audit (pinned)
+        # Compiled from pinned crates.io sources rather than fetched as prebuilt
+        # binaries by a marketplace installer: the faster option would add a
+        # third-party action to the trust surface of the supply-chain gate
+        # itself. Matches cachekit-core's security.yml, with version pins.
+        #
+        # The existence guard is not an optimisation. `cargo install` aborts
+        # with exit 101 ("binary already exists in destination") if the cache
+        # restores bin/ without the ledger, and the key is immutable, so every
+        # re-run would restore the same broken state — a permanently red
+        # required check with no self-heal. The key pins exact versions, so a
+        # present binary is by construction the right one.
+        run: |
+          [ -x "$TOOL_ROOT/bin/cargo-deny" ]  || cargo install cargo-deny  --locked --version "$CARGO_DENY_VERSION"  --root "$TOOL_ROOT"
+          [ -x "$TOOL_ROOT/bin/cargo-audit" ] || cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION" --root "$TOOL_ROOT"
+          echo "$TOOL_ROOT/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # This job never pushes; don't leave the token on a self-hosted
+          # runner workspace (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: cargo deny (advisories + bans + licenses + sources)
+        # --all-features is load-bearing, not tidiness. cargo-deny builds a
+        # feature-aware graph and this crate's default features exclude the
+        # memcached, redis, file and macros backends — so a banned crate
+        # reintroduced behind an optional feature, which is exactly the LAB-429
+        # regression shape, passes a bare `cargo deny check` while failing this
+        # one. Verified by planting native-tls behind `memcached`. The flag
+        # lives here rather than in deny.toml per cargo-deny's own guidance.
+        #
+        # --locked: cargo-deny shells out to `cargo metadata`, which will
+        # silently regenerate Cargo.lock when Cargo.toml has drifted. Without
+        # this, deny grades an uncommitted graph while audit grades the
+        # committed one.
+        run: cargo deny --locked --all-features check
+
+      - name: cargo audit (lockfile advisories)
+        # Complements cargo deny rather than duplicating it — see the table in
+        # README.md for the full split. The short version: cargo-deny prunes
+        # crates that no enabled feature activates, and cachekit-rs is a
+        # published library, so its lockfile is a lower bound on what a
+        # consumer's feature unification can reach. This step is what fails the
+        # build on a vulnerability in that pruned remainder.
+        #
+        # Informational (unsound / unmaintained) advisories are reported here,
+        # not enforced — cargo-audit exits 0 on them. Enforcing would mean any
+        # newly published advisory against any transitive crate blocks every
+        # open PR regardless of its diff; that treadmill is a known cost in
+        # this org. Vulnerabilities do fail, which is the coverage deny lacks.
+        #
+        # Runs even when the step above failed so one run shows both verdicts.
+        if: ${{ !cancelled() }}
+        run: cargo audit
