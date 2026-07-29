@@ -495,7 +495,7 @@ means it turns the check red — anything else is reported but not enforced:
 | Reads | feature-resolved dependency graph | `Cargo.lock` verbatim |
 | Licence allowlist, banned crates, registry/source policy | **fails** | not checked |
 | Vulnerabilities in crates no enabled feature activates | not seen (pruned) | **fails** |
-| Unsound / unmaintained advisories on *transitive* deps | not seen — `deny.toml` narrows both to `workspace` scope | reports only, does **not** fail |
+| Unsound / unmaintained advisories on *transitive* deps | not seen — `deny.toml` narrows `unmaintained` to `workspace`; `unsound` already defaults to that scope | reports only, does **not** fail |
 
 `--all-features` is load-bearing: the default feature set excludes the
 `memcached`, `redis`, `file` and `macros` backends, so a banned crate
