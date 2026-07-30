@@ -980,8 +980,9 @@ impl CacheKitBuilder {
     ///
     /// Enabled by default with production settings by the `production`,
     /// `encrypted`, and `io` intent presets; off for `minimal` and for
-    /// manually-built clients. To opt a preset out, pass a config with all
-    /// layers `None` — an empty config applies no wrapping at all.
+    /// manually-built clients. To opt a preset out, pass
+    /// [`ReliabilityConfig::disabled()`](crate::reliability::ReliabilityConfig::disabled)
+    /// — a disabled config applies no wrapping at all.
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
     pub fn reliability(mut self, config: crate::reliability::ReliabilityConfig) -> Self {
         self.reliability = Some(config);
