@@ -122,7 +122,9 @@ impl Default for CircuitBreakerConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackpressureConfig {
     /// Maximum backend data operations in flight at once (default: 100).
-    /// `0` behaves as `1`.
+    /// `0` behaves as `1`; values above tokio's `Semaphore::MAX_PERMITS`
+    /// (`usize::MAX >> 3`) are clamped to it, so `usize::MAX` reads as
+    /// "effectively unbounded" rather than panicking the builder.
     pub max_concurrent: usize,
     /// Maximum callers waiting for a permit before further calls are shed
     /// immediately (default: 1000). `0` disables waiting entirely: a call
@@ -175,6 +177,37 @@ impl Default for ReliabilityConfig {
             circuit_breaker: Some(CircuitBreakerConfig::default()),
             backpressure: Some(BackpressureConfig::default()),
         }
+    }
+}
+
+impl ReliabilityConfig {
+    /// A config with every layer off — the documented preset opt-out.
+    ///
+    /// Prefer this over spelling out a struct literal with all-`None`
+    /// fields: a literal breaks downstream code every time the stack gains
+    /// a layer (it has, twice).
+    ///
+    /// ```
+    /// use cachekit::reliability::ReliabilityConfig;
+    ///
+    /// assert!(ReliabilityConfig::disabled().is_disabled());
+    /// assert!(!ReliabilityConfig::default().is_disabled());
+    /// ```
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            retry: None,
+            circuit_breaker: None,
+            backpressure: None,
+        }
+    }
+
+    /// `true` when no layer is enabled — the builder skips the (no-op)
+    /// `ReliableBackend` decorator entirely. Lives here, next to the fields,
+    /// so adding a layer cannot silently miss the builder gate again.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.retry.is_none() && self.circuit_breaker.is_none() && self.backpressure.is_none()
     }
 }
 
@@ -485,8 +518,15 @@ impl ConcurrencyLimiter {
         Self {
             // `Semaphore::new(0)` would shed every call after acquire_timeout
             // with nothing ever admitted — clamp like RetryConfig's "0
-            // behaves as 1".
-            semaphore: tokio::sync::Semaphore::new(config.max_concurrent.max(1)),
+            // behaves as 1". The upper clamp matters too: `Semaphore::new`
+            // PANICS above `MAX_PERMITS` (usize::MAX >> 3), and usize::MAX
+            // is the natural "effectively unbounded" sentinel a caller will
+            // reach for — a config value must never panic the builder.
+            semaphore: tokio::sync::Semaphore::new(
+                config
+                    .max_concurrent
+                    .clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
+            ),
             waiting: std::sync::atomic::AtomicUsize::new(0),
             config,
         }
@@ -808,6 +848,19 @@ mod tests {
             .acquire()
             .await
             .expect("0 behaves as 1 — one permit exists");
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn limiter_clamps_huge_max_concurrent_instead_of_panicking() {
+        // usize::MAX is the natural "unbounded" sentinel; Semaphore::new
+        // panics above MAX_PERMITS, so the constructor must clamp.
+        let limiter = ConcurrencyLimiter::new(BackpressureConfig {
+            max_concurrent: usize::MAX,
+            max_queue: 0,
+            acquire_timeout: Duration::from_millis(10),
+        });
+        let permit = limiter.acquire().await.expect("clamped limiter admits");
         drop(permit);
     }
 

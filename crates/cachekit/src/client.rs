@@ -1074,15 +1074,13 @@ impl CacheKitBuilder {
         };
 
         // Apply the reliability stack last so it decorates the final backend.
-        // A config with no layer set is the documented opt-out: skip the
-        // (no-op) decorator entirely.
+        // A disabled config is the documented opt-out: skip the (no-op)
+        // decorator entirely. The layer check lives on ReliabilityConfig
+        // itself so a future layer can't be missed here (panel finding —
+        // this gate shipped that exact bug once already).
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         let backend = match self.reliability {
-            Some(config)
-                if config.retry.is_some()
-                    || config.circuit_breaker.is_some()
-                    || config.backpressure.is_some() =>
-            {
+            Some(config) if !config.is_disabled() => {
                 crate::reliability::wrap_reliable(backend, config)
             }
             _ => backend,
