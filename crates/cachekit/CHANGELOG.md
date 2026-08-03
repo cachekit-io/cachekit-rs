@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.6.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.5.0...cachekit-rs-v0.6.0) (2026-08-03)
+
+
+### Features
+
+* **l1:** LAB-728 stale-while-revalidate — serve stale + single-flight background refresh ([#47](https://github.com/cachekit-io/cachekit-rs/issues/47)) ([068b84a](https://github.com/cachekit-io/cachekit-rs/commit/068b84ac407cefa20c13a706798faf5354ade5d8))
+* **reliability:** retry, circuit breaker, graceful degradation, single-flight (LAB-518) ([#43](https://github.com/cachekit-io/cachekit-rs/issues/43)) ([e9b9a1e](https://github.com/cachekit-io/cachekit-rs/commit/e9b9a1e7ddf42225a81bc5247ad90e011a690937))
+
+
+### Bug Fixes
+
+* **l1:** guard LAB-728 SWR refresh commits ([#48](https://github.com/cachekit-io/cachekit-rs/issues/48)) ([e31109b](https://github.com/cachekit-io/cachekit-rs/commit/e31109bfb09c31970d940819a088c1a975ea4f45))
+* **reliability:** clamp max_concurrent to Semaphore::MAX_PERMITS; add ReliabilityConfig::disabled() (LAB-729) ([#50](https://github.com/cachekit-io/cachekit-rs/issues/50)) ([d851797](https://github.com/cachekit-io/cachekit-rs/commit/d85179744dc284dcf227ea2e256ef6ed9c15ee73))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.5.0 to 0.6.0
+
 ## [0.5.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.4.0...cachekit-rs-v0.5.0) (2026-07-24)
 
 
