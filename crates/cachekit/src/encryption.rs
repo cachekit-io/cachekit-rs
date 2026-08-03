@@ -85,6 +85,7 @@ impl EncryptionLayer {
     ///
     /// Output format: `[nonce(12)][ciphertext + auth_tag(16)]`
     pub fn encrypt(&self, plaintext: &[u8], cache_key: &str) -> Result<Vec<u8>, CachekitError> {
+        // compressed=false is normative, not a stub — see build_aad's invariant note.
         let aad = self.build_aad(cache_key, false);
         self.encryptor
             .encrypt_aes_gcm(plaintext, &*self.derived_key, &aad)
@@ -96,6 +97,7 @@ impl EncryptionLayer {
     /// Returns the original plaintext. Fails if the cache key does not match
     /// the one used during encryption (ciphertext substitution protection).
     pub fn decrypt(&self, ciphertext: &[u8], cache_key: &str) -> Result<Vec<u8>, CachekitError> {
+        // compressed=false is normative, not a stub — see build_aad's invariant note.
         let aad = self.build_aad(cache_key, false);
         self.encryptor
             .decrypt_aes_gcm(ciphertext, &*self.derived_key, &aad)
@@ -112,6 +114,41 @@ impl EncryptionLayer {
     /// Format: `[0x03][len][tenant_id][len][cache_key][len]["msgpack"][len]["True"/"False"]`
     ///
     /// All lengths are 4-byte big-endian u32 to prevent boundary-confusion attacks.
+    ///
+    /// # Invariant: `compressed` is always `false` in production
+    ///
+    /// `encrypt` and `decrypt` pass the literal `false`, and that is normative, not a
+    /// gap: this SDK's only cross-SDK encrypted surface is interop mode, and
+    /// `protocol/spec/interop-mode.md` ("Encryption in Interop Mode") mandates the AAD
+    /// components `format = "msgpack"`, `compressed = "False"` — there is no
+    /// compression in interop mode.
+    ///
+    /// Why a reader cannot recover from a wrong flag here: in the general flow a reader
+    /// rebuilds the AAD from the **stored cleartext metadata** written alongside the
+    /// ciphertext (`protocol/spec/encryption.md`, encrypt step 6 / decrypt step 3).
+    /// cachekit-rs stores no such per-entry metadata — it writes plain
+    /// `nonce ‖ ciphertext ‖ tag` with no header — so its readers have nothing to read
+    /// the flag from and must reconstruct the AAD from the interop-pinned constants
+    /// alone. Combined with the no-retry rule (a reader MUST NOT retry decryption with
+    /// any alternative AAD input, `protocol/spec/encryption.md`), emitting
+    /// `compressed = "True"` here would produce ciphertext that no conformant peer can
+    /// authenticate, and none may probe for.
+    ///
+    /// So do not flip this literal to thread a live compression flag through
+    /// `encrypt`/`decrypt`. If this SDK ever does compress, the flag must be *stored*
+    /// per entry and threaded from that stored value — `protocol/spec/encryption.md`
+    /// requires `compressed` to describe the actual plaintext, and claiming `"False"`
+    /// over compressed bytes is the cachekit-py#166 conformance bug (round-trips
+    /// in-process, fails authentication for every correct second reader). A compressed
+    /// cross-SDK profile is a versioned protocol change (interop/v2, Multica LAB-1135),
+    /// not an SDK flag.
+    ///
+    /// The `"True"`/`"False"` tokens are frozen byte-level protocol constants —
+    /// normative byte table in `protocol/spec/encryption.md`, section
+    /// "`compressed` tokens"; decided in
+    /// [protocol#12](https://github.com/cachekit-io/protocol/issues/12) (resolved
+    /// 2026-07-19: a spec correction, not a wire change). The `true` branch stays,
+    /// exercised by conformance tests, so those bytes remain pinned.
     pub fn build_aad(&self, cache_key: &str, compressed: bool) -> Vec<u8> {
         let format_str = b"msgpack";
         let compressed_str = if compressed {
