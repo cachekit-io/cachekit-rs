@@ -153,7 +153,7 @@ impl Eq for SwrToken {}
 
 // ── CacheKit ─────────────────────────────────────────────────────────────────
 
-/// Production-ready cache client with optional L1 in-process cache layer.
+/// Cache client with optional L1 in-process cache layer.
 ///
 /// `Clone` is cheap and shares everything: backend, L1 cache, single-flight
 /// state, and encryption layer. Clones exist so `'static` background work

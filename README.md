@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Production-ready caching for Rust — dual-layer L1/L2, zero-knowledge encryption, multi-backend.**
+**Caching for Rust — dual-layer L1/L2, zero-knowledge encryption, multi-backend.**
 
 [![Crates.io](https://img.shields.io/crates/v/cachekit-rs.svg)](https://crates.io/crates/cachekit-rs)
 [![docs.rs](https://docs.rs/cachekit-rs/badge.svg)](https://docs.rs/cachekit-rs)
@@ -12,6 +12,10 @@
 [Features](#features) · [Quick Start](#quick-start) · [Encryption](#zero-knowledge-encryption) · [Backends](#backends) · [Architecture](#architecture)
 
 </div>
+
+---
+
+> **Status: beta** — CacheKit is in closed beta ahead of 1.0. APIs are stabilising; minor breaking changes may still occur between 0.x releases.
 
 ---
 
