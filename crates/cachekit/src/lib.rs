@@ -1,4 +1,4 @@
-//! CacheKit — production-ready caching for Rust.
+//! CacheKit — caching for Rust.
 //!
 //! Supports cachekit.io SaaS, Redis, Memcached, local File, and Cloudflare
 //! Workers backends. Zero-knowledge encryption via AES-256-GCM with HKDF key
