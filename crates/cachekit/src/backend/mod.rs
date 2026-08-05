@@ -49,6 +49,16 @@ pub trait Backend: Send + Sync {
 
     /// Return health/status information for this backend.
     async fn health(&self) -> Result<HealthStatus, BackendError>;
+
+    /// Expose this backend's [`LockableBackend`] capability, if it has one.
+    ///
+    /// Trait objects (`dyn Backend`) cannot be cross-cast to a sibling trait,
+    /// so backends that support distributed locking opt in by overriding this
+    /// to return `Some(self)`. Used by the client's cold-miss single-flight
+    /// for cross-process fill suppression. Default: `None`.
+    fn as_lockable(&self) -> Option<&dyn LockableBackend> {
+        None
+    }
 }
 
 /// Async cache backend abstraction (`?Send` variant).
@@ -77,6 +87,16 @@ pub trait Backend {
 
     /// Return health/status information for this backend.
     async fn health(&self) -> Result<HealthStatus, BackendError>;
+
+    /// Expose this backend's [`LockableBackend`] capability, if it has one.
+    ///
+    /// Trait objects (`dyn Backend`) cannot be cross-cast to a sibling trait,
+    /// so backends that support distributed locking opt in by overriding this
+    /// to return `Some(self)`. Used by the client's cold-miss single-flight
+    /// for cross-process fill suppression. Default: `None`.
+    fn as_lockable(&self) -> Option<&dyn LockableBackend> {
+        None
+    }
 }
 
 // ── TtlInspectable ───────────────────────────────────────────────────────────
@@ -143,7 +163,35 @@ pub trait LockableBackend: Backend {
     async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError>;
 }
 
+// ── Blocking-pool bridge (file + memcached backends) ─────────────────────────
+
+/// Run sync I/O on tokio's blocking pool so the async executor never stalls.
+#[cfg(all(any(feature = "file", feature = "memcached"), not(feature = "unsync")))]
+pub(crate) async fn run_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, crate::error::BackendError> + Send + 'static,
+) -> Result<T, crate::error::BackendError> {
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        crate::error::BackendError::permanent(format!("backend blocking task failed: {e}"))
+    })?
+}
+
+/// `unsync` opts into single-threaded runtimes and drops `Send` from
+/// `BackendError`, so results cannot cross `spawn_blocking`. Run the I/O
+/// inline instead — the same sync-in-async trade-off cachekit-py documents.
+#[cfg(all(any(feature = "file", feature = "memcached"), feature = "unsync"))]
+pub(crate) async fn run_blocking<T>(
+    f: impl FnOnce() -> Result<T, crate::error::BackendError>,
+) -> Result<T, crate::error::BackendError> {
+    f()
+}
+
 // ── Feature-gated backend modules ─────────────────────────────────────────────
+
+/// JSON wire bodies for the SaaS lock/TTL endpoints. Compiled under `test`
+/// unconditionally so the wire-contract round-trip tests always run in CI,
+/// even though only the `workers` backend consumes the structs at runtime.
+#[cfg(any(feature = "workers", test))]
+mod saas_wire;
 
 /// HTTP backend for the cachekit.io SaaS API.
 #[cfg(feature = "cachekitio")]
@@ -156,6 +204,14 @@ mod cachekitio_ttl;
 /// Redis backend via the [`fred`](https://crates.io/crates/fred) client.
 #[cfg(feature = "redis")]
 pub mod redis;
+
+/// Memcached backend via the [`rust-memcache`](https://crates.io/crates/memcache) client.
+#[cfg(feature = "memcached")]
+pub mod memcached;
+
+/// Local filesystem backend, byte-compatible with cachekit-py's File backend.
+#[cfg(feature = "file")]
+pub mod file;
 
 /// Cloudflare Workers backend using `worker::Fetch`.
 #[cfg(feature = "workers")]

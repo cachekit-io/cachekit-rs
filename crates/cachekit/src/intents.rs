@@ -5,12 +5,19 @@
 //! use case and returns a [`CacheKitBuilder`] so callers can override any
 //! setting before building.
 //!
-//! | Intent | Backend | L1 | Encryption | Auto-reconnect | Default TTL |
-//! |------------|-----------|------|------------|----------------|-------------|
-//! | `minimal` | Redis | Off | No | No | 300 s |
-//! | `production` | Redis | On | No | Yes | 600 s |
-//! | `encrypted` | Redis | On | AES-256-GCM | Yes | 600 s |
-//! | `io` | cachekit.io | On | No | n/a (HTTP) | 3 600 s |
+//! | Intent | Backend | L1 | Encryption | Auto-reconnect | Reliability¹ | Default TTL |
+//! |------------|-----------|------|------------|----------------|--------------|-------------|
+//! | `minimal` | Redis | Off | No | No | Off | 300 s |
+//! | `production` | Redis | On | No | Yes | On | 600 s |
+//! | `encrypted` | Redis | On | AES-256-GCM | Yes | On | 600 s |
+//! | `io` | cachekit.io | On | No | n/a (HTTP) | On | 3 600 s |
+//!
+//! ¹ Retry with backoff + jitter, a circuit breaker, and backpressure
+//! (bounded backend concurrency) around backend ops (requires the
+//! `reliability` feature, on by default — see [`crate::reliability`]).
+//! Override via [`CacheKitBuilder::reliability`];
+//! [`ReliabilityConfig::disabled()`](crate::reliability::ReliabilityConfig::disabled)
+//! turns the stack off entirely.
 
 use std::time::Duration;
 
@@ -38,6 +45,9 @@ impl CacheKit {
     ///   connection is not re-established)
     /// * L1 cache: **off**
     /// * Encryption: **no**
+    /// * Reliability: **off** — no retry, no circuit breaker, no
+    ///   backpressure; every backend error propagates on first failure and
+    ///   backend concurrency is unbounded
     /// * Default TTL: **300 s**
     ///
     /// Good for: product catalogs, public data, development.
@@ -75,6 +85,8 @@ impl CacheKit {
     ///   exponential backoff after a dropped connection)
     /// * L1 cache: **on** (1 000 entries)
     /// * Encryption: **no**
+    /// * Reliability: **on** — retry with backoff + jitter, circuit
+    ///   breaker, backpressure (max 100 concurrent backend ops)
     /// * Default TTL: **600 s**
     ///
     /// Good for: user sessions, API responses, production services.
@@ -101,10 +113,13 @@ impl CacheKit {
             .build()?;
         drop(backend.connect().await?);
 
-        Ok(CacheKitBuilder::default()
+        let builder = CacheKitBuilder::default()
             .backend(wrap(backend))
             .default_ttl(Duration::from_secs(600))
-            .l1_capacity(1000))
+            .l1_capacity(1000);
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        let builder = builder.reliability(crate::reliability::ReliabilityConfig::default());
+        Ok(builder)
     }
 
     /// **Encrypted** — zero-knowledge encrypted Redis cache.
@@ -113,6 +128,8 @@ impl CacheKit {
     ///   exponential backoff after a dropped connection)
     /// * L1 cache: **on** (1 000 entries, stores ciphertext)
     /// * Encryption: **AES-256-GCM** with HKDF-SHA256
+    /// * Reliability: **on** — retry with backoff + jitter, circuit
+    ///   breaker, backpressure (max 100 concurrent backend ops)
     /// * Default TTL: **600 s**
     /// * Tenant ID: `"default"` (override via
     ///   [`.encryption_from_bytes()`](CacheKitBuilder::encryption_from_bytes))
@@ -148,6 +165,8 @@ impl CacheKit {
             .default_ttl(Duration::from_secs(600))
             .l1_capacity(1000)
             .encryption_from_bytes(master_key, "default")?;
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        let builder = builder.reliability(crate::reliability::ReliabilityConfig::default());
 
         let backend = crate::backend::redis::RedisBackend::builder()
             .url(redis_url)
@@ -164,6 +183,8 @@ impl CacheKit {
     /// * L1 cache: **on** (1 000 entries)
     /// * Encryption: **no** (add via
     ///   [`.encryption()`](CacheKitBuilder::encryption))
+    /// * Reliability: **on** — retry with backoff + jitter, circuit
+    ///   breaker, backpressure (max 100 concurrent backend ops)
     /// * Default TTL: **3 600 s**
     ///
     /// Good for: serverless, edge compute, managed caching without Redis.
@@ -188,9 +209,12 @@ impl CacheKit {
             .api_key(api_key)
             .build()?;
 
-        Ok(CacheKitBuilder::default()
+        let builder = CacheKitBuilder::default()
             .backend(wrap(backend))
             .default_ttl(Duration::from_secs(3600))
-            .l1_capacity(1000))
+            .l1_capacity(1000);
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        let builder = builder.reliability(crate::reliability::ReliabilityConfig::default());
+        Ok(builder)
     }
 }

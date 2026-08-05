@@ -172,3 +172,84 @@ async fn client_key_validation() {
         "1024-byte key should be accepted: {result:?}"
     );
 }
+
+// ── Interop mode ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn interop_get_round_trips_plain_msgpack() {
+    let client = mock_client();
+    let key = cachekit::interop::interop_key(
+        "users",
+        "get_user",
+        &[cachekit::interop::InteropValue::from(42i64)],
+    )
+    .expect("valid interop key");
+
+    let user = User {
+        id: 42,
+        name: "Alice".to_owned(),
+    };
+    // Regular set writes plain MessagePack — already the interop value format.
+    client.set(&key, &user).await.expect("set succeeds");
+
+    let fetched: Option<User> = client
+        .interop_get(&key)
+        .await
+        .expect("interop_get succeeds");
+    assert_eq!(fetched, Some(user));
+}
+
+#[tokio::test]
+async fn interop_get_rejects_trailing_bytes_that_get_accepts() {
+    let (backend, handle) = MockBackend::new_with_handle();
+    let client = CacheKit::builder()
+        .backend(backend)
+        .no_l1()
+        .build()
+        .expect("client builds");
+
+    // Simulate a corrupt/foreign entry: a valid document plus trailing bytes.
+    let mut bytes = rmp_serde::to_vec(&7u8).expect("encode");
+    bytes.push(0x00);
+    handle
+        .store
+        .lock()
+        .await
+        .insert("ns:op:deadbeef".to_owned(), bytes);
+
+    // The lenient auto-mode reader accepts it...
+    let lenient: Option<u8> = client.get("ns:op:deadbeef").await.expect("lenient get");
+    assert_eq!(lenient, Some(7));
+
+    // ...the interop reader must reject it (spec MUST: exactly one document).
+    let err = client
+        .interop_get::<u8>("ns:op:deadbeef")
+        .await
+        .expect_err("interop read must reject trailing bytes");
+    assert!(
+        err.to_string().contains("trailing"),
+        "expected trailing-bytes rejection: {err}"
+    );
+}
+
+#[tokio::test]
+async fn interop_get_fails_closed_on_namespaced_client() {
+    // A client namespace prefix would rewrite interop storage keys to
+    // {prefix}:{interop_key}, which no other SDK computes — every cross-SDK
+    // read would silently miss. interop_get must error instead.
+    let client = CacheKit::builder()
+        .backend(MockBackend::shared())
+        .namespace("app1")
+        .no_l1()
+        .build()
+        .expect("client builds");
+
+    let err = client
+        .interop_get::<User>("users:get_user:0000")
+        .await
+        .expect_err("namespaced client must fail closed for interop reads");
+    assert!(
+        matches!(err, CachekitError::Config(_)),
+        "expected Config error, got: {err:?}"
+    );
+}

@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.6.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.5.0...cachekit-rs-v0.6.0) (2026-08-03)
+
+
+### Features
+
+* **l1:** LAB-728 stale-while-revalidate — serve stale + single-flight background refresh ([#47](https://github.com/cachekit-io/cachekit-rs/issues/47)) ([068b84a](https://github.com/cachekit-io/cachekit-rs/commit/068b84ac407cefa20c13a706798faf5354ade5d8))
+* **reliability:** retry, circuit breaker, graceful degradation, single-flight (LAB-518) ([#43](https://github.com/cachekit-io/cachekit-rs/issues/43)) ([e9b9a1e](https://github.com/cachekit-io/cachekit-rs/commit/e9b9a1e7ddf42225a81bc5247ad90e011a690937))
+
+
+### Bug Fixes
+
+* **l1:** guard LAB-728 SWR refresh commits ([#48](https://github.com/cachekit-io/cachekit-rs/issues/48)) ([e31109b](https://github.com/cachekit-io/cachekit-rs/commit/e31109bfb09c31970d940819a088c1a975ea4f45))
+* **reliability:** clamp max_concurrent to Semaphore::MAX_PERMITS; add ReliabilityConfig::disabled() (LAB-729) ([#50](https://github.com/cachekit-io/cachekit-rs/issues/50)) ([d851797](https://github.com/cachekit-io/cachekit-rs/commit/d85179744dc284dcf227ea2e256ef6ed9c15ee73))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.5.0 to 0.6.0
+
+## [0.5.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.4.0...cachekit-rs-v0.5.0) (2026-07-24)
+
+
+### Features
+
+* **backend:** add Memcached and File backends (LAB-429) ([#44](https://github.com/cachekit-io/cachekit-rs/issues/44)) ([3afe8e7](https://github.com/cachekit-io/cachekit-rs/commit/3afe8e7c0138f770eb66f2a9975d70aa5b953f01))
+* **backend:** Redis lock + Workers lock/TTL capability parity (LAB-426) ([#37](https://github.com/cachekit-io/cachekit-rs/issues/37)) ([f6cf7b7](https://github.com/cachekit-io/cachekit-rs/commit/f6cf7b7f6c00d24afc9e4d5978639595f08c426b))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.4.0 to 0.5.0
+
+## [0.4.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.3.0...cachekit-rs-v0.4.0) (2026-07-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* the public module cachekit::key (and cachekit::key::generate_cache_key) is removed. It was never protocol-conformant and had no supported use. For cross-SDK, spec-conformant keys use the interop/v1 keygen (interop_key(), arriving with cachekit-rs#33 / LAB-246). The #[cachekit] macro's derived keys are unchanged.
+
+### Features
+
+* #[cachekit] mints interop/v1 keys — retire legacy non-conformant keygen (LAB-424) ([#35](https://github.com/cachekit-io/cachekit-rs/issues/35)) ([ff1d490](https://github.com/cachekit-io/cachekit-rs/commit/ff1d4902da40c9a99dae8e8e8179a6b83f4771c3))
+* intent-based cache API ([#19](https://github.com/cachekit-io/cachekit-rs/issues/19)) ([e86172b](https://github.com/cachekit-io/cachekit-rs/commit/e86172b9440cb11105856bf13563a5d4d1425a47))
+* interop mode (interop/v1) — first in-SDK keygen + Rust vector verification [LAB-246] ([#33](https://github.com/cachekit-io/cachekit-rs/issues/33)) ([188c170](https://github.com/cachekit-io/cachekit-rs/commit/188c1709e3bf0e7e741ffa9a6ee357f6ee7d1487))
+
+
+### Security
+
+* send lock_id via X-CacheKit-Lock-Id header, not query string ([#24](https://github.com/cachekit-io/cachekit-rs/issues/24)) ([#29](https://github.com/cachekit-io/cachekit-rs/issues/29)) ([f381e41](https://github.com/cachekit-io/cachekit-rs/commit/f381e41662c2f9d131fd2cb40c9a1790132c51be))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.3.0 to 0.4.0
+
 ## [0.3.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.2.0...cachekit-rs-v0.3.0) (2026-04-26)
 
 

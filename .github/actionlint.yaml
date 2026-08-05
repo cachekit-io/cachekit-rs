@@ -1,0 +1,7 @@
+# Self-hosted runner labels (lab ARC scalesets, see lab ADR-0001).
+# actionlint (run by CodeRabbit and available locally) treats unknown
+# runs-on labels as errors without this registry.
+self-hosted-runner:
+  labels:
+    - cachekit-lean
+    - cachekit

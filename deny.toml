@@ -1,6 +1,14 @@
 [advisories]
-# cargo-deny 0.19+: vulnerability/unmaintained/unsound/notice all deny by default.
-# Only yanked needs explicit config — warn instead of hard-fail so renovate can fix.
+# cargo-deny 0.19: vulnerability advisories always deny. `unmaintained` and
+# `unsound` are SCOPES, not booleans, and their defaults differ — unmaintained
+# defaults to "all", unsound to "workspace" (direct workspace deps only).
+# So the line below NARROWS unmaintained from its default. It is not a
+# redundant restatement, and deleting it would tighten this gate.
+# Consequence: transitive unsound/unmaintained advisories are not reported here
+# (e.g. rand 0.8.5 / RUSTSEC-2026-0097, reached via fred and memcache).
+# `cargo audit` in .github/workflows/security.yml lists them, but does not fail
+# on them either — widening both scopes to "all" is open work, not covered.
+# yanked: warn instead of hard-fail so renovate can fix.
 yanked = "warn"
 unmaintained = "workspace"
 
@@ -24,6 +32,15 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# This SDK is rustls-only: openssl/native-tls must never re-enter the graph.
+# (async-memcached 0.6 once dragged them in via a toxiproxy_rust runtime dep —
+# expert panel, LAB-429. toxiproxy is a fault-injection *test* proxy; banned
+# outright so no future dependency smuggles it back as a runtime edge.)
+deny = [
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+    { name = "toxiproxy_rust" },
+]
 
 [sources]
 unknown-registry = "deny"

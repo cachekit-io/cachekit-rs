@@ -48,6 +48,15 @@ pub enum BackendErrorKind {
     Timeout,
     /// Credentials are invalid or missing — retrying will not help.
     Authentication,
+    /// The circuit breaker is open — the call failed fast without reaching
+    /// the backend. Not retryable *now*; the breaker re-probes on its own
+    /// schedule (see `reliability::CircuitBreakerConfig::open_timeout`).
+    CircuitOpen,
+    /// The concurrency limiter shed this call before it reached the backend:
+    /// the waiting queue was full, or no permit freed up within the acquire
+    /// timeout. Not retryable *now* — an immediate retry would re-join the
+    /// same overloaded queue (see `reliability::BackpressureConfig`).
+    Backpressure,
 }
 
 impl BackendErrorKind {
@@ -65,6 +74,8 @@ impl std::fmt::Display for BackendErrorKind {
             Self::Permanent => write!(f, "permanent"),
             Self::Timeout => write!(f, "timeout"),
             Self::Authentication => write!(f, "authentication"),
+            Self::CircuitOpen => write!(f, "circuit-open"),
+            Self::Backpressure => write!(f, "backpressure"),
         }
     }
 }
@@ -121,6 +132,25 @@ impl BackendError {
     pub fn auth(message: impl Into<String>) -> Self {
         Self {
             kind: BackendErrorKind::Authentication,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Create a circuit-open backend error (call failed fast, backend not reached).
+    pub fn circuit_open(message: impl Into<String>) -> Self {
+        Self {
+            kind: BackendErrorKind::CircuitOpen,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Create a backpressure backend error (call shed by the concurrency
+    /// limiter, backend not reached).
+    pub fn backpressure(message: impl Into<String>) -> Self {
+        Self {
+            kind: BackendErrorKind::Backpressure,
             message: message.into(),
             source: None,
         }

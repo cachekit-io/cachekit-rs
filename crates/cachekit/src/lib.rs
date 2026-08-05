@@ -1,7 +1,8 @@
-//! CacheKit — production-ready caching for Rust.
+//! CacheKit — caching for Rust.
 //!
-//! Supports cachekit.io SaaS, Redis, and Cloudflare Workers backends.
-//! Zero-knowledge encryption via AES-256-GCM with HKDF key derivation.
+//! Supports cachekit.io SaaS, Redis, Memcached, local File, and Cloudflare
+//! Workers backends. Zero-knowledge encryption via AES-256-GCM with HKDF key
+//! derivation.
 
 // Production code lints — these only fire in src/, not tests/
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -16,7 +17,19 @@ compile_error!(
 #[cfg(all(feature = "workers", feature = "l1"))]
 compile_error!("features `workers` and `l1` are mutually exclusive — moka requires std threads unavailable in wasm32");
 
-/// Pluggable cache backend trait and implementations (CachekitIO, Redis, Workers).
+#[cfg(all(feature = "workers", feature = "reliability"))]
+compile_error!("features `workers` and `reliability` are mutually exclusive — retry/breaker timers need tokio `time`, unavailable in wasm32");
+
+#[cfg(all(feature = "workers", feature = "memcached"))]
+compile_error!("features `workers` and `memcached` are mutually exclusive — Workers runtime has no TCP sockets");
+
+#[cfg(all(feature = "workers", feature = "file"))]
+compile_error!(
+    "features `workers` and `file` are mutually exclusive — Workers runtime has no filesystem"
+);
+
+/// Pluggable cache backend trait and implementations (CachekitIO, Redis,
+/// Memcached, File, Workers).
 pub mod backend;
 /// High-level cache client with dual-layer (L1/L2) support.
 pub mod client;
@@ -24,8 +37,10 @@ pub mod client;
 pub mod config;
 /// Error types for cache operations and backend communication.
 pub mod error;
-/// Cache key generation using Blake2b hashing.
-pub mod key;
+/// Cold-miss single-flight: dedup concurrent fills of the same key.
+pub mod flight;
+/// Interop mode (interop/v1): cross-SDK cache keys and plain-MessagePack values.
+pub mod interop;
 /// L1 cache hit-rate metrics for CachekitIO request headers.
 pub mod metrics;
 /// Serialization and deserialization of cached values via MessagePack.
@@ -46,8 +61,12 @@ pub mod encryption;
 #[cfg(feature = "l1")]
 pub mod l1;
 
+/// Reliability tier: retry with backoff + jitter, circuit breaker.
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+pub mod reliability;
+
 // Re-exports
-pub use client::{CacheKit, CacheKitBuilder, SharedBackend};
+pub use client::{CacheKit, CacheKitBuilder, SharedBackend, SwrRead, SwrToken};
 pub use config::CachekitConfig;
 pub use error::{BackendError, BackendErrorKind, CachekitError};
 
@@ -59,18 +78,68 @@ pub use encryption::EncryptionLayer;
 #[cfg(feature = "macros")]
 pub use cachekit_macros::cachekit;
 
-/// Re-exports for proc-macro generated code. Not part of the public API.
+pub use flight::SingleFlight;
+
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+pub use reliability::{BackpressureConfig, CircuitBreakerConfig, ReliabilityConfig, RetryConfig};
+
+// ── Shared jitter source ─────────────────────────────────────────────────────
+
+/// Uniform random in `[0, 1)`. uuid v4 is the crate's existing entropy source
+/// (getrandom-backed); jitter needs decorrelation across clients, not crypto
+/// quality — 53 bits is plenty. Used by retry backoff (`reliability`) and the
+/// L1 SWR freshness threshold at entry insertion (`l1`).
+#[cfg(any(
+    feature = "l1",
+    all(feature = "reliability", not(target_arch = "wasm32"))
+))]
+pub(crate) fn random_unit() -> f64 {
+    let bits = uuid::Uuid::new_v4().as_u128() & ((1u128 << 53) - 1);
+    (bits as f64) / ((1u64 << 53) as f64)
+}
+
+// ── SWR background-refresh spawn (macro plumbing) ───────────────────────────
+
+/// Spawn a stale-while-revalidate background refresh onto the ambient tokio
+/// runtime. Macro plumbing for `#[cachekit]` — not public API.
+///
+/// Without a tokio runtime on the current thread the refresh is skipped: the
+/// caller has already been served the stale value, and a later stale read
+/// simply retries. Panicking here would turn a cache optimisation into an
+/// availability bug on non-tokio executors.
+#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
 #[doc(hidden)]
-pub mod __private {
-    pub use rmp_serde;
+pub fn __swr_spawn<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        drop(handle.spawn(fut));
+    }
+}
+
+/// No-op variant: under `unsync`, on wasm32, or without the `l1` feature the
+/// client never classifies a hit as stale (`SwrRead::Stale` is unreachable),
+/// so the refresh future handed here is dead code by construction. The stub
+/// exists so `#[cachekit]`-generated code compiles under every configuration.
+#[cfg(not(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32"))))]
+#[doc(hidden)]
+pub fn __swr_spawn<F>(_fut: F)
+where
+    F: std::future::Future<Output = ()> + 'static,
+{
 }
 
 /// Convenient glob import for the most common types.
 pub mod prelude {
     pub use crate::{
         BackendError, BackendErrorKind, CacheKit, CacheKitBuilder, CachekitConfig, CachekitError,
+        SwrRead, SwrToken,
     };
 
     #[cfg(feature = "encryption")]
     pub use crate::{EncryptionLayer, SecureCache};
+
+    #[cfg(feature = "macros")]
+    pub use crate::cachekit;
 }

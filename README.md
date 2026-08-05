@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Production-ready caching for Rust — dual-layer L1/L2, zero-knowledge encryption, multi-backend.**
+**Caching for Rust — dual-layer L1/L2, zero-knowledge encryption, multi-backend.**
 
 [![Crates.io](https://img.shields.io/crates/v/cachekit-rs.svg)](https://crates.io/crates/cachekit-rs)
 [![docs.rs](https://docs.rs/cachekit-rs/badge.svg)](https://docs.rs/cachekit-rs)
@@ -15,6 +15,10 @@
 
 ---
 
+> **Status: beta** — CacheKit is in closed beta ahead of 1.0. APIs are stabilising; minor breaking changes may still occur between 0.x releases.
+
+---
+
 ## Overview
 
 `cachekit-rs` is the Rust SDK for [cachekit.io](https://cachekit.io). Plug in a backend, get dual-layer caching with optional client-side encryption. Bytes never leave your process unencrypted unless you say so.
@@ -23,7 +27,7 @@
 |:----------|:-------------|
 | **CacheKit** | `get` / `set` / `delete` / `exists` with automatic L1 → L2 layering |
 | **SecureCache** | Transparent AES-256-GCM encryption before storage (zero-knowledge) |
-| **Backend** | Pluggable trait — cachekit.io SaaS, Redis, Cloudflare Workers |
+| **Backend** | Pluggable trait — cachekit.io SaaS, Redis, Memcached, local File, Cloudflare Workers |
 | **L1 Cache** | In-process [moka](https://crates.io/crates/moka) cache with write-through + backfill |
 
 > [!TIP]
@@ -38,29 +42,35 @@
 |:--------|:-------:|:------------|
 | `cachekitio` | ✅ | HTTP backend for [api.cachekit.io](https://api.cachekit.io) via [reqwest](https://crates.io/crates/reqwest) + rustls |
 | `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core) |
-| `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka) |
+| `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka), with stale-while-revalidate (native) |
+| `reliability` | ✅ | Retry with backoff + jitter, circuit breaker, backpressure, distributed fill locks (native only) |
 | `redis` | ❌ | Redis backend via [fred](https://crates.io/crates/fred) (native only) |
+| `memcached` | ❌ | Memcached backend via [rust-memcache](https://crates.io/crates/memcache) (native only) |
+| `file` | ❌ | Local filesystem backend, byte-compatible with cachekit-py's File backend (native only) |
 | `workers` | ❌ | Cloudflare Workers backend via [worker](https://crates.io/crates/worker) |
-| `macros` | ❌ | `#[cachekit]` proc-macro decorator |
+| `macros` | ❌ | `#[cachekit]` proc-macro decorator (mints [interop/v1](#cross-sdk-interop-mode) keys) |
 
 ```toml
 # Defaults: SaaS + encryption + L1
 [dependencies]
-cachekit-rs = "0.2"
+cachekit-rs = "0.5"
 
 # With Redis backend
 [dependencies]
-cachekit-rs = { version = "0.2", features = ["redis"] }
+cachekit-rs = { version = "0.5", features = ["redis"] }
 
 # For Cloudflare Workers (no L1, no Redis)
 [dependencies]
-cachekit-rs = { version = "0.2", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.5", default-features = false, features = ["workers", "encryption"] }
 ```
 
 > [!WARNING]
 > **Mutually exclusive features:**
 > - `workers` + `redis` — Workers runtime cannot use fred
 > - `workers` + `l1` — moka requires std threads unavailable in wasm32
+> - `workers` + `reliability` — retry/breaker timers need tokio `time`, unavailable in wasm32
+> - `workers` + `memcached` — Workers runtime has no TCP sockets
+> - `workers` + `file` — Workers runtime has no filesystem
 
 ---
 
@@ -158,6 +168,27 @@ Cross-SDK compatible — ciphertext produced by the Python SDK decrypts with the
 
 ---
 
+## Cross-SDK Interop Mode
+
+Interop mode ([interop/v1](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md)) lets the Python, TypeScript, and Rust SDKs share cache entries: keys are `{namespace}:{operation}:{args_hash}` with an explicit operation name (no language-specific function path), and values are plain MessagePack — no envelope, readable by any MessagePack library.
+
+```rust
+use cachekit::interop::{interop_key, InteropValue};
+
+// Every SDK computes this exact key for get_user(42)
+let key = interop_key("users", "get_user", &[InteropValue::from(42i64)])?;
+
+cache.set_with_ttl(&key, &user, ttl).await?;          // plain MessagePack — already interop
+let user: Option<User> = cache.interop_get(&key).await?; // strict read: exactly one document
+```
+
+Argument hashing is byte-identical across SDKs (canonical MessagePack + Blake2b-256), verified against the shared [protocol test vectors](https://github.com/cachekit-io/protocol/blob/main/test-vectors/interop-mode.json) in this repo's test suite. `interop_get` (also on `SecureCache`) rejects trailing bytes and Python-internal CK frames instead of silently misreading them. Encryption works unchanged — interop keys are identical across SDKs, so the AAD verifies cross-SDK.
+
+> [!IMPORTANT]
+> Use interop keys on a client **without** `.namespace()` / `CACHEKIT_NAMESPACE` — a client prefix would rewrite the storage key to `{prefix}:{interop_key}`, which no other SDK computes. `interop_get` fails closed with a config error rather than silently missing; interop keys already carry their own namespace segment.
+
+---
+
 ## Backends
 
 ### cachekit.io SaaS (default)
@@ -175,10 +206,10 @@ let backend = CachekitIO::builder()
 
 ### Redis
 
-Native Redis via [fred](https://crates.io/crates/fred) with cluster support. Requires the `redis` feature flag.
+Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Requires the `redis` feature flag.
 
 ```toml
-cachekit-rs = { version = "0.2", features = ["redis"] }
+cachekit-rs = { version = "0.5", features = ["redis"] }
 ```
 
 ```rust
@@ -190,12 +221,49 @@ let backend = RedisBackend::builder()
 backend.connect().await?;  // explicit connect required
 ```
 
-### Cloudflare Workers
+### Memcached
 
-`wasm32-unknown-unknown` backend using `worker::Fetch`. Requires the `workers` feature with default features disabled.
+Memcached via [rust-memcache](https://crates.io/crates/memcache) (single server, connection-pooled, per-socket timeouts — a hung server errors one operation instead of wedging the backend). Keys are validated against protocol metacharacters (whitespace/control bytes) before anything reaches the wire, keeping the key space identical to cachekit-py's.
+
+**TTL capability, precisely:** memcached's protocol cannot *read* a key's remaining TTL, so this backend does not implement `TtlInspectable` — matching cachekit-py, where Memcached is likewise not TTL-inspectable. Both SDKs do ship a bare `refresh_ttl` (wrapping the memcached `touch` command) callable directly on the backend, outside the capability trait — so TTL-refresh works, but TTL-*driven* features that need to read TTLs never engage on memcached in any SDK.
+
+TTLs above memcached's 30-day ceiling are clamped (larger values would be misread as absolute timestamps); values above the item-size limit (default 1 MiB) fail loudly client-side, and a server-side "object too large" classifies as permanent (never retried). Requires the `memcached` feature flag.
 
 ```toml
-cachekit-rs = { version = "0.2", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.5", features = ["memcached"] }
+```
+
+```rust
+use cachekit::backend::memcached::MemcachedBackend;
+
+let backend = MemcachedBackend::builder()
+    .url("tcp://localhost:11211")
+    .connect()          // eager: verifies the server is reachable
+    .await?;
+```
+
+### File (local filesystem)
+
+Local disk cache, **byte-compatible with cachekit-py's File backend** — a py and an rs process pointed at the same directory read each other's entries (Blake2b-128 hashed filenames, shared 14-byte header, atomic write-then-rename, lazy expiry). Implements `TtlInspectable` (TTL read off the on-disk header, in-place refresh). Concurrency matches py: same-process operations serialize on a backend-wide lock (py's `RLock`); on unix, reads and in-place TTL rewrites take advisory `flock` while writes stay lock-free via atomic rename; and expired-entry unlinks are inode-validated so a stale read decision doesn't delete a concurrent writer's fresh entry. On unix the cache directory must be owned by you and not group/other-writable. Not yet ported from py: LRU eviction and size caps — the directory grows until entries expire or you clear it. Requires the `file` feature flag and a tokio runtime (I/O runs via `spawn_blocking`).
+
+```toml
+cachekit-rs = { version = "0.5", features = ["file"] }
+```
+
+```rust
+use cachekit::backend::file::FileBackend;
+
+let backend = FileBackend::builder()
+    .cache_dir("/var/cache/myapp")  // default: <system temp dir>/cachekit
+    .build()?;
+```
+
+### Cloudflare Workers
+
+`wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. Requires the `workers` feature with default features disabled.
+
+```toml
+cachekit-rs = { version = "0.5", default-features = false, features = ["workers", "encryption"] }
 ```
 
 <details>
@@ -237,7 +305,8 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
 │  GET path:                                              │
-│  L1 hit (~50ns) ──► return immediately                  │
+│  L1 fresh hit (~50ns) ──► return immediately            │
+│  L1 stale hit ──► return + background refresh (SWR)     │
 │  L1 miss ──► L2 backend ──► backfill L1 (30s cap)      │
 │                                                         │
 │  SET path:                                              │
@@ -259,6 +328,99 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
 | **Encrypted L1** | `SecureCache` stores ciphertext in L1 (never plaintext) |
 | **Default capacity** | 1,000 entries (configurable via `.l1_capacity()`) |
+| **Stale-while-revalidate** | On by default (native): `#[cachekit]` serves an L1 hit past `swr_threshold_ratio` × entry TTL (default 0.5, ±10% jitter) immediately and refreshes it in the background — see below |
+
+### Stale-while-revalidate (SWR)
+
+With SWR (default when `l1` is on, native targets), an L1 entry has two phases
+before it disappears: *fresh* until `swr_threshold_ratio` of its TTL has
+elapsed, then *stale* until hard expiry. A `#[cachekit]`-wrapped call that
+hits a stale entry returns it **immediately** — no caller ever blocks on a
+merely-stale value — while exactly one background task re-executes the
+function. If the same-key mutation token is still current, the task rewrites
+both cache layers and renews L1 hard expiry with the full write-path TTL; if a
+newer `set()` or `delete()` landed through the same client (or one of its
+clones) while the origin ran, that explicit mutation wins and the older
+refresh result is discarded before it can touch L2. Entry expiry and capacity
+eviction do not invalidate the token, so a valid slow refresh can still
+repopulate both layers. Refresh dedup rides the same single-flight as the cold-miss path
+(in-process, plus distributed fill locks on lock-capable backends), so N
+concurrent stale readers cost one origin execution — misses are billable;
+stampedes are not acceptable. A hard-expired entry always takes the normal
+blocking miss path: SWR never serves past hard expiry.
+
+```rust,ignore
+let cache = CacheKit::builder()
+    .backend(backend)
+    .swr_threshold_ratio(0.25) // stale after 25% of entry TTL (default 0.5)
+    // .swr_enabled(false)     // restore strict expire-or-serve behaviour
+    .build()?;
+```
+
+Semantics mirror cachekit-py (`swr_threshold_ratio` = elapsed-lifetime
+fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
+
+- **The freshness window derives from each entry's own TTL.** A backfilled
+  entry (L2 hit → L1, 30 s cap) goes stale at ~`ratio × 30 s` — the cap still
+  bounds staleness of L2-derived data, but SWR replaces its expiry cliff with
+  a background refresh that restores the full write-path TTL. The configured
+  ratio is never silently clamped; the window follows the entry.
+- **Refresh completion is version-guarded and same-key ordered.** Each L1
+  stale read receives a mutation token. A concurrent explicit write or delete
+  through that client or a clone invalidates the token, so an older origin
+  result cannot clobber the new value or resurrect the deletion in either
+  layer. The guard is intentionally process-local; cross-instance invalidation
+  is outside SWR's serving-policy scope.
+- **Jitter is fixed per entry.** The ±10% threshold jitter is drawn when an
+  entry is inserted, not on every hit; hot L1 reads do not perform entropy
+  work and the entry's freshness boundary stays stable for its lifetime.
+- **The background refresh needs a tokio runtime** (`Handle::try_current`).
+  On other executors the stale value is still served and the refresh is
+  skipped — behaviourally SWR-off, never a panic.
+- **Refresh failures are absorbed**: the stale value keeps serving, a later
+  stale read retries, and once the entry hard-expires the blocking path
+  surfaces errors normally.
+- **Native only**: on wasm32 (`workers` excludes `l1`) and under `unsync`
+  there is no SWR; the builder knobs don't exist there, so misuse is a
+  compile error rather than a silent no-op. A sync function under
+  `#[cachekit]` is likewise a clear compile-time error.
+
+---
+
+## Reliability
+
+With the `reliability` feature (default, native only), the `production`, `encrypted`, and `io` presets wrap every backend operation in a reliability stack; `minimal` stays bare for maximum throughput:
+
+| Layer | What it does | Defaults |
+|:------|:-------------|:---------|
+| **Retry** | Truncated exponential backoff + jitter on transient/timeout errors (`BackendErrorKind::is_retryable`); permanent and auth errors propagate immediately | 3 attempts, 100 ms base, 5 s cap, jitter ×[0.5, 1.5) |
+| **Circuit breaker** | closed → open after N retryable failures in a rolling window; fails fast (`BackendErrorKind::CircuitOpen`) while open; half-open probes recovery | threshold 5, window 60 s, open 5 s, 3 probes, close after 3 successes |
+| **Backpressure** | Bounds concurrent backend data ops with a semaphore + bounded waiting queue; over-limit calls are shed with `BackendErrorKind::Backpressure` before reaching the backend — a slow backend can't exhaust the caller's connection pool or memory | 100 concurrent, 1 000 queued, 100 ms wait (Python SDK parity) |
+| **Graceful degradation** | On outage-class backend failure (transient, timeout, open breaker, backpressure shed), `#[cachekit]`-wrapped functions run uncached (fail-open); permanent/auth errors propagate — a wrong API key fails loudly. `secure` paths fail **closed** on everything — encrypted workloads never silently degrade | built into the macro |
+| **Single-flight** | Concurrent misses of one key collapse to a single execution: per-key in-process lock, plus a distributed fill lock across processes on lock-capable backends (cachekit.io, Redis) | in-process always on; cross-process 5 s lock, 100 ms polls |
+| **Stale-while-revalidate** | Stale-but-unexpired L1 hits are served immediately while one single-flight-deduplicated background task re-executes the function ([details](#stale-while-revalidate-swr)) | on by default with `l1` (native); threshold 0.5 × entry TTL ±10% jitter |
+
+Retry sits *inside* the breaker (one exhausted retry sequence = one breaker failure) and backpressure sits *outside* both — one permit per logical operation, held across the whole retry sequence, so retry amplification is bounded and shed calls never skew breaker state. Degradation, single-flight, and SWR sit in the `#[cachekit]` macro around the read path — the same composition as the TypeScript SDK's `ReliabilityExecutor` and the Python decorator.
+
+```rust,ignore
+use std::time::Duration;
+use cachekit::{CacheKit, ReliabilityConfig, RetryConfig};
+
+// Presets enable it — override or disable per client:
+let cache = CacheKit::production("redis://localhost:6379").await?
+    .reliability(ReliabilityConfig {
+        retry: Some(RetryConfig { max_attempts: 5, ..RetryConfig::default() }),
+        ..ReliabilityConfig::default()
+    })
+    .build()?;
+
+// Opt a preset out: a disabled config applies no wrapping.
+let bare = CacheKit::production("redis://localhost:6379").await?
+    .reliability(ReliabilityConfig::disabled())
+    .build()?;
+```
+
+Requires a tokio runtime for backoff timers (the `redis` and `cachekitio` backends already do).
 
 ---
 
@@ -289,7 +451,7 @@ cachekit-rs/
 │   │       ├── config.rs      # CachekitConfig + from_env()
 │   │       ├── encryption.rs  # AES-256-GCM + AAD v0x03
 │   │       ├── error.rs       # CachekitError, BackendError
-│   │       ├── key.rs         # Blake2b-256 cache key generation
+│   │       ├── interop.rs     # interop/v1 cross-SDK keys + strict reads
 │   │       ├── metrics.rs     # L1 hit-rate metrics headers
 │   │       ├── session.rs     # SDK session tracking
 │   │       ├── url_validator.rs # SSRF-safe URL validation
@@ -300,6 +462,7 @@ cachekit-rs/
 │   │           ├── cachekitio.rs      # cachekit.io HTTP backend
 │   │           ├── cachekitio_lock.rs # Distributed locking
 │   │           ├── cachekitio_ttl.rs  # TTL inspection
+│   │           ├── saas_wire.rs       # SaaS lock/TTL JSON wire bodies
 │   │           ├── redis.rs           # Redis backend (feature = "redis")
 │   │           └── workers.rs         # Workers backend (feature = "workers")
 │   │
@@ -316,10 +479,35 @@ cachekit-rs/
 
 ```bash
 make quick-check   # fmt + clippy + test (run before every commit)
+make security      # cargo deny + cargo audit (the CI supply-chain gate)
 make test          # cargo test --all-features
 make build         # cargo build --release
 make build-wasm    # wasm32-unknown-unknown (workers feature)
 ```
+
+`make security` runs the same two commands as the `supply-chain` job in
+`.github/workflows/security.yml`, so a local pass means a CI pass. It needs
+`cargo-deny` and `cargo-audit` installed, and it reaches the network to refresh
+the RustSec advisory database — which is why it is not folded into
+`quick-check`.
+
+Both tools are required, because they answer different questions. "Fails" below
+means it turns the check red — anything else is reported but not enforced:
+
+| | `cargo deny --locked --all-features check` | `cargo audit` |
+| :--- | :--- | :--- |
+| Reads | feature-resolved dependency graph | `Cargo.lock` verbatim |
+| Licence allowlist, banned crates, registry/source policy | **fails** | not checked |
+| Vulnerabilities in crates no enabled feature activates | not seen (pruned) | **fails** |
+| Unsound / unmaintained advisories on *transitive* deps | not seen — `deny.toml` narrows `unmaintained` to `workspace`; `unsound` already defaults to that scope | reports only, does **not** fail |
+
+`--all-features` is load-bearing: the default feature set excludes the
+`memcached`, `redis`, `file` and `macros` backends, so a banned crate
+reintroduced behind an optional feature passes a bare `cargo deny check`.
+
+`deny.toml` is the policy — notably a hard ban on `openssl-sys`, `native-tls`
+and `toxiproxy_rust`, because this SDK is rustls-only. Run `make deny` before
+adding or bumping a dependency.
 
 ## Minimum Supported Rust Version
 
