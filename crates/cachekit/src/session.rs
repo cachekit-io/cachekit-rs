@@ -69,10 +69,12 @@ mod tests {
     fn session_start_is_reasonable_epoch_millis() {
         let headers = session_headers();
         let start_ms: u64 = headers[1].1.parse().expect("Should be numeric");
-        // Should be after 2024-01-01 and before 2035-01-01 (bounds mirror
-        // tests/wasm_session_tests.rs — keep them in lockstep)
+        // Plausibility window: after 2024-01-01, before 2100-01-01. Wide on
+        // purpose — it exists to catch unit confusion (epoch seconds trip the
+        // lower bound, micros the upper), not to expire on a schedule. Bounds
+        // mirror tests/wasm_session_tests.rs — keep them in lockstep.
         assert!(start_ms > 1_704_067_200_000, "Should be after 2024");
-        assert!(start_ms < 2_051_222_400_000, "Should be before 2035");
+        assert!(start_ms < 4_102_444_800_000, "Should be before 2100");
     }
 
     #[test]

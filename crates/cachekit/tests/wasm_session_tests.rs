@@ -36,8 +36,8 @@ fn session_headers_valid_on_wasm32() {
         "start {start} should be after 2024"
     );
     assert!(
-        start < 2_051_222_400_000,
-        "start {start} should be before 2035"
+        start < 4_102_444_800_000,
+        "start {start} should be before 2100"
     );
 }
 
