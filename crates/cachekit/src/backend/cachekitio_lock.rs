@@ -31,14 +31,15 @@ impl CachekitIO {
     }
 }
 
+// Wire contract is snake_case (`spec/saas-api.md` Lock Endpoints): `timeout_ms` in,
+// `lock_id` out. No serde rename — the Rust field names ARE the wire names.
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct LockAcquireRequest {
     timeout_ms: u64,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 struct LockAcquireResponse {
     lock_id: Option<String>,
 }
@@ -150,5 +151,38 @@ mod tests {
             .get("X-CacheKit-Lock-Id")
             .expect("X-CacheKit-Lock-Id header must be set");
         assert_eq!(header, "lock-secret-123");
+    }
+
+    // Wire contract is snake_case (`spec/saas-api.md` Lock Endpoints): the server reads
+    // `timeout_ms` and writes `lock_id`. These tests pin the literal JSON so a serde
+    // rename can't silently break interop again.
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn acquire_request_serializes_snake_case() {
+        let body = serde_json::to_string(&LockAcquireRequest { timeout_ms: 5000 })
+            .expect("request must serialize");
+        assert_eq!(body, r#"{"timeout_ms":5000}"#);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn acquire_response_parses_acquired_lock() {
+        let resp: LockAcquireResponse =
+            serde_json::from_str(r#"{"lock_id":"a1b2c3d4-0000-0000-0000-000000000000"}"#)
+                .expect("acquired response must parse");
+        assert_eq!(
+            resp.lock_id.as_deref(),
+            Some("a1b2c3d4-0000-0000-0000-000000000000")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn acquire_response_parses_contested_lock() {
+        // Contested lock: server returns 200 {"lock_id": null} (protocol#22).
+        let resp: LockAcquireResponse =
+            serde_json::from_str(r#"{"lock_id":null}"#).expect("contested response must parse");
+        assert_eq!(resp.lock_id, None);
     }
 }
