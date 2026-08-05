@@ -96,11 +96,31 @@ cachekit-macros = { version = "0.6.0", path = "../cachekit-macros", optional = t
 libc = { version = "0.2", optional = true }
 rustix = { version = "1", optional = true, default-features = false, features = ["fs", "process", "std"] }
 
+# Non-optional on wasm32, regardless of features: `SystemTime::now()` panics on
+# wasm32-unknown-unknown, so session.rs reads `js_sys::Date::now()` there
+# (LAB-1079). Target-gated rather than feature-gated so every wasm32 build of
+# session_headers() — workers AND cachekitio — gets the safe clock.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 serde_json = "1"
+
+# Native-only test machinery: tokio's rt-multi-thread (and tempfile's fs use)
+# cannot build for wasm32, and cargo compiles the whole dev-dep graph whenever
+# any integration test compiles — so these must not be in the wasm32 dev graph.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 serial_test = "3"
 tempfile = "3"
+
+# wasm32 runtime tests (tests/wasm_session_tests.rs) — compile-only CI let the
+# SystemTime::now() trap ship in five releases (LAB-1079). Exact-pinned because
+# wasm-bindgen-test releases in lockstep with wasm-bindgen, and CI's
+# wasm-bindgen-test-runner binary must match the locked wasm-bindgen version
+# byte-for-byte (bump this, the lockfile, and the runner pin in ci.yml together).
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.71"
 
 [lints]
 workspace = true

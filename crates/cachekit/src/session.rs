@@ -1,5 +1,4 @@
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 struct SessionInfo {
     id: String,
@@ -8,18 +7,39 @@ struct SessionInfo {
 
 static SESSION: OnceLock<SessionInfo> = OnceLock::new();
 
+/// Current Unix time in milliseconds, via the JavaScript clock.
+///
+/// `std::time::SystemTime::now()` panics on `wasm32-unknown-unknown` ("time
+/// not implemented on this platform"), which trapped every Workers request
+/// (LAB-1079) — so wasm32 builds must read `js_sys::Date::now()` instead.
+#[cfg(target_arch = "wasm32")]
+fn now_epoch_millis() -> u64 {
+    let ms = js_sys::Date::now();
+    if !ms.is_finite() || ms < 0.0 {
+        return 0;
+    }
+    // `as` saturates float→int; ms is finite and non-negative here.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        ms as u64
+    }
+}
+
+/// Current Unix time in milliseconds, via the system clock (native targets).
+#[cfg(not(target_arch = "wasm32"))]
+fn now_epoch_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
 fn get_or_create() -> &'static SessionInfo {
-    SESSION.get_or_init(|| {
-        let id = uuid::Uuid::new_v4().to_string();
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let start_ms = u64::try_from(millis).unwrap_or(u64::MAX);
-        SessionInfo {
-            id,
-            start_str: start_ms.to_string(),
-        }
+    SESSION.get_or_init(|| SessionInfo {
+        id: uuid::Uuid::new_v4().to_string(),
+        start_str: now_epoch_millis().to_string(),
     })
 }
 
