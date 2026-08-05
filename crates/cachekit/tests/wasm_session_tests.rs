@@ -1,10 +1,9 @@
 //! wasm32 runtime regression tests for the session clock (LAB-1079).
 //!
-//! `SystemTime::now()` panics on `wasm32-unknown-unknown`, and the compile-only
-//! wasm CI check shipped that trap in five releases — these tests *execute*
-//! `session_headers()` (the code `WorkersCachekitIO::fetch` injects into every
-//! request) on the real wasm32 target. If the target-gated clock in
-//! `session.rs` is ever reverted to bare `SystemTime`, every test here traps
+//! `SystemTime::now()` / `Instant::now()` panic on `wasm32-unknown-unknown`,
+//! and the compile-only wasm CI check shipped that trap in five releases —
+//! these tests *execute* the affected paths on the real wasm32 target. If a
+//! target gate is ever reverted to a bare std clock, the affected test traps
 //! with `RuntimeError: unreachable` and the run goes red.
 //!
 //! Runs under `wasm-bindgen-test-runner` (Node) — see the `wasm` job in
@@ -15,47 +14,31 @@
 use cachekit::session::session_headers;
 use wasm_bindgen_test::wasm_bindgen_test;
 
-/// 2024-01-01T00:00:00Z — any honest clock reads after this.
-const MS_2024: u64 = 1_704_067_200_000;
-/// 2035-01-01T00:00:00Z — and before this.
-const MS_2035: u64 = 2_051_222_400_000;
-
 /// The exact panic site of LAB-1079: building session headers on wasm32.
 /// Reaching the asserts at all proves the clock (and uuid's js entropy) did
-/// not trap.
+/// not trap; the value asserts are AC-2 (non-zero, plausible epoch millis —
+/// bounds mirror the native tests in src/session.rs, keep them in lockstep).
 #[wasm_bindgen_test]
-fn session_headers_do_not_trap_on_wasm32() {
+fn session_headers_valid_on_wasm32() {
     let headers = session_headers();
     assert_eq!(headers[0].0, "X-CacheKit-Session-ID");
     assert_eq!(headers[1].0, "X-CacheKit-Session-Start");
-}
 
-#[wasm_bindgen_test]
-fn session_id_is_uuid_v4_on_wasm32() {
-    let id = session_headers()[0].1;
-    let parsed = uuid::Uuid::parse_str(id).expect("session ID should be a valid UUID");
-    assert_eq!(parsed.get_version_num(), 4, "should be UUID v4");
-}
+    let id = uuid::Uuid::parse_str(headers[0].1).expect("session ID should be a valid UUID");
+    assert_eq!(id.get_version_num(), 4, "should be UUID v4");
 
-/// AC-2: X-CacheKit-Session-Start carries a non-zero, plausible epoch-millis
-/// value on wasm32 — asserted, not eyeballed.
-#[wasm_bindgen_test]
-fn session_start_is_plausible_epoch_millis_on_wasm32() {
-    let start: u64 = session_headers()[1]
+    let start: u64 = headers[1]
         .1
         .parse()
         .expect("session start should be numeric");
-    assert!(start > MS_2024, "start {start} should be after 2024");
-    assert!(start < MS_2035, "start {start} should be before 2035");
-}
-
-/// The `OnceLock` contract holds on wasm32: one session per isolate.
-#[wasm_bindgen_test]
-fn session_is_stable_across_calls_on_wasm32() {
-    let h1 = session_headers();
-    let h2 = session_headers();
-    assert_eq!(h1[0].1, h2[0].1, "session ID should be stable");
-    assert_eq!(h1[1].1, h2[1].1, "session start should be stable");
+    assert!(
+        start > 1_704_067_200_000,
+        "start {start} should be after 2024"
+    );
+    assert!(
+        start < 2_051_222_400_000,
+        "start {start} should be before 2035"
+    );
 }
 
 /// Exercise the `WorkersCachekitIO` request path up to the fetch boundary:

@@ -14,14 +14,10 @@ static SESSION: OnceLock<SessionInfo> = OnceLock::new();
 /// (LAB-1079) — so wasm32 builds must read `js_sys::Date::now()` instead.
 #[cfg(target_arch = "wasm32")]
 fn now_epoch_millis() -> u64 {
-    let ms = js_sys::Date::now();
-    if !ms.is_finite() || ms < 0.0 {
-        return 0;
-    }
-    // `as` saturates float→int; ms is finite and non-negative here.
+    // Saturating float→int cast: NaN → 0, negative → 0, overflow → u64::MAX.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     {
-        ms as u64
+        js_sys::Date::now() as u64
     }
 }
 
@@ -73,9 +69,10 @@ mod tests {
     fn session_start_is_reasonable_epoch_millis() {
         let headers = session_headers();
         let start_ms: u64 = headers[1].1.parse().expect("Should be numeric");
-        // Should be after 2024-01-01 and before 2030-01-01
+        // Should be after 2024-01-01 and before 2035-01-01 (bounds mirror
+        // tests/wasm_session_tests.rs — keep them in lockstep)
         assert!(start_ms > 1_704_067_200_000, "Should be after 2024");
-        assert!(start_ms < 1_893_456_000_000, "Should be before 2030");
+        assert!(start_ms < 2_051_222_400_000, "Should be before 2035");
     }
 
     #[test]
