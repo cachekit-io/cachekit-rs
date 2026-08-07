@@ -7,11 +7,14 @@ use std::time::Duration;
 #[test]
 #[serial]
 fn config_from_env_defaults() {
-    // Clear relevant env vars so we get defaults.
-    std::env::remove_var("CACHEKIT_API_KEY");
-    std::env::remove_var("CACHEKIT_API_URL");
-    std::env::remove_var("CACHEKIT_MASTER_KEY");
-    std::env::remove_var("CACHEKIT_DEFAULT_TTL");
+    // Clear every from_env-read variable so we get defaults.
+    let _env = EnvGuard::set(&[
+        ("CACHEKIT_API_KEY", None),
+        ("CACHEKIT_API_URL", None),
+        ("CACHEKIT_MASTER_KEY", None),
+        ("CACHEKIT_PREVIOUS_MASTER_KEYS", None),
+        ("CACHEKIT_DEFAULT_TTL", None),
+    ]);
 
     let config = CachekitConfig::from_env().expect("from_env failed with no env vars");
 
@@ -28,9 +31,8 @@ fn config_from_env_defaults() {
 #[test]
 #[serial]
 fn config_from_env_reads_api_key() {
-    std::env::set_var("CACHEKIT_API_KEY", "test-key-123");
+    let _env = EnvGuard::set(&[("CACHEKIT_API_KEY", Some("test-key-123"))]);
     let config = CachekitConfig::from_env().expect("from_env failed");
-    std::env::remove_var("CACHEKIT_API_KEY");
 
     // Use .as_ref().map(|k| k.as_str()) NOT .as_deref()
     assert_eq!(
@@ -42,19 +44,19 @@ fn config_from_env_reads_api_key() {
 #[test]
 #[serial]
 fn config_from_env_rejects_http_url() {
-    std::env::set_var("CACHEKIT_API_URL", "http://insecure.example.com");
-    let result = CachekitConfig::from_env();
-    std::env::remove_var("CACHEKIT_API_URL");
+    let _env = EnvGuard::set(&[("CACHEKIT_API_URL", Some("http://insecure.example.com"))]);
 
-    assert!(result.is_err(), "expected error for non-HTTPS api_url");
+    assert!(
+        CachekitConfig::from_env().is_err(),
+        "expected error for non-HTTPS api_url"
+    );
 }
 
 #[test]
 #[serial]
 fn config_from_env_accepts_https_url() {
-    std::env::set_var("CACHEKIT_API_URL", "https://custom.cachekit.io");
+    let _env = EnvGuard::set(&[("CACHEKIT_API_URL", Some("https://custom.cachekit.io"))]);
     let config = CachekitConfig::from_env().expect("from_env failed");
-    std::env::remove_var("CACHEKIT_API_URL");
 
     assert_eq!(config.api_url, "https://custom.cachekit.io");
 }
@@ -63,20 +65,20 @@ fn config_from_env_accepts_https_url() {
 #[serial]
 fn config_from_env_rejects_short_master_key() {
     // 31 bytes = 62 hex chars — too short
-    std::env::set_var("CACHEKIT_MASTER_KEY", "aa".repeat(31));
-    let result = CachekitConfig::from_env();
-    std::env::remove_var("CACHEKIT_MASTER_KEY");
+    let _env = EnvGuard::set(&[("CACHEKIT_MASTER_KEY", Some(&"aa".repeat(31)))]);
 
-    assert!(result.is_err(), "expected error for short master key");
+    assert!(
+        CachekitConfig::from_env().is_err(),
+        "expected error for short master key"
+    );
 }
 
 #[test]
 #[serial]
 fn config_from_env_accepts_32_byte_master_key() {
     // 32 bytes = 64 hex chars — minimum valid
-    std::env::set_var("CACHEKIT_MASTER_KEY", "ab".repeat(32));
+    let _env = EnvGuard::set(&[("CACHEKIT_MASTER_KEY", Some(&"ab".repeat(32)))]);
     let config = CachekitConfig::from_env().expect("from_env failed");
-    std::env::remove_var("CACHEKIT_MASTER_KEY");
 
     assert!(config.master_key.is_some());
     assert_eq!(config.master_key.as_ref().unwrap().len(), 32);
@@ -85,19 +87,19 @@ fn config_from_env_accepts_32_byte_master_key() {
 #[test]
 #[serial]
 fn config_from_env_rejects_ttl_zero() {
-    std::env::set_var("CACHEKIT_DEFAULT_TTL", "0");
-    let result = CachekitConfig::from_env();
-    std::env::remove_var("CACHEKIT_DEFAULT_TTL");
+    let _env = EnvGuard::set(&[("CACHEKIT_DEFAULT_TTL", Some("0"))]);
 
-    assert!(result.is_err(), "expected error for TTL=0");
+    assert!(
+        CachekitConfig::from_env().is_err(),
+        "expected error for TTL=0"
+    );
 }
 
 #[test]
 #[serial]
 fn config_from_env_accepts_ttl_one() {
-    std::env::set_var("CACHEKIT_DEFAULT_TTL", "1");
+    let _env = EnvGuard::set(&[("CACHEKIT_DEFAULT_TTL", Some("1"))]);
     let config = CachekitConfig::from_env().expect("from_env failed");
-    std::env::remove_var("CACHEKIT_DEFAULT_TTL");
 
     assert_eq!(config.default_ttl, Duration::from_secs(1));
 }
@@ -107,11 +109,11 @@ fn config_from_env_accepts_ttl_one() {
 #[test]
 #[serial]
 fn config_debug_redacts_secrets() {
-    std::env::set_var("CACHEKIT_API_KEY", "super-secret-key");
-    std::env::set_var("CACHEKIT_MASTER_KEY", "ab".repeat(32));
+    let _env = EnvGuard::set(&[
+        ("CACHEKIT_API_KEY", Some("super-secret-key")),
+        ("CACHEKIT_MASTER_KEY", Some(&"ab".repeat(32))),
+    ]);
     let config = CachekitConfig::from_env().expect("from_env failed");
-    std::env::remove_var("CACHEKIT_API_KEY");
-    std::env::remove_var("CACHEKIT_MASTER_KEY");
 
     let debug_str = format!("{config:?}");
     assert!(
@@ -244,8 +246,6 @@ fn config_builder_accepts_previous_master_keys() {
 
 #[test]
 fn config_builder_accepts_exactly_three_previous_keys() {
-    // Boundary success for the cap: a `>=` check instead of `>` would block a
-    // legitimate three-key rotation window and still pass the rejecting test.
     let keys: Vec<String> = (1..=3).map(hexkey).collect();
     let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
 

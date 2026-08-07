@@ -105,7 +105,10 @@ impl CachekitConfig {
             config.api_url = val;
         }
 
-        // Master key — hex-decode and validate length >= 32 bytes
+        // Master key — hex-decode and validate length >= 32 bytes.
+        // Deliberately NO blank-value tolerance here (unlike the previous-keys
+        // var below): a blank CACHEKIT_MASTER_KEY treated as unset would
+        // silently turn encryption off.
         if let Ok(val) = std::env::var("CACHEKIT_MASTER_KEY") {
             config.master_key = Some(decode_master_key_hex(&val, "CACHEKIT_MASTER_KEY")?);
         }
