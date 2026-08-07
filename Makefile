@@ -1,4 +1,4 @@
-.PHONY: quick-check test build build-wasm fmt clippy security deny audit
+.PHONY: quick-check test test-wasm build build-wasm fmt clippy security deny audit
 
 CARGO := cargo
 
@@ -18,6 +18,13 @@ build:
 
 build-wasm:
 	$(CARGO) build --target wasm32-unknown-unknown --no-default-features --features workers,cachekitio,encryption
+
+# wasm32 runtime tests (LAB-1079) — same invocation as the CI `wasm` job.
+# Needs a wasm-bindgen-test-runner binary on PATH whose version matches the
+# wasm-bindgen pin in Cargo.lock, plus Node.
+test-wasm:
+	CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+	$(CARGO) test -p cachekit-rs --target wasm32-unknown-unknown --no-default-features --features workers,cachekitio,encryption,macros --test wasm_session_tests
 
 # Supply-chain gate — the same commands CI runs in
 # .github/workflows/security.yml, so a local pass means a CI pass. (CI runs the

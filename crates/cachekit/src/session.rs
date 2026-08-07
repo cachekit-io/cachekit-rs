@@ -1,5 +1,4 @@
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 struct SessionInfo {
     id: String,
@@ -8,18 +7,35 @@ struct SessionInfo {
 
 static SESSION: OnceLock<SessionInfo> = OnceLock::new();
 
+/// Current Unix time in milliseconds, via the JavaScript clock.
+///
+/// `std::time::SystemTime::now()` panics on `wasm32-unknown-unknown` ("time
+/// not implemented on this platform"), which trapped every Workers request
+/// (LAB-1079) — so wasm32 builds must read `js_sys::Date::now()` instead.
+#[cfg(target_arch = "wasm32")]
+fn now_epoch_millis() -> u64 {
+    // Saturating float→int cast: NaN → 0, negative → 0, overflow → u64::MAX.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        js_sys::Date::now() as u64
+    }
+}
+
+/// Current Unix time in milliseconds, via the system clock (native targets).
+#[cfg(not(target_arch = "wasm32"))]
+fn now_epoch_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
 fn get_or_create() -> &'static SessionInfo {
-    SESSION.get_or_init(|| {
-        let id = uuid::Uuid::new_v4().to_string();
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let start_ms = u64::try_from(millis).unwrap_or(u64::MAX);
-        SessionInfo {
-            id,
-            start_str: start_ms.to_string(),
-        }
+    SESSION.get_or_init(|| SessionInfo {
+        id: uuid::Uuid::new_v4().to_string(),
+        start_str: now_epoch_millis().to_string(),
     })
 }
 
@@ -53,9 +69,12 @@ mod tests {
     fn session_start_is_reasonable_epoch_millis() {
         let headers = session_headers();
         let start_ms: u64 = headers[1].1.parse().expect("Should be numeric");
-        // Should be after 2024-01-01 and before 2030-01-01
+        // Plausibility window: after 2024-01-01, before 2100-01-01. Wide on
+        // purpose — it exists to catch unit confusion (epoch seconds trip the
+        // lower bound, micros the upper), not to expire on a schedule. Bounds
+        // mirror tests/wasm_session_tests.rs — keep them in lockstep.
         assert!(start_ms > 1_704_067_200_000, "Should be after 2024");
-        assert!(start_ms < 1_893_456_000_000, "Should be before 2030");
+        assert!(start_ms < 4_102_444_800_000, "Should be before 2100");
     }
 
     #[test]
