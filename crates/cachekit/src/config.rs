@@ -113,6 +113,10 @@ impl CachekitConfig {
             // `env::var` hands back an owned copy of the hex secret. Wrap it so
             // that copy is wiped on drop too — the decoded bytes below are
             // already `Zeroizing`, but the hex form is the same key material.
+            // Defence in depth over the heap copy only: the process `environ`
+            // block still holds the identical hex for the process lifetime and
+            // is not wiped here, so this narrows post-lifetime recovery (core
+            // dumps, swap, heap reuse), it does not eliminate the exposure.
             let val = Zeroizing::new(val);
             config.master_key = Some(decode_master_key_hex(&val, "CACHEKIT_MASTER_KEY")?);
         }
