@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.1](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.6.0...cachekit-rs-v0.6.1) (2026-08-05)
+
+
+### Bug Fixes
+
+* use snake_case wire names for lock acquire request/response ([#34](https://github.com/cachekit-io/cachekit-rs/issues/34)) ([40b7277](https://github.com/cachekit-io/cachekit-rs/commit/40b7277e75b5019ad27206323f97135db14dc8b9))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.6.0 to 0.6.1
+
 ## [0.6.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.5.0...cachekit-rs-v0.6.0) (2026-08-03)
 
 
