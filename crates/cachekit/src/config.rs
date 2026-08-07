@@ -110,6 +110,10 @@ impl CachekitConfig {
         // var below): a blank CACHEKIT_MASTER_KEY treated as unset would
         // silently turn encryption off.
         if let Ok(val) = std::env::var("CACHEKIT_MASTER_KEY") {
+            // `env::var` hands back an owned copy of the hex secret. Wrap it so
+            // that copy is wiped on drop too — the decoded bytes below are
+            // already `Zeroizing`, but the hex form is the same key material.
+            let val = Zeroizing::new(val);
             config.master_key = Some(decode_master_key_hex(&val, "CACHEKIT_MASTER_KEY")?);
         }
 
@@ -119,6 +123,9 @@ impl CachekitConfig {
         // treated as unset; a blank entry inside a non-blank list is still an
         // operator mistake.
         if let Ok(val) = std::env::var("CACHEKIT_PREVIOUS_MASTER_KEYS") {
+            // Same reasoning as CACHEKIT_MASTER_KEY above: wipe the owned copy
+            // of the hex list on drop.
+            let val = Zeroizing::new(val);
             if !val.trim().is_empty() {
                 let mut previous = Vec::new();
                 for entry in val.split(',') {
