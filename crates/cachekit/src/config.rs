@@ -89,7 +89,7 @@ impl CachekitConfig {
     /// | `CACHEKIT_API_KEY` | API key for cachekit.io |
     /// | `CACHEKIT_API_URL` | Override API base URL (must be HTTPS) |
     /// | `CACHEKIT_MASTER_KEY` | Hex-encoded master key (min 32 bytes) |
-    /// | `CACHEKIT_PREVIOUS_MASTER_KEYS` | Comma-separated hex-encoded decrypt-only previous master keys (max 3) |
+    /// | `CACHEKIT_PREVIOUS_MASTER_KEYS` | Comma-separated hex-encoded decrypt-only previous master keys (max 3; blank value = unset) |
     /// | `CACHEKIT_DEFAULT_TTL` | Default TTL in seconds (min 1) |
     pub fn from_env() -> Result<Self, CachekitError> {
         let mut config = Self::default();
@@ -107,39 +107,44 @@ impl CachekitConfig {
 
         // Master key — hex-decode and validate length >= 32 bytes
         if let Ok(val) = std::env::var("CACHEKIT_MASTER_KEY") {
-            let bytes = decode_master_key_hex(&val, "CACHEKIT_MASTER_KEY")?;
-            config.master_key = Some(Zeroizing::new(bytes));
+            config.master_key = Some(decode_master_key_hex(&val, "CACHEKIT_MASTER_KEY")?);
         }
 
         // Previous master keys — comma-separated hex, decrypt-only, max 3.
+        // A wholly blank value retires the variable (the common way to disable
+        // it in shell profiles, Compose files, and k8s manifests) and is
+        // treated as unset; a blank entry inside a non-blank list is still an
+        // operator mistake.
         if let Ok(val) = std::env::var("CACHEKIT_PREVIOUS_MASTER_KEYS") {
-            let mut previous = Vec::new();
-            for entry in val.split(',') {
-                let entry = entry.trim();
-                if entry.is_empty() {
+            if !val.trim().is_empty() {
+                let mut previous = Vec::new();
+                for entry in val.split(',') {
+                    let entry = entry.trim();
+                    if entry.is_empty() {
+                        return Err(CachekitError::Config(
+                            "CACHEKIT_PREVIOUS_MASTER_KEYS contains an empty entry".to_owned(),
+                        ));
+                    }
+                    previous.push(decode_master_key_hex(
+                        entry,
+                        "CACHEKIT_PREVIOUS_MASTER_KEYS entry",
+                    )?);
+                }
+                // Previous keys without a current key is a broken rotation
+                // deploy: nothing would ever consume them, and the operator
+                // would only find out at the first secure() call. Fail at load.
+                if config.master_key.is_none() {
                     return Err(CachekitError::Config(
-                        "CACHEKIT_PREVIOUS_MASTER_KEYS contains an empty entry".to_owned(),
+                        "CACHEKIT_PREVIOUS_MASTER_KEYS requires CACHEKIT_MASTER_KEY to be set"
+                            .to_owned(),
                     ));
                 }
-                previous.push(Zeroizing::new(decode_master_key_hex(
-                    entry,
-                    "CACHEKIT_PREVIOUS_MASTER_KEYS entry",
-                )?));
+                validate_previous_master_keys(
+                    config.master_key.as_deref().map(Vec::as_slice),
+                    &previous,
+                )?;
+                config.previous_master_keys = previous;
             }
-            // Previous keys without a current key is a broken rotation
-            // deploy: nothing would ever consume them, and the operator
-            // would only find out at the first secure() call. Fail at load.
-            if config.master_key.is_none() {
-                return Err(CachekitError::Config(
-                    "CACHEKIT_PREVIOUS_MASTER_KEYS requires CACHEKIT_MASTER_KEY to be set"
-                        .to_owned(),
-                ));
-            }
-            validate_previous_master_keys(
-                config.master_key.as_deref().map(Vec::as_slice),
-                &previous,
-            )?;
-            config.previous_master_keys = previous;
         }
 
         // Default TTL — minimum 1 second
@@ -194,7 +199,7 @@ impl CachekitConfigBuilder {
     pub fn master_key(mut self, hex_key: &str) -> Result<Self, CachekitError> {
         let bytes = decode_master_key_hex(hex_key, "master_key")?;
         validate_previous_master_keys(Some(bytes.as_slice()), &self.inner.previous_master_keys)?;
-        self.inner.master_key = Some(Zeroizing::new(bytes));
+        self.inner.master_key = Some(bytes);
         Ok(self)
     }
 
@@ -228,10 +233,10 @@ impl CachekitConfigBuilder {
     pub fn previous_master_keys(mut self, hex_keys: &[&str]) -> Result<Self, CachekitError> {
         let mut previous = Vec::with_capacity(hex_keys.len());
         for hex_key in hex_keys {
-            previous.push(Zeroizing::new(decode_master_key_hex(
+            previous.push(decode_master_key_hex(
                 hex_key,
                 "previous_master_keys entry",
-            )?));
+            )?);
         }
         validate_previous_master_keys(
             self.inner.master_key.as_deref().map(Vec::as_slice),
@@ -274,9 +279,15 @@ impl CachekitConfigBuilder {
 
 /// Hex-decode a master key and require at least 32 bytes. Shared by the
 /// current-key and previous-key paths so validation cannot drift.
-fn decode_master_key_hex(hex_key: &str, what: &str) -> Result<Vec<u8>, CachekitError> {
-    let bytes = hex::decode(hex_key)
-        .map_err(|e| CachekitError::Config(format!("{what} is not valid hex: {e}")))?;
+///
+/// Returns `Zeroizing` so the decoded key material is wiped on drop for its
+/// whole lifetime — including the early-drop paths where a caller's later
+/// validation step fails.
+fn decode_master_key_hex(hex_key: &str, what: &str) -> Result<Zeroizing<Vec<u8>>, CachekitError> {
+    let bytes = Zeroizing::new(
+        hex::decode(hex_key)
+            .map_err(|e| CachekitError::Config(format!("{what} is not valid hex: {e}")))?,
+    );
     if bytes.len() < 32 {
         return Err(CachekitError::Config(format!(
             "{what} must be at least 32 bytes (64 hex chars); got {} bytes",

@@ -35,10 +35,10 @@ const AAD_VERSION: u8 = 0x03;
 ///
 /// Writes always encrypt under the current master key. Reads decrypt via the
 /// keyring: sequential attempts, current key first, then each decrypt-only
-/// previous key in order, rebuilding the identical AAD per attempt (rs
-/// entries carry no per-entry key identity — sequential attempts are the
-/// spec-assigned branch, `protocol/spec/encryption.md` → "Key Rotation
-/// (Keyring)").
+/// previous key in order, rebuilding the identical AAD per attempt
+/// (cachekit-rs entries carry no per-entry key identity — sequential
+/// attempts are the spec-assigned branch, `protocol/spec/encryption.md` →
+/// "Key Rotation (Keyring)").
 pub struct EncryptionLayer {
     encryptor: ZeroKnowledgeEncryptor,
     derived_key: Zeroizing<[u8; 32]>,
@@ -398,6 +398,21 @@ mod tests {
         assert_eq!(
             current_only.decrypt(&ciphertext, "user:2").unwrap(),
             b"fresh write"
+        );
+    }
+
+    #[test]
+    fn exactly_three_previous_keys_is_accepted() {
+        // Boundary success: a `>=` cap check instead of `>` would reject a
+        // legitimate three-key rotation window and still pass every
+        // rejecting-side test.
+        let keys: Vec<[u8; 32]> = (1..=3).map(|i| [i; 32]).collect();
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+
+        let layer = EncryptionLayer::with_previous_keys(K2, &refs, TEST_TENANT);
+        assert!(
+            layer.is_ok(),
+            "cap is 3: exactly three previous keys must build"
         );
     }
 

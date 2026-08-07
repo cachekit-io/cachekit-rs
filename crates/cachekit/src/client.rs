@@ -997,7 +997,7 @@ impl CacheKitBuilder {
 
     /// Configure encryption from raw master key bytes and tenant ID.
     ///
-    /// The master key must be at least 16 bytes (32 recommended).
+    /// The master key must be at least 32 bytes.
     /// Keys are derived per-tenant via HKDF-SHA256.
     #[cfg(feature = "encryption")]
     pub fn encryption_from_bytes(
@@ -1017,6 +1017,8 @@ impl CacheKitBuilder {
     /// key in `previous_keys` sequentially (attempt order = slice order).
     /// At most 3 previous keys; supplying more is a config error, never
     /// truncated. See [`crate::encryption::EncryptionLayer::with_previous_keys`].
+    ///
+    /// Every key, current and previous, must be at least 32 bytes.
     #[cfg(feature = "encryption")]
     pub fn encryption_from_bytes_with_previous(
         mut self,
