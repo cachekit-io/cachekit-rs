@@ -90,19 +90,22 @@ impl EncryptionLayer {
                 )));
             }
         }
+        // Key-length and tenant checks are configuration errors, kept in the
+        // same class as the previous-key and Keyring construction checks
+        // below (LAB-683: config errors must not fold into crypto failures).
         if master_key_bytes.len() < 32 {
-            return Err(CachekitError::Encryption(format!(
+            return Err(CachekitError::Config(format!(
                 "master key must be at least 32 bytes; got {}",
                 master_key_bytes.len()
             )));
         }
         if tenant_id.is_empty() {
-            return Err(CachekitError::Encryption(
+            return Err(CachekitError::Config(
                 "tenant_id must not be empty".to_owned(),
             ));
         }
         if tenant_id.len() > 255 {
-            return Err(CachekitError::Encryption(format!(
+            return Err(CachekitError::Config(format!(
                 "tenant_id must be at most 255 bytes; got {}",
                 tenant_id.len()
             )));
@@ -157,7 +160,16 @@ impl EncryptionLayer {
         let aad = self.build_aad(cache_key, false);
         self.keyring
             .decrypt(&self.encryptor, ciphertext, &self.tenant_id, &aad)
-            .map_err(|e| CachekitError::Encryption(format!("decrypt failed: {e}")))
+            .map_err(|e| match e {
+                // Config-class errors stay config-class (LAB-683 decision):
+                // a derivation failure or caller bug must never masquerade as
+                // a decrypt failure that fail-open callers read as a miss.
+                cachekit_core::EncryptionError::KeyDerivation(_)
+                | cachekit_core::EncryptionError::KeyringIndexOutOfRange { .. } => {
+                    CachekitError::Config(format!("keyring decrypt misconfiguration: {e}"))
+                }
+                _ => CachekitError::Encryption(format!("decrypt failed: {e}")),
+            })
     }
 
     /// Return the tenant ID used for key derivation.

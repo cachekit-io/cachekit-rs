@@ -323,3 +323,17 @@ fn previous_key_cap_matches_core_keyring_cap() {
         cachekit_core::MAX_DECRYPT_ONLY_KEYS
     );
 }
+
+#[test]
+#[serial]
+fn config_from_env_rejects_previous_keys_without_master_key() {
+    std::env::remove_var("CACHEKIT_MASTER_KEY");
+    std::env::set_var("CACHEKIT_PREVIOUS_MASTER_KEYS", hexkey(0x11));
+    let result = CachekitConfig::from_env();
+    std::env::remove_var("CACHEKIT_PREVIOUS_MASTER_KEYS");
+
+    assert!(
+        matches!(result, Err(cachekit::CachekitError::Config(_))),
+        "previous keys without a current master key must fail at load, not be silently dropped"
+    );
+}

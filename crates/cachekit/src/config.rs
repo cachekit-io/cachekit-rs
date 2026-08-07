@@ -126,6 +126,15 @@ impl CachekitConfig {
                     "CACHEKIT_PREVIOUS_MASTER_KEYS entry",
                 )?));
             }
+            // Previous keys without a current key is a broken rotation
+            // deploy: nothing would ever consume them, and the operator
+            // would only find out at the first secure() call. Fail at load.
+            if config.master_key.is_none() {
+                return Err(CachekitError::Config(
+                    "CACHEKIT_PREVIOUS_MASTER_KEYS requires CACHEKIT_MASTER_KEY to be set"
+                        .to_owned(),
+                ));
+            }
             validate_previous_master_keys(
                 config.master_key.as_deref().map(Vec::as_slice),
                 &previous,
