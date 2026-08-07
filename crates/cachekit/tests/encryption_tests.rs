@@ -341,3 +341,79 @@ async fn secure_set_rejects_payload_whose_ciphertext_exceeds_limit() {
     let got: Option<String> = secure.get("small:key").await.expect("small get");
     assert_eq!(got.as_deref(), Some("ok"));
 }
+
+// ── Key rotation (keyring) ────────────────────────────────────────────────────
+
+/// End-to-end rotation round-trip (LAB-686 acceptance):
+/// value written under k1 → k2 promoted with k1 decrypt-only → read succeeds
+/// without re-encryption → k1 dropped → read fails as an error.
+#[tokio::test]
+async fn rotation_round_trip_without_reencryption() {
+    const K1: &[u8] = &[0x11; 32];
+    const K2: &[u8] = &[0x22; 32];
+
+    let (backend, store) = common::MockBackend::new_with_handle();
+
+    // Phase 1: pre-rotation client writes under k1.
+    let writer = CacheKit::builder()
+        .backend(backend.clone())
+        .default_ttl(Duration::from_secs(60))
+        .no_l1()
+        .encryption_from_bytes(K1, "test-tenant")
+        .expect("encryption setup")
+        .build()
+        .expect("client builds");
+    let secret = Secret {
+        api_key: "sk-live-rotate-me".to_owned(), // pragma: allowlist secret
+        user_id: 7,
+    };
+    writer
+        .secure()
+        .expect("secure()")
+        .set("secret:7", &secret)
+        .await
+        .expect("secure set under k1");
+
+    let ciphertext_before = store.store.lock().await.get("secret:7").cloned().unwrap();
+
+    // Phase 2: k2 promoted to current, k1 retained decrypt-only.
+    let rotated = CacheKit::builder()
+        .backend(backend.clone())
+        .default_ttl(Duration::from_secs(60))
+        .no_l1()
+        .encryption_from_bytes_with_previous(K2, &[K1], "test-tenant")
+        .expect("keyring setup")
+        .build()
+        .expect("client builds");
+    let read_back: Secret = rotated
+        .secure()
+        .expect("secure()")
+        .get("secret:7")
+        .await
+        .expect("secure get after rotation")
+        .expect("value should exist");
+    assert_eq!(read_back, secret);
+
+    // The read must not have re-encrypted: stored bytes are untouched.
+    let ciphertext_after = store.store.lock().await.get("secret:7").cloned().unwrap();
+    assert_eq!(
+        ciphertext_before, ciphertext_after,
+        "read-through rotation must not rewrite the entry"
+    );
+
+    // Phase 3: k1 dropped — hard cut-over, the k1-era entry is unreadable.
+    let cut_over = CacheKit::builder()
+        .backend(backend)
+        .default_ttl(Duration::from_secs(60))
+        .no_l1()
+        .encryption_from_bytes_with_previous(K2, &[], "test-tenant")
+        .expect("keyring setup")
+        .build()
+        .expect("client builds");
+    let result: Result<Option<Secret>, _> =
+        cut_over.secure().expect("secure()").get("secret:7").await;
+    assert!(
+        matches!(result, Err(CachekitError::Encryption(_))),
+        "dropped-key read must surface as an encryption error, got {result:?}"
+    );
+}

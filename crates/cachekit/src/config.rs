@@ -4,6 +4,14 @@ use zeroize::Zeroizing;
 
 use crate::error::CachekitError;
 
+/// Maximum number of decrypt-only previous master keys.
+///
+/// Mirrors `cachekit_core::MAX_DECRYPT_ONLY_KEYS` (spec/encryption.md → "Key
+/// Rotation (Keyring)"), which is feature-gated behind `encryption` and so
+/// cannot be referenced here unconditionally. A drift-guard test in
+/// `config_tests.rs` asserts the two stay equal.
+pub const MAX_PREVIOUS_MASTER_KEYS: usize = 3;
+
 // ── CachekitConfig ────────────────────────────────────────────────────────────
 
 /// Runtime configuration for a [`crate::client::CacheKit`] instance.
@@ -14,6 +22,11 @@ pub struct CachekitConfig {
     pub api_url: String,
     /// Master key used for zero-knowledge encryption (AES-256-GCM).
     pub master_key: Option<Zeroizing<Vec<u8>>>,
+    /// Decrypt-only previous master keys retained during a rotation grace
+    /// window, in attempt order. Writes always use `master_key`; reads
+    /// attempt it first, then these, sequentially. At most
+    /// [`MAX_PREVIOUS_MASTER_KEYS`] entries.
+    pub previous_master_keys: Vec<Zeroizing<Vec<u8>>>,
     /// Default TTL for cache entries when none is specified at call site.
     pub default_ttl: Duration,
     /// Optional namespace prefix applied to all cache keys.
@@ -41,6 +54,10 @@ impl std::fmt::Debug for CachekitConfig {
             .field("api_key", &api_key_repr)
             .field("api_url", &self.api_url)
             .field("master_key", &master_key_repr)
+            .field(
+                "previous_master_keys",
+                &format_args!("[REDACTED; {}]", self.previous_master_keys.len()),
+            )
             .field("default_ttl", &self.default_ttl)
             .field("namespace", &self.namespace)
             .field("l1_capacity", &self.l1_capacity)
@@ -55,6 +72,7 @@ impl Default for CachekitConfig {
             api_key: None,
             api_url: "https://api.cachekit.io".to_owned(),
             master_key: None,
+            previous_master_keys: Vec::new(),
             default_ttl: Duration::from_secs(300),
             namespace: None,
             l1_capacity: 1000,
@@ -71,6 +89,7 @@ impl CachekitConfig {
     /// | `CACHEKIT_API_KEY` | API key for cachekit.io |
     /// | `CACHEKIT_API_URL` | Override API base URL (must be HTTPS) |
     /// | `CACHEKIT_MASTER_KEY` | Hex-encoded master key (min 32 bytes) |
+    /// | `CACHEKIT_PREVIOUS_MASTER_KEYS` | Comma-separated hex-encoded decrypt-only previous master keys (max 3) |
     /// | `CACHEKIT_DEFAULT_TTL` | Default TTL in seconds (min 1) |
     pub fn from_env() -> Result<Self, CachekitError> {
         let mut config = Self::default();
@@ -88,17 +107,30 @@ impl CachekitConfig {
 
         // Master key — hex-decode and validate length >= 32 bytes
         if let Ok(val) = std::env::var("CACHEKIT_MASTER_KEY") {
-            let bytes = hex::decode(&val).map_err(|e| {
-                CachekitError::Config(format!("CACHEKIT_MASTER_KEY is not valid hex: {e}"))
-            })?;
-            if bytes.len() < 32 {
-                return Err(CachekitError::Config(format!(
-                    "CACHEKIT_MASTER_KEY must be at least 32 bytes ({} hex chars); got {} bytes",
-                    64,
-                    bytes.len()
-                )));
-            }
+            let bytes = decode_master_key_hex(&val, "CACHEKIT_MASTER_KEY")?;
             config.master_key = Some(Zeroizing::new(bytes));
+        }
+
+        // Previous master keys — comma-separated hex, decrypt-only, max 3.
+        if let Ok(val) = std::env::var("CACHEKIT_PREVIOUS_MASTER_KEYS") {
+            let mut previous = Vec::new();
+            for entry in val.split(',') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    return Err(CachekitError::Config(
+                        "CACHEKIT_PREVIOUS_MASTER_KEYS contains an empty entry".to_owned(),
+                    ));
+                }
+                previous.push(Zeroizing::new(decode_master_key_hex(
+                    entry,
+                    "CACHEKIT_PREVIOUS_MASTER_KEYS entry",
+                )?));
+            }
+            validate_previous_master_keys(
+                config.master_key.as_deref().map(Vec::as_slice),
+                &previous,
+            )?;
+            config.previous_master_keys = previous;
         }
 
         // Default TTL — minimum 1 second
@@ -151,15 +183,52 @@ impl CachekitConfigBuilder {
 
     /// Set the master key from a hex string. Must decode to at least 32 bytes.
     pub fn master_key(mut self, hex_key: &str) -> Result<Self, CachekitError> {
-        let bytes = hex::decode(hex_key)
-            .map_err(|e| CachekitError::Config(format!("master_key is not valid hex: {e}")))?;
-        if bytes.len() < 32 {
-            return Err(CachekitError::Config(format!(
-                "master_key must be at least 32 bytes; got {}",
-                bytes.len()
-            )));
-        }
+        let bytes = decode_master_key_hex(hex_key, "master_key")?;
+        validate_previous_master_keys(Some(bytes.as_slice()), &self.inner.previous_master_keys)?;
         self.inner.master_key = Some(Zeroizing::new(bytes));
+        Ok(self)
+    }
+
+    /// Set decrypt-only previous master keys from hex strings, in attempt
+    /// order. Retained during a key-rotation grace window: reads attempt the
+    /// current master key first, then each of these sequentially.
+    ///
+    /// Validation is identical to [`Self::master_key`] per entry (valid hex,
+    /// at least 32 bytes). At most [`MAX_PREVIOUS_MASTER_KEYS`] entries —
+    /// more is a [`CachekitError::Config`], never truncated. The current
+    /// master key must not reappear here (forward-only rotation: a retired
+    /// key is never re-promoted).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cachekit::config::CachekitConfigBuilder;
+    ///
+    /// // k2 is current after rotation; k1 stays readable during the grace window.
+    /// let k1 = "11".repeat(32);
+    /// let k2 = "22".repeat(32);
+    ///
+    /// let config = CachekitConfigBuilder::new()
+    ///     .master_key(&k2)?
+    ///     .previous_master_keys(&[k1.as_str()])?
+    ///     .build();
+    ///
+    /// assert_eq!(config.previous_master_keys.len(), 1);
+    /// # Ok::<(), cachekit::CachekitError>(())
+    /// ```
+    pub fn previous_master_keys(mut self, hex_keys: &[&str]) -> Result<Self, CachekitError> {
+        let mut previous = Vec::with_capacity(hex_keys.len());
+        for hex_key in hex_keys {
+            previous.push(Zeroizing::new(decode_master_key_hex(
+                hex_key,
+                "previous_master_keys entry",
+            )?));
+        }
+        validate_previous_master_keys(
+            self.inner.master_key.as_deref().map(Vec::as_slice),
+            &previous,
+        )?;
+        self.inner.previous_master_keys = previous;
         Ok(self)
     }
 
@@ -193,6 +262,51 @@ impl CachekitConfigBuilder {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Hex-decode a master key and require at least 32 bytes. Shared by the
+/// current-key and previous-key paths so validation cannot drift.
+fn decode_master_key_hex(hex_key: &str, what: &str) -> Result<Vec<u8>, CachekitError> {
+    let bytes = hex::decode(hex_key)
+        .map_err(|e| CachekitError::Config(format!("{what} is not valid hex: {e}")))?;
+    if bytes.len() < 32 {
+        return Err(CachekitError::Config(format!(
+            "{what} must be at least 32 bytes (64 hex chars); got {} bytes",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Enforce the keyring config invariants: at most [`MAX_PREVIOUS_MASTER_KEYS`]
+/// previous keys (rejected, never truncated), and the current master key must
+/// not also appear in the previous list (the detectable subset of the
+/// forward-only rotation rule — re-promoting a retired key would resume a
+/// used, unknowable AES-GCM nonce budget).
+///
+/// Fail-fast mirror of the checks `cachekit_core::Keyring::new` repeats at
+/// client build time; plain equality is fine — both operands are
+/// operator-supplied configuration, not secrets under timing attack.
+fn validate_previous_master_keys(
+    master_key: Option<&[u8]>,
+    previous: &[Zeroizing<Vec<u8>>],
+) -> Result<(), CachekitError> {
+    if previous.len() > MAX_PREVIOUS_MASTER_KEYS {
+        return Err(CachekitError::Config(format!(
+            "previous_master_keys accepts at most {MAX_PREVIOUS_MASTER_KEYS} entries; got {}",
+            previous.len()
+        )));
+    }
+    if let Some(master) = master_key {
+        if previous.iter().any(|key| key.as_slice() == master) {
+            return Err(CachekitError::Config(
+                "the current master key must not appear in previous_master_keys \
+                 (rotation is forward-only; retired keys are never re-promoted)"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
 
 fn validate_https(url: &str) -> Result<(), CachekitError> {
     if !url.starts_with("https://") {

@@ -174,3 +174,152 @@ fn config_builder_accepts_valid_master_key() {
     assert!(config.master_key.is_some());
     assert_eq!(config.master_key.as_ref().unwrap().len(), 32);
 }
+
+// ── Previous master keys (key rotation) ───────────────────────────────────────
+
+fn hexkey(byte: u8) -> String {
+    hex::encode([byte; 32])
+}
+
+fn assert_config_err(result: Result<CachekitConfigBuilder, cachekit::CachekitError>, what: &str) {
+    match result {
+        Err(cachekit::CachekitError::Config(_)) => {}
+        other => panic!(
+            "{what}: expected CachekitError::Config, got {:?}",
+            other.map(|_| "Ok(builder)")
+        ),
+    }
+}
+
+#[test]
+fn config_builder_accepts_previous_master_keys() {
+    let config = CachekitConfigBuilder::new()
+        .master_key(&hexkey(0x22))
+        .expect("valid master key")
+        .previous_master_keys(&[hexkey(0x11).as_str(), hexkey(0x33).as_str()])
+        .expect("valid previous keys")
+        .build();
+
+    assert_eq!(config.previous_master_keys.len(), 2);
+    // Attempt order preserved: slice order.
+    assert_eq!(config.previous_master_keys[0].as_slice(), &[0x11u8; 32]);
+    assert_eq!(config.previous_master_keys[1].as_slice(), &[0x33u8; 32]);
+}
+
+#[test]
+fn config_builder_rejects_more_than_three_previous_keys() {
+    let keys: Vec<String> = (1..=4).map(hexkey).collect();
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+
+    let result = CachekitConfigBuilder::new()
+        .master_key(&hexkey(0x22))
+        .expect("valid master key")
+        .previous_master_keys(&refs);
+    assert_config_err(result, "cap of 3 must reject, never truncate");
+}
+
+#[test]
+fn config_builder_rejects_invalid_hex_previous_key() {
+    let result = CachekitConfigBuilder::new().previous_master_keys(&["not-hex"]);
+    assert_config_err(result, "invalid hex previous key");
+}
+
+#[test]
+fn config_builder_rejects_short_previous_key() {
+    let short_hex = "aa".repeat(31);
+    let result = CachekitConfigBuilder::new().previous_master_keys(&[short_hex.as_str()]);
+    assert_config_err(result, "short previous key");
+}
+
+#[test]
+fn config_builder_rejects_master_key_in_previous_list() {
+    let current = hexkey(0x22);
+
+    // previous set after master_key
+    let result = CachekitConfigBuilder::new()
+        .master_key(&current)
+        .expect("valid master key")
+        .previous_master_keys(&[current.as_str()]);
+    assert_config_err(result, "self-collision (previous after master)");
+
+    // master_key set after previous — same invariant, other call order
+    let result = CachekitConfigBuilder::new()
+        .previous_master_keys(&[current.as_str()])
+        .expect("valid previous keys")
+        .master_key(&current);
+    assert_config_err(result, "self-collision (master after previous)");
+}
+
+#[test]
+#[serial]
+fn config_from_env_reads_previous_master_keys() {
+    std::env::set_var("CACHEKIT_MASTER_KEY", hexkey(0x22));
+    std::env::set_var(
+        "CACHEKIT_PREVIOUS_MASTER_KEYS",
+        format!("{}, {}", hexkey(0x11), hexkey(0x33)), // whitespace around commas tolerated
+    );
+    let config = CachekitConfig::from_env();
+    std::env::remove_var("CACHEKIT_MASTER_KEY");
+    std::env::remove_var("CACHEKIT_PREVIOUS_MASTER_KEYS");
+
+    let config = config.expect("from_env failed");
+    assert_eq!(config.previous_master_keys.len(), 2);
+    assert_eq!(config.previous_master_keys[0].as_slice(), &[0x11u8; 32]);
+    assert_eq!(config.previous_master_keys[1].as_slice(), &[0x33u8; 32]);
+}
+
+#[test]
+#[serial]
+fn config_from_env_rejects_more_than_three_previous_keys() {
+    let val: Vec<String> = (1..=4).map(hexkey).collect();
+    std::env::set_var("CACHEKIT_PREVIOUS_MASTER_KEYS", val.join(","));
+    let result = CachekitConfig::from_env();
+    std::env::remove_var("CACHEKIT_PREVIOUS_MASTER_KEYS");
+
+    assert!(
+        matches!(result, Err(cachekit::CachekitError::Config(_))),
+        "cap of 3 must reject at load, never truncate"
+    );
+}
+
+#[test]
+#[serial]
+fn config_from_env_rejects_master_key_in_previous_list() {
+    std::env::set_var("CACHEKIT_MASTER_KEY", hexkey(0x22));
+    std::env::set_var(
+        "CACHEKIT_PREVIOUS_MASTER_KEYS",
+        format!("{},{}", hexkey(0x11), hexkey(0x22)),
+    );
+    let result = CachekitConfig::from_env();
+    std::env::remove_var("CACHEKIT_MASTER_KEY");
+    std::env::remove_var("CACHEKIT_PREVIOUS_MASTER_KEYS");
+
+    assert!(
+        matches!(result, Err(cachekit::CachekitError::Config(_))),
+        "current key in previous list must fail at load"
+    );
+}
+
+#[test]
+#[serial]
+fn config_from_env_rejects_empty_previous_key_entry() {
+    std::env::set_var(
+        "CACHEKIT_PREVIOUS_MASTER_KEYS",
+        format!("{},", hexkey(0x11)), // trailing comma → empty entry
+    );
+    let result = CachekitConfig::from_env();
+    std::env::remove_var("CACHEKIT_PREVIOUS_MASTER_KEYS");
+
+    assert!(result.is_err(), "empty entry must be rejected, not skipped");
+}
+
+/// Drift guard: the config-level cap (compiled without the `encryption`
+/// feature) must equal the core keyring's cap.
+#[test]
+#[cfg(feature = "encryption")]
+fn previous_key_cap_matches_core_keyring_cap() {
+    assert_eq!(
+        cachekit::config::MAX_PREVIOUS_MASTER_KEYS,
+        cachekit_core::MAX_DECRYPT_ONLY_KEYS
+    );
+}

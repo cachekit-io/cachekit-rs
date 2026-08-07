@@ -45,7 +45,7 @@ reliability = ["tokio/time"]
 unsync = []
 
 [dependencies]
-cachekit-core = { version = "0.4", features = ["messagepack"] }
+cachekit-core = { version = "0.5", features = ["messagepack"] }
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
 thiserror = "2.0"
