@@ -202,7 +202,7 @@ let user: Option<User> = cache.interop_get(&key).await?; // strict read: exactly
 Argument hashing is byte-identical across SDKs (canonical MessagePack + Blake2b-256), verified against the shared [protocol test vectors](https://github.com/cachekit-io/protocol/blob/main/test-vectors/interop-mode.json) in this repo's test suite. `interop_get` (also on `SecureCache`) rejects trailing bytes and Python-internal CK frames instead of silently misreading them. Encryption works unchanged — interop keys are identical across SDKs, so the AAD verifies cross-SDK.
 
 > [!IMPORTANT]
-> Use interop keys on a client **without** `.namespace()` / `CACHEKIT_NAMESPACE` — a client prefix would rewrite the storage key to `{prefix}:{interop_key}`, which no other SDK computes. `interop_get` fails closed with a config error rather than silently missing; interop keys already carry their own namespace segment.
+> Use interop keys on a client **without** `.namespace()` — a client prefix would rewrite the storage key to `{prefix}:{interop_key}`, which no other SDK computes. `interop_get` fails closed with a config error rather than silently missing; interop keys already carry their own namespace segment.
 
 Interop mode in production: [Skyline](https://github.com/cachekit-io/bluesky-thinking) — the canonical example project — runs this SDK on `wasm32` (Cloudflare Workers) deriving interop keys and verifying payload integrity for the namespace the Python and TypeScript SDKs share (public aggregate reads stay on the TypeScript edge — see the [example page](https://docs.cachekit.io/examples/skyline/)).
 

@@ -197,11 +197,15 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   (`NAN`, `±INFINITY`) and `i128` outside `[-2^63, 2^64-1]`. This
 ///   fail-loud contract matches the Python and TypeScript SDKs — silently
 ///   running uncached would mask cross-SDK key divergence.
-/// - The client must be built **without** `.namespace()` /
-///   `CACHEKIT_NAMESPACE` — interop keys carry their own namespace segment,
-///   and reads fail closed on a namespaced client.
-/// - A stored entry that cannot be decoded as the return type is treated as
-///   a miss and overwritten (self-healing), never an error loop.
+/// - The client must be built **without** `.namespace()` — interop keys
+///   carry their own namespace segment, and reads fail closed on a
+///   namespaced client.
+/// - A stored entry that cannot be decoded as the return type
+///   (`CachekitError::Serialization`) is treated as a miss and overwritten
+///   (self-healing). On `secure` functions this covers only post-decrypt
+///   decode failures: an entry that fails AES-GCM authentication raises
+///   `CachekitError::Encryption`, which propagates (fail-closed) until the
+///   entry expires or is deleted.
 ///
 /// # Requirements (continued)
 ///

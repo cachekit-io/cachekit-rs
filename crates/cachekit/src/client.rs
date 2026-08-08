@@ -378,7 +378,7 @@ impl CacheKit {
     /// # Errors
     ///
     /// Returns [`CachekitError::Config`] if the client was built with
-    /// [`CacheKitBuilder::namespace`] (or `CACHEKIT_NAMESPACE`): the prefix
+    /// [`CacheKitBuilder::namespace`]: the prefix
     /// would rewrite the storage key to `{prefix}:{interop_key}`, which no
     /// other SDK computes — every cross-SDK entry would silently miss. Interop
     /// keys carry their own namespace segment; failing loudly here beats a
@@ -400,8 +400,8 @@ impl CacheKit {
         match self.namespace {
             None => Ok(()),
             Some(_) => Err(CachekitError::Config(
-                "interop reads require a client without a namespace prefix: .namespace() / \
-                 CACHEKIT_NAMESPACE would store interop entries under {prefix}:{interop_key}, \
+                "interop reads require a client without a namespace prefix: .namespace() \
+                 would store interop entries under {prefix}:{interop_key}, \
                  which other SDKs never compute (interop keys already carry a namespace \
                  segment) — use a dedicated non-namespaced client for interop entries"
                     .to_owned(),
