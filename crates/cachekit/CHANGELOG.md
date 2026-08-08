@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.8.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.7.0...cachekit-rs-v0.8.0) (2026-08-08)
+
+
+### Features
+
+* **encryption:** keyring rotation — previous_master_keys + sequential decrypt (LAB-686) ([#63](https://github.com/cachekit-io/cachekit-rs/issues/63)) ([8b9e7ac](https://github.com/cachekit-io/cachekit-rs/commit/8b9e7ac03f803b7e9f2979537f525136fdc59c40))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.7.0 to 0.8.0
+
 ## [0.7.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.6.1...cachekit-rs-v0.7.0) (2026-08-07)
 
 
