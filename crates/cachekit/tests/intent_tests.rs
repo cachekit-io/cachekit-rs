@@ -82,11 +82,11 @@ mod encrypted_intent {
     #[tokio::test]
     async fn rejects_short_master_key_before_connecting() {
         // The URL points at an unreachable Redis on purpose: key validation
-        // must fire first, so we get the deterministic Encryption error —
-        // never a Backend (connection) error.
+        // must fire first, so we get the deterministic Config error (a short
+        // key is a configuration mistake) — never a Backend (connection) error.
         let result = CacheKit::encrypted("redis://127.0.0.1:1", b"too_short").await;
         assert!(
-            matches!(result, Err(CachekitError::Encryption(_))),
+            matches!(result, Err(CachekitError::Config(_))),
             "short master key must be rejected before any Redis I/O"
         );
     }

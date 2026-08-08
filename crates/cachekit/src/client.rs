@@ -229,7 +229,13 @@ impl CacheKit {
         #[cfg(feature = "encryption")]
         if let Some(ref master_key) = config.master_key {
             let namespace = config.namespace.as_deref().unwrap_or("default");
-            builder = builder.encryption_from_bytes(master_key, namespace)?;
+            let previous: Vec<&[u8]> = config
+                .previous_master_keys
+                .iter()
+                .map(|key| key.as_slice())
+                .collect();
+            builder =
+                builder.encryption_from_bytes_with_previous(master_key, &previous, namespace)?;
         }
 
         Ok(builder)
@@ -991,7 +997,7 @@ impl CacheKitBuilder {
 
     /// Configure encryption from raw master key bytes and tenant ID.
     ///
-    /// The master key must be at least 16 bytes (32 recommended).
+    /// The master key must be at least 32 bytes.
     /// Keys are derived per-tenant via HKDF-SHA256.
     #[cfg(feature = "encryption")]
     pub fn encryption_from_bytes(
@@ -1000,6 +1006,31 @@ impl CacheKitBuilder {
         tenant_id: &str,
     ) -> Result<Self, CachekitError> {
         let layer = crate::encryption::EncryptionLayer::new(master_key, tenant_id)?;
+        self.encryption = Some(SharedEncryption::new(layer));
+        Ok(self)
+    }
+
+    /// Configure encryption with decrypt-only previous master keys for
+    /// key rotation.
+    ///
+    /// Writes encrypt under `master_key`; reads attempt it first, then each
+    /// key in `previous_keys` sequentially (attempt order = slice order).
+    /// At most 3 previous keys; supplying more is a config error, never
+    /// truncated. See [`crate::encryption::EncryptionLayer::with_previous_keys`].
+    ///
+    /// Every key, current and previous, must be at least 32 bytes.
+    #[cfg(feature = "encryption")]
+    pub fn encryption_from_bytes_with_previous(
+        mut self,
+        master_key: &[u8],
+        previous_keys: &[&[u8]],
+        tenant_id: &str,
+    ) -> Result<Self, CachekitError> {
+        let layer = crate::encryption::EncryptionLayer::with_previous_keys(
+            master_key,
+            previous_keys,
+            tenant_id,
+        )?;
         self.encryption = Some(SharedEncryption::new(layer));
         Ok(self)
     }
@@ -1020,6 +1051,16 @@ impl CacheKitBuilder {
     pub fn encryption_from_bytes(
         self,
         _master_key: &[u8],
+        _tenant_id: &str,
+    ) -> Result<Self, CachekitError> {
+        Ok(self)
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    pub fn encryption_from_bytes_with_previous(
+        self,
+        _master_key: &[u8],
+        _previous_keys: &[&[u8]],
         _tenant_id: &str,
     ) -> Result<Self, CachekitError> {
         Ok(self)

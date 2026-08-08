@@ -166,6 +166,23 @@ Cross-SDK compatible — ciphertext produced by the Python SDK decrypts with the
 
 </details>
 
+### Key Rotation
+
+Rotate the master key without invalidating existing entries: promote the new key to current and keep the old one as a decrypt-only previous key during a grace window (max 3, per the [protocol keyring spec](https://github.com/cachekit-io/protocol/blob/main/spec/encryption.md)). Writes always use the current key; reads attempt the current key first, then each previous key in order. Old entries age out via TTL or re-encrypt on the next write — no bulk re-encryption.
+
+```rust
+// Env: CACHEKIT_MASTER_KEY=<k2-hex> CACHEKIT_PREVIOUS_MASTER_KEYS=<k1-hex>
+let cache = CacheKit::from_env()?.build()?;
+
+// Or explicitly on the client builder:
+let cache = CacheKit::builder()
+    .backend(backend)
+    .encryption_from_bytes_with_previous(&k2_bytes, &[&k1_bytes], "tenant")?
+    .build()?;
+```
+
+Rotation is forward-only: a retired key is never re-promoted (re-promoting would resume a used AES-GCM nonce budget), and a config listing the current key among the previous keys is rejected at load.
+
 ---
 
 ## Cross-SDK Interop Mode
@@ -433,6 +450,7 @@ Requires a tokio runtime for backoff timers (the `redis` and `cachekitio` backen
 | `CACHEKIT_API_KEY` | ✅ | API key for cachekit.io |
 | `CACHEKIT_API_URL` | ❌ | Override API endpoint (default: `https://api.cachekit.io`) |
 | `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key (min 32 bytes) for encryption |
+| `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (max 3; a blank value is treated as unset) |
 | `CACHEKIT_DEFAULT_TTL` | ❌ | Default TTL in seconds (min 1, default: 300) |
 
 > [!CAUTION]
