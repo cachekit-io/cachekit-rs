@@ -507,7 +507,10 @@ make build-wasm    # wasm32-unknown-unknown (workers feature)
 
 `make security` runs the same two commands as the `supply-chain` job in
 `.github/workflows/security.yml`, with `cargo audit` in its strictest CI form
-(`--deny yanked`) — so a local pass means a pass on every CI event. It needs
+(`--deny yanked`) — so a local pass means a pass on every CI event, with one
+asymmetry: the weekly run additionally proves the yank check actually executed
+(see the guard in `security.yml`), so with crates.io unreachable a local run
+warns and passes where the weekly run goes red. It needs
 `cargo-deny` and `cargo-audit` installed, and it reaches the network to refresh
 the RustSec advisory database — which is why it is not folded into
 `quick-check`.
