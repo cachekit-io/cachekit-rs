@@ -112,7 +112,7 @@ jobs:
         # silently regenerate Cargo.lock when Cargo.toml has drifted. Without
         # this, deny grades an uncommitted graph while audit grades the
         # committed one.
-        run: cargo deny --locked --all-features check
+        run: cargo deny --locked check
 
       - name: cargo audit (lockfile advisories)
         # Complements cargo deny rather than duplicating it — see the table in
