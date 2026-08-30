@@ -5,17 +5,15 @@
 //! use case and returns a [`CacheKitBuilder`] so callers can override any
 //! setting before building.
 //!
-//! | Intent | Backend | L1 | Encryption | Auto-reconnect | Reliability¹ | Default TTL |
-//! |------------|-----------|------|------------|----------------|--------------|-------------|
-//! | `minimal` | Redis | Off | No | No | Off | 300 s |
-//! | `production` | Redis | On | No | Yes | On | 600 s |
-//! | `encrypted` | Redis | On | AES-256-GCM | Yes | On | 600 s |
-//! | `io` | cachekit.io | On | No | n/a (HTTP) | On | 3 600 s |
+//! The preset matrix and per-intent resilience contract live in the
+//! crate-level docs (`lib.rs`) — the single rustdoc-rendered copy. This
+//! module is private, so docs here reach source readers only; the per-method
+//! docs below are what docs.rs renders.
 //!
-//! ¹ Retry with backoff + jitter, a circuit breaker, and backpressure
-//! (bounded backend concurrency) around backend ops (requires the
-//! `reliability` feature, on by default — see [`crate::reliability`]).
-//! Override via [`CacheKitBuilder::reliability`];
+//! Reliability defaults come from
+//! [`ReliabilityConfig::default()`](crate::reliability::ReliabilityConfig)
+//! (requires the `reliability` feature, on by default). Override via
+//! [`CacheKitBuilder::reliability`];
 //! [`ReliabilityConfig::disabled()`](crate::reliability::ReliabilityConfig::disabled)
 //! turns the stack off entirely.
 
@@ -81,8 +79,9 @@ impl CacheKit {
 
     /// **Production** — reliability-first Redis cache with L1.
     ///
-    /// * Backend: Redis (connects eagerly; **auto-reconnects** with
-    ///   exponential backoff after a dropped connection)
+    /// * Backend: Redis (connects eagerly, failing fast if unreachable;
+    ///   **auto-reconnects** after a dropped connection with exponential
+    ///   backoff, 100 ms → 30 s, retrying indefinitely)
     /// * L1 cache: **on** (1 000 entries)
     /// * Encryption: **no**
     /// * Reliability: **on** — retry with backoff + jitter, circuit
@@ -124,8 +123,9 @@ impl CacheKit {
 
     /// **Encrypted** — zero-knowledge encrypted Redis cache.
     ///
-    /// * Backend: Redis (connects eagerly; **auto-reconnects** with
-    ///   exponential backoff after a dropped connection)
+    /// * Backend: Redis (connects eagerly, failing fast if unreachable;
+    ///   **auto-reconnects** after a dropped connection with exponential
+    ///   backoff, 100 ms → 30 s, retrying indefinitely)
     /// * L1 cache: **on** (1 000 entries, stores ciphertext)
     /// * Encryption: **AES-256-GCM** with HKDF-SHA256
     /// * Reliability: **on** — retry with backoff + jitter, circuit
@@ -136,7 +136,9 @@ impl CacheKit {
     ///
     /// Good for: PII, payments, GDPR/HIPAA-sensitive data.
     ///
-    /// `master_key` must be at least 32 raw bytes.
+    /// `master_key` must be at least 32 raw bytes. It is validated **before**
+    /// any Redis connection is attempted — a bad key is a deterministic local
+    /// error, never masked by (or paying for) network I/O.
     ///
     /// # Errors
     ///
