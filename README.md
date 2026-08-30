@@ -540,11 +540,14 @@ keeping the job name green. Two properties defend against that:
 
 - **Deletion fails closed.** `supply-chain` is a required status check with no
   bypass actors; a PR that deletes the workflow leaves the context unreported
-  and the PR permanently unmergeable. The one deletion variant that would not
-  fail closed — shipping a replacement check under the same name — is why the
-  wire below also trips on any other changed workflow file mentioning
-  `supply-chain`, and why the required check is pinned to the GitHub Actions
-  app, so an API-posted commit status cannot impersonate it.
+  and the PR permanently unmergeable. A replacement check shipped under the
+  same name trips the wire below (it fires on any other changed workflow file
+  mentioning `supply-chain`) — but the wire lives in `security.yml`, so it
+  only fires while that file still runs. Deleting it and shipping the
+  replacement in the same commit removes the wire with it; that
+  self-protection gap is the first residual listed below. Either way an
+  API-posted commit status cannot impersonate the check: it is pinned to the
+  GitHub Actions app.
 - **Modification trips a wire.** The job's final step diffs `deny.toml` and
   `security.yml` against the PR's base and fails the required check on any
   change, unless the PR body contains the exact, case-sensitive string
@@ -553,8 +556,10 @@ keeping the job name green. Two properties defend against that:
   not re-trigger). Legitimate policy updates therefore stay possible, but
   only as a conscious, loudly-marked act.
 
-What this does **not** defend against: a PR that edits the tamper-check step
-itself out in the same commit; an author who self-serves the marker without
+What this does **not** defend against: a PR that removes the tamper-check
+step in the same commit — by editing it out, or by deleting `security.yml`
+outright while shipping a same-named replacement check that reports the
+required context; an author who self-serves the marker without
 sign-off; and a marker hidden inside an HTML comment, which satisfies the
 check but is invisible in the rendered body — when reviewing a gate-file
 diff, check the raw PR body, not just the rendered view. All are deliberate

@@ -140,9 +140,12 @@ jobs:
         # command faithfully enforces (LAB-1151). Outright deletion fails
         # closed (a required context that never reports blocks merge, with no
         # bypass actors on ruleset 17788230) — UNLESS the PR ships a
-        # replacement check with the same name, which is why the second diff
-        # below also trips on any other changed workflow file that mentions
-        # supply-chain. This step makes modification fail closed: gate-file
+        # replacement check with the same name. The second diff below catches
+        # that, but only while this file still runs: delete this file and ship
+        # the replacement in one commit and the wire dies with it. That
+        # residual is documented in README "Gate tamper-evidence" and is only
+        # closable out-of-tree (org workflows rule — tracked on LAB-1151).
+        # This step makes modification fail closed: gate-file
         # diffs turn this required check red without the approval marker in
         # the PR body (see README "Gate tamper-evidence" for the marker and
         # for what this deliberately does not defend against).
