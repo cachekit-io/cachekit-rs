@@ -117,12 +117,29 @@ jobs:
         # consumer's feature unification can reach. This step is what fails the
         # build on a vulnerability in that pruned remainder.
         #
-        # Informational (unsound / unmaintained) advisories are reported here,
-        # not enforced — cargo-audit exits 0 on them. Enforcing would mean any
-        # newly published advisory against any transitive crate blocks every
-        # open PR regardless of its diff; that treadmill is a known cost in
-        # this org. Vulnerabilities do fail, which is the coverage deny lacks.
+        # Advisory posture (LAB-1152): vulnerabilities fail every run; yanked
+        # fails only the weekly schedule run — a yank lands against an
+        # unchanged lockfile and must not block unrelated PRs, and the
+        # schedule run exists precisely for advisories no PR diff touches.
+        # unsound / unmaintained warn on every event. Decision of record with
+        # the full per-class rationale: deny.toml [advisories].
         #
         # Runs even when the step above failed so one run shows both verdicts.
         if: ${{ !cancelled() }}
-        run: cargo audit
+        run: |
+          set -o pipefail
+          cargo audit ${{ github.event_name == 'schedule' && '--deny yanked' || '' }} 2>&1 | tee "$RUNNER_TEMP/audit.log"
+          # The yank check fails open: with the crates.io index unreachable,
+          # cargo-audit 0.22.1 skips it and still exits 0 — silently, or with
+          # a "couldn't check" warning — indistinguishable from yank-clean in
+          # a green log (verified locally, LAB-1152). The one run that
+          # enforces yanked must prove the check ran, not merely that it
+          # didn't fail. Fail-closed on the pinned tool's wording is fine
+          # here: a wording change turns the weekly run red, never a PR.
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            grep -q "Updating crates.io index" "$RUNNER_TEMP/audit.log"
+            if grep -qi "couldn't check" "$RUNNER_TEMP/audit.log"; then
+              echo "::error::cargo-audit could not evaluate yanked crates (crates.io index unavailable)"
+              exit 1
+            fi
+          fi
