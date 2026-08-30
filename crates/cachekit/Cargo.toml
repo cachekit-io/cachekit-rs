@@ -88,6 +88,7 @@ getrandom = { version = "0.2", optional = true, features = ["js"] }
 
 # Optional: proc-macro decorator
 cachekit-macros = { version = "0.7.0", path = "../cachekit-macros", optional = true }
+native-tls = "0.2.18"
 
 # Optional (file backend, unix only): libc for the O_NOFOLLOW/ELOOP constants
 # (std has no portable spelling); rustix for safe flock/geteuid wrappers —
