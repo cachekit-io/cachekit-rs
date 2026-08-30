@@ -198,8 +198,9 @@ impl CacheKit {
     /// # Example
     ///
     /// ```no_run
-    /// # fn example() -> Result<(), cachekit::CachekitError> {
-    /// let cache = cachekit::CacheKit::io("ck_live_abc123")?
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let api_key = std::env::var("CACHEKIT_API_KEY")?;
+    /// let cache = cachekit::CacheKit::io(&api_key)?
     ///     .namespace("edge")
     ///     .build()?;
     /// # Ok(())

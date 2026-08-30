@@ -23,17 +23,19 @@
 //! ² `production`/`encrypted` re-establish a dropped Redis connection with
 //! exponential backoff (100 ms → 30 s, retrying indefinitely); `minimal` is
 //! fail-fast (a dropped connection stays dead). **Initial** connections fail
-//! fast for every Redis preset — `io` opens no connection at construction, so
-//! an invalid key or unreachable endpoint surfaces at the first request.
+//! fast for every Redis preset — `io` opens no connection at construction: an
+//! empty API key fails at construction, while an invalid key or unreachable
+//! endpoint surfaces at the first request.
 //! Auto-reconnect is connection-level repair, distinct from the per-operation
 //! reliability stack.
 //! ³ Requires the `redis` cargo feature; `encrypted` also needs the
 //! default-on `encryption` feature.
 //!
 //! ```no_run
-//! # async fn example() -> Result<(), cachekit::CachekitError> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Load the key from your environment/secrets manager — never hardcode it.
-//! let cache = cachekit::CacheKit::io("ck_live_abc123")?
+//! let api_key = std::env::var("CACHEKIT_API_KEY")?;
+//! let cache = cachekit::CacheKit::io(&api_key)?
 //!     .namespace("myapp")
 //!     .build()?;
 //!

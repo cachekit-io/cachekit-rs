@@ -113,7 +113,7 @@ async fn main() -> Result<(), CachekitError> {
 
 - `production` / `encrypted` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely.
 - `minimal` is **fail-fast**: a dropped connection is not re-established — every subsequent operation errors until you rebuild the client.
-- **Initial** connections fail fast for every Redis preset: a bad URL or unreachable Redis errors immediately at construction, never enters a retry loop. `io` opens no connection at construction — an invalid key or unreachable endpoint surfaces at the first request.
+- **Initial** connections fail fast for every Redis preset: a bad URL or unreachable Redis errors immediately at construction, never enters a retry loop. `io` opens no connection at construction: an empty API key fails at construction, while an invalid key or unreachable endpoint surfaces at the first request.
 - `encrypted` validates the master key **before** any Redis connection is attempted — a bad key is a deterministic local error, never masked by (or paying for) network I/O.
 - Auto-reconnect is connection-level repair, distinct from the per-operation [reliability stack](#reliability) (retry, circuit breaker, backpressure) that `production` / `encrypted` / `io` also enable. `minimal` has neither — every failure is yours to handle.
 
