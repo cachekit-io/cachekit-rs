@@ -11,7 +11,7 @@
 //! different key. The ASCII `get` validates the echoed key, and a desynced
 //! connection fails its next pool-checkout ping and is discarded. Every
 //! operation additionally runs under a hard async time budget (see
-//! [`MemcachedBackendBuilder::timeout`]) so a wedged server surfaces as a
+//! [`crate::backend::memcached::MemcachedBackendBuilder::timeout`]) so a wedged server surfaces as a
 //! `Timeout` error instead of hanging callers.
 //!
 //! ## TTL capability — the honest parity picture
@@ -24,7 +24,7 @@
 //!
 //! This backend mirrors that exactly: no [`TtlInspectable`] impl (the trait
 //! requires the unreadable `ttl()`), and a bare inherent
-//! [`refresh_ttl`](MemcachedBackend::refresh_ttl) wrapping `touch`. Rust
+//! [`refresh_ttl`](crate::backend::memcached::MemcachedBackend::refresh_ttl) wrapping `touch`. Rust
 //! *could* read TTLs via the meta protocol (`mg <key> t`, memcached >= 1.6),
 //! but shipping a capability py cannot match would make TTL-driven behaviour
 //! diverge between SDKs on the same cluster. Revisit only when cachekit-py

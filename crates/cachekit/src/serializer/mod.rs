@@ -16,7 +16,7 @@ use crate::error::CachekitError;
 /// every profile and target (wasm32 included), and sits inside the protocol's
 /// required `32..=1024` window (`spec/interop-mode.md` → Decode bounds).
 ///
-/// Depth is only half the bound: see [`check_structure`] for the allocation
+/// Depth is only half the bound: see `check_structure` for the allocation
 /// half. `tests/decode_bounds_tests.rs` runs the shared `decode-bounds.json`
 /// vectors against both decode entry points so a dependency bump cannot move
 /// either silently.
@@ -31,11 +31,13 @@ pub const MAX_DECODE_DEPTH: usize = 100;
 /// reserved marker, truncation, and length overflow.
 ///
 /// Why it is needed even though `rmp-serde` reads str/bin lazily: serde's
-/// `Vec<T>` visitor pre-allocates `min(declared_len, 1 MiB)` per collection
-/// from `size_hint`, so without this walk a 500-byte payload of nested
-/// `array32(0xFFFFFFFF)` headers costs `MAX_DECODE_DEPTH` MiB before the first
-/// EOF error — an OOM kill on a Cloudflare Workers isolate. Trailing bytes are
-/// left to the caller (auto mode ignores them; interop rejects them).
+/// sequence visitors (`Vec<T>`, and the `Content` buffer that
+/// `#[serde(untagged)]` targets decode through) reserve
+/// `min(declared_len × size_of::<Element>(), 1 MiB)` bytes per collection from
+/// `size_hint`, so without this walk a 500-byte payload of nested
+/// `array32(0xFFFFFFFF)` headers requests `MAX_DECODE_DEPTH` MiB before the
+/// first EOF error — an OOM kill on a Cloudflare Workers isolate. Trailing
+/// bytes are left to the caller (auto mode ignores them; interop rejects them).
 pub(crate) fn check_structure(bytes: &[u8]) -> Result<(), CachekitError> {
     fn reject(what: &str) -> CachekitError {
         CachekitError::Serialization(format!("decode bound: {what}"))
@@ -95,7 +97,7 @@ pub(crate) fn check_structure(bytes: &[u8]) -> Result<(), CachekitError> {
 ///
 /// Every decode of backend-supplied bytes (auto-mode [`deserialize`] and
 /// [`crate::interop::deserialize`]) MUST go through here so the bounds cannot
-/// drift between paths. Runs [`check_structure`] first, then applies
+/// drift between paths. Runs `check_structure` first, then applies
 /// [`MAX_DECODE_DEPTH`].
 pub(crate) fn bounded_deserializer(
     bytes: &[u8],
@@ -116,7 +118,7 @@ pub fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, CachekitError> {
 }
 
 /// Deserialize `bytes` from MessagePack into `T` under the decode bounds
-/// ([`MAX_DECODE_DEPTH`], [`check_structure`]). Trailing bytes are ignored
+/// ([`MAX_DECODE_DEPTH`], `check_structure`). Trailing bytes are ignored
 /// (auto mode is SDK-internal; interop mode's strict single-document read is
 /// [`crate::interop::deserialize`]).
 pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError> {

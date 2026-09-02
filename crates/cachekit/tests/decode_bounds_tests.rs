@@ -140,9 +140,10 @@ fn depth_bound_is_owned_and_matches_the_typescript_sdk() {
     });
 }
 
-/// A recursive `Vec`-bearing target: serde's `Vec<T>` visitor pre-allocates
-/// `min(declared, 1 MiB)` per level from the header, so WITHOUT the structural walk
-/// 50 nested `array32(0xFFFFFFFF)` headers (250 bytes) cost 50 MiB before EOF.
+/// A recursive `Vec`-bearing target. `#[serde(untagged)]` decodes through serde's
+/// `Content` buffer, which pre-allocates from `size_hint` like `Vec<T>` (1 MiB per
+/// level; see `check_structure`), so WITHOUT the structural walk 50 nested
+/// `array32(0xFFFFFFFF)` headers (250 bytes) request 50 MiB before EOF.
 /// `serde_json::Value` happens to allocate nothing here, which is why the vector
 /// tests alone cannot catch a walk regression — this one can.
 #[derive(Debug, Deserialize)]

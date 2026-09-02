@@ -24,7 +24,7 @@
 //! sorted by encoded bytes, and integral-float collapse. `rmp-serde` happens to
 //! emit shortest forms but provides no sorting, no set semantics, and no number
 //! canonicalization — hashing whatever serde produces would make key equality an
-//! implementation accident. The closed [`InteropValue`] model plus an explicit
+//! implementation accident. The closed [`crate::interop::InteropValue`] model plus an explicit
 //! encoder is the only way to guarantee byte-identical hashes across SDKs.
 //!
 //! # Values
@@ -34,7 +34,7 @@
 //! (via [`crate::serializer`]), so regular [`crate::CacheKit::set`] output is
 //! interop-readable as-is. Reads are the sharp edge: interop readers MUST
 //! consume exactly one MessagePack document and reject trailing bytes — see
-//! [`deserialize`].
+//! [`crate::interop::deserialize`].
 //!
 //! # Example
 //!
