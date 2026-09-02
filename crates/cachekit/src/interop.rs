@@ -344,7 +344,8 @@ pub fn serialize_value(value: &InteropValue) -> Result<Vec<u8>, CachekitError> {
 /// Deserialize an interop-mode MessagePack document, consuming **exactly one**
 /// document and rejecting trailing bytes (spec MUST).
 ///
-/// Nesting depth is bounded by [`crate::serializer::MAX_DECODE_DEPTH`] (LAB-2503).
+/// Decode bounds: [`crate::serializer::MAX_DECODE_DEPTH`] and the header walk in
+/// `crate::serializer::check_structure` (LAB-2503).
 ///
 /// `rmp_serde::from_slice` silently ignores trailing bytes. That leniency is
 /// dangerous here: a Python-SDK-internal CK frame begins `0x43` (`'C'`), which
@@ -367,13 +368,13 @@ pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError
         ));
     }
 
-    // `Read for &[u8]` advances the slice, so `remaining` ends up holding
-    // whatever the decoder did not consume.
-    let mut remaining: &[u8] = bytes;
-    let mut de = crate::serializer::bounded_deserializer(&mut remaining);
+    let mut de = crate::serializer::bounded_deserializer(bytes)?;
     let value = T::deserialize(&mut de)
         .map_err(|e| CachekitError::Serialization(format!("interop decode: {e}")))?;
 
+    // `Read for &[u8]` advances the slice, so the reader now holds exactly the
+    // bytes the decoder did not consume.
+    let remaining: &[u8] = de.into_inner();
     if !remaining.is_empty() {
         return Err(CachekitError::Serialization(format!(
             "interop payload has {} trailing byte(s) after the MessagePack document — \

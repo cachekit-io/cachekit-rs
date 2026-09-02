@@ -3,20 +3,18 @@
 //!
 //! Vectors: `tests/vectors/decode-bounds.json`, vendored verbatim from
 //! `cachekit-io/protocol` `test-vectors/decode-bounds.json`
-//! (sha256 `864b7126986e9a2bd0dd50358018eda34fe2f70bca06ae9763e8ce6321f34b0a`).
+//! (sha256 `fa8bc750a4911fe3663b9ab68f13438a3e924b6bc742e9f6763ca35ad2407476`).
 //! Do not edit the JSON here; regenerate upstream and re-vendor.
 //!
-//! Why this exists: `rmp-serde` never pre-allocates from a header, so the only
-//! amplification axis is recursion depth — and its 1024 default is NOT a safe
-//! bound: a debug build overflows a 2 MiB thread stack (uncatchable abort)
-//! somewhere between 512 and 768 nested arrays, i.e. a ~700-byte forged entry.
-//! `serializer::MAX_DECODE_DEPTH` (100) makes the bound ours, and this file
-//! fails if a dependency bump (or a new decode path bypassing
-//! `bounded_deserializer`) re-opens it.
+//! Why 100 and not rmp-serde's 1024, and why a header walk is needed at all:
+//! see the rustdoc on `serializer::MAX_DECODE_DEPTH` and `check_structure`.
+//! This file fails if a dependency bump (or a new decode path bypassing
+//! `bounded_deserializer`) re-opens either bound.
 
 use cachekit::interop;
 use cachekit::serializer::{self, MAX_DECODE_DEPTH};
 use cachekit::CachekitError;
+use serde::Deserialize;
 use serde_json::Value as Json;
 
 const VECTORS_JSON: &str = include_str!("vectors/decode-bounds.json");
@@ -75,11 +73,6 @@ fn every_reject_vector_is_rejected_by_both_decoders() {
         for vector in vectors()["reject_vectors"].as_array().unwrap() {
             let name = vector["name"].as_str().unwrap();
             let bytes = unhex(vector["input_hex"].as_str().unwrap());
-            assert_eq!(
-                bytes.len() as u64,
-                vector["input_len"].as_u64().unwrap(),
-                "{name}: input_len"
-            );
             for (path, result) in decode_both(&bytes) {
                 let err = result
                     .err()
@@ -145,4 +138,61 @@ fn depth_bound_is_owned_and_matches_the_typescript_sdk() {
             );
         }
     });
+}
+
+/// A recursive `Vec`-bearing target: serde's `Vec<T>` visitor pre-allocates
+/// `min(declared, 1 MiB)` per level from the header, so WITHOUT the structural walk
+/// 50 nested `array32(0xFFFFFFFF)` headers (250 bytes) cost 50 MiB before EOF.
+/// `serde_json::Value` happens to allocate nothing here, which is why the vector
+/// tests alone cannot catch a walk regression — this one can.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Tree {
+    Leaf(u8),
+    Node(Vec<Tree>),
+}
+
+#[test]
+fn vec_target_amplifier_is_rejected_before_any_allocation() {
+    let mut bomb = Vec::new();
+    for _ in 0..50 {
+        bomb.extend_from_slice(&[0xdd, 0xff, 0xff, 0xff, 0xff]);
+    }
+    for (path, result) in [
+        ("serializer", serializer::deserialize::<Tree>(&bomb)),
+        ("interop", interop::deserialize::<Tree>(&bomb)),
+    ] {
+        let msg = result
+            .err()
+            .unwrap_or_else(|| panic!("{path}: decoded the amplifier"))
+            .to_string();
+        assert!(
+            msg.contains("more elements than the input can back"),
+            "{path}: {msg}"
+        );
+    }
+    // …and a legitimately backed Vec-tree still decodes on both paths.
+    let legit = [0x92, 0x92, 0x01, 0x02, 0x91, 0x03]; // [[1, 2], [3]]
+    for tree in [
+        serializer::deserialize::<Tree>(&legit).unwrap(),
+        interop::deserialize::<Tree>(&legit).unwrap(),
+    ] {
+        let Tree::Node(children) = tree else {
+            panic!("root must be a node")
+        };
+        let leaves: Vec<Vec<u8>> = children
+            .iter()
+            .map(|c| match c {
+                Tree::Node(n) => n
+                    .iter()
+                    .map(|l| match l {
+                        Tree::Leaf(v) => *v,
+                        Tree::Node(_) => u8::MAX,
+                    })
+                    .collect(),
+                Tree::Leaf(v) => vec![*v],
+            })
+            .collect();
+        assert_eq!(leaves, vec![vec![1, 2], vec![3]]);
+    }
 }
