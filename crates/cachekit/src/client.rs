@@ -709,9 +709,7 @@ impl std::fmt::Debug for SecureCache<'_> {
 
 #[cfg(feature = "encryption")]
 impl SecureCache<'_> {
-    /// Rotation drain signal: reads decrypted by each previous master key, by
-    /// position in the previous-key list. Watch the retiring key's count stop
-    /// growing before dropping it. See
+    /// Rotation drain signal; see
     /// [`EncryptionLayer::previous_key_hits`](crate::EncryptionLayer::previous_key_hits).
     pub fn previous_key_hits(&self) -> Vec<u64> {
         self.encryption.previous_key_hits()

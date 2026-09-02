@@ -418,9 +418,9 @@ async fn rotation_round_trip_without_reencryption() {
     );
 }
 
-/// Rotation drain signal (LAB-1678): an operator running a grace window reads
-/// per-previous-key hit counts off the secure handle. A read served by the
-/// retiring key increments its slot; a read served by the current key does not.
+/// Rotation drain signal (LAB-1678): the builder wires the counters into the
+/// user-held secure handle, so a read served by the retiring key is visible
+/// there. Index-0 silence is owned and tested at the layer (`encryption.rs`).
 #[tokio::test]
 async fn rotation_drain_signal_is_visible_on_secure_cache() {
     const K1: &[u8] = &[0x11; 32];
@@ -453,18 +453,6 @@ async fn rotation_drain_signal_is_visible_on_secure_cache() {
         .expect("client builds");
     let secure = rotated.secure().expect("secure()");
     assert_eq!(secure.previous_key_hits(), vec![0], "nothing read yet");
-
-    // Fresh write + read under the current key: no drain signal.
-    secure
-        .set("drain:new", &"written under k2")
-        .await
-        .expect("secure set under k2");
-    let _: Option<String> = secure.get("drain:new").await.expect("secure get");
-    assert_eq!(
-        secure.previous_key_hits(),
-        vec![0],
-        "current-key hit is silent"
-    );
 
     // The k1-era entry is served by previous[0]: the grace window is still live.
     let _: Option<String> = secure.get("drain:old").await.expect("secure get");

@@ -40,25 +40,14 @@ const AAD_VERSION: u8 = 0x03;
 /// previous key in order, rebuilding the identical AAD per attempt
 /// (cachekit-rs entries carry no per-entry key identity — sequential
 /// attempts are the spec-assigned branch, `protocol/spec/encryption.md` →
-/// "Key Rotation (Keyring)").
-///
-/// ## Rotation drain signal
-///
-/// Every read served by a previous key is counted against that key's
-/// position; [`Self::previous_key_hits`] returns the counts. During a
-/// rotation grace window, watch the retiring key's count: once it stops
-/// growing — every live entry has aged out via TTL or been re-encrypted on
-/// write — the key is no longer serving reads and can be dropped from the
-/// previous list safely, instead of guessing and risking a hard cut-over.
-/// Reads served by the current key are not counted, and the signal carries
-/// no key material — positions and counts only.
+/// "Key Rotation (Keyring)"). Reads served by a previous key are counted —
+/// see [`Self::previous_key_hits`] for the rotation drain workflow.
 pub struct EncryptionLayer {
     encryptor: ZeroKnowledgeEncryptor,
     derived_key: Zeroizing<[u8; 32]>,
     keyring: Keyring,
     tenant_id: String,
-    /// `previous_key_hits[i]` = reads decrypted by `previous_keys[i]`
-    /// (keyring index `i + 1`). Current-key reads are not counted.
+    /// `hits[i]` ↔ `previous_keys[i]`; see [`Self::previous_key_hits`].
     previous_key_hits: Vec<AtomicU64>,
 }
 
@@ -191,9 +180,13 @@ impl EncryptionLayer {
                 }
                 _ => CachekitError::Encryption(format!("decrypt failed: {e}")),
             })?;
-        // Index 0 is the current key: no drain signal. Index i >= 1 is
-        // previous_keys[i - 1]; the keyring was built from the same slice, so
-        // the slot always exists — `get` only guards against a core bug.
+        // index 0 = current key (no signal); i >= 1 = previous_keys[i - 1].
+        // The keyring was built from the same slice, so the slot always
+        // exists; `get` keeps a core bug from panicking the read path.
+        debug_assert!(
+            index <= self.previous_key_hits.len(),
+            "keyring index {index} beyond previous-key slots"
+        );
         if let Some(hits) = index
             .checked_sub(1)
             .and_then(|i| self.previous_key_hits.get(i))
@@ -205,10 +198,18 @@ impl EncryptionLayer {
 
     /// Reads decrypted by each previous key, by position in the previous-key
     /// list (`hits[i]` ↔ `previous_keys[i]`); empty when there are none.
+    /// Reads served by the current key are not counted.
     ///
-    /// This is the rotation drain signal — see the [type docs](Self) for the
-    /// operator workflow. Counts are monotonic for the life of the layer and
-    /// carry no key material.
+    /// This is the rotation **drain signal**. During a rotation grace window,
+    /// watch the retiring key's count: once it stops growing — every live
+    /// entry has aged out via TTL or been re-encrypted on write — the key is
+    /// no longer serving reads and can be dropped from the previous list
+    /// safely, instead of guessing and risking a hard cut-over.
+    ///
+    /// Counts are per process and reset on restart: aggregate across every
+    /// instance holding the retiring key, and watch for growth over a full
+    /// TTL window, before dropping it. The signal carries no key material —
+    /// positions and counts only.
     ///
     /// ```
     /// use cachekit::EncryptionLayer;
