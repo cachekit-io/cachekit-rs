@@ -13,6 +13,8 @@
 //! Each component is length-prefixed with a 4-byte big-endian u32 to prevent
 //! collision attacks from boundary confusion.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use zeroize::Zeroizing;
 
 use cachekit_core::{Keyring, ZeroKnowledgeEncryptor};
@@ -39,11 +41,25 @@ const AAD_VERSION: u8 = 0x03;
 /// (cachekit-rs entries carry no per-entry key identity — sequential
 /// attempts are the spec-assigned branch, `protocol/spec/encryption.md` →
 /// "Key Rotation (Keyring)").
+///
+/// ## Rotation drain signal
+///
+/// Every read served by a previous key is counted against that key's
+/// position; [`Self::previous_key_hits`] returns the counts. During a
+/// rotation grace window, watch the retiring key's count: once it stops
+/// growing — every live entry has aged out via TTL or been re-encrypted on
+/// write — the key is no longer serving reads and can be dropped from the
+/// previous list safely, instead of guessing and risking a hard cut-over.
+/// Reads served by the current key are not counted, and the signal carries
+/// no key material — positions and counts only.
 pub struct EncryptionLayer {
     encryptor: ZeroKnowledgeEncryptor,
     derived_key: Zeroizing<[u8; 32]>,
     keyring: Keyring,
     tenant_id: String,
+    /// `previous_key_hits[i]` = reads decrypted by `previous_keys[i]`
+    /// (keyring index `i + 1`). Current-key reads are not counted.
+    previous_key_hits: Vec<AtomicU64>,
 }
 
 impl EncryptionLayer {
@@ -132,6 +148,7 @@ impl EncryptionLayer {
             derived_key: Zeroizing::new(tenant_keys.encryption_key),
             keyring,
             tenant_id: tenant_id.to_owned(),
+            previous_key_hits: previous_keys.iter().map(|_| AtomicU64::new(0)).collect(),
         })
     }
 
@@ -155,11 +172,15 @@ impl EncryptionLayer {
     /// attempted first, then each decrypt-only previous key in order, with
     /// the identical AAD per attempt. Entries written before a key rotation
     /// stay readable as long as their key remains in the previous list.
+    ///
+    /// A read served by a previous key is counted in
+    /// [`Self::previous_key_hits`] (the rotation drain signal).
     pub fn decrypt(&self, ciphertext: &[u8], cache_key: &str) -> Result<Vec<u8>, CachekitError> {
         // compressed=false is normative, not a stub — see build_aad's invariant note.
         let aad = self.build_aad(cache_key, false);
-        self.keyring
-            .decrypt(&self.encryptor, ciphertext, &self.tenant_id, &aad)
+        let (plaintext, index) = self
+            .keyring
+            .decrypt_indexed(&self.encryptor, ciphertext, &self.tenant_id, &aad)
             .map_err(|e| match e {
                 // Config-class errors stay config-class (LAB-683 decision):
                 // a derivation failure or caller bug must never masquerade as
@@ -169,7 +190,48 @@ impl EncryptionLayer {
                     CachekitError::Config(format!("keyring decrypt misconfiguration: {e}"))
                 }
                 _ => CachekitError::Encryption(format!("decrypt failed: {e}")),
-            })
+            })?;
+        // Index 0 is the current key: no drain signal. Index i >= 1 is
+        // previous_keys[i - 1]; the keyring was built from the same slice, so
+        // the slot always exists — `get` only guards against a core bug.
+        if let Some(hits) = index
+            .checked_sub(1)
+            .and_then(|i| self.previous_key_hits.get(i))
+        {
+            hits.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(plaintext)
+    }
+
+    /// Reads decrypted by each previous key, by position in the previous-key
+    /// list (`hits[i]` ↔ `previous_keys[i]`); empty when there are none.
+    ///
+    /// This is the rotation drain signal — see the [type docs](Self) for the
+    /// operator workflow. Counts are monotonic for the life of the layer and
+    /// carry no key material.
+    ///
+    /// ```
+    /// use cachekit::EncryptionLayer;
+    ///
+    /// let k1 = [0x11u8; 32]; // retiring master key
+    /// let k2 = [0x22u8; 32]; // current master key after rotation
+    ///
+    /// // Encrypted under k1, before the rotation...
+    /// let ciphertext = EncryptionLayer::new(&k1, "tenant-123")?.encrypt(b"cached value", "user:1")?;
+    ///
+    /// // ...a layer [current=k2, previous=[k1]] serves it from previous[0]:
+    /// // the retiring key is still draining, not yet safe to drop.
+    /// let layer = EncryptionLayer::with_previous_keys(&k2, &[&k1], "tenant-123")?;
+    /// assert_eq!(layer.previous_key_hits(), vec![0]);
+    /// assert_eq!(layer.decrypt(&ciphertext, "user:1")?, b"cached value");
+    /// assert_eq!(layer.previous_key_hits(), vec![1]);
+    /// # Ok::<(), cachekit::CachekitError>(())
+    /// ```
+    pub fn previous_key_hits(&self) -> Vec<u64> {
+        self.previous_key_hits
+            .iter()
+            .map(|h| h.load(Ordering::Relaxed))
+            .collect()
     }
 
     /// Return the tenant ID used for key derivation.
@@ -442,6 +504,60 @@ mod tests {
         let short = [0x01u8; 16]; // core would accept 16; the rs SDK contract is 32
         let result = EncryptionLayer::with_previous_keys(K2, &[&short], TEST_TENANT);
         assert!(matches!(result, Err(CachekitError::Config(_))));
+    }
+
+    // ── Rotation drain signal (LAB-1678) ─────────────────────────────────────
+
+    #[test]
+    fn current_key_hit_is_not_counted() {
+        // No previous keys: the drain signal has nothing to report.
+        let single = EncryptionLayer::new(K2, TEST_TENANT).unwrap();
+        let ct = single.encrypt(b"v", "user:3").unwrap();
+        single.decrypt(&ct, "user:3").unwrap();
+        assert!(single.previous_key_hits().is_empty());
+
+        // With a previous key, a current-key read (index 0) is a zero reading.
+        let rotated = EncryptionLayer::with_previous_keys(K2, &[K1], TEST_TENANT).unwrap();
+        let ct = rotated.encrypt(b"fresh write", "user:3").unwrap();
+        rotated.decrypt(&ct, "user:3").unwrap();
+        assert_eq!(rotated.previous_key_hits(), vec![0]);
+    }
+
+    #[test]
+    fn previous_key_hit_is_counted_at_its_position() {
+        const K3: &[u8] = &[0x33; 32];
+        let k1_ct = EncryptionLayer::new(K1, TEST_TENANT)
+            .unwrap()
+            .encrypt(b"k1 era", "user:4")
+            .unwrap();
+        let k2_ct = EncryptionLayer::new(K2, TEST_TENANT)
+            .unwrap()
+            .encrypt(b"k2 era", "user:5")
+            .unwrap();
+
+        // current=k3, previous=[k2, k1]: counts index by position in the previous list.
+        let rotated = EncryptionLayer::with_previous_keys(K3, &[K2, K1], TEST_TENANT).unwrap();
+        assert_eq!(rotated.previous_key_hits(), vec![0, 0]);
+
+        rotated.decrypt(&k1_ct, "user:4").unwrap();
+        assert_eq!(rotated.previous_key_hits(), vec![0, 1], "k1 is previous[1]");
+
+        rotated.decrypt(&k2_ct, "user:5").unwrap();
+        rotated.decrypt(&k2_ct, "user:5").unwrap();
+        assert_eq!(rotated.previous_key_hits(), vec![2, 1], "k2 is previous[0]");
+    }
+
+    #[test]
+    fn failed_decrypt_is_not_a_previous_key_hit() {
+        let k1_ct = EncryptionLayer::new(K1, TEST_TENANT)
+            .unwrap()
+            .encrypt(b"v", "key:a")
+            .unwrap();
+        let rotated = EncryptionLayer::with_previous_keys(K2, &[K1], TEST_TENANT).unwrap();
+
+        // Wrong cache key: every attempt fails authentication — no key won.
+        assert!(rotated.decrypt(&k1_ct, "key:b").is_err());
+        assert_eq!(rotated.previous_key_hits(), vec![0]);
     }
 
     #[test]

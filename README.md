@@ -183,6 +183,12 @@ let cache = CacheKit::builder()
 
 Rotation is forward-only: a retired key is never re-promoted (re-promoting would resume a used AES-GCM nonce budget), and a config listing the current key among the previous keys is rejected at load.
 
+**Knowing when to drop the old key.** Every read served by a previous key is counted against that key's position; `cache.secure()?.previous_key_hits()` returns the counts (`hits[i]` for `previous_keys[i]`, current-key reads not counted, no key material). During the grace window, watch the retiring key's count: once it stops growing — every live entry has aged out via TTL or been re-encrypted on write — the key is no longer serving reads and can be dropped from `CACHEKIT_PREVIOUS_MASTER_KEYS` safely, instead of guessing and risking a hard cut-over.
+
+```rust
+let hits = cache.secure()?.previous_key_hits(); // e.g. [0] once k1 has drained
+```
+
 ---
 
 ## Cross-SDK Interop Mode
