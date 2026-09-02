@@ -200,16 +200,23 @@ impl EncryptionLayer {
     /// list (`hits[i]` ↔ `previous_keys[i]`); empty when there are none.
     /// Reads served by the current key are not counted.
     ///
-    /// This is the rotation **drain signal**. During a rotation grace window,
-    /// watch the retiring key's count: once it stops growing — every live
-    /// entry has aged out via TTL or been re-encrypted on write — the key is
-    /// no longer serving reads and can be dropped from the previous list
-    /// safely, instead of guessing and risking a hard cut-over.
-    ///
-    /// Counts are per process and reset on restart: aggregate across every
-    /// instance holding the retiring key, and watch for growth over a full
-    /// TTL window, before dropping it. The signal carries no key material —
-    /// positions and counts only.
+    /// This is the rotation **drain signal**. It confirms that a grace window
+    /// has drained; it does not shorten one. Follow the protocol's
+    /// [scheduled-rotation runbook](https://github.com/cachekit-io/protocol/blob/main/decisions/key-rotation.md#runbooks-normative-for-docs):
+    /// audit for non-expiring entries first, add the incoming key as
+    /// decrypt-only fleet-wide, then promote it. The window clock starts only
+    /// when that promotion deploy has completed on every instance — until
+    /// then a lagging instance still writes fresh ciphertext under the
+    /// retiring key and reads it silently as *its* current key (index 0).
+    /// From that point, wait at least the longest TTL in use (per-entry TTLs
+    /// passed to `set_with_ttl` count, not just the default), aggregating
+    /// counts across every instance — they are per process and reset on
+    /// restart. Only when the retiring key's count has stayed flat over that
+    /// whole window has every live entry aged out or been re-encrypted on
+    /// write, and the key can be dropped from the previous list without a
+    /// hard cut-over. Positions are comparable across instances only once
+    /// they all run the same keyring configuration. The signal carries no
+    /// key material — positions and counts only.
     ///
     /// ```
     /// use cachekit::EncryptionLayer;
