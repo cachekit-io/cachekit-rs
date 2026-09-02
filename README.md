@@ -181,7 +181,7 @@ let cache = CacheKit::builder()
     .build()?;
 ```
 
-Rotation is forward-only: a retired key is never re-promoted (re-promoting would resume a used AES-GCM nonce budget), and a config listing the current key among the previous keys is rejected at load.
+Rotation is forward-only: a retired key is never re-promoted (re-promoting would resume a used AES-GCM nonce budget), and a config listing the current key among the previous keys is rejected at load. For the three-phase zero-miss rollout and compromise response, see the [key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/).
 
 ---
 
