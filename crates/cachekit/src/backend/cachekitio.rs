@@ -425,29 +425,6 @@ mod path_encoding_tests {
         }
     }
 
-    /// spec rule 2 — the route tokens collide with real routes: a key of exactly
-    /// `health` builds the health endpoint's own path, and `ttl`/`lock` build the
-    /// bare sub-resource paths. This is why they are reserved (rejected above).
-    #[test]
-    fn route_token_keys_would_collide_with_reserved_routes() {
-        // What url("health")/url("ttl")/url("lock") *would* produce if unguarded,
-        // parsed with the same url crate reqwest uses.
-        assert_eq!(
-            Url::parse(&format!("{API}/v1/cache/health"))
-                .expect("parse")
-                .path(),
-            "/v1/cache/health", // identical to the health endpoint — a "health" key = the health route
-        );
-        for token in ["ttl", "lock"] {
-            assert_eq!(
-                Url::parse(&format!("{API}/v1/cache/{token}"))
-                    .expect("parse")
-                    .path(),
-                format!("/v1/cache/{token}"), // reads as an empty key + sub-resource selector
-            );
-        }
-    }
-
     /// AC-2 — every non-dot vector builds a URL whose *parsed* path (the real
     /// wire path, post-normalisation) stays inside `/v1/cache/`. Asserting on the
     /// unparsed `format!` output would pass while still shipping a traversal, so

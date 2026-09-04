@@ -319,21 +319,9 @@ mod encode_key_tests {
                 "reserved segment {k:?} must be rejected"
             );
         }
-        // Near-misses are NOT reserved — only an exact, whole-segment match is.
-        for k in [
-            "healthy",
-            "HEALTH",
-            "ttls",
-            "unlock",
-            ".hidden",
-            "a..",
-            "x/../../health",
-        ] {
-            assert!(
-                encode_key(k).is_ok(),
-                "near-miss {k:?} must not be rejected"
-            );
-        }
+        // Near-miss acceptance (`healthy`, `HEALTH`, `x/../../health`, …) is
+        // covered by `SAFE_VECTORS` in the two tests below — a `contains`/
+        // case-insensitive regression there panics on `.expect`.
     }
 
     #[test]
