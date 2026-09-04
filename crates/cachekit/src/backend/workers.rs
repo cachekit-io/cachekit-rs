@@ -55,11 +55,13 @@ impl WorkersCachekitIO {
     /// Build the full URL for a cache key path segment.
     ///
     /// Keys are percent-encoded via [`encode_key`](crate::backend::encode_key); a
-    /// key that is exactly `.` or `..` is **rejected** (fallible return) rather
-    /// than encoded, because the Workers runtime `fetch` (WHATWG URL) would strip
-    /// an all-dot segment out of the `/v1/cache/` prefix before the request is
-    /// sent (CWE-22) — see [`encode_key`](crate::backend::encode_key).
-    /// `ttl_url`/`lock_url` build on this, so all three wasm paths inherit the guard.
+    /// key whose encoded form is a reserved segment (`.`, `..`, `health`, `ttl`,
+    /// `lock`) is **rejected** (fallible return) rather than sent — the Workers
+    /// runtime `fetch` (WHATWG URL) strips the dot segments and the route tokens
+    /// collide with the health/sub-resource routes, both escaping
+    /// `/v1/cache/{key}` (CWE-22, spec rule 2) — see
+    /// [`encode_key`](crate::backend::encode_key). `ttl_url`/`lock_url` build on
+    /// this, so all three wasm paths inherit the guard.
     fn url(&self, key: &str) -> Result<String, BackendError> {
         Ok(format!("{}/v1/cache/{}", self.api_url, encode_key(key)?))
     }

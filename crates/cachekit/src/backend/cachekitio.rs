@@ -60,11 +60,12 @@ impl CachekitIO {
     /// Build the full URL for a cache key path segment.
     ///
     /// Keys are percent-encoded via [`encode_key`](crate::backend::encode_key) so
-    /// slashes or special characters do not break the URL structure. A key that
-    /// is exactly `.` or `..` is **rejected** (fallible return) rather than
-    /// encoded: `reqwest`'s WHATWG URL parser would strip an all-dot segment out
-    /// of the `/v1/cache/` prefix before the request is sent (CWE-22), and no
-    /// encoding survives that — see [`encode_key`](crate::backend::encode_key).
+    /// slashes or special characters do not break the URL structure. A key whose
+    /// encoded form is a reserved segment (`.`, `..`, `health`, `ttl`, `lock`) is
+    /// **rejected** (fallible return) rather than sent: the dot segments are
+    /// stripped by `reqwest`'s WHATWG URL parser and the route tokens collide
+    /// with the health/sub-resource routes, both escaping `/v1/cache/{key}`
+    /// (CWE-22, spec rule 2) — see [`encode_key`](crate::backend::encode_key).
     fn url(&self, key: &str) -> Result<String, BackendError> {
         Ok(format!("{}/v1/cache/{}", self.api_url, encode_key(key)?))
     }
@@ -408,17 +409,41 @@ mod path_encoding_tests {
         }
     }
 
-    /// AC-2 — the two all-dot keys are rejected by every builder (base, ttl,
-    /// lock): no URL is produced, so no rewritten request can ever be sent.
+    /// AC-2 / spec rule 2 — all five reserved segments (`.`, `..`, `health`,
+    /// `ttl`, `lock`) are rejected by every builder (base, ttl, lock): no URL is
+    /// produced, so no rewritten or mis-routed request can ever be sent.
     #[test]
-    fn dot_keys_are_rejected_by_every_builder() {
+    fn reserved_segments_rejected_by_every_builder() {
         let b = backend();
-        for key in [".", ".."] {
+        for key in [".", "..", "health", "ttl", "lock"] {
             assert!(b.url(key).is_err(), "url({key:?}) must be rejected");
             assert!(b.ttl_url(key).is_err(), "ttl_url({key:?}) must be rejected");
             assert!(
                 b.lock_url(key).is_err(),
                 "lock_url({key:?}) must be rejected"
+            );
+        }
+    }
+
+    /// spec rule 2 — the route tokens collide with real routes: a key of exactly
+    /// `health` builds the health endpoint's own path, and `ttl`/`lock` build the
+    /// bare sub-resource paths. This is why they are reserved (rejected above).
+    #[test]
+    fn route_token_keys_would_collide_with_reserved_routes() {
+        // What url("health")/url("ttl")/url("lock") *would* produce if unguarded,
+        // parsed with the same url crate reqwest uses.
+        assert_eq!(
+            Url::parse(&format!("{API}/v1/cache/health"))
+                .expect("parse")
+                .path(),
+            "/v1/cache/health", // identical to the health endpoint — a "health" key = the health route
+        );
+        for token in ["ttl", "lock"] {
+            assert_eq!(
+                Url::parse(&format!("{API}/v1/cache/{token}"))
+                    .expect("parse")
+                    .path(),
+                format!("/v1/cache/{token}"), // reads as an empty key + sub-resource selector
             );
         }
     }
@@ -435,6 +460,8 @@ mod path_encoding_tests {
             "default:../../admin",
             "k?x=1#f",
             "a b",
+            "healthy",        // route-token near-miss: not reserved, must build fine
+            "x/../../health", // embedded route token, `/`→`%2F` keeps it one segment
             "ns:default:func:m.f:args:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:",
         ];
         for key in vectors {
