@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use zeroize::Zeroizing;
 
-use crate::backend::{Backend, HealthStatus, LockableBackend};
+use crate::backend::{encode_key, Backend, HealthStatus, LockableBackend};
 use crate::error::{BackendError, BackendErrorKind};
 use crate::metrics::{metrics_headers, MetricsProvider};
 use crate::session::session_headers;
@@ -59,11 +59,32 @@ impl CachekitIO {
 
     /// Build the full URL for a cache key path segment.
     ///
-    /// Keys are percent-encoded so that slashes or special characters in the
-    /// cache key do not break the URL structure.
-    fn url(&self, key: &str) -> String {
-        let encoded = urlencoding::encode(key);
-        format!("{}/v1/cache/{}", self.api_url, encoded)
+    /// Keys are percent-encoded via [`encode_key`](crate::backend::encode_key) so
+    /// slashes or special characters do not break the URL structure. A key whose
+    /// encoded form is a reserved segment (`.`, `..`, `health`, `ttl`, `lock`) is
+    /// **rejected** (fallible return) rather than sent: the dot segments are
+    /// stripped by `reqwest`'s WHATWG URL parser and the route tokens collide
+    /// with the health/sub-resource routes, both escaping `/v1/cache/{key}`
+    /// (CWE-22, spec rule 2) — see [`encode_key`](crate::backend::encode_key).
+    fn url(&self, key: &str) -> Result<String, BackendError> {
+        Ok(format!("{}/v1/cache/{}", self.api_url, encode_key(key)?))
+    }
+
+    /// Build the TTL URL for a cache key (`…/ttl`). Composes on [`Self::url`], so
+    /// it inherits the same [`encode_key`](crate::backend::encode_key) guard and
+    /// the `/v1/cache/` prefix lives in one place (matching the wasm `workers`
+    /// backend). `pub(crate)` so the [`TtlInspectable`](super::TtlInspectable)
+    /// impl in the sibling `cachekitio_ttl` module builds its path through it.
+    pub(crate) fn ttl_url(&self, key: &str) -> Result<String, BackendError> {
+        Ok(format!("{}/ttl", self.url(key)?))
+    }
+
+    /// Build the lock URL for a cache key (`…/lock`). Composes on [`Self::url`]
+    /// (same guard, same single prefix). `pub(crate)` so the
+    /// [`LockableBackend`](super::LockableBackend) impl in the sibling
+    /// `cachekitio_lock` module builds its path through it.
+    pub(crate) fn lock_url(&self, key: &str) -> Result<String, BackendError> {
+        Ok(format!("{}/lock", self.url(key)?))
     }
 
     /// Build the health-check URL.
@@ -125,7 +146,7 @@ impl Backend for CachekitIO {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
         let req = self.with_standard_headers(
             self.client
-                .get(self.url(key))
+                .get(self.url(key)?)
                 .bearer_auth(self.api_key.as_str()),
         );
 
@@ -155,7 +176,7 @@ impl Backend for CachekitIO {
     ) -> Result<(), BackendError> {
         let mut req = self
             .client
-            .put(self.url(key))
+            .put(self.url(key)?)
             .bearer_auth(self.api_key.as_str())
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(value);
@@ -182,7 +203,7 @@ impl Backend for CachekitIO {
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
         let req = self.with_standard_headers(
             self.client
-                .delete(self.url(key))
+                .delete(self.url(key)?)
                 .bearer_auth(self.api_key.as_str()),
         );
 
@@ -201,7 +222,7 @@ impl Backend for CachekitIO {
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
         let req = self.with_standard_headers(
             self.client
-                .head(self.url(key))
+                .head(self.url(key)?)
                 .bearer_auth(self.api_key.as_str()),
         );
 
@@ -335,5 +356,116 @@ impl CachekitIOBuilder {
             api_url,
             metrics_provider: self.metrics_provider,
         })
+    }
+}
+
+// ── Cache-key path encoding tests (CWE-22) ────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::expect_used)] // test-only: a builder/parse failure on a fixture should panic loudly
+mod path_encoding_tests {
+    use super::CachekitIO;
+    use url::Url;
+
+    const API: &str = "https://api.cachekit.io";
+
+    fn backend() -> CachekitIO {
+        CachekitIO::builder()
+            .api_url(API)
+            .api_key("ck_test_key")
+            .build()
+            .expect("builder should succeed for the canonical host")
+    }
+
+    /// AC-0 — Repro. Before any guard, a raw-encoded `.`/`..` key collapses in
+    /// rust-url (the parser `reqwest` uses) *before* the request leaves the
+    /// process: the segment is stripped and the path escapes `/v1/cache/`.
+    /// `%2E%2E` collapses identically, which is why the fix rejects rather than
+    /// re-encodes (WHATWG treats `%2e%2e` as a dot-segment too).
+    #[test]
+    fn repro_raw_dot_key_escapes_the_cache_prefix() {
+        let cases = [
+            ("..", "", "/v1/"),
+            ("..", "/ttl", "/v1/ttl"),
+            ("..", "/lock", "/v1/lock"),
+            (".", "", "/v1/cache/"),
+        ];
+        for (key, suffix, escaped) in cases {
+            let raw = format!("{API}/v1/cache/{}{suffix}", urlencoding::encode(key));
+            let parsed = Url::parse(&raw).expect("parses");
+            assert_eq!(
+                parsed.path(),
+                escaped,
+                "raw {key:?}{suffix} should collapse to {escaped}"
+            );
+            // The %2E form the Python SDK emits collapses just the same in rust-url.
+            let pct = key.replace('.', "%2E");
+            let enc = format!("{API}/v1/cache/{pct}{suffix}");
+            assert_eq!(
+                Url::parse(&enc).expect("parses").path(),
+                escaped,
+                "%2E-encoded {key:?}{suffix} also collapses — encoding cannot fix this in rust-url"
+            );
+        }
+    }
+
+    /// AC-2 / spec rule 2 — all five reserved segments (`.`, `..`, `health`,
+    /// `ttl`, `lock`) are rejected by every builder (base, ttl, lock): no URL is
+    /// produced, so no rewritten or mis-routed request can ever be sent.
+    #[test]
+    fn reserved_segments_rejected_by_every_builder() {
+        let b = backend();
+        for key in [".", "..", "health", "ttl", "lock"] {
+            assert!(b.url(key).is_err(), "url({key:?}) must be rejected");
+            assert!(b.ttl_url(key).is_err(), "ttl_url({key:?}) must be rejected");
+            assert!(
+                b.lock_url(key).is_err(),
+                "lock_url({key:?}) must be rejected"
+            );
+        }
+    }
+
+    /// AC-2 — every non-dot vector builds a URL whose *parsed* path (the real
+    /// wire path, post-normalisation) stays inside `/v1/cache/`. Asserting on the
+    /// unparsed `format!` output would pass while still shipping a traversal, so
+    /// we parse with the same `url` crate `reqwest` uses.
+    #[test]
+    fn safe_keys_never_escape_the_cache_prefix() {
+        let b = backend();
+        let vectors = [
+            "a:..",
+            "default:../../admin",
+            "k?x=1#f",
+            "a b",
+            "healthy",        // route-token near-miss: not reserved, must build fine
+            "x/../../health", // embedded route token, `/`→`%2F` keeps it one segment
+            "ns:default:func:m.f:args:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:",
+        ];
+        for key in vectors {
+            let base = Url::parse(&b.url(key).expect("url")).expect("parse base");
+            let ttl = Url::parse(&b.ttl_url(key).expect("ttl_url")).expect("parse ttl");
+            let lock = Url::parse(&b.lock_url(key).expect("lock_url")).expect("parse lock");
+
+            assert!(
+                base.path().starts_with("/v1/cache/") && base.path().len() > "/v1/cache/".len(),
+                "base path {} escaped prefix for {key:?}",
+                base.path()
+            );
+            assert_eq!(
+                base.path(),
+                format!("/v1/cache/{}", urlencoding::encode(key)),
+                "base wire path mismatch for {key:?}"
+            );
+            assert!(
+                ttl.path().starts_with("/v1/cache/") && ttl.path().ends_with("/ttl"),
+                "ttl path {} escaped prefix for {key:?}",
+                ttl.path()
+            );
+            assert!(
+                lock.path().starts_with("/v1/cache/") && lock.path().ends_with("/lock"),
+                "lock path {} escaped prefix for {key:?}",
+                lock.path()
+            );
+        }
     }
 }
