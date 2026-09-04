@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 use crate::backend::saas_wire::{
     LockAcquireRequest, LockAcquireResponse, RefreshTtlRequest, TtlResponse,
 };
-use crate::backend::{Backend, HealthStatus, LockableBackend, TtlInspectable};
+use crate::backend::{encode_key, Backend, HealthStatus, LockableBackend, TtlInspectable};
 use crate::error::BackendError;
 use crate::metrics::{metrics_headers, MetricsProvider};
 use crate::session::session_headers;
@@ -53,9 +53,15 @@ impl WorkersCachekitIO {
     }
 
     /// Build the full URL for a cache key path segment.
-    fn url(&self, key: &str) -> String {
-        let encoded = urlencoding::encode(key);
-        format!("{}/v1/cache/{}", self.api_url, encoded)
+    ///
+    /// Keys are percent-encoded via [`encode_key`](crate::backend::encode_key); a
+    /// key that is exactly `.` or `..` is **rejected** (fallible return) rather
+    /// than encoded, because the Workers runtime `fetch` (WHATWG URL) would strip
+    /// an all-dot segment out of the `/v1/cache/` prefix before the request is
+    /// sent (CWE-22) — see [`encode_key`](crate::backend::encode_key).
+    /// `ttl_url`/`lock_url` build on this, so all three wasm paths inherit the guard.
+    fn url(&self, key: &str) -> Result<String, BackendError> {
+        Ok(format!("{}/v1/cache/{}", self.api_url, encode_key(key)?))
     }
 
     /// Build the health-check URL.
@@ -65,13 +71,13 @@ impl WorkersCachekitIO {
 
     /// Build the lock URL for a cache key. Callers pass the bare cache key;
     /// the SaaS lock endpoint owns the lock namespace server-side.
-    fn lock_url(&self, key: &str) -> String {
-        format!("{}/lock", self.url(key))
+    fn lock_url(&self, key: &str) -> Result<String, BackendError> {
+        Ok(format!("{}/lock", self.url(key)?))
     }
 
     /// Build the TTL URL for a cache key.
-    fn ttl_url(&self, key: &str) -> String {
-        format!("{}/ttl", self.url(key))
+    fn ttl_url(&self, key: &str) -> Result<String, BackendError> {
+        Ok(format!("{}/ttl", self.url(key)?))
     }
 
     /// Convert a non-success response into a classified, sanitized error.
@@ -171,7 +177,7 @@ impl WorkersCachekitIO {
 #[async_trait(?Send)]
 impl Backend for WorkersCachekitIO {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
-        let mut resp = self.fetch("GET", &self.url(key), None, vec![]).await?;
+        let mut resp = self.fetch("GET", &self.url(key)?, None, vec![]).await?;
 
         match resp.status_code() {
             200 => {
@@ -200,7 +206,7 @@ impl Backend for WorkersCachekitIO {
         }
 
         let mut resp = self
-            .fetch("PUT", &self.url(key), Some(value), headers)
+            .fetch("PUT", &self.url(key)?, Some(value), headers)
             .await?;
         let status = resp.status_code();
 
@@ -212,7 +218,7 @@ impl Backend for WorkersCachekitIO {
     }
 
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
-        let mut resp = self.fetch("DELETE", &self.url(key), None, vec![]).await?;
+        let mut resp = self.fetch("DELETE", &self.url(key)?, None, vec![]).await?;
 
         match resp.status_code() {
             200 | 204 => Ok(true),
@@ -222,7 +228,7 @@ impl Backend for WorkersCachekitIO {
     }
 
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
-        let resp = self.fetch("HEAD", &self.url(key), None, vec![]).await?;
+        let resp = self.fetch("HEAD", &self.url(key)?, None, vec![]).await?;
 
         match resp.status_code() {
             200 => Ok(true),
@@ -272,7 +278,7 @@ impl LockableBackend for WorkersCachekitIO {
         let mut resp = self
             .fetch(
                 "POST",
-                &self.lock_url(key),
+                &self.lock_url(key)?,
                 Some(body),
                 vec![("Content-Type", "application/json".to_owned())],
             )
@@ -302,7 +308,7 @@ impl LockableBackend for WorkersCachekitIO {
         let resp = self
             .fetch(
                 "DELETE",
-                &self.lock_url(key),
+                &self.lock_url(key)?,
                 None,
                 vec![(LOCK_ID_HEADER, lock_id.to_owned())],
             )
@@ -321,7 +327,7 @@ impl LockableBackend for WorkersCachekitIO {
 #[async_trait(?Send)]
 impl TtlInspectable for WorkersCachekitIO {
     async fn ttl(&self, key: &str) -> Result<Option<Duration>, BackendError> {
-        let mut resp = self.fetch("GET", &self.ttl_url(key), None, vec![]).await?;
+        let mut resp = self.fetch("GET", &self.ttl_url(key)?, None, vec![]).await?;
 
         match resp.status_code() {
             200 => {
@@ -356,7 +362,7 @@ impl TtlInspectable for WorkersCachekitIO {
         let resp = self
             .fetch(
                 "PATCH",
-                &self.ttl_url(key),
+                &self.ttl_url(key)?,
                 Some(body),
                 vec![("Content-Type", "application/json".to_owned())],
             )

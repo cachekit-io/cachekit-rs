@@ -16,18 +16,18 @@ const LOCK_ID_HEADER: &str = "X-CacheKit-Lock-Id";
 impl CachekitIO {
     /// Build the unlock request. Extracted so tests can assert the lock_id rides the
     /// `X-CacheKit-Lock-Id` header and never appears in the URL (CWE-532).
-    fn release_request(&self, key: &str, lock_id: &str) -> reqwest::RequestBuilder {
-        let url = format!(
-            "{}/v1/cache/{}/lock",
-            self.api_url(),
-            urlencoding::encode(key)
-        );
-        self.with_standard_headers(
+    fn release_request(
+        &self,
+        key: &str,
+        lock_id: &str,
+    ) -> Result<reqwest::RequestBuilder, BackendError> {
+        let url = self.lock_url(key)?;
+        Ok(self.with_standard_headers(
             self.client()
                 .delete(&url)
                 .bearer_auth(self.api_key_str())
                 .header(LOCK_ID_HEADER, lock_id),
-        )
+        ))
     }
 }
 
@@ -53,11 +53,7 @@ impl LockableBackend for CachekitIO {
         key: &str,
         timeout_ms: u64,
     ) -> Result<Option<String>, BackendError> {
-        let url = format!(
-            "{}/v1/cache/{}/lock",
-            self.api_url(),
-            urlencoding::encode(key)
-        );
+        let url = self.lock_url(key)?;
 
         let body = serde_json::to_vec(&LockAcquireRequest { timeout_ms }).map_err(|e| {
             BackendError::permanent(format!("failed to serialize lock request: {e}"))
@@ -92,7 +88,7 @@ impl LockableBackend for CachekitIO {
         // lock_id is a capability token → X-CacheKit-Lock-Id header, not the query string
         // (CWE-532). See `release_request`.
         let resp = self
-            .release_request(key, lock_id)
+            .release_request(key, lock_id)?
             .send()
             .await
             .map_err(|e| reqwest_err_sanitized(e, self.api_key_str()))?;
@@ -130,6 +126,7 @@ mod tests {
 
         let req = backend
             .release_request("my-key", "lock-secret-123")
+            .expect("release_request should build for a normal key")
             .build()
             .expect("request should build");
 
