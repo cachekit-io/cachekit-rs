@@ -25,11 +25,7 @@ struct RefreshTtlRequest {
 #[cfg_attr(feature = "unsync", async_trait(?Send))]
 impl TtlInspectable for CachekitIO {
     async fn ttl(&self, key: &str) -> Result<Option<Duration>, BackendError> {
-        let url = format!(
-            "{}/v1/cache/{}/ttl",
-            self.api_url(),
-            urlencoding::encode(key)
-        );
+        let url = self.ttl_url(key)?;
 
         let req =
             self.with_standard_headers(self.client().get(&url).bearer_auth(self.api_key_str()));
@@ -59,11 +55,7 @@ impl TtlInspectable for CachekitIO {
             ));
         }
 
-        let url = format!(
-            "{}/v1/cache/{}/ttl",
-            self.api_url(),
-            urlencoding::encode(key)
-        );
+        let url = self.ttl_url(key)?;
 
         let body = serde_json::to_vec(&RefreshTtlRequest { ttl: secs }).map_err(|e| {
             BackendError::permanent(format!("failed to serialize refresh_ttl request: {e}"))
