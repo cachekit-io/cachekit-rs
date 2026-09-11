@@ -24,7 +24,7 @@
 //! sorted by encoded bytes, and integral-float collapse. `rmp-serde` happens to
 //! emit shortest forms but provides no sorting, no set semantics, and no number
 //! canonicalization — hashing whatever serde produces would make key equality an
-//! implementation accident. The closed [`InteropValue`] model plus an explicit
+//! implementation accident. The closed [`crate::interop::InteropValue`] model plus an explicit
 //! encoder is the only way to guarantee byte-identical hashes across SDKs.
 //!
 //! # Values
@@ -34,7 +34,7 @@
 //! (via [`crate::serializer`]), so regular [`crate::CacheKit::set`] output is
 //! interop-readable as-is. Reads are the sharp edge: interop readers MUST
 //! consume exactly one MessagePack document and reject trailing bytes — see
-//! [`deserialize`].
+//! [`crate::interop::deserialize`].
 //!
 //! # Example
 //!
@@ -344,6 +344,9 @@ pub fn serialize_value(value: &InteropValue) -> Result<Vec<u8>, CachekitError> {
 /// Deserialize an interop-mode MessagePack document, consuming **exactly one**
 /// document and rejecting trailing bytes (spec MUST).
 ///
+/// Decode bounds: [`crate::serializer::MAX_DECODE_DEPTH`] and the header walk in
+/// `crate::serializer::check_structure` (LAB-2503).
+///
 /// `rmp_serde::from_slice` silently ignores trailing bytes. That leniency is
 /// dangerous here: a Python-SDK-internal CK frame begins `0x43` (`'C'`), which
 /// is a *complete* one-byte MessagePack document (positive fixint 67) — a
@@ -365,13 +368,13 @@ pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError
         ));
     }
 
-    // `Read for &[u8]` advances the slice, so `remaining` ends up holding
-    // whatever the decoder did not consume.
-    let mut remaining: &[u8] = bytes;
-    let mut de = rmp_serde::Deserializer::new(&mut remaining);
+    let mut de = crate::serializer::bounded_deserializer(bytes)?;
     let value = T::deserialize(&mut de)
         .map_err(|e| CachekitError::Serialization(format!("interop decode: {e}")))?;
 
+    // `Read for &[u8]` advances the slice, so the reader now holds exactly the
+    // bytes the decoder did not consume.
+    let remaining: &[u8] = de.into_inner();
     if !remaining.is_empty() {
         return Err(CachekitError::Serialization(format!(
             "interop payload has {} trailing byte(s) after the MessagePack document — \
