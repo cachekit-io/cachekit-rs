@@ -3,6 +3,50 @@
 //! Supports cachekit.io SaaS, Redis, Memcached, local File, and Cloudflare
 //! Workers backends. Zero-knowledge encryption via AES-256-GCM with HKDF key
 //! derivation.
+//!
+//! # Getting started: intent presets
+//!
+//! The intent presets are the primary entry point — one call that names your
+//! use case and returns a pre-configured [`CacheKitBuilder`] you can still
+//! override before [`build()`](CacheKitBuilder::build):
+//!
+//! | Intent | Backend | L1 | Encryption | Auto-reconnect² | Reliability¹ | Default TTL |
+//! |------------|-----------|------|------------|-----------------|--------------|-------------|
+//! | `CacheKit::minimal`³ | Redis | Off | No | No | Off | 300 s |
+//! | `CacheKit::production`³ | Redis | On | No | Yes | On | 600 s |
+//! | `CacheKit::encrypted`³ | Redis | On | AES-256-GCM | Yes | On | 600 s |
+//! | [`io`](CacheKit::io) | cachekit.io | On | No | n/a (HTTP) | On | 3 600 s |
+//!
+//! ¹ Retry with backoff + jitter, a circuit breaker, and backpressure around
+//! backend ops — see [`reliability`]. Requires the default-on `reliability`
+//! cargo feature.
+//! ² `production`/`encrypted` re-establish a dropped Redis connection with
+//! exponential backoff (100 ms → 30 s, retrying indefinitely); `minimal` is
+//! fail-fast (a dropped connection stays dead). **Initial** connections fail
+//! fast for every Redis preset — `io` opens no connection at construction: an
+//! empty API key fails at construction, while an invalid key or unreachable
+//! endpoint surfaces at the first request.
+//! Auto-reconnect is connection-level repair, distinct from the per-operation
+//! reliability stack.
+//! ³ Requires the `redis` cargo feature; `encrypted` also needs the
+//! default-on `encryption` feature.
+//!
+//! ```no_run
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Load the key from your environment/secrets manager — never hardcode it.
+//! let api_key = std::env::var("CACHEKIT_API_KEY")?;
+//! let cache = cachekit::CacheKit::io(&api_key)?
+//!     .namespace("myapp")
+//!     .build()?;
+//!
+//! cache.set("greeting", &"Hello, world!").await?;
+//! let val: Option<String> = cache.get("greeting").await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! For full control, drop down to [`CacheKit::builder`] or
+//! [`CacheKit::from_env`].
 
 // Production code lints — these only fire in src/, not tests/
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
