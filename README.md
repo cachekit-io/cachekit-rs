@@ -227,6 +227,8 @@ let cache = CacheKit::builder()
 
 Rotation is forward-only: a retired key is never re-promoted (re-promoting would resume a used AES-GCM nonce budget), and a config listing the current key among the previous keys is rejected at load.
 
+**Knowing when to drop the old key.** Every read served by a previous key is counted against that key's position; `cache.secure()?.previous_key_hits()` returns the counts (`hits[i]` for `previous_keys[i]`, current-key reads not counted, no key material). The signal confirms a grace window has drained; it does not shorten one. Follow the protocol's [scheduled-rotation runbook](https://github.com/cachekit-io/protocol/blob/main/decisions/key-rotation.md#runbooks-normative-for-docs): audit for non-expiring entries, add the incoming key as decrypt-only fleet-wide, then promote it. The clock starts only when the promotion deploy has completed on every instance — a lagging instance still writes under the retiring key and reads it silently as *its* current key. From then, wait at least the longest TTL in use (including any explicit `set_with_ttl` values), aggregating counts across every instance (they are per process and reset on restart). Once the retiring key's count has stayed flat over that whole window, every live entry has aged out or been re-encrypted on write, and the key can be dropped from `CACHEKIT_PREVIOUS_MASTER_KEYS` without a hard cut-over.
+
 ---
 
 ## Cross-SDK Interop Mode
