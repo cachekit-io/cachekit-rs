@@ -549,8 +549,10 @@ make build         # cargo build --release
 make build-wasm    # wasm32-unknown-unknown (workers feature)
 ```
 
-`make security` runs the same two commands as the `supply-chain` job in
-`.github/workflows/security.yml`, so a local pass means a CI pass. It needs
+`make security` runs the same two enforcement commands as the `supply-chain`
+job in `.github/workflows/security.yml`, so a local pass means a CI pass
+(the job's final step, the gate tamper check below, is PR-context-only and
+has no local equivalent). It needs
 `cargo-deny` and `cargo-audit` installed, and it reaches the network to refresh
 the RustSec advisory database — which is why it is not folded into
 `quick-check`.
@@ -572,6 +574,45 @@ reintroduced behind an optional feature passes a bare `cargo deny check`.
 `deny.toml` is the policy — notably a hard ban on `openssl-sys`, `native-tls`
 and `toxiproxy_rust`, because this SDK is rustls-only. Run `make deny` before
 adding or bumping a dependency.
+
+### Gate tamper-evidence
+
+The `supply-chain` check reads both its policy (`deny.toml`) and its own
+definition (`security.yml`) from the PR head, so a PR could weaken the gate it
+is being graded by — delete a `[bans]` entry, or drop `--all-features` while
+keeping the job name green. Two properties defend against that:
+
+- **Deletion fails closed.** `supply-chain` is a required status check with no
+  bypass actors; a PR that deletes the workflow leaves the context unreported
+  and the PR permanently unmergeable. A replacement check shipped under the
+  same name trips the wire below (it fires on any other changed workflow file
+  mentioning `supply-chain`) — but the wire lives in `security.yml`, so it
+  only fires while that file still runs. Deleting it and shipping the
+  replacement in the same commit removes the wire with it; that
+  self-protection gap is the first residual listed below. Either way an
+  API-posted commit status cannot impersonate the check: it is pinned to the
+  GitHub Actions app.
+- **Modification trips a wire.** The job's final step diffs `deny.toml` and
+  `security.yml` against the PR's base and fails the required check on any
+  change, unless the PR body contains the exact, case-sensitive string
+  `[gate-change-approved]` (add it after human sign-off, *then* push a commit
+  — the marker is read from the push-time event, so a body edit alone does
+  not re-trigger). Legitimate policy updates therefore stay possible, but
+  only as a conscious, loudly-marked act.
+
+What this does **not** defend against: a PR that removes the tamper-check
+step in the same commit — by editing it out, or by deleting `security.yml`
+outright while shipping a same-named replacement check that reports the
+required context; an author who self-serves the marker without
+sign-off; and a marker hidden inside an HTML comment, which satisfies the
+check but is invisible in the rendered body — when reviewing a gate-file
+diff, check the raw PR body, not just the rendered view. All are deliberate
+evasion, not the lazy path — each leaves an explicit trail in a reviewed
+diff or the PR body source. Closing the first mechanically requires an
+org-ruleset `workflows` rule pinning `security.yml` to an out-of-tree ref
+(an org-scope decision, tracked on LAB-1151), which would still not protect
+`deny.toml` — the wire above remains the only guard on the policy file
+itself.
 
 ## Minimum Supported Rust Version
 

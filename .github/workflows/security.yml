@@ -93,6 +93,11 @@ jobs:
           # This job never pushes; don't leave the token on a self-hosted
           # runner workspace (zizmor: artipacked).
           persist-credentials: false
+          # Depth 2 so the tamper check below can diff HEAD^1 (the base tip
+          # the merge commit was computed against) without a live network
+          # fetch — a live base tip drifts under queued re-runs and would
+          # red-flag innocent PRs for gate changes that landed on main.
+          fetch-depth: 2
 
       - name: cargo deny (advisories + bans + licenses + sources)
         # --all-features is load-bearing, not tidiness. cargo-deny builds a
@@ -126,3 +131,46 @@ jobs:
         # Runs even when the step above failed so one run shows both verdicts.
         if: ${{ !cancelled() }}
         run: cargo audit
+
+      - name: Gate tamper check (deny.toml / security.yml vs base)
+        # This job reads its own policy (deny.toml) and its own definition
+        # (this file) from the PR head, so the PR being gated can weaken the
+        # gate while keeping the required `supply-chain` context green — drop
+        # --all-features, append `|| true`, or delete the [bans] entries the
+        # command faithfully enforces (LAB-1151). Outright deletion fails
+        # closed (a required context that never reports blocks merge, with no
+        # bypass actors on ruleset 17788230) — UNLESS the PR ships a
+        # replacement check with the same name. The second diff below catches
+        # that, but only while this file still runs: delete this file and ship
+        # the replacement in one commit and the wire dies with it. That
+        # residual is documented in README "Gate tamper-evidence" and is only
+        # closable out-of-tree (org workflows rule — tracked on LAB-1151).
+        # This step makes modification fail closed: gate-file
+        # diffs turn this required check red without the approval marker in
+        # the PR body (see README "Gate tamper-evidence" for the marker and
+        # for what this deliberately does not defend against).
+        #
+        # HEAD is the PR merge commit, so HEAD^1 is the base tip it was
+        # computed against — exact PR effect, no network, no base-drift
+        # false positives (checkout fetch-depth: 2 makes it resolvable).
+        # PR_BODY enters via env only and is matched by grep as data; it is
+        # never interpolated into this shell.
+        if: ${{ github.event_name == 'pull_request' && !cancelled() }}
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -o pipefail
+          changed=$(git diff --name-only HEAD^1 HEAD -- deny.toml .github/workflows/security.yml | tr '\n' ' ')
+          shadow=""
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if git grep -qe supply-chain HEAD -- "$f"; then shadow="$shadow$f "; fi
+          done < <(git diff --name-only HEAD^1 HEAD -- '.github/workflows/' ':!.github/workflows/security.yml')
+          if [ -z "$changed$shadow" ]; then
+            echo "Gate files unchanged vs PR base."
+          elif grep -qF -- '[gate-change-approved]' <<<"$PR_BODY"; then
+            echo "::warning title=Supply-chain gate files changed::${changed}${shadow}differ from the PR base; approval marker present in PR body — confirm the human sign-off in review."
+          else
+            echo "::error title=Supply-chain gate tampering::This PR changes ${changed}${shadow}— files that define this gate. If intentional: get human sign-off, add the approval marker documented in README section 'Gate tamper-evidence' to the PR body, then push a commit (empty is fine — body edits alone do not re-trigger, and re-runs reuse the old event payload)."
+            exit 1
+          fi
