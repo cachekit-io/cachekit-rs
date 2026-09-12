@@ -550,7 +550,11 @@ make build-wasm    # wasm32-unknown-unknown (workers feature)
 ```
 
 `make security` runs the same two commands as the `supply-chain` job in
-`.github/workflows/security.yml`, so a local pass means a CI pass. It needs
+`.github/workflows/security.yml`, with `cargo audit` in its strictest CI form
+(`--deny yanked`) — so a local pass means a pass on every CI event, with one
+asymmetry: the weekly run additionally proves the yank check actually executed
+(see the guard in `security.yml`), so with crates.io unreachable a local run
+warns and passes where the weekly run goes red. It needs
 `cargo-deny` and `cargo-audit` installed, and it reaches the network to refresh
 the RustSec advisory database — which is why it is not folded into
 `quick-check`.
@@ -563,7 +567,8 @@ means it turns the check red — anything else is reported but not enforced:
 | Reads | feature-resolved dependency graph | `Cargo.lock` verbatim |
 | Licence allowlist, banned crates, registry/source policy | **fails** | not checked |
 | Vulnerabilities in crates no enabled feature activates | not seen (pruned) | **fails** |
-| Unsound / unmaintained advisories on *transitive* deps | not seen — `deny.toml` narrows `unmaintained` to `workspace`; `unsound` already defaults to that scope | reports only, does **not** fail |
+| Yanked crates in `Cargo.lock` | warns (feature-resolved graph only, so lockfile-only crates are missed) | warns on PR and push runs; **fails** only the weekly scheduled run (`--deny yanked`) |
+| Unsound / unmaintained advisories on *transitive* deps | not seen — `deny.toml` narrows `unmaintained` to `workspace`; `unsound` already defaults to that scope | reports only, does **not** fail — deliberate (see `deny.toml`) |
 
 `--all-features` is load-bearing: the default feature set excludes the
 `memcached`, `redis`, `file` and `macros` backends, so a banned crate
