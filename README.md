@@ -21,7 +21,7 @@
 
 ## Overview
 
-`cachekit-rs` is the Rust SDK for [cachekit.io](https://cachekit.io). Plug in a backend, get dual-layer caching with optional client-side encryption. Bytes never leave your process unencrypted unless you say so.
+`cachekit-rs` is the Rust SDK for [cachekit.io](https://cachekit.io). Pick an [intent preset](#intent-presets-recommended) — `minimal`, `production`, `encrypted`, or `io` — and get a pre-configured cache in one call, from bare Redis speed to dual-layer with client-side encryption. Pick `encrypted` and bytes never leave your process in plaintext.
 
 | Component | What it does |
 |:----------|:-------------|
@@ -53,15 +53,15 @@
 ```toml
 # Defaults: SaaS + encryption + L1
 [dependencies]
-cachekit-rs = "0.5"
+cachekit-rs = "0.7"
 
 # With Redis backend
 [dependencies]
-cachekit-rs = { version = "0.5", features = ["redis"] }
+cachekit-rs = { version = "0.7", features = ["redis"] }
 
 # For Cloudflare Workers (no L1, no Redis)
 [dependencies]
-cachekit-rs = { version = "0.5", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.7", default-features = false, features = ["workers", "encryption"] }
 ```
 
 > [!WARNING]
@@ -75,6 +75,47 @@ cachekit-rs = { version = "0.5", default-features = false, features = ["workers"
 ---
 
 ## Quick Start
+
+### Intent Presets (recommended)
+
+One call that names your use case. Each preset returns a pre-configured builder you can still override before `.build()`:
+
+| Preset | When to use | Backend | L1 | Encryption | Reliability¹ | Auto-reconnect² | Default TTL |
+|:-------|:------------|:--------|:--:|:----------:|:------------:|:---------------:|:-----------:|
+| `CacheKit::minimal(url)` | Development, public data, product catalogs — speed first, no extras | Redis³ | ❌ | ❌ | ❌ | ❌ | 300 s |
+| `CacheKit::production(url)` | User sessions, API responses, production services | Redis³ | ✅ | ❌ | ✅ | ✅ | 600 s |
+| `CacheKit::encrypted(url, key)` | PII, payments, GDPR/HIPAA-sensitive data — zero-knowledge AES-256-GCM | Redis³ | ✅ | ✅ | ✅ | ✅ | 600 s |
+| `CacheKit::io(api_key)` | Serverless, edge compute, managed caching without running Redis | cachekit.io | ✅ | ❌ | ✅ | n/a (HTTP) | 3 600 s |
+
+¹ Retry with backoff + jitter, circuit breaker, backpressure — the [reliability stack](#reliability). Requires the default-on `reliability` feature.
+² See the resilience contract below.
+³ Requires the `redis` feature flag; `encrypted` also needs the default-on `encryption` feature.
+
+```rust
+use cachekit::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), CachekitError> {
+    // Needs: cachekit-rs = { version = "0.7", features = ["redis"] }
+    let cache = CacheKit::production("redis://localhost:6379").await?
+        .namespace("api")
+        .build()?;
+
+    cache.set("greeting", &"Hello, world!").await?;
+    let val: Option<String> = cache.get("greeting").await?;
+    println!("{val:?}");
+
+    Ok(())
+}
+```
+
+**Resilience contract** — connection failures, at construction and mid-run:
+
+- `production` / `encrypted` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely.
+- `minimal` is **fail-fast**: a dropped connection is not re-established — every subsequent operation errors until you rebuild the client.
+- **Initial** connections fail fast for every Redis preset: a bad URL or unreachable Redis errors immediately at construction, never enters a retry loop. `io` opens no connection at construction: an empty API key fails at construction, while an invalid key or unreachable endpoint surfaces at the first request.
+- `encrypted` validates the master key **before** any Redis connection is attempted — a bad key is a deterministic local error, never masked by (or paying for) network I/O.
+- Auto-reconnect is connection-level repair, distinct from the per-operation [reliability stack](#reliability) (retry, circuit breaker, backpressure) that `production` / `encrypted` / `io` also enable. `minimal` has neither — every failure is yours to handle.
 
 ### From Environment Variables
 
@@ -154,6 +195,9 @@ let ssn: String = secure.get("user:42:ssn").await?.unwrap();
 | **AAD Binding** | Cache key bound to ciphertext (prevents substitution attacks) |
 | **Memory Safety** | [zeroize](https://crates.io/crates/zeroize) on drop for all key material |
 | **L1 Guarantee** | L1 stores ciphertext, never plaintext |
+| **Cache-key path encoding (CWE-22)** | Keys are percent-encoded into the CachekitIO request path; a key encoding to a reserved segment (`.`, `..`, `health`, `ttl`, `lock`) is **rejected** rather than sent |
+
+**Cache-key path encoding (CWE-22):** CachekitIO keys are percent-encoded (`urlencoding::encode`) so a key can only ever address `/v1/cache/{key}`. A key whose encoded form is one of the five reserved path segments — `.`, `..`, `health`, `ttl`, `lock` — is **rejected** with a permanent error rather than sent (protocol `spec/saas-api.md` § Cache-Key Path Encoding, rule 2). `.`/`..` are dot segments that `reqwest`'s WHATWG URL parser (rust-url) strips *before the request leaves the process* (`/v1/cache/..` → `/v1/`); `health`/`ttl`/`lock` are live route tokens (`/v1/cache/health` is the health endpoint, a trailing `ttl`/`lock` selects a sub-resource). Encoding can't neutralise either — WHATWG collapses `%2E%2E` too — so the SDK refuses rather than emit a request whose path was rewritten. This matches the cachekit-ts twin and is stricter than cachekit-py's older `%2E` rewrite; none of the five is ever a canonical CacheKit key (those contain `:`), so nothing legitimate is affected and every other key encodes byte-identically across the SDKs.
 
 **AAD v0x03 wire format:**
 
@@ -228,7 +272,7 @@ let backend = CachekitIO::builder()
 Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Requires the `redis` feature flag.
 
 ```toml
-cachekit-rs = { version = "0.5", features = ["redis"] }
+cachekit-rs = { version = "0.7", features = ["redis"] }
 ```
 
 ```rust
@@ -249,7 +293,7 @@ Memcached via [rust-memcache](https://crates.io/crates/memcache) (single server,
 TTLs above memcached's 30-day ceiling are clamped (larger values would be misread as absolute timestamps); values above the item-size limit (default 1 MiB) fail loudly client-side, and a server-side "object too large" classifies as permanent (never retried). Requires the `memcached` feature flag.
 
 ```toml
-cachekit-rs = { version = "0.5", features = ["memcached"] }
+cachekit-rs = { version = "0.7", features = ["memcached"] }
 ```
 
 ```rust
@@ -266,7 +310,7 @@ let backend = MemcachedBackend::builder()
 Local disk cache, **byte-compatible with cachekit-py's File backend** — a py and an rs process pointed at the same directory read each other's entries (Blake2b-128 hashed filenames, shared 14-byte header, atomic write-then-rename, lazy expiry). Implements `TtlInspectable` (TTL read off the on-disk header, in-place refresh). Concurrency matches py: same-process operations serialize on a backend-wide lock (py's `RLock`); on unix, reads and in-place TTL rewrites take advisory `flock` while writes stay lock-free via atomic rename; and expired-entry unlinks are inode-validated so a stale read decision doesn't delete a concurrent writer's fresh entry. On unix the cache directory must be owned by you and not group/other-writable. Not yet ported from py: LRU eviction and size caps — the directory grows until entries expire or you clear it. Requires the `file` feature flag and a tokio runtime (I/O runs via `spawn_blocking`).
 
 ```toml
-cachekit-rs = { version = "0.5", features = ["file"] }
+cachekit-rs = { version = "0.7", features = ["file"] }
 ```
 
 ```rust
@@ -282,7 +326,7 @@ let backend = FileBackend::builder()
 `wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. Requires the `workers` feature with default features disabled.
 
 ```toml
-cachekit-rs = { version = "0.5", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.7", default-features = false, features = ["workers", "encryption"] }
 ```
 
 <details>
