@@ -36,7 +36,7 @@ env:
 
 jobs:
   supply-chain:
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       # Checkout is deliberately LAST. cargo honours a `.cargo/config.toml`
