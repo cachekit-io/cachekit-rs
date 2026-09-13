@@ -34,7 +34,6 @@ jobs:
         # on its own line) — a grep anchored on the `runs-on:` line only
         # catches the first form and silently misses the other two.
         run: |
-          yq --version
           bad=0
           for f in .github/workflows/*.yml; do
             hits=$(yq eval '(.jobs[].runs-on, .jobs[].strategy.matrix.os[]?, .jobs[].strategy.matrix.runner[]?)' "$f" \
