@@ -36,8 +36,17 @@ jobs:
         run: |
           bad=0
           for f in .github/workflows/*.yml; do
-            hits=$(yq eval '(.jobs[].runs-on, .jobs[].strategy.matrix.os[]?, .jobs[].strategy.matrix.runner[]?)' "$f" \
-              | grep -oE '\b(cachekit(-lean)?|self-hosted)\b' || true)
+            # yq's own parse failure must not be swallowed by the grep on the
+            # next line: GitHub Actions runs bash steps with `-e` but not
+            # `-o pipefail`, so `yq ... | grep ... || true` would mask a
+            # broken/unparseable workflow as "no hits found" instead of
+            # erroring. Capture yq's output and exit status separately.
+            if ! values=$(yq eval '(.jobs[].runs-on, .jobs[].strategy.matrix.os[]?, .jobs[].strategy.matrix.runner[]?)' "$f"); then
+              echo "::error::failed to parse $f with yq"
+              bad=1
+              continue
+            fi
+            hits=$(echo "$values" | grep -oE '\b(cachekit(-lean)?|self-hosted)\b' || true)
             if [ -n "$hits" ]; then
               echo "::error::$f still targets a self-hosted runner label: $(echo "$hits" | tr '\n' ' ')"
               bad=1
