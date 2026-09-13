@@ -709,6 +709,12 @@ impl std::fmt::Debug for SecureCache<'_> {
 
 #[cfg(feature = "encryption")]
 impl SecureCache<'_> {
+    /// Rotation drain signal; see
+    /// [`EncryptionLayer::previous_key_hits`](crate::EncryptionLayer::previous_key_hits).
+    pub fn previous_key_hits(&self) -> Vec<u64> {
+        self.encryption.previous_key_hits()
+    }
+
     /// Encrypt and store `value` under `key` using the client's default TTL.
     pub async fn set<T: Serialize>(&self, key: &str, value: &T) -> Result<(), CachekitError> {
         self.set_with_ttl(key, value, self.client.default_ttl).await
