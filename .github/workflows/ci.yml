@@ -27,12 +27,23 @@ jobs:
         # LAB-1161 moves both scale sets into the `cachekit-private` runner
         # group, which excludes public repos. This job only stops a
         # maintainer from accidentally merging the drift back in.
+        #
+        # Parsed with yq, not a line-oriented grep: `runs-on:` (and
+        # matrix.os/matrix.runner) are equally valid as a scalar, a
+        # flow-list (`[self-hosted, cachekit]`), or a block-list (`- cachekit`
+        # on its own line) — a grep anchored on the `runs-on:` line only
+        # catches the first form and silently misses the other two.
         run: |
-          hits=$(grep -rnE '^\s*runs-on:|^\s*(os|runner):|"os":' .github/workflows/ \
-            | grep -E '\b(cachekit|self-hosted)\b' || true)
-          if [ -n "$hits" ]; then
-            echo "::error::self-hosted runner label found in .github/workflows/ — this repo is hosted-only (LAB-3502)."
-            echo "$hits"
+          bad=0
+          for f in .github/workflows/*.yml; do
+            hits=$(yq eval '(.jobs[].runs-on, .jobs[].strategy.matrix.os[]?, .jobs[].strategy.matrix.runner[]?)' "$f" \
+              | grep -oE '\b(cachekit(-lean)?|self-hosted)\b' || true)
+            if [ -n "$hits" ]; then
+              echo "::error::$f still targets a self-hosted runner label: $(echo "$hits" | tr '\n' ' ')"
+              bad=1
+            fi
+          done
+          if [ "$bad" -eq 1 ]; then
             exit 1
           fi
 
