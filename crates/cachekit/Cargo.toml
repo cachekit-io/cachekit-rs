@@ -128,7 +128,7 @@ tempfile = "3"
 # wasm-bindgen-test-runner binary must match the locked wasm-bindgen version
 # byte-for-byte (bump this, the lockfile, and the runner pin in ci.yml together).
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-wasm-bindgen-test = "=0.3.71"
+wasm-bindgen-test = "=0.3.78"
 
 [lints]
 workspace = true
