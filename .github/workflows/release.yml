@@ -77,14 +77,8 @@ jobs:
     # stops a feature branch from driving a publish) — the required tag input
     # alone decides what content ships.
     if: ${{ needs.release-please.outputs.release_created == 'true' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
-    runs-on: cachekit-lean
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      RUSTUP_HOME: /tmp/rustup
-      CARGO_HOME: /tmp/cargo
-      # Same 6Gi cgroup OOM constraint as CI (issue #25): cap parallel jobs so
-      # the cold pre-publish build doesn't OOM-kill the linker on cachekit-lean.
-      CARGO_BUILD_JOBS: "4"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
