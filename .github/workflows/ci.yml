@@ -19,13 +19,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Fail if any workflow still targets the retired self-hosted pool
+      - name: Fail if any workflow still targets a self-hosted runner
         # Drift protection for maintainers only, NOT a fork-PR control — a
         # fork PR runs its own copy of this workflow file, so this check
         # cannot stop an attacker's fork from restoring `runs-on: cachekit`.
-        # The control that actually blocks that is server-side: stage 2 of
-        # LAB-1161 moves both scale sets into the `cachekit-private` runner
-        # group, which excludes public repos. This job only stops a
+        # The control that actually blocks that lives in repository and org
+        # runner settings, outside this file. This job only stops a
         # maintainer from accidentally merging the drift back in.
         #
         # Parsed with yq, not a line-oriented grep: `runs-on:` (and
@@ -93,7 +92,7 @@ jobs:
   redis-lock:
     name: redis lock integration
     # GitHub-hosted runners have Docker preinstalled, so `services:` works
-    # unchanged here — no dind sidecar required. Without a live redis the
+    # unchanged here with no extra Docker setup. Without a live redis the
     # lock acquire/release path has zero automated coverage — the
     # redis_lock_live_semantics test skips when CACHEKIT_TEST_REDIS_URL is
     # unset (LAB-426: the AC requires locking exercised against a container).
@@ -144,7 +143,7 @@ jobs:
   memcached:
     name: memcached integration
     # Same reasoning as redis-lock: hosted runners have Docker built in, so
-    # `services:` needs no dind sidecar. Without a live memcached the
+    # `services:` needs no extra Docker setup. Without a live memcached the
     # get/set/delete/ttl path has zero automated coverage — the
     # memcached_live_semantics test skips when CACHEKIT_TEST_MEMCACHED_URL is
     # unset (LAB-429: the AC requires memcached exercised against a container).
