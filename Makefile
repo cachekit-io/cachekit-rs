@@ -26,9 +26,10 @@ test-wasm:
 	CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
 	$(CARGO) test -p cachekit-rs --target wasm32-unknown-unknown --no-default-features --features workers,cachekitio,encryption,macros --test wasm_session_tests
 
-# Supply-chain gate — the same enforcement commands CI runs in
-# .github/workflows/security.yml, so a local pass means a CI pass. (CI runs the
-# audit step even when deny fails, plus a PR-only gate tamper check with no
+# Supply-chain gate — deny is identical to CI's; audit runs the strict form
+# (`--deny yanked`, which CI applies only on the weekly schedule run), so a
+# local pass covers every CI event in .github/workflows/security.yml. (CI runs
+# the audit step even when deny fails, plus a PR-only gate tamper check with no
 # local equivalent; make stops at the first failure.)
 # Kept out of `quick-check`: both tools fetch the RustSec advisory database over
 # the network, which does not belong in a per-commit loop.
@@ -39,4 +40,4 @@ deny:
 	$(CARGO) deny --locked --all-features check
 
 audit:
-	$(CARGO) audit
+	$(CARGO) audit --deny yanked
