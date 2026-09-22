@@ -417,3 +417,48 @@ async fn rotation_round_trip_without_reencryption() {
         "dropped-key read must surface as an encryption error, got {result:?}"
     );
 }
+
+/// Rotation drain signal (LAB-1678): the builder wires the counters into the
+/// user-held secure handle, so a read served by the retiring key is visible
+/// there. Index-0 silence is owned and tested at the layer (`encryption.rs`).
+#[tokio::test]
+async fn rotation_drain_signal_is_visible_on_secure_cache() {
+    const K1: &[u8] = &[0x11; 32];
+    const K2: &[u8] = &[0x22; 32];
+
+    let backend = common::MockBackend::shared();
+
+    let writer = CacheKit::builder()
+        .backend(backend.clone())
+        .default_ttl(Duration::from_secs(60))
+        .no_l1()
+        .encryption_from_bytes(K1, "test-tenant")
+        .expect("encryption setup")
+        .build()
+        .expect("client builds");
+    writer
+        .secure()
+        .expect("secure()")
+        .set("drain:old", &"written under k1")
+        .await
+        .expect("secure set under k1");
+
+    let rotated = CacheKit::builder()
+        .backend(backend)
+        .default_ttl(Duration::from_secs(60))
+        .no_l1()
+        .encryption_from_bytes_with_previous(K2, &[K1], "test-tenant")
+        .expect("keyring setup")
+        .build()
+        .expect("client builds");
+    let secure = rotated.secure().expect("secure()");
+    assert_eq!(secure.previous_key_hits(), vec![0], "nothing read yet");
+
+    // The k1-era entry is served by previous[0]: the grace window is still live.
+    let _: Option<String> = secure.get("drain:old").await.expect("secure get");
+    assert_eq!(
+        secure.previous_key_hits(),
+        vec![1],
+        "previous-key hit is counted"
+    );
+}

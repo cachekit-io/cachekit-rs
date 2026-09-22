@@ -227,6 +227,8 @@ let cache = CacheKit::builder()
 
 Rotation is forward-only: a retired key is never re-promoted (re-promoting would resume a used AES-GCM nonce budget), and a config listing the current key among the previous keys is rejected at load. For the three-phase zero-miss rollout and compromise response, see the [key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/).
 
+**Knowing when to drop the old key.** Every read served by a previous key is counted against that key's position; `cache.secure()?.previous_key_hits()` returns the counts (`hits[i]` for `previous_keys[i]`, current-key reads not counted, no key material). The signal confirms a grace window has drained; it does not shorten one. Follow the protocol's [scheduled-rotation runbook](https://github.com/cachekit-io/protocol/blob/main/decisions/key-rotation.md#runbooks-normative-for-docs): audit for non-expiring entries, add the incoming key as decrypt-only fleet-wide, then promote it. The clock starts only when the promotion deploy has completed on every instance — a lagging instance still writes under the retiring key and reads it silently as *its* current key. From then, wait at least the longest TTL in use (including any explicit `set_with_ttl` values), aggregating counts across every instance (they are per process and reset on restart). Once the retiring key's count has stayed flat over that whole window, every live entry has aged out or been re-encrypted on write, and the key can be dropped from `CACHEKIT_PREVIOUS_MASTER_KEYS` without a hard cut-over.
+
 ---
 
 ## Cross-SDK Interop Mode
@@ -243,7 +245,7 @@ cache.set_with_ttl(&key, &user, ttl).await?;          // plain MessagePack — a
 let user: Option<User> = cache.interop_get(&key).await?; // strict read: exactly one document
 ```
 
-Argument hashing is byte-identical across SDKs (canonical MessagePack + Blake2b-256), verified against the shared [protocol test vectors](https://github.com/cachekit-io/protocol/blob/main/test-vectors/interop-mode.json) in this repo's test suite. `interop_get` (also on `SecureCache`) rejects trailing bytes and Python-internal CK frames instead of silently misreading them. Encryption works unchanged — interop keys are identical across SDKs, so the AAD verifies cross-SDK.
+Argument hashing is byte-identical across SDKs (canonical MessagePack + Blake2b-256), verified against the shared [protocol](https://github.com/cachekit-io/protocol) test vectors ([`interop-mode.json`](crates/cachekit/tests/vectors/interop-mode.json), vendored) in this repo's test suite. `interop_get` (also on `SecureCache`) rejects trailing bytes and Python-internal CK frames instead of silently misreading them. Every decode of backend-supplied bytes (`get` and `interop_get` alike) runs under an explicit nesting-depth bound (`serializer::MAX_DECODE_DEPTH` = 100, matching the TypeScript SDK) and a header-only structural walk that rejects headers declaring more than the input can back, verified against the protocol's shared [`decode-bounds.json`](crates/cachekit/tests/vectors/decode-bounds.json) vectors (vendored) — a forged nested-header entry is a bounded `Serialization` error, not a memory blow-up or a stack overflow. Encryption works unchanged — interop keys are identical across SDKs, so the AAD verifies cross-SDK.
 
 > [!IMPORTANT]
 > Use interop keys on a client **without** `.namespace()` — a client prefix would rewrite the storage key to `{prefix}:{interop_key}`, which no other SDK computes. `interop_get` fails closed with a config error rather than silently missing; interop keys already carry their own namespace segment.
@@ -550,7 +552,11 @@ make build-wasm    # wasm32-unknown-unknown (workers feature)
 ```
 
 `make security` runs the same two commands as the `supply-chain` job in
-`.github/workflows/security.yml`, so a local pass means a CI pass. It needs
+`.github/workflows/security.yml`, with `cargo audit` in its strictest CI form
+(`--deny yanked`) — so a local pass means a pass on every CI event, with one
+asymmetry: the weekly run additionally proves the yank check actually executed
+(see the guard in `security.yml`), so with crates.io unreachable a local run
+warns and passes where the weekly run goes red. It needs
 `cargo-deny` and `cargo-audit` installed, and it reaches the network to refresh
 the RustSec advisory database — which is why it is not folded into
 `quick-check`.
@@ -563,7 +569,8 @@ means it turns the check red — anything else is reported but not enforced:
 | Reads | feature-resolved dependency graph | `Cargo.lock` verbatim |
 | Licence allowlist, banned crates, registry/source policy | **fails** | not checked |
 | Vulnerabilities in crates no enabled feature activates | not seen (pruned) | **fails** |
-| Unsound / unmaintained advisories on *transitive* deps | not seen — `deny.toml` narrows `unmaintained` to `workspace`; `unsound` already defaults to that scope | reports only, does **not** fail |
+| Yanked crates in `Cargo.lock` | warns (feature-resolved graph only, so lockfile-only crates are missed) | warns on PR and push runs; **fails** only the weekly scheduled run (`--deny yanked`) |
+| Unsound / unmaintained advisories on *transitive* deps | not seen — `deny.toml` narrows `unmaintained` to `workspace`; `unsound` already defaults to that scope | reports only, does **not** fail — deliberate (see `deny.toml`) |
 
 `--all-features` is load-bearing: the default feature set excludes the
 `memcached`, `redis`, `file` and `macros` backends, so a banned crate

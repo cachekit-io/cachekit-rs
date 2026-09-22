@@ -4,11 +4,25 @@
 # defaults to "all", unsound to "workspace" (direct workspace deps only).
 # So the line below NARROWS unmaintained from its default. It is not a
 # redundant restatement, and deleting it would tighten this gate.
-# Consequence: transitive unsound/unmaintained advisories are not reported here
-# (e.g. rand 0.8.5 / RUSTSEC-2026-0097, reached via fred and memcache).
-# `cargo audit` in .github/workflows/security.yml lists them, but does not fail
-# on them either — widening both scopes to "all" is open work, not covered.
-# yanked: warn instead of hard-fail so renovate can fix.
+#
+# Warn-vs-fail posture per class (LAB-1152, decided 2026-08-31):
+# - yanked: warn here, ENFORCED by `cargo audit --deny yanked` on the weekly
+#   schedule run in .github/workflows/security.yml. Audit is the enforcement
+#   point because cargo-deny grades the feature-resolved graph, which prunes
+#   lockfile-only crates — it scored 0 warnings while the lockfile held the
+#   yanked chacha20 0.10.1 (behind reqwest's unused quinn path). Warn, not
+#   deny, here so an upstream yank against an unchanged lockfile never blocks
+#   unrelated PRs. The weekly red is typically fixed same-day with
+#   `cargo update -p <crate>` — a yank almost always has a compatible
+#   non-yanked sibling; a full-crate or semver-gapped yank needs a dependency
+#   bump or replacement instead (rarer, still actionable).
+# - unsound / unmaintained: warn, and the scopes stay narrow — widening to
+#   "all" would only duplicate warnings `cargo audit` already prints every run
+#   from the verbatim lockfile. Not enforced anywhere: neither class
+#   guarantees a fixed version exists (today's rand 0.8.5 / RUSTSEC-2026-0097,
+#   via fred 9.4 + memcache 0.19, has no compatible upgrade), so failing on
+#   them forces an ignore-list that accumulates — a worse posture than an
+#   honest warning.
 yanked = "warn"
 unmaintained = "workspace"
 
