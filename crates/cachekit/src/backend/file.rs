@@ -53,12 +53,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use blake2::{digest::consts::U16, Blake2b, Digest};
 
 use crate::backend::{run_blocking, Backend, HealthStatus, TtlInspectable};
 use crate::error::{BackendError, BackendErrorKind};
-
-type Blake2b128 = Blake2b<U16>;
 
 // Header layout — byte-identical to cachekit-py's `backends/file/backend.py`.
 const MAGIC: &[u8; 2] = b"CK";
@@ -459,10 +456,10 @@ impl FileBackend {
         &self.cache_dir
     }
 
+    /// Blake2b-128 hex of the key — the same digest `tracing` events carry as
+    /// `key_hash`, so a log line names the file it touched.
     fn entry_path(&self, key: &str) -> PathBuf {
-        let mut hasher = Blake2b128::new();
-        hasher.update(key.as_bytes());
-        self.cache_dir.join(hex::encode(hasher.finalize()))
+        self.cache_dir.join(crate::metrics::key_hash(key))
     }
 
     /// Run `f` on the blocking pool holding the backend-wide lock.

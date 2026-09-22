@@ -47,6 +47,17 @@
 //!
 //! For full control, drop down to [`CacheKit::builder`] or
 //! [`CacheKit::from_env`].
+//!
+//! # Observability
+//!
+//! Every client counts its reads: [`CacheKit::stats`] answers "is my cache
+//! hitting?" (L1 hits / L2 hits / misses), [`CacheKit::l1_entry_count`]
+//! reports L1 occupancy, and with `reliability` on,
+//! [`CacheKit::circuit_state`] reports the breaker. The same counters feed the
+//! cachekit.io backends' `X-CacheKit-*` telemetry headers automatically. Enable
+//! the `tracing` cargo feature for a `debug` event per operation on the
+//! `cachekit` target (`op`, `outcome`, `key_hash` — never the key) and
+//! breaker transitions on `cachekit::reliability` — see [`metrics`].
 
 // Production code lints — these only fire in src/, not tests/
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -85,7 +96,8 @@ pub mod error;
 pub mod flight;
 /// Interop mode (interop/v1): cross-SDK cache keys and plain-MessagePack values.
 pub mod interop;
-/// L1 cache hit-rate metrics for CachekitIO request headers.
+/// Live hit/miss counters, the SaaS telemetry headers built from them, and
+/// (feature `tracing`) structured events for cache operations.
 pub mod metrics;
 /// Serialization and deserialization of cached values via MessagePack.
 pub mod serializer;
@@ -113,6 +125,7 @@ pub mod reliability;
 pub use client::{CacheKit, CacheKitBuilder, SharedBackend, SwrRead, SwrToken};
 pub use config::CachekitConfig;
 pub use error::{BackendError, BackendErrorKind, CachekitError};
+pub use metrics::L1Stats;
 
 #[cfg(feature = "encryption")]
 pub use client::SecureCache;
@@ -125,7 +138,9 @@ pub use cachekit_macros::cachekit;
 pub use flight::SingleFlight;
 
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-pub use reliability::{BackpressureConfig, CircuitBreakerConfig, ReliabilityConfig, RetryConfig};
+pub use reliability::{
+    BackpressureConfig, CircuitBreakerConfig, CircuitState, ReliabilityConfig, RetryConfig,
+};
 
 // ── Shared jitter source ─────────────────────────────────────────────────────
 

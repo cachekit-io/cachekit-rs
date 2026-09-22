@@ -85,3 +85,51 @@ impl Backend for MockBackend {
         })
     }
 }
+
+/// Backend whose every data operation fails with a transient error — the
+/// "backend is down" fixture for breaker and not-counted-read tests.
+#[derive(Debug, Default, Clone)]
+pub struct FailingBackend;
+
+impl FailingBackend {
+    /// Wrap as a [`SharedBackend`].
+    pub fn shared() -> SharedBackend {
+        #[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
+        {
+            std::sync::Arc::new(Self)
+        }
+        #[cfg(any(target_arch = "wasm32", feature = "unsync"))]
+        {
+            std::rc::Rc::new(Self)
+        }
+    }
+}
+
+#[cfg_attr(not(any(target_arch = "wasm32", feature = "unsync")), async_trait)]
+#[cfg_attr(any(target_arch = "wasm32", feature = "unsync"), async_trait(?Send))]
+impl Backend for FailingBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        Err(BackendError::transient("down"))
+    }
+
+    async fn set(&self, _: &str, _: Vec<u8>, _: Option<Duration>) -> Result<(), BackendError> {
+        Err(BackendError::transient("down"))
+    }
+
+    async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+        Err(BackendError::transient("down"))
+    }
+
+    async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+        Err(BackendError::transient("down"))
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Ok(HealthStatus {
+            is_healthy: false,
+            latency_ms: 0.0,
+            backend_type: "failing".to_owned(),
+            details: HashMap::new(),
+        })
+    }
+}

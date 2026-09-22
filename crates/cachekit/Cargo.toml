@@ -17,7 +17,7 @@ categories = ["caching", "web-programming", "cryptography"]
 # exclusive with redis/l1/reliability/memcached/file (the five compile_error
 # guards in lib.rs).
 [package.metadata.docs.rs]
-features = ["cachekitio", "redis", "encryption", "l1", "reliability", "macros", "memcached", "file"]
+features = ["cachekitio", "redis", "encryption", "l1", "reliability", "macros", "memcached", "file", "tracing"]
 
 [lib]
 name = "cachekit"
@@ -51,6 +51,11 @@ reliability = ["tokio/time"]
 # Opt into ?Send / Rc on native targets (for tokio::task::LocalSet, single-threaded
 # runtimes, etc.). Same code paths that wasm32 already uses.
 unsync = []
+# Structured `tracing` events: one debug event per get/set/delete on the
+# `cachekit` target, and circuit-breaker transitions on `cachekit::reliability`.
+# Events carry `key_hash` (Blake2b-128), never the key (CWE-532). Off by
+# default — with no subscriber the callsites are a disabled-check each.
+tracing = ["dep:tracing"]
 
 [dependencies]
 cachekit-core = { version = "0.6", features = ["messagepack"] }
@@ -96,6 +101,11 @@ getrandom = { version = "0.2", optional = true, features = ["js"] }
 
 # Optional: proc-macro decorator
 cachekit-macros = { version = "0.7.0", path = "../cachekit-macros", optional = true }
+
+# Optional: structured events. `std` only — no `attributes`: the crate uses no
+# `#[instrument]`, so users don't pay for the proc-macro build. Already in the
+# lockfile transitively via reqwest/fred, so this adds no new crate to the graph.
+tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
 
 # Optional (file backend, unix only): libc for the O_NOFOLLOW/ELOOP constants
 # (std has no portable spelling); rustix for safe flock/geteuid wrappers —

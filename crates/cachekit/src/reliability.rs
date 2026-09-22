@@ -34,7 +34,7 @@
 //! backends already do). Not available on wasm32 targets.
 
 use std::future::Future;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -260,12 +260,11 @@ impl RetryPolicy {
 
 // ── CircuitBreaker ───────────────────────────────────────────────────────────
 
-/// Circuit breaker states. Test-only until the observability tier (LAB-101)
-/// exposes breaker state at runtime — a public type with no producer is API
-/// noise (expert-panel cut).
-#[cfg(test)]
+/// Circuit breaker state, as reported by
+/// [`CacheKit::circuit_state`](crate::CacheKit::circuit_state) and carried by
+/// the `tracing` transition events (`from` / `to` fields).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CircuitState {
+pub enum CircuitState {
     /// Normal operation; calls pass through.
     Closed,
     /// Failing fast; calls return a [`crate::error::BackendErrorKind::CircuitOpen`] error
@@ -280,6 +279,16 @@ enum State {
     Closed,
     Open { since: Instant },
     HalfOpen,
+}
+
+impl From<&State> for CircuitState {
+    fn from(state: &State) -> Self {
+        match state {
+            State::Closed => Self::Closed,
+            State::Open { .. } => Self::Open,
+            State::HalfOpen => Self::HalfOpen,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -331,26 +340,26 @@ impl CircuitBreaker {
     }
 
     /// Current state (transitions open → half-open lazily on inspection).
-    /// Test-only until the observability tier (LAB-101) needs it at runtime.
-    #[cfg(test)]
     pub(crate) fn state(&self) -> CircuitState {
         let mut inner = self.lock();
-        self.maybe_half_open(&mut inner);
-        match inner.state {
-            State::Closed => CircuitState::Closed,
-            State::Open { .. } => CircuitState::Open,
-            State::HalfOpen => CircuitState::HalfOpen,
-        }
+        let change = self.maybe_half_open(&mut inner);
+        let state = CircuitState::from(&inner.state);
+        drop(inner);
+        emit(change);
+        state
     }
 
-    fn maybe_half_open(&self, inner: &mut BreakerInner) {
-        if let State::Open { since } = inner.state {
-            if since.elapsed() >= self.config.open_timeout {
-                inner.state = State::HalfOpen;
-                inner.half_open_successes = 0;
-                inner.half_open_calls = 0;
-            }
+    fn maybe_half_open(&self, inner: &mut BreakerInner) -> Option<Transition> {
+        let State::Open { since } = inner.state else {
+            return None;
+        };
+        if since.elapsed() < self.config.open_timeout {
+            return None;
         }
+        let change = transition(inner, State::HalfOpen);
+        inner.half_open_successes = 0;
+        inner.half_open_calls = 0;
+        Some(change)
     }
 
     /// Admit a call, or fail fast with a circuit-open error.
@@ -363,8 +372,8 @@ impl CircuitBreaker {
     /// recovered backend.
     fn try_acquire(&self) -> Result<ProbePermit<'_>, BackendError> {
         let mut inner = self.lock();
-        self.maybe_half_open(&mut inner);
-        match inner.state {
+        let change = self.maybe_half_open(&mut inner);
+        let admitted = match inner.state {
             State::Closed => Ok(ProbePermit {
                 breaker: self,
                 took_slot: false,
@@ -385,17 +394,21 @@ impl CircuitBreaker {
                     })
                 }
             }
-        }
+        };
+        drop(inner);
+        emit(change);
+        admitted
     }
 
     fn record(&self, outcome: &Outcome) {
         let mut inner = self.lock();
+        let mut change = None;
         match outcome {
             Outcome::Success => {
                 if matches!(inner.state, State::HalfOpen) {
                     inner.half_open_successes += 1;
                     if inner.half_open_successes >= self.config.success_threshold {
-                        inner.state = State::Closed;
+                        change = Some(transition(&mut inner, State::Closed));
                         inner.failures.clear();
                         inner.half_open_successes = 0;
                         inner.half_open_calls = 0;
@@ -415,9 +428,8 @@ impl CircuitBreaker {
             }
             Outcome::Failure => match inner.state {
                 State::HalfOpen => {
-                    inner.state = State::Open {
-                        since: Instant::now(),
-                    };
+                    let now = Instant::now();
+                    change = Some(transition(&mut inner, State::Open { since: now }));
                     inner.half_open_successes = 0;
                     inner.half_open_calls = 0;
                 }
@@ -427,7 +439,7 @@ impl CircuitBreaker {
                     let window = self.config.rolling_window;
                     inner.failures.retain(|t| now.duration_since(*t) <= window);
                     if inner.failures.len() >= self.config.failure_threshold as usize {
-                        inner.state = State::Open { since: now };
+                        change = Some(transition(&mut inner, State::Open { since: now }));
                         inner.failures.clear();
                     }
                 }
@@ -441,7 +453,44 @@ impl CircuitBreaker {
                 }
             }
         }
+        drop(inner);
+        emit(change);
     }
+}
+
+/// A breaker state change, `(from, to)`, handed back by [`transition`] so the
+/// caller can report it once the breaker lock is released.
+type Transition = (CircuitState, CircuitState);
+
+/// Apply a breaker state change under the lock and return it for [`emit`].
+fn transition(inner: &mut BreakerInner, to: State) -> Transition {
+    let change = (CircuitState::from(&inner.state), CircuitState::from(&to));
+    inner.state = to;
+    change
+}
+
+/// Report a transition on the `tracing` target (feature `tracing`): `warn`
+/// when the circuit opens — traffic is now failing fast — `info` for half-open
+/// and closed.
+///
+/// Must be called with the breaker lock **released**: a subscriber may react
+/// to the event by calling
+/// [`CacheKit::circuit_state`](crate::CacheKit::circuit_state), which takes
+/// the same lock, and a synchronous writer must not stall every other
+/// worker's `try_acquire` for the duration of the write. Emission therefore
+/// trails the transition by a few instructions; the `from`/`to` pair is
+/// captured under the lock, so the reported sequence is still the true one.
+fn emit(change: Option<Transition>) {
+    #[cfg(feature = "tracing")]
+    if let Some((from, to)) = change {
+        if to == CircuitState::Open {
+            tracing::warn!(from = ?from, to = ?to, "circuit breaker opened");
+        } else {
+            tracing::info!(from = ?from, to = ?to, "circuit breaker transitioned");
+        }
+    }
+    #[cfg(not(feature = "tracing"))]
+    let _ = change;
 }
 
 // ── ProbePermit ──────────────────────────────────────────────────────────────
@@ -584,7 +633,10 @@ impl ConcurrencyLimiter {
 pub(crate) struct ReliableBackend {
     inner: SharedBackend,
     retry: Option<RetryPolicy>,
-    breaker: Option<CircuitBreaker>,
+    /// Shared with the owning `CacheKit` so
+    /// [`CacheKit::circuit_state`](crate::CacheKit::circuit_state) can read
+    /// it through the type-erased backend.
+    breaker: Option<Arc<CircuitBreaker>>,
     limiter: Option<ConcurrencyLimiter>,
 }
 
@@ -593,7 +645,9 @@ impl ReliableBackend {
         Self {
             inner,
             retry: config.retry.map(RetryPolicy::new),
-            breaker: config.circuit_breaker.map(CircuitBreaker::new),
+            breaker: config
+                .circuit_breaker
+                .map(|config| Arc::new(CircuitBreaker::new(config))),
             limiter: config.backpressure.map(ConcurrencyLimiter::new),
         }
     }
@@ -665,16 +719,19 @@ impl Backend for ReliableBackend {
     }
 }
 
-/// Wrap `inner` in a [`ReliableBackend`] and re-share it.
-#[cfg(not(feature = "unsync"))]
-pub(crate) fn wrap_reliable(inner: SharedBackend, config: ReliabilityConfig) -> SharedBackend {
-    std::sync::Arc::new(ReliableBackend::new(inner, config))
-}
-
-/// Wrap `inner` in a [`ReliableBackend`] and re-share it (`?Send` variant).
-#[cfg(feature = "unsync")]
-pub(crate) fn wrap_reliable(inner: SharedBackend, config: ReliabilityConfig) -> SharedBackend {
-    std::rc::Rc::new(ReliableBackend::new(inner, config))
+/// Wrap `inner` in a [`ReliableBackend`] and re-share it, handing back the
+/// breaker (if configured) for the client's state accessor.
+pub(crate) fn wrap_reliable(
+    inner: SharedBackend,
+    config: ReliabilityConfig,
+) -> (SharedBackend, Option<Arc<CircuitBreaker>>) {
+    let reliable = ReliableBackend::new(inner, config);
+    let breaker = reliable.breaker.clone();
+    #[cfg(not(feature = "unsync"))]
+    let shared: SharedBackend = std::sync::Arc::new(reliable);
+    #[cfg(feature = "unsync")]
+    let shared: SharedBackend = std::rc::Rc::new(reliable);
+    (shared, breaker)
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────────────
