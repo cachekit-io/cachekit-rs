@@ -1,6 +1,6 @@
 //! Tests for intent-based cache presets.
 //!
-//! The async Redis intents (minimal, production, encrypted) connect eagerly,
+//! The async Redis intents (minimal, production, secure) connect eagerly,
 //! so their success paths need a live Redis and are not tested here. Their
 //! error paths (invalid URL, invalid key) are deterministic and local — those
 //! are exercised through the public factories directly. The sync io() intent
@@ -71,10 +71,10 @@ mod redis_intents {
     }
 }
 
-// ── encrypted (factory key validation, no network) ───────────────────────────
+// ── secure (factory key validation, no network) ──────────────────────────────
 
 #[cfg(all(feature = "redis", feature = "encryption"))]
-mod encrypted_intent {
+mod secure_intent {
     use crate::common::MockBackend;
     use cachekit::error::CachekitError;
     use cachekit::CacheKit;
@@ -84,7 +84,7 @@ mod encrypted_intent {
         // The URL points at an unreachable Redis on purpose: key validation
         // must fire first, so we get the deterministic Config error (a short
         // key is a configuration mistake) — never a Backend (connection) error.
-        let result = CacheKit::encrypted("redis://127.0.0.1:1", b"too_short").await;
+        let result = CacheKit::secure("redis://127.0.0.1:1", b"too_short").await;
         assert!(
             matches!(result, Err(CachekitError::Config(_))),
             "short master key must be rejected before any Redis I/O"

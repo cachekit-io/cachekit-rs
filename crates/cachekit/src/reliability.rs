@@ -5,7 +5,7 @@
 //! All three are composed by a private `ReliableBackend` decorator around any
 //! [`crate::backend::Backend`], applied by the builder when a [`ReliabilityConfig`] is set
 //! (see [`crate::CacheKitBuilder::reliability`]). The intent presets
-//! `production`, `encrypted`, and `io` enable it by default; `minimal` does
+//! `production`, `secure`, and `io` enable it by default; `minimal` does
 //! not — mirroring the TypeScript SDK's preset posture.
 //!
 //! Composition order is `backpressure(breaker(retry(op)))`:

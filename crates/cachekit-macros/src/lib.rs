@@ -183,7 +183,7 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   `interop=` / TypeScript's `interop:`.
 /// - `namespace = "<string>"` (required): interop/v1 namespace segment,
 ///   same grammar.
-/// - `secure` (optional flag): Use encrypted cache via `cache.secure()`.
+/// - `secure` (optional flag): Use encrypted cache via `cache.secure_cache()`.
 ///
 /// # Requirements
 ///
@@ -337,22 +337,22 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
         (
             quote! {
                 {
-                    let __ck_sec = #client_ident.secure()?;
+                    let __ck_sec = #client_ident.secure_cache()?;
                     __ck_sec.interop_get::<#ok_type>(&__ck_key).await
                 }
             },
             quote! {
                 {
-                    let __ck_sec = #client_ident.secure()?;
+                    let __ck_sec = #client_ident.secure_cache()?;
                     __ck_sec.interop_get_swr::<#ok_type>(&__ck_key).await
                 }
             },
             quote! {
-                let __ck_sec = #client_ident.secure()?;
+                let __ck_sec = #client_ident.secure_cache()?;
                 let _ = __ck_sec.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await;
             },
             quote! {
-                let __ck_sec = #client_ident.secure()?;
+                let __ck_sec = #client_ident.secure_cache()?;
                 let _ = __ck_sec.__complete_swr_refresh(
                     &__ck_key,
                     __ck_val,

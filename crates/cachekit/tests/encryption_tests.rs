@@ -64,8 +64,8 @@ async fn secure_set_and_get() {
     };
 
     let secure = client
-        .secure()
-        .expect("secure() should work with encryption configured");
+        .secure_cache()
+        .expect("secure_cache() should work with encryption configured");
     secure.set("secret:42", &secret).await.expect("secure set");
 
     let retrieved: Secret = secure
@@ -87,7 +87,7 @@ async fn secure_data_is_encrypted_in_backend() {
         user_id: 999,
     };
 
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
     secure.set("secret:999", &secret).await.unwrap();
 
     // Read raw bytes from the backend
@@ -122,24 +122,28 @@ async fn secure_without_master_key_fails() {
         .build()
         .expect("client builds without encryption");
 
-    let result = client.secure();
-    assert!(result.is_err(), "secure() without encryption should fail");
+    let result = client.secure_cache();
+    assert!(
+        result.is_err(),
+        "secure_cache() without encryption should fail"
+    );
 
     let err = result.unwrap_err();
     assert!(
         matches!(err, CachekitError::Config(_)),
         "expected Config error, got: {err:?}"
     );
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("CACHEKIT_MASTER_KEY"),
-        "error should mention CACHEKIT_MASTER_KEY: {err}"
+        msg.contains("CacheKit::secure") && msg.contains("CACHEKIT_MASTER_KEY"),
+        "error should name the secure preset and CACHEKIT_MASTER_KEY: {msg}"
     );
 }
 
 #[tokio::test]
 async fn secure_get_missing_returns_none() {
     let client = make_encrypted_client(MockBackend::shared());
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
 
     let result: Option<String> = secure.get("nonexistent").await.expect("get should succeed");
     assert!(result.is_none());
@@ -148,7 +152,7 @@ async fn secure_get_missing_returns_none() {
 #[tokio::test]
 async fn secure_delete() {
     let client = make_encrypted_client(MockBackend::shared());
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
 
     secure.set("to-delete", &"temporary").await.unwrap();
     assert!(secure.exists("to-delete").await.unwrap());
@@ -165,7 +169,7 @@ async fn secure_wrong_key_fails_decryption() {
     let (shared, backend) = MockBackend::new_with_handle();
     let client = make_encrypted_client(shared);
 
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
     secure.set("key-a", &"secret data").await.unwrap();
 
     // Manually swap the value to a different key in the backend
@@ -206,14 +210,15 @@ async fn secure_different_tenants_cant_decrypt() {
         .unwrap();
 
     client_a
-        .secure()
+        .secure_cache()
         .unwrap()
         .set("shared-key", &"tenant-a-secret")
         .await
         .unwrap();
 
     // Tenant B should fail to decrypt tenant A's data
-    let result: Result<Option<String>, _> = client_b.secure().unwrap().get("shared-key").await;
+    let result: Result<Option<String>, _> =
+        client_b.secure_cache().unwrap().get("shared-key").await;
     assert!(
         result.is_err(),
         "cross-tenant decryption must fail (different derived keys)"
@@ -230,7 +235,7 @@ async fn secure_hex_builder() {
         .build()
         .unwrap();
 
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
     secure.set("hex-test", &42u64).await.unwrap();
 
     let val: u64 = secure.get("hex-test").await.unwrap().unwrap();
@@ -242,7 +247,7 @@ async fn secure_with_l1_roundtrip() {
     let (shared, backend) = MockBackend::new_with_handle();
     let client = make_encrypted_client_with_l1(shared);
 
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
     secure.set("l1-test", &"encrypted in L1").await.unwrap();
 
     // First get populates L1 (already done by set write-through)
@@ -262,7 +267,7 @@ async fn secure_l1_stores_ciphertext_not_plaintext() {
     let (shared, backend) = MockBackend::new_with_handle();
     let client = make_encrypted_client_with_l1(shared);
 
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
     secure.set("l1-cipher", &"PLAINTEXT_VALUE").await.unwrap();
 
     // The backend should have ciphertext, not the msgpack encoding of "PLAINTEXT_VALUE".
@@ -292,7 +297,7 @@ async fn secure_with_namespace() {
         .build()
         .unwrap();
 
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
     secure.set("namespaced", &"value").await.unwrap();
 
     // Backend should have the namespaced key
@@ -321,7 +326,7 @@ async fn secure_set_rejects_payload_whose_ciphertext_exceeds_limit() {
         .expect("encryption setup")
         .build()
         .expect("client builds");
-    let secure = client.secure().expect("secure handle");
+    let secure = client.secure_cache().expect("secure handle");
 
     // 50 serialized bytes: under the 64-byte limit as plaintext, over it as
     // ciphertext (50 + 28 = 78). Must fail at write time, not become
@@ -368,8 +373,8 @@ async fn rotation_round_trip_without_reencryption() {
         user_id: 7,
     };
     writer
-        .secure()
-        .expect("secure()")
+        .secure_cache()
+        .expect("secure_cache()")
         .set("secret:7", &secret)
         .await
         .expect("secure set under k1");
@@ -386,8 +391,8 @@ async fn rotation_round_trip_without_reencryption() {
         .build()
         .expect("client builds");
     let read_back: Secret = rotated
-        .secure()
-        .expect("secure()")
+        .secure_cache()
+        .expect("secure_cache()")
         .get("secret:7")
         .await
         .expect("secure get after rotation")
@@ -410,8 +415,11 @@ async fn rotation_round_trip_without_reencryption() {
         .expect("keyring setup")
         .build()
         .expect("client builds");
-    let result: Result<Option<Secret>, _> =
-        cut_over.secure().expect("secure()").get("secret:7").await;
+    let result: Result<Option<Secret>, _> = cut_over
+        .secure_cache()
+        .expect("secure_cache()")
+        .get("secret:7")
+        .await;
     assert!(
         matches!(result, Err(CachekitError::Encryption(_))),
         "dropped-key read must surface as an encryption error, got {result:?}"
@@ -437,8 +445,8 @@ async fn rotation_drain_signal_is_visible_on_secure_cache() {
         .build()
         .expect("client builds");
     writer
-        .secure()
-        .expect("secure()")
+        .secure_cache()
+        .expect("secure_cache()")
         .set("drain:old", &"written under k1")
         .await
         .expect("secure set under k1");
@@ -451,7 +459,7 @@ async fn rotation_drain_signal_is_visible_on_secure_cache() {
         .expect("keyring setup")
         .build()
         .expect("client builds");
-    let secure = rotated.secure().expect("secure()");
+    let secure = rotated.secure_cache().expect("secure_cache()");
     assert_eq!(secure.previous_key_hits(), vec![0], "nothing read yet");
 
     // The k1-era entry is served by previous[0]: the grace window is still live.
