@@ -2,16 +2,24 @@
 
 CARGO := cargo
 
+# Native feature set for clippy/test — must equal the `test` job's string in
+# .github/workflows/ci.yml. Not --all-features: `workers` is mutually exclusive
+# with redis/l1/reliability/memcached/file (compile_error! guards in
+# crates/cachekit/src/lib.rs), so --all-features can never compile. `deny`
+# keeps --all-features on purpose: cargo-deny resolves the graph without
+# compiling (see README).
+NATIVE_FEATURES := cachekitio,redis,encryption,l1,macros,memcached,file
+
 quick-check: fmt clippy test
 
 fmt:
 	$(CARGO) fmt --all
 
 clippy:
-	$(CARGO) clippy --all-targets --all-features -- -D warnings
+	$(CARGO) clippy --all-targets --features $(NATIVE_FEATURES) -- -D warnings
 
 test:
-	$(CARGO) test --all-features
+	$(CARGO) test --features $(NATIVE_FEATURES)
 
 build:
 	$(CARGO) build --release
