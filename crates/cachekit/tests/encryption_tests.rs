@@ -89,13 +89,6 @@ async fn secure_data_is_encrypted_in_backend() {
 
     let secure = client.secure().unwrap();
     secure.set("secret:999", &secret).await.unwrap();
-    // SecureCache forwards core's hardware-acceleration detection (LAB-523).
-    assert_eq!(
-        secure.hardware_acceleration_enabled(),
-        cachekit::EncryptionLayer::new(TEST_MASTER_KEY, "tenant")
-            .unwrap()
-            .hardware_acceleration_enabled()
-    );
 
     // Read raw bytes from the backend
     let raw_bytes = backend

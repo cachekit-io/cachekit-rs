@@ -244,22 +244,9 @@ impl EncryptionLayer {
 
     /// Whether cachekit-core detected AES hardware support on this host.
     ///
-    /// Informational only — `ring` (native) and `aes-gcm` (wasm32) pick their
-    /// implementation independently of this flag. Detection is core's: a
-    /// runtime AES-NI probe on x86/x86_64, compile-time target features on
-    /// aarch64, always `false` on wasm32 (no AES instructions to detect). It
-    /// answers the capacity/latency triage question "is `.secure()` running
-    /// software AES here?" — the same signal cachekit-py surfaces as
-    /// `hardware_acceleration_enabled`.
-    ///
-    /// ```
-    /// use cachekit::EncryptionLayer;
-    ///
-    /// let layer = EncryptionLayer::new(&[0x11u8; 32], "tenant-123")?;
-    /// let software_aes = !layer.hardware_acceleration_enabled();
-    /// # let _ = software_aes;
-    /// # Ok::<(), cachekit::CachekitError>(())
-    /// ```
+    /// Forwards `ZeroKnowledgeEncryptor::hardware_acceleration_enabled()`.
+    /// Informational only — `ring`/`aes-gcm` dispatch independently of it; the
+    /// per-architecture semantics are core's (README → Zero-Knowledge Encryption).
     pub fn hardware_acceleration_enabled(&self) -> bool {
         self.encryptor.hardware_acceleration_enabled()
     }
@@ -363,10 +350,6 @@ impl std::fmt::Debug for EncryptionLayer {
         f.debug_struct("EncryptionLayer")
             .field("tenant_id", &self.tenant_id)
             .field("derived_key", &"[REDACTED]")
-            .field(
-                "hardware_acceleration",
-                &self.hardware_acceleration_enabled(),
-            )
             .finish()
     }
 }
@@ -603,14 +586,14 @@ mod tests {
             layer.hardware_acceleration_enabled(),
             core.hardware_acceleration_enabled()
         );
-        // ...and on x86_64 with the CPU itself (core's runtime probe).
+        // ...and on x86_64 with the CPU itself. This pins core 0.6's runtime
+        // probe — the only executed evidence in any repo that the bool is live
+        // detection, not a constant.
         #[cfg(target_arch = "x86_64")]
         assert_eq!(
             layer.hardware_acceleration_enabled(),
             std::arch::is_x86_feature_detected!("aes")
         );
-        // Surfaced in the Debug/info output, as py does in get_info().
-        assert!(format!("{layer:?}").contains("hardware_acceleration"));
     }
 
     #[test]
