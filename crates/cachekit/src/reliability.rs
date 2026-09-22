@@ -298,6 +298,9 @@ struct BreakerInner {
     failures: Vec<Instant>,
     half_open_successes: u32,
     half_open_calls: u32,
+    /// Number of state transitions so far; stamps each [`Transition`] with
+    /// its `seq` under the lock.
+    transitions: u64,
 }
 
 /// How a completed call is reported back to the breaker.
@@ -329,6 +332,7 @@ impl CircuitBreaker {
                 failures: Vec::new(),
                 half_open_successes: 0,
                 half_open_calls: 0,
+                transitions: 0,
             }),
         }
     }
@@ -458,35 +462,52 @@ impl CircuitBreaker {
     }
 }
 
-/// A breaker state change, `(from, to)`, handed back by [`transition`] so the
-/// caller can report it once the breaker lock is released.
-type Transition = (CircuitState, CircuitState);
+/// A breaker state change handed back by [`transition`] so the caller can
+/// report it once the breaker lock is released.
+///
+/// `seq` is assigned under the lock and is the authoritative order. Emission
+/// happens after unlock, so two transitions can reach a subscriber in the
+/// wrong wall-clock order (`Closed → Open` committed, unlock, a zero
+/// `open_timeout` lets another caller commit and emit `Open → HalfOpen`
+/// first); a consumer that orders by `seq` reconstructs the true timeline.
+#[cfg_attr(not(feature = "tracing"), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+struct Transition {
+    seq: u64,
+    from: CircuitState,
+    to: CircuitState,
+}
 
 /// Apply a breaker state change under the lock and return it for [`emit`].
 fn transition(inner: &mut BreakerInner, to: State) -> Transition {
-    let change = (CircuitState::from(&inner.state), CircuitState::from(&to));
+    inner.transitions += 1;
+    let change = Transition {
+        seq: inner.transitions,
+        from: CircuitState::from(&inner.state),
+        to: CircuitState::from(&to),
+    };
     inner.state = to;
     change
 }
 
 /// Report a transition on the `tracing` target (feature `tracing`): `warn`
 /// when the circuit opens — traffic is now failing fast — `info` for half-open
-/// and closed.
+/// and closed. Fields: `seq`, `from`, `to`.
 ///
 /// Must be called with the breaker lock **released**: a subscriber may react
 /// to the event by calling
 /// [`CacheKit::circuit_state`](crate::CacheKit::circuit_state), which takes
 /// the same lock, and a synchronous writer must not stall every other
-/// worker's `try_acquire` for the duration of the write. Emission therefore
-/// trails the transition by a few instructions; the `from`/`to` pair is
-/// captured under the lock, so the reported sequence is still the true one.
+/// worker's `try_acquire` for the duration of the write. The price is that
+/// emission order is not transition order under contention — see
+/// [`Transition`]; `seq` is what a consumer orders by.
 fn emit(change: Option<Transition>) {
     #[cfg(feature = "tracing")]
-    if let Some((from, to)) = change {
+    if let Some(Transition { seq, from, to }) = change {
         if to == CircuitState::Open {
-            tracing::warn!(from = ?from, to = ?to, "circuit breaker opened");
+            tracing::warn!(seq, from = ?from, to = ?to, "circuit breaker opened");
         } else {
-            tracing::info!(from = ?from, to = ?to, "circuit breaker transitioned");
+            tracing::info!(seq, from = ?from, to = ?to, "circuit breaker transitioned");
         }
     }
     #[cfg(not(feature = "tracing"))]

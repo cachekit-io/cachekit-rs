@@ -22,13 +22,37 @@ use cachekit::CacheKit;
 
 // ── Capturing subscriber ─────────────────────────────────────────────────────
 
+/// A reaction a test installs on the subscriber: runs synchronously inside
+/// `event()` for the first event whose rendering contains the trigger, before
+/// that event is recorded — the shape of a real alerting layer that reads the
+/// breaker back when it sees a transition.
+type Hook = Box<dyn Fn(&str) + Send + Sync>;
+
 /// Renders every event as `"<target> <LEVEL> field=value ..."`.
 #[derive(Default, Clone)]
-struct Capture(Arc<Mutex<Vec<String>>>);
+struct Capture {
+    lines: Arc<Mutex<Vec<String>>>,
+    on_event: Arc<Mutex<Option<(&'static str, Hook)>>>,
+}
 
 impl Capture {
     fn lines(&self) -> Vec<String> {
-        self.0.lock().expect("capture lock").clone()
+        self.lines.lock().expect("capture lock").clone()
+    }
+
+    fn on_event_containing(&self, trigger: &'static str, hook: Hook) {
+        *self.on_event.lock().expect("hook lock") = Some((trigger, hook));
+    }
+
+    /// Take the hook if this line triggers it — taken before running, so a
+    /// hook that emits nested events cannot re-enter itself, and no lock is
+    /// held while it runs.
+    fn take_hook_for(&self, line: &str) -> Option<Hook> {
+        let mut slot = self.on_event.lock().expect("hook lock");
+        match &*slot {
+            Some((trigger, _)) if line.contains(trigger) => slot.take().map(|(_, hook)| hook),
+            _ => None,
+        }
     }
 }
 
@@ -61,7 +85,10 @@ impl Subscriber for Capture {
         let meta = event.metadata();
         let mut render = Render(format!("{} {}", meta.target(), meta.level()));
         event.record(&mut render);
-        self.0.lock().expect("capture lock").push(render.0);
+        if let Some(hook) = self.take_hook_for(&render.0) {
+            hook(&render.0);
+        }
+        self.lines.lock().expect("capture lock").push(render.0);
     }
 
     fn enter(&self, _: &Id) {}
@@ -163,7 +190,7 @@ mod breaker {
             has(
                 &capture.lines(),
                 "cachekit::reliability WARN",
-                &["from=Closed", "to=Open", "circuit breaker opened"],
+                &["seq=1", "from=Closed", "to=Open", "circuit breaker opened"],
             ),
             "{:?}",
             capture.lines()
@@ -175,10 +202,94 @@ mod breaker {
             has(
                 &capture.lines(),
                 "cachekit::reliability INFO",
-                &["from=Open", "to=HalfOpen"],
+                &["seq=2", "from=Open", "to=HalfOpen"],
             ),
             "{:?}",
             capture.lines()
+        );
+    }
+
+    /// Events are emitted after the breaker lock is released, so while the
+    /// subscriber handles `Closed → Open` another thread may read the breaker
+    /// (an alerting layer confirming live state) — the deadlock that order
+    /// prevents. With `open_timeout = 0` that read commits and emits
+    /// `Open → HalfOpen` before the first callback returns, so the later
+    /// transition reaches the subscriber first. Arrival order is wrong; `seq`,
+    /// assigned under the lock, is the true order.
+    ///
+    /// The reader runs on its own thread with its own subscriber default:
+    /// `tracing` drops events emitted from *inside* a callback on the same
+    /// thread (re-entrancy guard), which is also why the race is cross-thread
+    /// in production.
+    #[cfg(not(feature = "unsync"))]
+    #[tokio::test]
+    async fn subscriber_may_read_the_breaker_and_seq_orders_out_of_order_events() {
+        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex};
+
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+
+        let client = CacheKit::builder()
+            .backend(FailingBackend::shared())
+            .no_l1()
+            .reliability(ReliabilityConfig {
+                retry: None,
+                circuit_breaker: Some(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    open_timeout: Duration::ZERO,
+                    ..CircuitBreakerConfig::default()
+                }),
+                backpressure: None,
+            })
+            .build()
+            .expect("client builds");
+
+        // The "alerting layer": on the open event, another thread reads the
+        // live breaker while this callback waits for its answer. Were the
+        // breaker lock still held during emission, the reader would block and
+        // the wait below would time out.
+        let observed = Arc::new(Mutex::new(None));
+        let (probe, recorder, sink) = (client.clone(), capture.clone(), Arc::clone(&observed));
+        capture.on_event_containing(
+            "to=Open",
+            Box::new(move |_| {
+                let (tx, rx) = mpsc::channel();
+                let (probe, recorder) = (probe.clone(), recorder.clone());
+                std::thread::spawn(move || {
+                    let state =
+                        tracing::subscriber::with_default(recorder, || probe.circuit_state());
+                    let _ = tx.send(state);
+                });
+                *sink.lock().expect("observed lock") = rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the breaker lock is released during emission");
+            }),
+        );
+
+        client
+            .get::<u32>("k")
+            .await
+            .expect_err("backend is down: opens the circuit");
+
+        assert_eq!(
+            *observed.lock().expect("observed lock"),
+            Some(CircuitState::HalfOpen),
+            "the concurrent read returned and saw the zero-timeout half-open"
+        );
+        let lines: Vec<String> = capture
+            .lines()
+            .into_iter()
+            .filter(|l| l.starts_with("cachekit::reliability"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("to=HalfOpen") && lines[0].contains("seq=2"),
+            "the nested, later transition arrives first: {lines:?}"
+        );
+        assert!(
+            lines[1].contains("to=Open") && lines[1].contains("seq=1"),
+            "the earlier transition arrives second: {lines:?}"
         );
     }
 }
