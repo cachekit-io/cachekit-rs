@@ -190,7 +190,13 @@ mod breaker {
             has(
                 &capture.lines(),
                 "cachekit::reliability WARN",
-                &["seq=1", "from=Closed", "to=Open", "circuit breaker opened"],
+                &[
+                    "breaker=",
+                    "seq=1",
+                    "from=Closed",
+                    "to=Open",
+                    "circuit breaker opened"
+                ],
             ),
             "{:?}",
             capture.lines()
@@ -202,10 +208,80 @@ mod breaker {
             has(
                 &capture.lines(),
                 "cachekit::reliability INFO",
-                &["seq=2", "from=Open", "to=HalfOpen"],
+                &["breaker=", "seq=2", "from=Open", "to=HalfOpen"],
             ),
             "{:?}",
             capture.lines()
+        );
+    }
+
+    /// Several clients under one subscriber: `seq` restarts at 1 per breaker,
+    /// so `seq` alone cannot tell whose `seq=2` it is. `breaker` is a
+    /// process-unique id; grouping by it and ordering by `seq` reconstructs
+    /// each timeline.
+    #[tokio::test]
+    async fn breaker_field_groups_events_when_several_breakers_share_a_subscriber() {
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+
+        let build = |open_timeout: Duration| {
+            CacheKit::builder()
+                .backend(FailingBackend::shared())
+                .no_l1()
+                .reliability(ReliabilityConfig {
+                    retry: None,
+                    circuit_breaker: Some(CircuitBreakerConfig {
+                        failure_threshold: 1,
+                        open_timeout,
+                        ..CircuitBreakerConfig::default()
+                    }),
+                    backpressure: None,
+                })
+                .build()
+                .expect("client builds")
+        };
+        let a = build(Duration::from_secs(60));
+        let b = build(Duration::ZERO);
+
+        a.get::<u32>("k").await.expect_err("A opens"); // A: seq=1
+        b.get::<u32>("k").await.expect_err("B opens"); // B: seq=1
+        assert_eq!(b.circuit_state(), Some(CircuitState::HalfOpen)); // B: seq=2
+        assert_eq!(a.circuit_state(), Some(CircuitState::Open));
+
+        let lines: Vec<String> = capture
+            .lines()
+            .into_iter()
+            .filter(|l| l.starts_with("cachekit::reliability"))
+            .collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+
+        let field = |line: &str, name: &str| -> String {
+            line.split_whitespace()
+                .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("no {name}= in {line:?}"))
+                .to_owned()
+        };
+        let (a_id, b_id) = (field(&lines[0], "breaker"), field(&lines[1], "breaker"));
+        assert_ne!(a_id, b_id, "each breaker has its own id");
+        // Two `seq=1` events: only the pair disambiguates them.
+        assert_eq!(
+            [&lines[0], &lines[1], &lines[2]].map(|l| field(l, "seq")),
+            ["1", "1", "2"]
+        );
+
+        let timeline = |id: &str| -> Vec<(u64, String)> {
+            let mut t: Vec<(u64, String)> = lines
+                .iter()
+                .filter(|l| field(l, "breaker") == id)
+                .map(|l| (field(l, "seq").parse().expect("seq is u64"), field(l, "to")))
+                .collect();
+            t.sort();
+            t
+        };
+        assert_eq!(timeline(&a_id), vec![(1, "Open".to_owned())]);
+        assert_eq!(
+            timeline(&b_id),
+            vec![(1, "Open".to_owned()), (2, "HalfOpen".to_owned())]
         );
     }
 

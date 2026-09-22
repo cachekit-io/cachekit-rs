@@ -34,6 +34,7 @@
 //! backends already do). Not available on wasm32 targets.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -319,13 +320,22 @@ enum Outcome {
 /// or (any counted failure) → open.
 #[derive(Debug)]
 pub(crate) struct CircuitBreaker {
+    /// Process-unique id, stable for the breaker's lifetime; the `breaker`
+    /// field on transition events. Several clients under one subscriber each
+    /// restart `seq` at 1, so `(breaker, seq)` is the ordering key.
+    id: u64,
     config: CircuitBreakerConfig,
     inner: Mutex<BreakerInner>,
 }
 
+/// Source of [`CircuitBreaker::id`]s. Per process: fleet-wide correlation
+/// combines the field with the host/process context the subscriber adds.
+static BREAKER_IDS: AtomicU64 = AtomicU64::new(0);
+
 impl CircuitBreaker {
     pub(crate) fn new(config: CircuitBreakerConfig) -> Self {
         Self {
+            id: BREAKER_IDS.fetch_add(1, Ordering::Relaxed) + 1,
             config,
             inner: Mutex::new(BreakerInner {
                 state: State::Closed,
@@ -360,7 +370,7 @@ impl CircuitBreaker {
         if since.elapsed() < self.config.open_timeout {
             return None;
         }
-        let change = transition(inner, State::HalfOpen);
+        let change = transition(self.id, inner, State::HalfOpen);
         inner.half_open_successes = 0;
         inner.half_open_calls = 0;
         Some(change)
@@ -412,7 +422,7 @@ impl CircuitBreaker {
                 if matches!(inner.state, State::HalfOpen) {
                     inner.half_open_successes += 1;
                     if inner.half_open_successes >= self.config.success_threshold {
-                        change = Some(transition(&mut inner, State::Closed));
+                        change = Some(transition(self.id, &mut inner, State::Closed));
                         inner.failures.clear();
                         inner.half_open_successes = 0;
                         inner.half_open_calls = 0;
@@ -433,7 +443,7 @@ impl CircuitBreaker {
             Outcome::Failure => match inner.state {
                 State::HalfOpen => {
                     let now = Instant::now();
-                    change = Some(transition(&mut inner, State::Open { since: now }));
+                    change = Some(transition(self.id, &mut inner, State::Open { since: now }));
                     inner.half_open_successes = 0;
                     inner.half_open_calls = 0;
                 }
@@ -443,7 +453,7 @@ impl CircuitBreaker {
                     let window = self.config.rolling_window;
                     inner.failures.retain(|t| now.duration_since(*t) <= window);
                     if inner.failures.len() >= self.config.failure_threshold as usize {
-                        change = Some(transition(&mut inner, State::Open { since: now }));
+                        change = Some(transition(self.id, &mut inner, State::Open { since: now }));
                         inner.failures.clear();
                     }
                 }
@@ -465,23 +475,28 @@ impl CircuitBreaker {
 /// A breaker state change handed back by [`transition`] so the caller can
 /// report it once the breaker lock is released.
 ///
-/// `seq` is assigned under the lock and is the authoritative order. Emission
+/// `(breaker, seq)` is the ordering key. `seq` is assigned under the lock and
+/// counts this breaker's transitions; `breaker` says which breaker, since
+/// several clients under one subscriber each restart `seq` at 1. Emission
 /// happens after unlock, so two transitions can reach a subscriber in the
 /// wrong wall-clock order (`Closed → Open` committed, unlock, a zero
 /// `open_timeout` lets another caller commit and emit `Open → HalfOpen`
-/// first); a consumer that orders by `seq` reconstructs the true timeline.
+/// first); a consumer that groups by `breaker` and orders by `seq`
+/// reconstructs each true timeline.
 #[cfg_attr(not(feature = "tracing"), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 struct Transition {
+    breaker: u64,
     seq: u64,
     from: CircuitState,
     to: CircuitState,
 }
 
 /// Apply a breaker state change under the lock and return it for [`emit`].
-fn transition(inner: &mut BreakerInner, to: State) -> Transition {
+fn transition(breaker: u64, inner: &mut BreakerInner, to: State) -> Transition {
     inner.transitions += 1;
     let change = Transition {
+        breaker,
         seq: inner.transitions,
         from: CircuitState::from(&inner.state),
         to: CircuitState::from(&to),
@@ -492,7 +507,7 @@ fn transition(inner: &mut BreakerInner, to: State) -> Transition {
 
 /// Report a transition on the `tracing` target (feature `tracing`): `warn`
 /// when the circuit opens — traffic is now failing fast — `info` for half-open
-/// and closed. Fields: `seq`, `from`, `to`.
+/// and closed. Fields: `breaker`, `seq`, `from`, `to`.
 ///
 /// Must be called with the breaker lock **released**: a subscriber may react
 /// to the event by calling
@@ -500,14 +515,20 @@ fn transition(inner: &mut BreakerInner, to: State) -> Transition {
 /// the same lock, and a synchronous writer must not stall every other
 /// worker's `try_acquire` for the duration of the write. The price is that
 /// emission order is not transition order under contention — see
-/// [`Transition`]; `seq` is what a consumer orders by.
+/// [`Transition`]; `(breaker, seq)` is what a consumer orders by.
 fn emit(change: Option<Transition>) {
     #[cfg(feature = "tracing")]
-    if let Some(Transition { seq, from, to }) = change {
+    if let Some(Transition {
+        breaker,
+        seq,
+        from,
+        to,
+    }) = change
+    {
         if to == CircuitState::Open {
-            tracing::warn!(seq, from = ?from, to = ?to, "circuit breaker opened");
+            tracing::warn!(breaker, seq, from = ?from, to = ?to, "circuit breaker opened");
         } else {
-            tracing::info!(seq, from = ?from, to = ?to, "circuit breaker transitioned");
+            tracing::info!(breaker, seq, from = ?from, to = ?to, "circuit breaker transitioned");
         }
     }
     #[cfg(not(feature = "tracing"))]
