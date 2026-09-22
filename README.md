@@ -210,6 +210,8 @@ Cross-SDK compatible — ciphertext produced by the Python SDK decrypts with the
 
 </details>
 
+**Is AES hardware-accelerated on this host?** `cache.secure()?.hardware_acceleration_enabled()` (also on `EncryptionLayer`) reports cachekit-core's detection — a runtime AES-NI probe on x86/x86_64, compile-time target features on aarch64, and always `false` on wasm32 (no AES instructions; `aes-gcm` runs in software). Informational: `ring`/`aes-gcm` pick their implementation independently, so use it to explain `.secure()` latency on a host without AES instructions, not to change behaviour. Same signal as cachekit-py's `hardware_acceleration_enabled` and cachekit-ts's `isHardwareAccelerated()`.
+
 ### Key Rotation
 
 Rotate the master key without invalidating existing entries: promote the new key to current and keep the old one as a decrypt-only previous key during a grace window (max 3, per the [protocol keyring spec](https://github.com/cachekit-io/protocol/blob/main/spec/encryption.md)). Writes always use the current key; reads attempt the current key first, then each previous key in order. Old entries age out via TTL or re-encrypt on the next write — no bulk re-encryption.

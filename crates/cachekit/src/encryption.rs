@@ -242,6 +242,28 @@ impl EncryptionLayer {
             .collect()
     }
 
+    /// Whether cachekit-core detected AES hardware support on this host.
+    ///
+    /// Informational only — `ring` (native) and `aes-gcm` (wasm32) pick their
+    /// implementation independently of this flag. Detection is core's: a
+    /// runtime AES-NI probe on x86/x86_64, compile-time target features on
+    /// aarch64, always `false` on wasm32 (no AES instructions to detect). It
+    /// answers the capacity/latency triage question "is `.secure()` running
+    /// software AES here?" — the same signal cachekit-py surfaces as
+    /// `hardware_acceleration_enabled`.
+    ///
+    /// ```
+    /// use cachekit::EncryptionLayer;
+    ///
+    /// let layer = EncryptionLayer::new(&[0x11u8; 32], "tenant-123")?;
+    /// let software_aes = !layer.hardware_acceleration_enabled();
+    /// # let _ = software_aes;
+    /// # Ok::<(), cachekit::CachekitError>(())
+    /// ```
+    pub fn hardware_acceleration_enabled(&self) -> bool {
+        self.encryptor.hardware_acceleration_enabled()
+    }
+
     /// Return the tenant ID used for key derivation.
     pub fn tenant_id(&self) -> &str {
         &self.tenant_id
@@ -341,6 +363,10 @@ impl std::fmt::Debug for EncryptionLayer {
         f.debug_struct("EncryptionLayer")
             .field("tenant_id", &self.tenant_id)
             .field("derived_key", &"[REDACTED]")
+            .field(
+                "hardware_acceleration",
+                &self.hardware_acceleration_enabled(),
+            )
             .finish()
     }
 }
@@ -566,6 +592,25 @@ mod tests {
         // Wrong cache key: every attempt fails authentication — no key won.
         assert!(rotated.decrypt(&k1_ct, "key:b").is_err());
         assert_eq!(rotated.previous_key_hits(), vec![0]);
+    }
+
+    #[test]
+    fn hardware_acceleration_reports_core_detection() {
+        let layer = EncryptionLayer::new(TEST_MASTER_KEY, TEST_TENANT).unwrap();
+        // Delegation, not a constant: agrees with a fresh core encryptor...
+        let core = ZeroKnowledgeEncryptor::new().unwrap();
+        assert_eq!(
+            layer.hardware_acceleration_enabled(),
+            core.hardware_acceleration_enabled()
+        );
+        // ...and on x86_64 with the CPU itself (core's runtime probe).
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            layer.hardware_acceleration_enabled(),
+            std::arch::is_x86_feature_detected!("aes")
+        );
+        // Surfaced in the Debug/info output, as py does in get_info().
+        assert!(format!("{layer:?}").contains("hardware_acceleration"));
     }
 
     #[test]
