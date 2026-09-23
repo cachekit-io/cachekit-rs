@@ -50,10 +50,10 @@ jobs:
 
       - name: Clippy
         if: matrix.rust != '1.85'
-        run: cargo clippy --all-targets --features "cachekitio,redis,encryption,l1,macros,memcached,file" -- -D warnings
+        run: cargo clippy --all-targets --features "cachekitio,redis,encryption,l1,macros,memcached,file,tracing" -- -D warnings
 
       - name: Run tests
-        run: cargo test --features "cachekitio,redis,encryption,l1,macros,memcached,file"
+        run: cargo test --features "cachekitio,redis,encryption,l1,macros,memcached,file,tracing"
 
   redis-lock:
     name: redis lock integration
