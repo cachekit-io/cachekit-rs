@@ -100,10 +100,20 @@ pub struct EnvGuard {
 impl EnvGuard {
     /// Apply `(name, value)` pairs: `Some` sets the variable, `None` removes
     /// it. The prior value of every named variable is restored on drop.
+    ///
+    /// Panics — before touching any variable — if one holds a non-UTF-8
+    /// value: it could not be restored as a `String`, and treating it as
+    /// absent would make drop delete it.
     pub fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
         let saved = vars
             .iter()
-            .map(|(name, _)| (*name, std::env::var(name).ok().map(Zeroizing::new)))
+            .map(|(name, _)| match std::env::var(name) {
+                Ok(v) => (*name, Some(Zeroizing::new(v))),
+                Err(std::env::VarError::NotPresent) => (*name, None),
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    panic!("EnvGuard: {name} holds a non-UTF-8 value; refusing to clobber it")
+                }
+            })
             .collect();
         for (name, value) in vars {
             match value {
