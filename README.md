@@ -49,6 +49,7 @@
 | `file` | ❌ | Local filesystem backend, byte-compatible with cachekit-py's File backend (native only) |
 | `workers` | ❌ | Cloudflare Workers backend via [worker](https://crates.io/crates/worker) |
 | `macros` | ❌ | `#[cachekit]` proc-macro decorator (mints [interop/v1](#cross-sdk-interop-mode) keys) |
+| `tracing` | ❌ | [`tracing`](https://crates.io/crates/tracing) events per cache operation and breaker transition — see [Observability](#observability) |
 
 ```toml
 # Defaults: SaaS + encryption + L1
@@ -394,6 +395,7 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
 | **Encrypted L1** | `SecureCache` stores ciphertext in L1 (never plaintext) |
 | **Default capacity** | 1,000 entries (configurable via `.l1_capacity()`) |
+| **Live counters** | `cache.stats()` reports L1 hits / L2 hits / misses; `cache.l1_entry_count()` the current occupancy — see [Observability](#observability) |
 | **Stale-while-revalidate** | On by default (native): `#[cachekit]` serves an L1 hit past `swr_threshold_ratio` × entry TTL (default 0.5, ±10% jitter) immediately and refreshes it in the background — see below |
 
 ### Stale-while-revalidate (SWR)
@@ -490,6 +492,47 @@ Requires a tokio runtime for backoff timers (the `redis` and `cachekitio` backen
 
 ---
 
+## Observability
+
+Every client counts its reads, with no configuration:
+
+```rust,ignore
+let stats = cache.stats();                 // cachekit::L1Stats — live, shared by all clones
+println!(
+    "L1 {} / L2 {} / miss {} — L1 hit rate {:.1}%",
+    stats.l1_hits, stats.l2_hits, stats.misses, stats.l1_hit_rate() * 100.0,
+);
+let occupancy = cache.l1_entry_count();    // Option<u64>: None when L1 is off
+let breaker = cache.circuit_state();       // Option<CircuitState>: Closed / Open / HalfOpen
+```
+
+| Surface | What you get |
+|:--------|:-------------|
+| `CacheKit::stats()` | `L1Stats { l1_hits, l2_hits, misses, l1_enabled }` for every value read (`get`, `interop_get`, SWR and `SecureCache` variants). `exists` and reads that fail with a backend error are not counted. |
+| `CacheKit::l1_entry_count()` | Exact L1 occupancy (runs moka's pending housekeeping first — poll it, don't put it on a hot path). |
+| `CacheKit::circuit_state()` | Live breaker state (`reliability` feature); `None` when the client has no breaker. |
+| SaaS telemetry headers | The cachekit.io backends send `X-CacheKit-L1-Hits` / `L2-Hits` / `Misses` / `L1-Hit-Rate` from the **same counters**, wired automatically by `CacheKitBuilder::build()`. A `.metrics_provider(..)` set on the backend builder still takes precedence. One backend instance reports one client — the first built over it; once that client is gone the headers fall back to `disabled`. |
+| `tracing` feature | One `debug` event per completed operation on the `cachekit` target, and breaker transitions on `cachekit::reliability` (`warn` on open, `info` for half-open / closed). |
+
+With the `tracing` feature, point your subscriber at the crate:
+
+```bash
+RUST_LOG=cachekit=debug cargo run
+```
+
+```text
+DEBUG cachekit: op=get key_hash=bcb35ae6f64fa65b2770ab3af631b1ce outcome=miss
+DEBUG cachekit: op=set key_hash=bcb35ae6f64fa65b2770ab3af631b1ce ttl_secs=3600
+DEBUG cachekit: op=get key_hash=bcb35ae6f64fa65b2770ab3af631b1ce outcome=l1_hit
+ WARN cachekit::reliability: circuit breaker opened breaker=1 seq=1 from=Closed to=Open
+```
+
+Fields: `op` (`get` | `set` | `delete`), `outcome` (`l1_hit` | `l1_stale` | `l2_hit` | `miss`), `ttl_secs`, `existed`. Breaker events carry `breaker`, `seq`, `from`, `to`, and **`(breaker, seq)` is the ordering key**: `breaker` is a process-unique id assigned when the breaker is built (stable for its lifetime, not a key or secret), `seq` counts that breaker's transitions and is assigned under the breaker lock. Events are emitted after the lock is released (so a subscriber may call `circuit_state()` safely), which means two transitions can arrive out of order under contention, and several clients in one process each restart `seq` at 1 — group by `breaker`, order by `seq`, never by arrival. For fleet-wide correlation combine the pair with the host/process fields your subscriber adds. Events carry `key_hash` — Blake2b-128 of the namespaced storage key (`cachekit::metrics::key_hash`) — **never the key itself**: keys routinely embed user identifiers (CWE-532). The digest is a correlator, not a redaction: it is unkeyed and deterministic, so it matches the [File backend](#file-local-filesystem)'s on-disk filename (a log line names the cache file it touched), and for the same reason a low-entropy key like `user:42` can be recovered from it by enumeration. Treat `cachekit=debug` output with the care you give the keys themselves.
+
+Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rust services bring their own registry and bridge `tracing` themselves.
+
+---
+
 ## Environment Variables
 
 | Variable | Required | Description |
@@ -519,7 +562,7 @@ cachekit-rs/
 │   │       ├── encryption.rs  # AES-256-GCM + AAD v0x03
 │   │       ├── error.rs       # CachekitError, BackendError
 │   │       ├── interop.rs     # interop/v1 cross-SDK keys + strict reads
-│   │       ├── metrics.rs     # L1 hit-rate metrics headers
+│   │       ├── metrics.rs     # Live counters, SaaS telemetry headers, tracing events
 │   │       ├── session.rs     # SDK session tracking
 │   │       ├── url_validator.rs # SSRF-safe URL validation
 │   │       ├── serializer/    # MessagePack serialization

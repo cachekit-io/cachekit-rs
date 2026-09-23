@@ -5,6 +5,7 @@
 //! single-threaded and `worker::Fetch` futures are `!Send`.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -28,7 +29,10 @@ use crate::url_validator::validate_cachekitio_url;
 pub struct WorkersCachekitIO {
     api_key: Zeroizing<String>,
     api_url: String,
-    metrics_provider: Option<MetricsProvider>,
+    /// Source of the `X-CacheKit-*` telemetry headers. Set once: by the
+    /// builder when the user supplies one, otherwise by the client at build
+    /// time via [`Backend::attach_metrics`] (first writer wins).
+    metrics_provider: OnceLock<MetricsProvider>,
 }
 
 /// Redact `api_key` from debug output.
@@ -131,7 +135,7 @@ impl WorkersCachekitIO {
         }
 
         // Inject metrics headers
-        for (name, value) in metrics_headers(self.metrics_provider.as_ref()) {
+        for (name, value) in metrics_headers(self.metrics_provider.get()) {
             headers.set(name, &value).map_err(|e| {
                 BackendError::permanent(format!("failed to set metrics header {name}: {e}"))
             })?;
@@ -178,6 +182,11 @@ impl WorkersCachekitIO {
 
 #[async_trait(?Send)]
 impl Backend for WorkersCachekitIO {
+    fn attach_metrics(&self, provider: MetricsProvider) {
+        // A provider supplied on the builder is already set and wins.
+        self.metrics_provider.get_or_init(|| provider);
+    }
+
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
         let mut resp = self.fetch("GET", &self.url(key)?, None, vec![]).await?;
 
@@ -409,7 +418,11 @@ impl WorkersCachekitIOBuilder {
         self
     }
 
-    /// Provide L1 cache metrics for request telemetry headers.
+    /// Override the source of the `X-CacheKit-*` telemetry headers.
+    ///
+    /// Not needed for normal use: `CacheKitBuilder::build` attaches the
+    /// client's own live counters to any backend without one. Set this only
+    /// to report numbers from somewhere else; it takes precedence.
     pub fn metrics_provider(mut self, provider: MetricsProvider) -> Self {
         self.metrics_provider = Some(provider);
         self
@@ -444,7 +457,9 @@ impl WorkersCachekitIOBuilder {
         Ok(WorkersCachekitIO {
             api_key,
             api_url,
-            metrics_provider: self.metrics_provider,
+            metrics_provider: self
+                .metrics_provider
+                .map_or_else(OnceLock::new, OnceLock::from),
         })
     }
 }
