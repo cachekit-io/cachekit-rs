@@ -37,7 +37,6 @@
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Reads CACHEKIT_API_KEY; CacheKit::io(&key) takes it explicitly instead.
 //! let cache = cachekit::CacheKit::io_from_env()?
 //!     .namespace("myapp")
 //!     .build()?;

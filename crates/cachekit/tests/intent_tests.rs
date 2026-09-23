@@ -157,20 +157,14 @@ mod io_intent {
 
     #[test]
     #[serial]
-    fn io_from_env_treats_empty_as_unset() {
+    fn io_explicit_argument_beats_env() {
+        // Empty env is unset for io_from_env, and must not shadow an
+        // explicit argument.
         let _env = EnvGuard::set(&[("CACHEKIT_API_KEY", Some(""))]);
         assert!(matches!(
             CacheKit::io_from_env(),
             Err(CachekitError::Config(_))
         ));
-    }
-
-    #[test]
-    #[serial]
-    fn io_explicit_argument_beats_env() {
-        // Env holds an empty key that io_from_env would reject; the explicit
-        // argument must not be shadowed by the environment.
-        let _env = EnvGuard::set(&[("CACHEKIT_API_KEY", Some(""))]);
         assert!(CacheKit::io("ck_live_explicit").unwrap().build().is_ok());
     }
 

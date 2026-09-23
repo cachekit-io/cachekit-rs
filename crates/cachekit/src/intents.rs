@@ -191,9 +191,7 @@ impl CacheKit {
     ///
     /// Good for: serverless, edge compute, managed caching without Redis.
     ///
-    /// Takes the API key explicitly; use [`CacheKit::io_from_env`] to read
-    /// `CACHEKIT_API_KEY` instead. Neither reads `CACHEKIT_MASTER_KEY` —
-    /// encryption on `io` is always an explicit builder call.
+    /// Use [`CacheKit::io_from_env`] to read the key from `CACHEKIT_API_KEY`.
     ///
     /// # Errors
     ///
@@ -228,11 +226,9 @@ impl CacheKit {
     /// **CachekitIO**, API key from the environment — [`CacheKit::io`] with
     /// the key read from `CACHEKIT_API_KEY`.
     ///
-    /// Identical preset to [`io`](CacheKit::io). Unlike
-    /// [`CacheKit::from_env`], this reads **only** `CACHEKIT_API_KEY`: it
-    /// ignores `CACHEKIT_MASTER_KEY` (no encryption is activated) and
-    /// `CACHEKIT_DEFAULT_TTL`. Pass the key to [`CacheKit::io`] instead when
-    /// one process needs two keys.
+    /// Identical preset to [`io`](CacheKit::io). Reads **only**
+    /// `CACHEKIT_API_KEY` — unlike [`CacheKit::from_env`], never
+    /// `CACHEKIT_MASTER_KEY`, so no encryption is activated.
     ///
     /// # Errors
     ///
@@ -253,10 +249,11 @@ impl CacheKit {
     pub fn io_from_env() -> Result<CacheKitBuilder, CachekitError> {
         let api_key = std::env::var("CACHEKIT_API_KEY")
             .ok()
+            .map(zeroize::Zeroizing::new)
             .filter(|k| !k.is_empty())
             .ok_or_else(|| {
                 CachekitError::Config(
-                    "CACHEKIT_API_KEY is unset: set it or pass the key to CacheKit::io(api_key)"
+                    "CACHEKIT_API_KEY is unset or empty: set it or pass the key to CacheKit::io(api_key)"
                         .to_owned(),
                 )
             })?;

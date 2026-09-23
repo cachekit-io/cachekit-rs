@@ -90,7 +90,7 @@ One call that names your use case. Each preset returns a pre-configured builder 
 ¹ Retry with backoff + jitter, circuit breaker, backpressure — the [reliability stack](#reliability). Requires the default-on `reliability` feature.
 ² See the resilience contract below.
 ³ Requires the `redis` feature flag; `encrypted` also needs the default-on `encryption` feature.
-⁴ Or `CacheKit::io_from_env()` to read `CACHEKIT_API_KEY`. Neither reads `CACHEKIT_MASTER_KEY` — `io` never activates encryption from the environment (that is `from_env()` behaviour).
+⁴ Or `CacheKit::io_from_env()` to read `CACHEKIT_API_KEY`.
 
 ```rust
 use cachekit::prelude::*;
