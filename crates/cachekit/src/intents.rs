@@ -45,9 +45,7 @@ fn minimal_defaults(backend: SharedBackend) -> CacheKitBuilder {
         .backend(backend)
         .default_ttl(Duration::from_secs(300))
         .l1_capacity(1000);
-    // SWR is builder-default-on; the spec says minimal MUST NOT enable it.
-    // The knob only exists on native, non-unsync builds — elsewhere SWR
-    // reads are never produced, so the contract holds without it.
+    // Builder default is SWR-on; spec § L1 Posture says minimal MUST NOT.
     #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
     let builder = builder.swr_enabled(false);
     builder
@@ -60,7 +58,8 @@ impl CacheKit {
     ///   connection is not re-established)
     /// * L1 cache: **on** (1 000 entries, **no SWR / invalidation**) — an L1
     ///   hit is served as-is until it expires, so a read may return an entry
-    ///   up to 300 s after another process changed it in Redis. Chain
+    ///   up to its TTL (300 s by default) after another process changed it
+    ///   in Redis. Chain
     ///   [`.no_l1()`](CacheKitBuilder::no_l1) to read through every time.
     /// * Encryption: **no**
     /// * Reliability: **off** — no retry, no circuit breaker, no
