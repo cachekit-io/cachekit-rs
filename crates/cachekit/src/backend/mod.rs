@@ -4,6 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::error::BackendError;
+use crate::metrics::MetricsProvider;
 
 // ── HealthStatus ─────────────────────────────────────────────────────────────
 
@@ -59,6 +60,20 @@ pub trait Backend: Send + Sync {
     fn as_lockable(&self) -> Option<&dyn LockableBackend> {
         None
     }
+
+    /// Receive the client's live hit/miss statistics.
+    ///
+    /// `CacheKitBuilder::build` calls this once, on the raw backend before any
+    /// reliability decorator, so a backend that reports telemetry — the
+    /// cachekit.io backends' `X-CacheKit-*` headers — carries real numbers
+    /// with no user plumbing. A provider the user set on the backend's own
+    /// builder must take precedence; implementations keep the first value
+    /// they receive — so one backend instance reports one client, the first
+    /// built over it (build one backend per client, as the presets do, for
+    /// per-client attribution). The provider holds the client's counters
+    /// weakly and reports `None` once that client is gone. Backends with
+    /// nothing to report keep this default no-op.
+    fn attach_metrics(&self, _provider: MetricsProvider) {}
 }
 
 /// Async cache backend abstraction (`?Send` variant).
@@ -97,6 +112,20 @@ pub trait Backend {
     fn as_lockable(&self) -> Option<&dyn LockableBackend> {
         None
     }
+
+    /// Receive the client's live hit/miss statistics.
+    ///
+    /// `CacheKitBuilder::build` calls this once, on the raw backend before any
+    /// reliability decorator, so a backend that reports telemetry — the
+    /// cachekit.io backends' `X-CacheKit-*` headers — carries real numbers
+    /// with no user plumbing. A provider the user set on the backend's own
+    /// builder must take precedence; implementations keep the first value
+    /// they receive — so one backend instance reports one client, the first
+    /// built over it (build one backend per client, as the presets do, for
+    /// per-client attribution). The provider holds the client's counters
+    /// weakly and reports `None` once that client is gone. Backends with
+    /// nothing to report keep this default no-op.
+    fn attach_metrics(&self, _provider: MetricsProvider) {}
 }
 
 // ── TtlInspectable ───────────────────────────────────────────────────────────

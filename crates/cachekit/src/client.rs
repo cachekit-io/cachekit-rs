@@ -1,9 +1,11 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::backend::Backend;
 use crate::error::CachekitError;
+use crate::metrics::{CacheCounters, L1Stats, ReadOutcome};
 use crate::serializer;
 
 // ── SharedBackend type alias ──────────────────────────────────────────────────
@@ -166,6 +168,14 @@ pub struct CacheKit {
     namespace: Option<String>,
     max_payload_bytes: usize,
     flight: SharedFlight,
+    /// Read counters behind [`Self::stats`]; the backend holds a
+    /// `MetricsProvider` over the same allocation.
+    counters: Arc<CacheCounters>,
+
+    /// The reliability stack's breaker, when configured — kept so
+    /// [`Self::circuit_state`] can read it through the type-erased backend.
+    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+    breaker: Option<Arc<crate::reliability::CircuitBreaker>>,
 
     #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
     mutations: SharedMutations,
@@ -323,6 +333,7 @@ impl CacheKit {
         self.backend.set(&full_key, bytes, Some(ttl)).await?;
         self.l1_set(&full_key, &l1_bytes, ttl);
         mutation.advance();
+        crate::metrics::trace_write(&full_key, ttl);
         Ok(true)
     }
 
@@ -459,6 +470,7 @@ impl CacheKit {
                 let full_key = self.resolve_key(key)?;
                 match l1.get_with_swr(&full_key, self.swr_threshold_ratio) {
                     crate::l1::L1SwrRead::Fresh(bytes) => {
+                        self.counters.record(ReadOutcome::L1Hit, &full_key);
                         self.check_payload_size(bytes.len())?;
                         return Ok(SwrRead::Fresh(bytes));
                     }
@@ -470,10 +482,12 @@ impl CacheKit {
                         let mutation = self.mutations.lock(&full_key).await;
                         match l1.get_with_swr(&full_key, self.swr_threshold_ratio) {
                             crate::l1::L1SwrRead::Fresh(bytes) => {
+                                self.counters.record(ReadOutcome::L1Hit, &full_key);
                                 self.check_payload_size(bytes.len())?;
                                 return Ok(SwrRead::Fresh(bytes));
                             }
                             crate::l1::L1SwrRead::Stale(bytes) => {
+                                self.counters.record(ReadOutcome::L1Stale, &full_key);
                                 self.check_payload_size(bytes.len())?;
                                 let (state, version) = mutation.snapshot();
                                 return Ok(SwrRead::Stale(bytes, SwrToken { state, version }));
@@ -502,6 +516,7 @@ impl CacheKit {
         // L1 hit
         #[cfg(feature = "l1")]
         if let Some(bytes) = self.l1_get(&full_key) {
+            self.counters.record(ReadOutcome::L1Hit, &full_key);
             self.check_payload_size(bytes.len())?;
             return Ok(Some(bytes));
         }
@@ -514,14 +529,21 @@ impl CacheKit {
 
         #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
         if let Some(bytes) = self.l1_get(&full_key) {
+            self.counters.record(ReadOutcome::L1Hit, &full_key);
             self.check_payload_size(bytes.len())?;
             return Ok(Some(bytes));
         }
 
         // L2 backend
         let bytes = match self.backend.get(&full_key).await? {
-            Some(b) => b,
-            None => return Ok(None),
+            Some(b) => {
+                self.counters.record(ReadOutcome::L2Hit, &full_key);
+                b
+            }
+            None => {
+                self.counters.record(ReadOutcome::Miss, &full_key);
+                return Ok(None);
+            }
         };
 
         self.check_payload_size(bytes.len())?;
@@ -577,6 +599,7 @@ impl CacheKit {
             self.backend.set(&full_key, bytes, Some(ttl)).await?;
         }
 
+        crate::metrics::trace_write(&full_key, ttl);
         Ok(())
     }
 
@@ -615,7 +638,9 @@ impl CacheKit {
         #[cfg(feature = "l1")]
         self.l1_delete(&full_key);
 
-        Ok(self.backend.delete(&full_key).await?)
+        let existed = self.backend.delete(&full_key).await?;
+        crate::metrics::trace_delete(&full_key, existed);
+        Ok(existed)
     }
 
     /// Return `true` if `key` exists without fetching the value.
@@ -629,6 +654,57 @@ impl CacheKit {
         }
 
         Ok(self.backend.exists(&full_key).await?)
+    }
+
+    // ── Observability ─────────────────────────────────────────────────────────
+
+    /// Live hit/miss counters for this client and all of its clones.
+    ///
+    /// Every value read — `get`, `interop_get`, their SWR variants, and the
+    /// [`SecureCache`] equivalents — is counted by where it was served from.
+    /// `exists` and reads that fail with a backend error are not counted. The
+    /// same counters feed the cachekit.io backends' `X-CacheKit-*` telemetry
+    /// headers, so for a backend used by this client alone, what you see here
+    /// is what the SaaS sees (a backend shared by several clients reports the
+    /// first client built over it — see [`Backend::attach_metrics`]).
+    ///
+    /// ```no_run
+    /// # fn example(cache: &cachekit::CacheKit) {
+    /// let stats = cache.stats();
+    /// let reads = stats.l1_hits + stats.l2_hits + stats.misses;
+    /// eprintln!("L1 hit rate {:.1}% over {reads} reads", stats.l1_hit_rate() * 100.0);
+    /// # }
+    /// ```
+    pub fn stats(&self) -> L1Stats {
+        self.counters.snapshot()
+    }
+
+    /// Number of entries currently held in L1, or `None` when L1 is disabled
+    /// (or the `l1` feature is off).
+    ///
+    /// Exact at the time of the call: moka's pending expirations and
+    /// evictions are applied first, which makes this a housekeeping call, not
+    /// a free counter read — poll it, don't put it on a hot path.
+    pub fn l1_entry_count(&self) -> Option<u64> {
+        #[cfg(feature = "l1")]
+        let count = self.l1.as_ref().map(crate::l1::L1Cache::entry_count);
+        #[cfg(not(feature = "l1"))]
+        let count = None;
+        count
+    }
+
+    /// Current circuit-breaker state, or `None` when this client has no
+    /// breaker (reliability disabled, or configured with
+    /// `circuit_breaker: None`).
+    ///
+    /// Reads the live state: an open circuit whose `open_timeout` has elapsed
+    /// reports [`CircuitState::HalfOpen`](crate::CircuitState::HalfOpen). With
+    /// the `tracing` feature every transition is also emitted on the
+    /// `cachekit::reliability` target — `warn` when the circuit opens, `info`
+    /// for half-open and closed.
+    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+    pub fn circuit_state(&self) -> Option<crate::reliability::CircuitState> {
+        self.breaker.as_ref().map(|breaker| breaker.state())
     }
 
     // ── Single-flight ─────────────────────────────────────────────────────────
@@ -768,6 +844,7 @@ impl SecureCache<'_> {
                 .await?;
         }
 
+        crate::metrics::trace_write(&full_key, ttl);
         Ok(())
     }
 
@@ -1121,17 +1198,29 @@ impl CacheKitBuilder {
             ratio
         };
 
+        // Hand the backend a live view of this client's read counters so the
+        // SaaS telemetry headers report real numbers with no user plumbing.
+        // Attached to the raw backend, before the reliability decorator, so
+        // no forwarding is needed; a provider set on the backend's own
+        // builder wins (see `Backend::attach_metrics`).
+        #[cfg(feature = "l1")]
+        let l1_enabled = l1.is_some();
+        #[cfg(not(feature = "l1"))]
+        let l1_enabled = false;
+        let counters = Arc::new(CacheCounters::new(l1_enabled));
+        backend.attach_metrics(counters.provider());
+
         // Apply the reliability stack last so it decorates the final backend.
         // A disabled config is the documented opt-out: skip the (no-op)
         // decorator entirely. The layer check lives on ReliabilityConfig
         // itself so a future layer can't be missed here (panel finding —
         // this gate shipped that exact bug once already).
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-        let backend = match self.reliability {
+        let (backend, breaker) = match self.reliability {
             Some(config) if !config.is_disabled() => {
                 crate::reliability::wrap_reliable(backend, config)
             }
-            _ => backend,
+            _ => (backend, None),
         };
 
         Ok(CacheKit {
@@ -1140,6 +1229,10 @@ impl CacheKitBuilder {
             namespace: self.namespace,
             max_payload_bytes: self.max_payload_bytes.unwrap_or(5 * 1024 * 1024),
             flight: SharedFlight::default(),
+            counters,
+
+            #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+            breaker,
 
             #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
             mutations: SharedMutations::default(),
