@@ -1,7 +1,9 @@
+mod common;
+
 use cachekit::config::{CachekitConfig, CachekitConfigBuilder};
+use common::EnvGuard;
 use serial_test::serial;
 use std::time::Duration;
-use zeroize::Zeroizing;
 
 // ── from_env defaults ────────────────────────────────────────────────────────
 
@@ -191,45 +193,6 @@ fn assert_config_err(result: Result<CachekitConfigBuilder, cachekit::CachekitErr
             "{what}: expected CachekitError::Config, got {:?}",
             other.map(|_| "Ok(builder)")
         ),
-    }
-}
-
-/// RAII guard for `#[serial]` env tests: records each variable's pre-test
-/// value and restores it on drop — including on assertion failure — so a
-/// test can never destroy state the surrounding shell exported.
-struct EnvGuard {
-    /// `Zeroizing` because the saved set includes `CACHEKIT_MASTER_KEY` and
-    /// `CACHEKIT_PREVIOUS_MASTER_KEYS` — a pre-test shell value is real key
-    /// material, so the copy this guard holds is wiped on drop.
-    saved: Vec<(&'static str, Option<Zeroizing<String>>)>,
-}
-
-impl EnvGuard {
-    /// Apply `(name, value)` pairs: `Some` sets the variable, `None` removes
-    /// it. The prior value of every named variable is restored on drop.
-    fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
-        let saved = vars
-            .iter()
-            .map(|(name, _)| (*name, std::env::var(name).ok().map(Zeroizing::new)))
-            .collect();
-        for (name, value) in vars {
-            match value {
-                Some(v) => std::env::set_var(name, v),
-                None => std::env::remove_var(name),
-            }
-        }
-        Self { saved }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in &self.saved {
-            match value {
-                Some(v) => std::env::set_var(name, v.as_str()),
-                None => std::env::remove_var(name),
-            }
-        }
     }
 }
 

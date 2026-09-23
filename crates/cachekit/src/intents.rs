@@ -191,9 +191,13 @@ impl CacheKit {
     ///
     /// Good for: serverless, edge compute, managed caching without Redis.
     ///
+    /// Takes the API key explicitly; use [`CacheKit::io_from_env`] to read
+    /// `CACHEKIT_API_KEY` instead. Neither reads `CACHEKIT_MASTER_KEY` —
+    /// encryption on `io` is always an explicit builder call.
+    ///
     /// # Errors
     ///
-    /// Returns [`CachekitError`] if `api_key` is empty.
+    /// Returns [`CachekitError::Config`] if `api_key` is empty.
     ///
     /// # Example
     ///
@@ -219,5 +223,43 @@ impl CacheKit {
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         let builder = builder.reliability(crate::reliability::ReliabilityConfig::default());
         Ok(builder)
+    }
+
+    /// **CachekitIO**, API key from the environment — [`CacheKit::io`] with
+    /// the key read from `CACHEKIT_API_KEY`.
+    ///
+    /// Identical preset to [`io`](CacheKit::io). Unlike
+    /// [`CacheKit::from_env`], this reads **only** `CACHEKIT_API_KEY`: it
+    /// ignores `CACHEKIT_MASTER_KEY` (no encryption is activated) and
+    /// `CACHEKIT_DEFAULT_TTL`. Pass the key to [`CacheKit::io`] instead when
+    /// one process needs two keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CachekitError::Config`] when `CACHEKIT_API_KEY` is unset or
+    /// empty.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # fn example() -> Result<(), cachekit::CachekitError> {
+    /// let cache = cachekit::CacheKit::io_from_env()?
+    ///     .namespace("edge")
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
+    pub fn io_from_env() -> Result<CacheKitBuilder, CachekitError> {
+        let api_key = std::env::var("CACHEKIT_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| {
+                CachekitError::Config(
+                    "CACHEKIT_API_KEY is unset: set it or pass the key to CacheKit::io(api_key)"
+                        .to_owned(),
+                )
+            })?;
+        Self::io(&api_key)
     }
 }

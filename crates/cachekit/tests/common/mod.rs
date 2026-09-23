@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 use cachekit::backend::{Backend, HealthStatus};
 use cachekit::client::SharedBackend;
@@ -83,5 +84,44 @@ impl Backend for MockBackend {
             backend_type: "mock".to_owned(),
             details: HashMap::new(),
         })
+    }
+}
+
+/// RAII guard for `#[serial]` env tests: records each variable's pre-test
+/// value and restores it on drop — including on assertion failure — so a
+/// test can never destroy state the surrounding shell exported.
+pub struct EnvGuard {
+    /// `Zeroizing` because the saved set includes `CACHEKIT_MASTER_KEY` and
+    /// `CACHEKIT_PREVIOUS_MASTER_KEYS` — a pre-test shell value is real key
+    /// material, so the copy this guard holds is wiped on drop.
+    saved: Vec<(&'static str, Option<Zeroizing<String>>)>,
+}
+
+impl EnvGuard {
+    /// Apply `(name, value)` pairs: `Some` sets the variable, `None` removes
+    /// it. The prior value of every named variable is restored on drop.
+    pub fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(name, _)| (*name, std::env::var(name).ok().map(Zeroizing::new)))
+            .collect();
+        for (name, value) in vars {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.saved {
+            match value {
+                Some(v) => std::env::set_var(name, v.as_str()),
+                None => std::env::remove_var(name),
+            }
+        }
     }
 }

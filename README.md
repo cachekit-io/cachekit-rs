@@ -85,11 +85,12 @@ One call that names your use case. Each preset returns a pre-configured builder 
 | `CacheKit::minimal(url)` | Development, public data, product catalogs — speed first, no extras | Redis³ | ❌ | ❌ | ❌ | ❌ | 300 s |
 | `CacheKit::production(url)` | User sessions, API responses, production services | Redis³ | ✅ | ❌ | ✅ | ✅ | 600 s |
 | `CacheKit::encrypted(url, key)` | PII, payments, GDPR/HIPAA-sensitive data — zero-knowledge AES-256-GCM | Redis³ | ✅ | ✅ | ✅ | ✅ | 600 s |
-| `CacheKit::io(api_key)` | Serverless, edge compute, managed caching without running Redis | cachekit.io | ✅ | ❌ | ✅ | n/a (HTTP) | 3 600 s |
+| `CacheKit::io(api_key)`⁴ | Serverless, edge compute, managed caching without running Redis | cachekit.io | ✅ | ❌ | ✅ | n/a (HTTP) | 3 600 s |
 
 ¹ Retry with backoff + jitter, circuit breaker, backpressure — the [reliability stack](#reliability). Requires the default-on `reliability` feature.
 ² See the resilience contract below.
 ³ Requires the `redis` feature flag; `encrypted` also needs the default-on `encryption` feature.
+⁴ Or `CacheKit::io_from_env()` to read `CACHEKIT_API_KEY`. Neither reads `CACHEKIT_MASTER_KEY` — `io` never activates encryption from the environment (that is `from_env()` behaviour).
 
 ```rust
 use cachekit::prelude::*;
@@ -493,7 +494,7 @@ Requires a tokio runtime for backoff timers (the `redis` and `cachekitio` backen
 
 | Variable | Required | Description |
 |:---------|:--------:|:------------|
-| `CACHEKIT_API_KEY` | ✅ | API key for cachekit.io |
+| `CACHEKIT_API_KEY` | ✅ | API key for cachekit.io (`from_env()` and `CacheKit::io_from_env()`) |
 | `CACHEKIT_API_URL` | ❌ | Override API endpoint (default: `https://api.cachekit.io`) |
 | `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key (min 32 bytes) for encryption |
 | `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (max 3; a blank value is treated as unset) |
