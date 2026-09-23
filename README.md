@@ -82,7 +82,7 @@ One call that names your use case. Each preset returns a pre-configured builder 
 
 | Preset | When to use | Backend | L1 | Encryption | Reliability¹ | Auto-reconnect² | Default TTL |
 |:-------|:------------|:--------|:--:|:----------:|:------------:|:---------------:|:-----------:|
-| `CacheKit::minimal(url)` | Development, public data, product catalogs — speed first, no extras | Redis³ | ❌ | ❌ | ❌ | ❌ | 300 s |
+| `CacheKit::minimal(url)` | Development, public data, product catalogs — speed first, no extras | Redis³ | ✅ (no SWR) | ❌ | ❌ | ❌ | 300 s |
 | `CacheKit::production(url)` | User sessions, API responses, production services | Redis³ | ✅ | ❌ | ✅ | ✅ | 600 s |
 | `CacheKit::encrypted(url, key)` | PII, payments, GDPR/HIPAA-sensitive data — zero-knowledge AES-256-GCM | Redis³ | ✅ | ✅ | ✅ | ✅ | 600 s |
 | `CacheKit::io(api_key)` | Serverless, edge compute, managed caching without running Redis | cachekit.io | ✅ | ❌ | ✅ | n/a (HTTP) | 3 600 s |
@@ -393,7 +393,7 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
 | **Encrypted L1** | `SecureCache` stores ciphertext in L1 (never plaintext) |
 | **Default capacity** | 1,000 entries (configurable via `.l1_capacity()`) |
-| **Stale-while-revalidate** | On by default (native): `#[cachekit]` serves an L1 hit past `swr_threshold_ratio` × entry TTL (default 0.5, ±10% jitter) immediately and refreshes it in the background — see below |
+| **Stale-while-revalidate** | On by default (native; `minimal` turns it off): `#[cachekit]` serves an L1 hit past `swr_threshold_ratio` × entry TTL (default 0.5, ±10% jitter) immediately and refreshes it in the background — see below |
 
 ### Stale-while-revalidate (SWR)
 

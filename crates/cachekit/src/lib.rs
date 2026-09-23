@@ -12,7 +12,7 @@
 //!
 //! | Intent | Backend | L1 | Encryption | Auto-reconnect² | Reliability¹ | Default TTL |
 //! |------------|-----------|------|------------|-----------------|--------------|-------------|
-//! | `CacheKit::minimal`³ | Redis | Off | No | No | Off | 300 s |
+//! | `CacheKit::minimal`³ | Redis | On (no SWR) | No | No | Off | 300 s |
 //! | `CacheKit::production`³ | Redis | On | No | Yes | On | 600 s |
 //! | `CacheKit::encrypted`³ | Redis | On | AES-256-GCM | Yes | On | 600 s |
 //! | [`io`](CacheKit::io) | cachekit.io | On | No | n/a (HTTP) | On | 3 600 s |

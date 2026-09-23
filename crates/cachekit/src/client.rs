@@ -171,10 +171,10 @@ pub struct CacheKit {
     mutations: SharedMutations,
 
     #[cfg(feature = "l1")]
-    l1: Option<crate::l1::L1Cache>,
+    pub(crate) l1: Option<crate::l1::L1Cache>,
 
     #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
-    swr_enabled: bool,
+    pub(crate) swr_enabled: bool,
 
     #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
     swr_threshold_ratio: f64,

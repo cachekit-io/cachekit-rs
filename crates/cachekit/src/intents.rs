@@ -36,12 +36,32 @@ fn wrap(b: impl crate::backend::Backend + 'static) -> SharedBackend {
 
 // ── Intent presets ───────────────────────────────────────────────────────────
 
+/// `minimal` builder defaults, split from the eager Redis connect so the
+/// L1-on / SWR-off contract (`protocol/spec/intent-presets.md` § L1 Posture)
+/// is unit-testable without a live server.
+#[cfg(feature = "redis")]
+fn minimal_defaults(backend: SharedBackend) -> CacheKitBuilder {
+    let builder = CacheKitBuilder::default()
+        .backend(backend)
+        .default_ttl(Duration::from_secs(300))
+        .l1_capacity(1000);
+    // SWR is builder-default-on; the spec says minimal MUST NOT enable it.
+    // The knob only exists on native, non-unsync builds — elsewhere SWR
+    // reads are never produced, so the contract holds without it.
+    #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+    let builder = builder.swr_enabled(false);
+    builder
+}
+
 impl CacheKit {
     /// **Minimal** — speed-first Redis cache, no extras.
     ///
     /// * Backend: Redis (connects eagerly; **fails fast** — a dropped
     ///   connection is not re-established)
-    /// * L1 cache: **off**
+    /// * L1 cache: **on** (1 000 entries, **no SWR / invalidation**) — an L1
+    ///   hit is served as-is until it expires, so a read may return an entry
+    ///   up to 300 s after another process changed it in Redis. Chain
+    ///   [`.no_l1()`](CacheKitBuilder::no_l1) to read through every time.
     /// * Encryption: **no**
     /// * Reliability: **off** — no retry, no circuit breaker, no
     ///   backpressure; every backend error propagates on first failure and
@@ -71,10 +91,7 @@ impl CacheKit {
             .build()?;
         drop(backend.connect().await?);
 
-        Ok(CacheKitBuilder::default()
-            .backend(wrap(backend))
-            .default_ttl(Duration::from_secs(300))
-            .no_l1())
+        Ok(minimal_defaults(wrap(backend)))
     }
 
     /// **Production** — reliability-first Redis cache with L1.
@@ -219,5 +236,32 @@ impl CacheKit {
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         let builder = builder.reliability(crate::reliability::ReliabilityConfig::default());
         Ok(builder)
+    }
+}
+
+#[cfg(all(test, feature = "redis", feature = "l1"))]
+#[allow(clippy::expect_used)] // test-only: a failing build here should panic loudly
+mod tests {
+    /// `RedisBackend::build()` does not connect, so the preset's defaults
+    /// are observable without a live server.
+    #[test]
+    fn minimal_enables_l1_without_swr() {
+        let backend = crate::backend::redis::RedisBackend::builder()
+            .url("redis://localhost:6379")
+            .build()
+            .expect("valid URL");
+        let cache = super::minimal_defaults(super::wrap(backend))
+            .build()
+            .expect("minimal defaults must build");
+
+        assert!(
+            cache.l1.is_some(),
+            "spec/intent-presets.md § L1 Posture: minimal MUST enable L1"
+        );
+        #[cfg(all(not(feature = "unsync"), not(target_arch = "wasm32")))]
+        assert!(
+            !cache.swr_enabled,
+            "spec/intent-presets.md § L1 Posture: minimal MUST NOT enable SWR"
+        );
     }
 }
