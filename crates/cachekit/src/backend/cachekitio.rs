@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,7 +18,10 @@ pub struct CachekitIO {
     client: reqwest::Client,
     api_key: Zeroizing<String>,
     api_url: String,
-    metrics_provider: Option<MetricsProvider>,
+    /// Source of the `X-CacheKit-*` telemetry headers. Set once: by the
+    /// builder when the user supplies one, otherwise by the client at build
+    /// time via [`Backend::attach_metrics`] (first writer wins).
+    metrics_provider: OnceLock<MetricsProvider>,
 }
 
 /// Redact `api_key` from debug output.
@@ -49,12 +53,6 @@ impl CachekitIO {
     /// Return the API key as a string slice (for bearer auth in sibling modules).
     pub(crate) fn api_key_str(&self) -> &str {
         self.api_key.as_str()
-    }
-
-    /// Return a reference to the optional metrics provider (for testing/introspection).
-    #[allow(dead_code)]
-    pub(crate) fn metrics_provider(&self) -> Option<&MetricsProvider> {
-        self.metrics_provider.as_ref()
     }
 
     /// Build the full URL for a cache key path segment.
@@ -100,7 +98,7 @@ impl CachekitIO {
         for (name, value) in session_headers() {
             req = req.header(name, value);
         }
-        for (name, value) in metrics_headers(self.metrics_provider.as_ref()) {
+        for (name, value) in metrics_headers(self.metrics_provider.get()) {
             req = req.header(name, value);
         }
         req
@@ -143,6 +141,11 @@ pub(crate) fn from_http_status_sanitized(status: u16, body: &[u8], api_key: &str
 #[cfg_attr(not(feature = "unsync"), async_trait)]
 #[cfg_attr(feature = "unsync", async_trait(?Send))]
 impl Backend for CachekitIO {
+    fn attach_metrics(&self, provider: MetricsProvider) {
+        // A provider supplied on the builder is already set and wins.
+        self.metrics_provider.get_or_init(|| provider);
+    }
+
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
         let req = self.with_standard_headers(
             self.client
@@ -305,7 +308,11 @@ impl CachekitIOBuilder {
         self
     }
 
-    /// Provide L1 cache metrics for request telemetry headers.
+    /// Override the source of the `X-CacheKit-*` telemetry headers.
+    ///
+    /// Not needed for normal use: `CacheKitBuilder::build` attaches the
+    /// client's own live counters to any backend without one. Set this only
+    /// to report numbers from somewhere else; it takes precedence.
     pub fn metrics_provider(mut self, provider: MetricsProvider) -> Self {
         self.metrics_provider = Some(provider);
         self
@@ -354,8 +361,68 @@ impl CachekitIOBuilder {
             client,
             api_key,
             api_url,
-            metrics_provider: self.metrics_provider,
+            metrics_provider: self
+                .metrics_provider
+                .map_or_else(OnceLock::new, OnceLock::from),
         })
+    }
+}
+
+// ── Telemetry-header wiring tests ─────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::expect_used)] // test-only: a builder failure on a fixture should panic loudly
+mod metrics_wiring_tests {
+    use std::sync::Arc;
+
+    use super::CachekitIO;
+    use crate::backend::Backend;
+    use crate::metrics::{metrics_headers, L1Stats, MetricsProvider};
+
+    fn provider(l1_hits: u64) -> MetricsProvider {
+        Arc::new(move || {
+            Some(L1Stats {
+                l1_hits,
+                l2_hits: 0,
+                misses: 0,
+                l1_enabled: true,
+            })
+        })
+    }
+
+    fn l1_hits_header(backend: &CachekitIO) -> Option<String> {
+        metrics_headers(backend.metrics_provider.get())
+            .into_iter()
+            .find(|h| h.0 == "X-CacheKit-L1-Hits")
+            .map(|h| h.1)
+    }
+
+    #[test]
+    fn attach_fills_an_unset_provider() {
+        let backend = CachekitIO::builder()
+            .api_key("ck_test_key")
+            .build()
+            .expect("builder succeeds");
+        assert_eq!(l1_hits_header(&backend), None, "nothing attached yet");
+
+        backend.attach_metrics(provider(7));
+        assert_eq!(l1_hits_header(&backend).as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn builder_provider_is_retained_over_attach() {
+        let backend = CachekitIO::builder()
+            .api_key("ck_test_key")
+            .metrics_provider(provider(1))
+            .build()
+            .expect("builder succeeds");
+
+        backend.attach_metrics(provider(99));
+        assert_eq!(
+            l1_hits_header(&backend).as_deref(),
+            Some("1"),
+            "user-supplied provider wins"
+        );
     }
 }
 

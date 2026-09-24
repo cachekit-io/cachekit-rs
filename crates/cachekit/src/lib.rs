@@ -15,7 +15,7 @@
 //! | `CacheKit::minimal`³ | Redis | Off | No | No | Off | 300 s |
 //! | `CacheKit::production`³ | Redis | On | No | Yes | On | 600 s |
 //! | `CacheKit::secure`³ | Redis | On | AES-256-GCM | Yes | On | 600 s |
-//! | [`io`](CacheKit::io) | cachekit.io | On | No | n/a (HTTP) | On | 3 600 s |
+//! | [`io`](CacheKit::io)⁴ | cachekit.io | On | No | n/a (HTTP) | On | 3 600 s |
 //!
 //! ¹ Retry with backoff + jitter, a circuit breaker, and backpressure around
 //! backend ops — see [`reliability`]. Requires the default-on `reliability`
@@ -30,12 +30,14 @@
 //! reliability stack.
 //! ³ Requires the `redis` cargo feature; `secure` also needs the
 //! default-on `encryption` feature.
+//! ⁴ API key by argument, or from `CACHEKIT_API_KEY` via
+//! [`io_from_env`](CacheKit::io_from_env). Neither reads
+//! `CACHEKIT_MASTER_KEY`; unlike [`from_env`](CacheKit::from_env), the `io`
+//! preset never activates encryption from the environment.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Load the key from your environment/secrets manager — never hardcode it.
-//! let api_key = std::env::var("CACHEKIT_API_KEY")?;
-//! let cache = cachekit::CacheKit::io(&api_key)?
+//! let cache = cachekit::CacheKit::io_from_env()?
 //!     .namespace("myapp")
 //!     .build()?;
 //!
@@ -47,6 +49,17 @@
 //!
 //! For full control, drop down to [`CacheKit::builder`] or
 //! [`CacheKit::from_env`].
+//!
+//! # Observability
+//!
+//! Every client counts its reads: [`CacheKit::stats`] answers "is my cache
+//! hitting?" (L1 hits / L2 hits / misses), [`CacheKit::l1_entry_count`]
+//! reports L1 occupancy, and with `reliability` on,
+//! [`CacheKit::circuit_state`] reports the breaker. The same counters feed the
+//! cachekit.io backends' `X-CacheKit-*` telemetry headers automatically. Enable
+//! the `tracing` cargo feature for a `debug` event per operation on the
+//! `cachekit` target (`op`, `outcome`, `key_hash` — never the key) and
+//! breaker transitions on `cachekit::reliability` — see [`metrics`].
 
 // Production code lints — these only fire in src/, not tests/
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -85,7 +98,8 @@ pub mod error;
 pub mod flight;
 /// Interop mode (interop/v1): cross-SDK cache keys and plain-MessagePack values.
 pub mod interop;
-/// L1 cache hit-rate metrics for CachekitIO request headers.
+/// Live hit/miss counters, the SaaS telemetry headers built from them, and
+/// (feature `tracing`) structured events for cache operations.
 pub mod metrics;
 /// Serialization and deserialization of cached values via MessagePack.
 pub mod serializer;
@@ -113,6 +127,7 @@ pub mod reliability;
 pub use client::{CacheKit, CacheKitBuilder, SharedBackend, SwrRead, SwrToken};
 pub use config::CachekitConfig;
 pub use error::{BackendError, BackendErrorKind, CachekitError};
+pub use metrics::L1Stats;
 
 #[cfg(feature = "encryption")]
 pub use client::SecureCache;
@@ -125,7 +140,9 @@ pub use cachekit_macros::cachekit;
 pub use flight::SingleFlight;
 
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-pub use reliability::{BackpressureConfig, CircuitBreakerConfig, ReliabilityConfig, RetryConfig};
+pub use reliability::{
+    BackpressureConfig, CircuitBreakerConfig, CircuitState, ReliabilityConfig, RetryConfig,
+};
 
 // ── Shared jitter source ─────────────────────────────────────────────────────
 

@@ -20,7 +20,7 @@ use cachekit::backend::{Backend, HealthStatus, LockableBackend};
 use cachekit::client::SharedBackend;
 use cachekit::error::{BackendError, BackendErrorKind};
 use cachekit::reliability::{
-    BackpressureConfig, CircuitBreakerConfig, ReliabilityConfig, RetryConfig,
+    BackpressureConfig, CircuitBreakerConfig, CircuitState, ReliabilityConfig, RetryConfig,
 };
 use cachekit::{CacheKit, CachekitError};
 
@@ -1002,4 +1002,62 @@ async fn backpressure_permit_released_after_error() {
         );
     }
     assert_eq!(handle.calls(), 2);
+}
+
+// ── Breaker state accessor (LAB-521) ─────────────────────────────────────────
+
+#[tokio::test]
+async fn circuit_state_tracks_the_breaker() {
+    // One failure opens the circuit; after open_timeout the accessor reads
+    // the lazy open → half-open transition; one successful probe closes it.
+    let (shared, _handle) = ScriptedBackend::new_with_handle(1, BackendErrorKind::Transient);
+    let client = client_with(
+        shared,
+        ReliabilityConfig {
+            retry: None,
+            circuit_breaker: Some(CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold: 1,
+                open_timeout: Duration::from_millis(20),
+                ..CircuitBreakerConfig::default()
+            }),
+            backpressure: None,
+        },
+    );
+    assert_eq!(client.circuit_state(), Some(CircuitState::Closed));
+
+    client
+        .get::<u32>("k")
+        .await
+        .expect_err("first call fails and opens the circuit");
+    assert_eq!(client.circuit_state(), Some(CircuitState::Open));
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        client.circuit_state(),
+        Some(CircuitState::HalfOpen),
+        "open_timeout elapsed: the accessor reads the live state"
+    );
+
+    let value: Option<u32> = client.get("k").await.expect("probe succeeds");
+    assert_eq!(value, Some(7));
+    assert_eq!(client.circuit_state(), Some(CircuitState::Closed));
+}
+
+#[tokio::test]
+async fn circuit_state_is_none_without_a_breaker() {
+    let (shared, _) = ScriptedBackend::new_with_handle(0, BackendErrorKind::Transient);
+    let retry_only = client_with(
+        shared,
+        ReliabilityConfig {
+            retry: Some(fast_retry(2)),
+            circuit_breaker: None,
+            backpressure: None,
+        },
+    );
+    assert_eq!(retry_only.circuit_state(), None);
+
+    let (shared, _) = ScriptedBackend::new_with_handle(0, BackendErrorKind::Transient);
+    let disabled = client_with(shared, ReliabilityConfig::disabled());
+    assert_eq!(disabled.circuit_state(), None);
 }
