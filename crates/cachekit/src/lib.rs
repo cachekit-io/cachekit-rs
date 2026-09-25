@@ -15,7 +15,7 @@
 //! | `CacheKit::minimal`³ | Redis | On (no SWR) | No | No | Off | 300 s |
 //! | `CacheKit::production`³ | Redis | On | No | Yes | On | 600 s |
 //! | `CacheKit::encrypted`³ | Redis | On | AES-256-GCM | Yes | On | 600 s |
-//! | [`io`](CacheKit::io) | cachekit.io | On | No | n/a (HTTP) | On | 3 600 s |
+//! | [`io`](CacheKit::io)⁴ | cachekit.io | On | No | n/a (HTTP) | On | 3 600 s |
 //!
 //! ¹ Retry with backoff + jitter, a circuit breaker, and backpressure around
 //! backend ops — see [`reliability`]. Requires the default-on `reliability`
@@ -30,12 +30,14 @@
 //! reliability stack.
 //! ³ Requires the `redis` cargo feature; `encrypted` also needs the
 //! default-on `encryption` feature.
+//! ⁴ API key by argument, or from `CACHEKIT_API_KEY` via
+//! [`io_from_env`](CacheKit::io_from_env). Neither reads
+//! `CACHEKIT_MASTER_KEY`; unlike [`from_env`](CacheKit::from_env), the `io`
+//! preset never activates encryption from the environment.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! // Load the key from your environment/secrets manager — never hardcode it.
-//! let api_key = std::env::var("CACHEKIT_API_KEY")?;
-//! let cache = cachekit::CacheKit::io(&api_key)?
+//! let cache = cachekit::CacheKit::io_from_env()?
 //!     .namespace("myapp")
 //!     .build()?;
 //!

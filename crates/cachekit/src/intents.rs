@@ -207,9 +207,11 @@ impl CacheKit {
     ///
     /// Good for: serverless, edge compute, managed caching without Redis.
     ///
+    /// Use [`CacheKit::io_from_env`] to read the key from `CACHEKIT_API_KEY`.
+    ///
     /// # Errors
     ///
-    /// Returns [`CachekitError`] if `api_key` is empty.
+    /// Returns [`CachekitError::Config`] if `api_key` is empty.
     ///
     /// # Example
     ///
@@ -235,6 +237,43 @@ impl CacheKit {
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         let builder = builder.reliability(crate::reliability::ReliabilityConfig::default());
         Ok(builder)
+    }
+
+    /// **CachekitIO**, API key from the environment — [`CacheKit::io`] with
+    /// the key read from `CACHEKIT_API_KEY`.
+    ///
+    /// Identical preset to [`io`](CacheKit::io). Reads **only**
+    /// `CACHEKIT_API_KEY` — unlike [`CacheKit::from_env`], never
+    /// `CACHEKIT_MASTER_KEY`, so no encryption is activated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CachekitError::Config`] when `CACHEKIT_API_KEY` is unset or
+    /// empty.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # fn example() -> Result<(), cachekit::CachekitError> {
+    /// let cache = cachekit::CacheKit::io_from_env()?
+    ///     .namespace("edge")
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
+    pub fn io_from_env() -> Result<CacheKitBuilder, CachekitError> {
+        let api_key = std::env::var("CACHEKIT_API_KEY")
+            .ok()
+            .map(zeroize::Zeroizing::new)
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| {
+                CachekitError::Config(
+                    "CACHEKIT_API_KEY is unset or empty: set it or pass the key to CacheKit::io(api_key)"
+                        .to_owned(),
+                )
+            })?;
+        Self::io(&api_key)
     }
 }
 
