@@ -29,7 +29,8 @@ test-wasm:
 # Supply-chain gate — deny is identical to CI's; audit runs the strict form
 # (`--deny yanked`, which CI applies only on the weekly schedule run), so a
 # local pass covers every CI event in .github/workflows/security.yml. (CI runs
-# the audit step even when deny fails; make stops at the first failure.)
+# the audit step even when deny fails, plus a PR-only gate tamper check with no
+# local equivalent; make stops at the first failure.)
 # Kept out of `quick-check`: both tools fetch the RustSec advisory database over
 # the network, which does not belong in a per-commit loop.
 # Why both tools, and why --all-features: see the table in README.md.
