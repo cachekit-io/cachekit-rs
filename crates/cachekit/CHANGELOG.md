@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.8.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.7.0...cachekit-rs-v0.8.0) (2026-09-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* **intents:** `CacheKit::encrypted(url, key)` is now `CacheKit::secure(url, key)`, and the `SecureCache` accessor `cache.secure()` is now `cache.secure_cache()`. Migration: rename both call sites; behaviour, defaults and feature gates are unchanged.
+
+### Features
+
+* **encryption:** keyring rotation — previous_master_keys + sequential decrypt (LAB-686) ([#63](https://github.com/cachekit-io/cachekit-rs/issues/63)) ([8b9e7ac](https://github.com/cachekit-io/cachekit-rs/commit/8b9e7ac03f803b7e9f2979537f525136fdc59c40))
+* **intents:** CacheKit::io falls back to CACHEKIT_API_KEY via io_from_env (LAB-4647) ([#86](https://github.com/cachekit-io/cachekit-rs/issues/86)) ([464b9d2](https://github.com/cachekit-io/cachekit-rs/commit/464b9d29ad551be9e3d169f73a07a3748e8739b6))
+* **observability:** live read counters, auto-wired SaaS telemetry, tracing events (LAB-521) ([#81](https://github.com/cachekit-io/cachekit-rs/issues/81)) ([afe77ad](https://github.com/cachekit-io/cachekit-rs/commit/afe77add961601eb05772599ff9ef7d6d1947308))
+* **rs:** surface rotation drain signal via decrypt_indexed (LAB-1678) ([#74](https://github.com/cachekit-io/cachekit-rs/issues/74)) ([15b94cf](https://github.com/cachekit-io/cachekit-rs/commit/15b94cfb0ebab032af67b39363a3d5ef89a6c82c))
+
+
+### Bug Fixes
+
+* **cachekitio:** reject reserved cache-key segments in request path (LAB-2878) ([#76](https://github.com/cachekit-io/cachekit-rs/issues/76)) ([0ed7e1d](https://github.com/cachekit-io/cachekit-rs/commit/0ed7e1d0e75a21b8deffb59031897fe664b3dc6e))
+* **serializer:** own the msgpack decode depth bound and add a structural walk (LAB-2503) ([#73](https://github.com/cachekit-io/cachekit-rs/issues/73)) ([306c1b1](https://github.com/cachekit-io/cachekit-rs/commit/306c1b1529ddfa025d809bc465a1dedaa98e2139))
+
+
+### Code Refactoring
+
+* **intents:** rename CacheKit::encrypted to CacheKit::secure (LAB-4651) ([#82](https://github.com/cachekit-io/cachekit-rs/issues/82)) ([11802d9](https://github.com/cachekit-io/cachekit-rs/commit/11802d9c3a002f4782269222ff610d9f18331ca7))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.7.0 to 0.8.0
+
 ## [0.7.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.6.1...cachekit-rs-v0.7.0) (2026-08-07)
 
 

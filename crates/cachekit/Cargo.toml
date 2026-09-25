@@ -1,6 +1,6 @@
 [package]
 name = "cachekit-rs"
-version = "0.7.0"
+version = "0.8.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -100,7 +100,7 @@ js-sys = { version = "0.3", optional = true }
 getrandom = { version = "0.2", optional = true, features = ["js"] }
 
 # Optional: proc-macro decorator
-cachekit-macros = { version = "0.7.0", path = "../cachekit-macros", optional = true }
+cachekit-macros = { version = "0.8.0", path = "../cachekit-macros", optional = true }
 
 # Optional: structured events. `std` only — no `attributes`: the crate uses no
 # `#[instrument]`, so users don't pay for the proc-macro build. Already in the
