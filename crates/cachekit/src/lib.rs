@@ -14,13 +14,13 @@
 //! |------------|-----------|------|------------|-----------------|--------------|-------------|
 //! | `CacheKit::minimal`³ | Redis | On (no SWR) | No | No | Off | 300 s |
 //! | `CacheKit::production`³ | Redis | On | No | Yes | On | 600 s |
-//! | `CacheKit::encrypted`³ | Redis | On | AES-256-GCM | Yes | On | 600 s |
+//! | `CacheKit::secure`³ | Redis | On | AES-256-GCM | Yes | On | 600 s |
 //! | [`io`](CacheKit::io)⁴ | cachekit.io | On | No | n/a (HTTP) | On | 3 600 s |
 //!
 //! ¹ Retry with backoff + jitter, a circuit breaker, and backpressure around
 //! backend ops — see [`reliability`]. Requires the default-on `reliability`
 //! cargo feature.
-//! ² `production`/`encrypted` re-establish a dropped Redis connection with
+//! ² `production`/`secure` re-establish a dropped Redis connection with
 //! exponential backoff (100 ms → 30 s, retrying indefinitely); `minimal` is
 //! fail-fast (a dropped connection stays dead). **Initial** connections fail
 //! fast for every Redis preset — `io` opens no connection at construction: an
@@ -28,7 +28,7 @@
 //! endpoint surfaces at the first request.
 //! Auto-reconnect is connection-level repair, distinct from the per-operation
 //! reliability stack.
-//! ³ Requires the `redis` cargo feature; `encrypted` also needs the
+//! ³ Requires the `redis` cargo feature; `secure` also needs the
 //! default-on `encryption` feature.
 //! ⁴ API key by argument, or from `CACHEKIT_API_KEY` via
 //! [`io_from_env`](CacheKit::io_from_env). Neither reads
@@ -108,7 +108,7 @@ pub mod session;
 /// SSRF-safe URL validation for CachekitIO endpoints.
 pub mod url_validator;
 
-/// Intent-based cache presets (`CacheKit::minimal`, `::production`, `::encrypted`, `::io`).
+/// Intent-based cache presets (`CacheKit::minimal`, `::production`, `::secure`, `::io`).
 mod intents;
 
 /// Client-side AES-256-GCM encryption with HKDF key derivation.

@@ -206,14 +206,19 @@ async fn concurrent_delete_wins_over_an_older_secure_refresh() {
     )
     .await
     .expect("secure refresh origin started");
-    assert!(cache.secure().unwrap().delete(&storage_key).await.unwrap());
+    assert!(cache
+        .secure_cache()
+        .unwrap()
+        .delete(&storage_key)
+        .await
+        .unwrap());
 
     SECURE_DELETE_REFRESH_RELEASE.notify_one();
     let flight = cache.single_flight(&storage_key).await;
     flight.release().await;
 
     let value: Option<String> = cache
-        .secure()
+        .secure_cache()
         .unwrap()
         .interop_get(&storage_key)
         .await

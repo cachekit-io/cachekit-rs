@@ -137,7 +137,7 @@ impl CacheKit {
         Ok(builder)
     }
 
-    /// **Encrypted** — zero-knowledge encrypted Redis cache.
+    /// **Secure** — zero-knowledge encrypted Redis cache.
     ///
     /// * Backend: Redis (connects eagerly, failing fast if unreachable;
     ///   **auto-reconnects** after a dropped connection with exponential
@@ -166,14 +166,14 @@ impl CacheKit {
     /// ```no_run
     /// # async fn example() -> Result<(), cachekit::CachekitError> {
     /// let key = b"my_32_byte_production_key_here!!";
-    /// let cache = cachekit::CacheKit::encrypted("redis://localhost:6379", key).await?
+    /// let cache = cachekit::CacheKit::secure("redis://localhost:6379", key).await?
     ///     .build()?;
-    /// let encrypted = cache.secure()?;
+    /// let secure = cache.secure_cache()?;
     /// # Ok(())
     /// # }
     /// ```
     #[cfg(all(feature = "redis", feature = "encryption"))]
-    pub async fn encrypted(
+    pub async fn secure(
         redis_url: &str,
         master_key: &[u8],
     ) -> Result<CacheKitBuilder, CachekitError> {
