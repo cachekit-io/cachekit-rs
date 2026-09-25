@@ -590,7 +590,7 @@ cachekit-rs/
 ```bash
 make quick-check   # fmt + clippy + test (run before every commit)
 make security      # cargo deny + cargo audit (the CI supply-chain gate)
-make test          # cargo test --all-features
+make test          # cargo test --features $(NATIVE_FEATURES) (CI's list; see Makefile)
 make build         # cargo build --release
 make build-wasm    # wasm32-unknown-unknown (workers feature)
 ```
