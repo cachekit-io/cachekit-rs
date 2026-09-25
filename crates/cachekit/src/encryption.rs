@@ -242,6 +242,15 @@ impl EncryptionLayer {
             .collect()
     }
 
+    /// Whether cachekit-core detected AES hardware support on this host.
+    ///
+    /// Forwards `ZeroKnowledgeEncryptor::hardware_acceleration_enabled()`.
+    /// Informational only — `ring`/`aes-gcm` dispatch independently of it; the
+    /// per-architecture semantics are core's (README → Zero-Knowledge Encryption).
+    pub fn hardware_acceleration_enabled(&self) -> bool {
+        self.encryptor.hardware_acceleration_enabled()
+    }
+
     /// Return the tenant ID used for key derivation.
     pub fn tenant_id(&self) -> &str {
         &self.tenant_id
@@ -566,6 +575,25 @@ mod tests {
         // Wrong cache key: every attempt fails authentication — no key won.
         assert!(rotated.decrypt(&k1_ct, "key:b").is_err());
         assert_eq!(rotated.previous_key_hits(), vec![0]);
+    }
+
+    #[test]
+    fn hardware_acceleration_reports_core_detection() {
+        let layer = EncryptionLayer::new(TEST_MASTER_KEY, TEST_TENANT).unwrap();
+        // Delegation, not a constant: agrees with a fresh core encryptor...
+        let core = ZeroKnowledgeEncryptor::new().unwrap();
+        assert_eq!(
+            layer.hardware_acceleration_enabled(),
+            core.hardware_acceleration_enabled()
+        );
+        // ...and on x86_64 with the CPU itself. This pins core 0.6's runtime
+        // probe — the only executed evidence in any repo that the bool is live
+        // detection, not a constant.
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            layer.hardware_acceleration_enabled(),
+            std::arch::is_x86_feature_detected!("aes")
+        );
     }
 
     #[test]

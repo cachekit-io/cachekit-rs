@@ -791,6 +791,12 @@ impl SecureCache<'_> {
         self.encryption.previous_key_hits()
     }
 
+    /// Whether AES is hardware-accelerated on this host (informational); see
+    /// [`EncryptionLayer::hardware_acceleration_enabled`](crate::EncryptionLayer::hardware_acceleration_enabled).
+    pub fn hardware_acceleration_enabled(&self) -> bool {
+        self.encryption.hardware_acceleration_enabled()
+    }
+
     /// Encrypt and store `value` under `key` using the client's default TTL.
     pub async fn set<T: Serialize>(&self, key: &str, value: &T) -> Result<(), CachekitError> {
         self.set_with_ttl(key, value, self.client.default_ttl).await
