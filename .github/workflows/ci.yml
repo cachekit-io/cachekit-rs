@@ -9,27 +9,57 @@ on:
 permissions:
   contents: read
 
-env:
-  # Rustup's temp dir must be on the same filesystem as RUSTUP_HOME to avoid
-  # cross-device link errors on container overlay filesystems.
-  RUSTUP_HOME: /tmp/rustup
-  CARGO_HOME: /tmp/cargo
-  # The cachekit-lean ARC runner has a hard 6Gi memory cgroup (lab ADR-0001).
-  # cargo defaults -j to the visible core count (~24 via the pod's CPU limit),
-  # and a cold `cargo test` build of this 246-crate async/TLS/crypto graph with
-  # full test-profile debuginfo peaks above 6Gi at that fan-out — the kernel
-  # OOM-kills the linker and the runner "loses communication" (issue #25,
-  # confirmed by a 6Gi-cgroup repro). Cap parallel compile/link jobs so peak
-  # RSS stays well under the cap on the cache-less lean pod.
-  CARGO_BUILD_JOBS: "4"
-
 jobs:
+  guard-hosted-runners:
+    name: guard — no self-hosted runner labels
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Fail if any workflow still targets a self-hosted runner
+        # Drift protection for maintainers only, NOT a fork-PR control — a
+        # fork PR runs its own copy of this workflow file, so this check
+        # cannot stop an attacker's fork from restoring `runs-on: cachekit`.
+        # The control that actually blocks that lives in repository and org
+        # runner settings, outside this file. This job only stops a
+        # maintainer from accidentally merging the drift back in.
+        #
+        # Parsed with yq, not a line-oriented grep: `runs-on:` (and
+        # matrix.os/matrix.runner) are equally valid as a scalar, a
+        # flow-list (`[self-hosted, cachekit]`), or a block-list (`- cachekit`
+        # on its own line) — a grep anchored on the `runs-on:` line only
+        # catches the first form and silently misses the other two.
+        run: |
+          bad=0
+          for f in .github/workflows/*.yml; do
+            # yq's own parse failure must not be swallowed by the grep on the
+            # next line: GitHub Actions runs bash steps with `-e` but not
+            # `-o pipefail`, so `yq ... | grep ... || true` would mask a
+            # broken/unparseable workflow as "no hits found" instead of
+            # erroring. Capture yq's output and exit status separately.
+            if ! values=$(yq eval '(.jobs[].runs-on, .jobs[].strategy.matrix.os[]?, .jobs[].strategy.matrix.runner[]?)' "$f"); then
+              echo "::error::failed to parse $f with yq"
+              bad=1
+              continue
+            fi
+            hits=$(echo "$values" | grep -oE '\b(cachekit(-lean)?|self-hosted)\b' || true)
+            if [ -n "$hits" ]; then
+              echo "::error::$f still targets a self-hosted runner label: $(echo "$hits" | tr '\n' ' ')"
+              bad=1
+            fi
+          done
+          if [ "$bad" -eq 1 ]; then
+            exit 1
+          fi
+
   test:
     name: ${{ matrix.rust }}
-    runs-on: cachekit-lean
-    # Backstop: a wedged/killed runner otherwise hangs ~10min until GitHub's
-    # heartbeat reckoning (issue #25). Fail fast — a healthy cold -j4 build of
-    # this tree finishes well inside this window.
+    runs-on: ubuntu-latest
+    # Fail fast rather than waiting out a hung build — a healthy cold build
+    # of this tree finishes well inside this window on a hosted runner.
     timeout-minutes: 20
     continue-on-error: ${{ matrix.rust == 'beta' }}
     strategy:
@@ -44,6 +74,10 @@ jobs:
           rustup toolchain install ${{ matrix.rust }} --profile minimal --component rustfmt,clippy
           rustup default ${{ matrix.rust }}
 
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          key: ${{ matrix.rust }}
+
       - name: Check formatting
         if: matrix.rust != '1.85'
         run: cargo fmt --all -- --check
@@ -57,13 +91,12 @@ jobs:
 
   redis-lock:
     name: redis lock integration
-    # `services:` containers require Docker. cachekit-lean is a no-dind
-    # scaleset (lab ADR-0001), so a redis service can only run on the
-    # with-dind `cachekit` scaleset. Without a live redis the lock
-    # acquire/release path has zero automated coverage — the
+    # GitHub-hosted runners have Docker preinstalled, so `services:` works
+    # unchanged here with no extra Docker setup. Without a live redis the
+    # lock acquire/release path has zero automated coverage — the
     # redis_lock_live_semantics test skips when CACHEKIT_TEST_REDIS_URL is
     # unset (LAB-426: the AC requires locking exercised against a container).
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
       redis:
@@ -80,8 +113,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          # This job never pushes; don't leave the token on a self-hosted
-          # runner workspace (zizmor: artipacked).
+          # This job never pushes; don't leave the token in the git config
+          # (zizmor: artipacked).
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -89,12 +122,13 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+
       - name: Run redis lock integration test
         env:
-          # The job runs directly on the runner, which shares the pod network
-          # namespace with the dind sidecar, so the mapped service port is
-          # reachable on localhost. redis-only, no default features — leanest
-          # build for the memory-tight (5Gi) with-dind pod.
+          # The job container shares a network namespace with the redis
+          # service container, so the mapped port is reachable on localhost.
+          # redis-only, no default features — leanest build.
           CACHEKIT_TEST_REDIS_URL: redis://localhost:6379
         run: |
           cargo test --no-default-features --features redis --test redis_tests -- --nocapture 2>&1 | tee redis-test.log
@@ -108,12 +142,12 @@ jobs:
 
   memcached:
     name: memcached integration
-    # Same reasoning as redis-lock: `services:` needs Docker, so this runs on
-    # the with-dind `cachekit` scaleset. Without a live memcached the
+    # Same reasoning as redis-lock: hosted runners have Docker built in, so
+    # `services:` needs no extra Docker setup. Without a live memcached the
     # get/set/delete/ttl path has zero automated coverage — the
     # memcached_live_semantics test skips when CACHEKIT_TEST_MEMCACHED_URL is
     # unset (LAB-429: the AC requires memcached exercised against a container).
-    runs-on: cachekit
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
       memcached:
@@ -130,8 +164,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          # This job never pushes; don't leave the token on a self-hosted
-          # runner workspace (zizmor: artipacked).
+          # This job never pushes; don't leave the token in the git config
+          # (zizmor: artipacked).
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -139,12 +173,13 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+
       - name: Run memcached integration test
         env:
-          # The job runs directly on the runner, which shares the pod network
-          # namespace with the dind sidecar, so the mapped service port is
-          # reachable on localhost. memcached-only, no default features —
-          # leanest build for the memory-tight (5Gi) with-dind pod.
+          # The job container shares a network namespace with the memcached
+          # service container, so the mapped port is reachable on localhost.
+          # memcached-only, no default features — leanest build.
           CACHEKIT_TEST_MEMCACHED_URL: tcp://localhost:11211
         run: |
           cargo test --no-default-features --features memcached --test memcached_tests -- --nocapture 2>&1 | tee memcached-test.log
@@ -158,7 +193,7 @@ jobs:
 
   wasm:
     name: wasm32 check + runtime tests
-    runs-on: cachekit-lean
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       # Must equal the wasm-bindgen version in Cargo.lock — the test runner
@@ -175,6 +210,8 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
 
       - name: Check wasm32 build
         run: cargo check -p cachekit-rs --target wasm32-unknown-unknown --features workers,encryption --no-default-features

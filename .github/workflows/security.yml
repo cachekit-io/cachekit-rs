@@ -26,12 +26,6 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # Same rationale as ci.yml: rustup's temp dir must share a filesystem with
-  # RUSTUP_HOME, and -j must be capped or cargo reads the node's core count
-  # instead of the 6Gi pod cgroup and OOM-kills the linker (lab ADR-0001).
-  RUSTUP_HOME: /tmp/rustup
-  CARGO_HOME: /tmp/cargo
-  CARGO_BUILD_JOBS: "4"
   # Pinned so the gate cannot change meaning without a diff. Renovate bumps
   # these like any other pin; the cache key below is derived from them.
   CARGO_DENY_VERSION: "0.19.4"
@@ -42,10 +36,7 @@ env:
 
 jobs:
   supply-chain:
-    # cachekit-lean: neither tool needs Docker — cargo-deny resolves `cargo
-    # metadata`, cargo-audit reads Cargo.lock — so there is no reason to occupy
-    # the scarcer with-dind scaleset.
-    runs-on: cachekit-lean
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       # Checkout is deliberately LAST. cargo honours a `.cargo/config.toml`
@@ -90,8 +81,8 @@ jobs:
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          # This job never pushes; don't leave the token on a self-hosted
-          # runner workspace (zizmor: artipacked).
+          # This job never pushes; don't leave the token in the git config
+          # (zizmor: artipacked).
           persist-credentials: false
 
       - name: cargo deny (advisories + bans + licenses + sources)
