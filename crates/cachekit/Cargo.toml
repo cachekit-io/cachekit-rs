@@ -12,7 +12,7 @@ keywords = ["cache", "redis", "encryption", "moka", "cloudflare-workers"]
 categories = ["caching", "web-programming", "cryptography"]
 
 # docs.rs builds with default features only unless told otherwise; without this
-# the Redis intent presets (minimal/production/encrypted) and the optional
+# the Redis intent presets (minimal/production/secure) and the optional
 # backends never appear in the rendered docs. `workers` stays off — mutually
 # exclusive with redis/l1/reliability/memcached/file (the five compile_error
 # guards in lib.rs).

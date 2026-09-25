@@ -21,7 +21,7 @@
 
 ## Overview
 
-`cachekit-rs` is the Rust SDK for [cachekit.io](https://cachekit.io). Pick an [intent preset](#intent-presets-recommended) — `minimal`, `production`, `encrypted`, or `io` — and get a pre-configured cache in one call, from bare Redis speed to dual-layer with client-side encryption. Pick `encrypted` and bytes never leave your process in plaintext.
+`cachekit-rs` is the Rust SDK for [cachekit.io](https://cachekit.io). Pick an [intent preset](#intent-presets-recommended) — `minimal`, `production`, `secure`, or `io` — and get a pre-configured cache in one call, from bare Redis speed to dual-layer with client-side encryption. Pick `secure` and bytes never leave your process in plaintext.
 
 | Component | What it does |
 |:----------|:-------------|
@@ -54,15 +54,15 @@
 ```toml
 # Defaults: SaaS + encryption + L1
 [dependencies]
-cachekit-rs = "0.7"
+cachekit-rs = "0.8"
 
 # With Redis backend
 [dependencies]
-cachekit-rs = { version = "0.7", features = ["redis"] }
+cachekit-rs = { version = "0.8", features = ["redis"] }
 
 # For Cloudflare Workers (no L1, no Redis)
 [dependencies]
-cachekit-rs = { version = "0.7", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.8", default-features = false, features = ["workers", "encryption"] }
 ```
 
 > [!WARNING]
@@ -85,12 +85,12 @@ One call that names your use case. Each preset returns a pre-configured builder 
 |:-------|:------------|:--------|:--:|:----------:|:------------:|:---------------:|:-----------:|
 | `CacheKit::minimal(url)` | Development, public data, product catalogs — speed first, no extras | Redis³ | ❌ | ❌ | ❌ | ❌ | 300 s |
 | `CacheKit::production(url)` | User sessions, API responses, production services | Redis³ | ✅ | ❌ | ✅ | ✅ | 600 s |
-| `CacheKit::encrypted(url, key)` | PII, payments, GDPR/HIPAA-sensitive data — zero-knowledge AES-256-GCM | Redis³ | ✅ | ✅ | ✅ | ✅ | 600 s |
+| `CacheKit::secure(url, key)` | PII, payments, GDPR/HIPAA-sensitive data — zero-knowledge AES-256-GCM | Redis³ | ✅ | ✅ | ✅ | ✅ | 600 s |
 | `CacheKit::io(api_key)`⁴ | Serverless, edge compute, managed caching without running Redis | cachekit.io | ✅ | ❌ | ✅ | n/a (HTTP) | 3 600 s |
 
 ¹ Retry with backoff + jitter, circuit breaker, backpressure — the [reliability stack](#reliability). Requires the default-on `reliability` feature.
 ² See the resilience contract below.
-³ Requires the `redis` feature flag; `encrypted` also needs the default-on `encryption` feature.
+³ Requires the `redis` feature flag; `secure` also needs the default-on `encryption` feature.
 ⁴ Or `CacheKit::io_from_env()` to read `CACHEKIT_API_KEY`.
 
 ```rust
@@ -98,7 +98,7 @@ use cachekit::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), CachekitError> {
-    // Needs: cachekit-rs = { version = "0.7", features = ["redis"] }
+    // Needs: cachekit-rs = { version = "0.8", features = ["redis"] }
     let cache = CacheKit::production("redis://localhost:6379").await?
         .namespace("api")
         .build()?;
@@ -113,11 +113,11 @@ async fn main() -> Result<(), CachekitError> {
 
 **Resilience contract** — connection failures, at construction and mid-run:
 
-- `production` / `encrypted` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely.
+- `production` / `secure` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely.
 - `minimal` is **fail-fast**: a dropped connection is not re-established — every subsequent operation errors until you rebuild the client.
 - **Initial** connections fail fast for every Redis preset: a bad URL or unreachable Redis errors immediately at construction, never enters a retry loop. `io` opens no connection at construction: an empty API key fails at construction, while an invalid key or unreachable endpoint surfaces at the first request.
-- `encrypted` validates the master key **before** any Redis connection is attempted — a bad key is a deterministic local error, never masked by (or paying for) network I/O.
-- Auto-reconnect is connection-level repair, distinct from the per-operation [reliability stack](#reliability) (retry, circuit breaker, backpressure) that `production` / `encrypted` / `io` also enable. `minimal` has neither — every failure is yours to handle.
+- `secure` validates the master key **before** any Redis connection is attempted — a bad key is a deterministic local error, never masked by (or paying for) network I/O.
+- Auto-reconnect is connection-level repair, distinct from the per-operation [reliability stack](#reliability) (retry, circuit breaker, backpressure) that `production` / `secure` / `io` also enable. `minimal` has neither — every failure is yours to handle.
 
 ### From Environment Variables
 
@@ -163,11 +163,11 @@ let cache = CacheKit::builder()
 
 ## Zero-Knowledge Encryption
 
-Call `.secure()` to get an encrypted cache handle. All values are encrypted client-side with AES-256-GCM before hitting any backend. The backend only ever sees ciphertext.
+Call `.secure_cache()` to get an encrypted cache handle. All values are encrypted client-side with AES-256-GCM before hitting any backend. The backend only ever sees ciphertext.
 
 ```rust
 let cache = CacheKit::from_env()?.build()?;
-let secure = cache.secure()?;
+let secure = cache.secure_cache()?;
 
 // Encrypt → store (backend sees only ciphertext)
 secure.set("user:42:ssn", &"123-45-6789").await?;
@@ -229,7 +229,7 @@ let cache = CacheKit::builder()
 
 Rotation is forward-only: a retired key is never re-promoted (re-promoting would resume a used AES-GCM nonce budget), and a config listing the current key among the previous keys is rejected at load. For the three-phase zero-miss rollout and compromise response, see the [key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/).
 
-**Knowing when to drop the old key.** Every read served by a previous key is counted against that key's position; `cache.secure()?.previous_key_hits()` returns the counts (`hits[i]` for `previous_keys[i]`, current-key reads not counted, no key material). The signal confirms a grace window has drained; it does not shorten one. Follow the protocol's [scheduled-rotation runbook](https://github.com/cachekit-io/protocol/blob/main/decisions/key-rotation.md#runbooks-normative-for-docs): audit for non-expiring entries, add the incoming key as decrypt-only fleet-wide, then promote it. The clock starts only when the promotion deploy has completed on every instance — a lagging instance still writes under the retiring key and reads it silently as *its* current key. From then, wait at least the longest TTL in use (including any explicit `set_with_ttl` values), aggregating counts across every instance (they are per process and reset on restart). Once the retiring key's count has stayed flat over that whole window, every live entry has aged out or been re-encrypted on write, and the key can be dropped from `CACHEKIT_PREVIOUS_MASTER_KEYS` without a hard cut-over.
+**Knowing when to drop the old key.** Every read served by a previous key is counted against that key's position; `cache.secure_cache()?.previous_key_hits()` returns the counts (`hits[i]` for `previous_keys[i]`, current-key reads not counted, no key material). The signal confirms a grace window has drained; it does not shorten one. Follow the protocol's [scheduled-rotation runbook](https://github.com/cachekit-io/protocol/blob/main/decisions/key-rotation.md#runbooks-normative-for-docs): audit for non-expiring entries, add the incoming key as decrypt-only fleet-wide, then promote it. The clock starts only when the promotion deploy has completed on every instance — a lagging instance still writes under the retiring key and reads it silently as *its* current key. From then, wait at least the longest TTL in use (including any explicit `set_with_ttl` values), aggregating counts across every instance (they are per process and reset on restart). Once the retiring key's count has stayed flat over that whole window, every live entry has aged out or been re-encrypted on write, and the key can be dropped from `CACHEKIT_PREVIOUS_MASTER_KEYS` without a hard cut-over.
 
 ---
 
@@ -276,7 +276,7 @@ let backend = CachekitIO::builder()
 Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Requires the `redis` feature flag.
 
 ```toml
-cachekit-rs = { version = "0.7", features = ["redis"] }
+cachekit-rs = { version = "0.8", features = ["redis"] }
 ```
 
 ```rust
@@ -297,7 +297,7 @@ Memcached via [rust-memcache](https://crates.io/crates/memcache) (single server,
 TTLs above memcached's 30-day ceiling are clamped (larger values would be misread as absolute timestamps); values above the item-size limit (default 1 MiB) fail loudly client-side, and a server-side "object too large" classifies as permanent (never retried). Requires the `memcached` feature flag.
 
 ```toml
-cachekit-rs = { version = "0.7", features = ["memcached"] }
+cachekit-rs = { version = "0.8", features = ["memcached"] }
 ```
 
 ```rust
@@ -314,7 +314,7 @@ let backend = MemcachedBackend::builder()
 Local disk cache, **byte-compatible with cachekit-py's File backend** — a py and an rs process pointed at the same directory read each other's entries (Blake2b-128 hashed filenames, shared 14-byte header, atomic write-then-rename, lazy expiry). Implements `TtlInspectable` (TTL read off the on-disk header, in-place refresh). Concurrency matches py: same-process operations serialize on a backend-wide lock (py's `RLock`); on unix, reads and in-place TTL rewrites take advisory `flock` while writes stay lock-free via atomic rename; and expired-entry unlinks are inode-validated so a stale read decision doesn't delete a concurrent writer's fresh entry. On unix the cache directory must be owned by you and not group/other-writable. Not yet ported from py: LRU eviction and size caps — the directory grows until entries expire or you clear it. Requires the `file` feature flag and a tokio runtime (I/O runs via `spawn_blocking`).
 
 ```toml
-cachekit-rs = { version = "0.7", features = ["file"] }
+cachekit-rs = { version = "0.8", features = ["file"] }
 ```
 
 ```rust
@@ -330,7 +330,7 @@ let backend = FileBackend::builder()
 `wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. Requires the `workers` feature with default features disabled.
 
 ```toml
-cachekit-rs = { version = "0.7", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.8", default-features = false, features = ["workers", "encryption"] }
 ```
 
 <details>
@@ -457,14 +457,14 @@ fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
 
 ## Reliability
 
-With the `reliability` feature (default, native only), the `production`, `encrypted`, and `io` presets wrap every backend operation in a reliability stack; `minimal` stays bare for maximum throughput:
+With the `reliability` feature (default, native only), the `production`, `secure`, and `io` presets wrap every backend operation in a reliability stack; `minimal` stays bare for maximum throughput:
 
 | Layer | What it does | Defaults |
 |:------|:-------------|:---------|
 | **Retry** | Truncated exponential backoff + jitter on transient/timeout errors (`BackendErrorKind::is_retryable`); permanent and auth errors propagate immediately | 3 attempts, 100 ms base, 5 s cap, jitter ×[0.5, 1.5) |
 | **Circuit breaker** | closed → open after N retryable failures in a rolling window; fails fast (`BackendErrorKind::CircuitOpen`) while open; half-open probes recovery | threshold 5, window 60 s, open 5 s, 3 probes, close after 3 successes |
 | **Backpressure** | Bounds concurrent backend data ops with a semaphore + bounded waiting queue; over-limit calls are shed with `BackendErrorKind::Backpressure` before reaching the backend — a slow backend can't exhaust the caller's connection pool or memory | 100 concurrent, 1 000 queued, 100 ms wait (Python SDK parity) |
-| **Graceful degradation** | On outage-class backend failure (transient, timeout, open breaker, backpressure shed), `#[cachekit]`-wrapped functions run uncached (fail-open); permanent/auth errors propagate — a wrong API key fails loudly. `secure` paths fail **closed** on everything — encrypted workloads never silently degrade | built into the macro |
+| **Graceful degradation** | On outage-class backend failure (transient, timeout, open breaker, backpressure shed), `#[cachekit]`-wrapped functions run uncached (fail-open); permanent/auth errors propagate — a wrong API key fails loudly. `#[cachekit(secure)]` paths fail **closed** on everything — encrypted workloads never silently degrade | built into the macro |
 | **Single-flight** | Concurrent misses of one key collapse to a single execution: per-key in-process lock, plus a distributed fill lock across processes on lock-capable backends (cachekit.io, Redis) | in-process always on; cross-process 5 s lock, 100 ms polls |
 | **Stale-while-revalidate** | Stale-but-unexpired L1 hits are served immediately while one single-flight-deduplicated background task re-executes the function ([details](#stale-while-revalidate-swr)) | on by default with `l1` (native); threshold 0.5 × entry TTL ±10% jitter |
 

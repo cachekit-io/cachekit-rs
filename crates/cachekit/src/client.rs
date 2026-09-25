@@ -734,13 +734,17 @@ impl CacheKit {
     ///
     /// # Errors
     /// Returns `CachekitError::Config` if no encryption layer is configured.
-    /// Configure encryption via [`CacheKitBuilder::encryption`] or
-    /// [`CacheKitBuilder::encryption_from_bytes`].
+    /// Configure encryption via [`CacheKitBuilder::encryption`] /
+    /// [`CacheKitBuilder::encryption_from_bytes`], or start from the
+    /// `CacheKit::secure` preset (`redis` feature).
     #[cfg(feature = "encryption")]
-    pub fn secure(&self) -> Result<SecureCache<'_>, CachekitError> {
+    pub fn secure_cache(&self) -> Result<SecureCache<'_>, CachekitError> {
         let enc = self.encryption.as_ref().ok_or_else(|| {
             CachekitError::Config(
-                "encryption requires CACHEKIT_MASTER_KEY or .encryption() on builder".to_owned(),
+                "encryption not configured: call .encryption() on the builder, \
+                 use the CacheKit::secure(url, key) preset, or set \
+                 CACHEKIT_MASTER_KEY for CacheKit::from_env()"
+                    .to_owned(),
             )
         })?;
         Ok(SecureCache {
@@ -764,7 +768,7 @@ impl CacheKit {
 
 // ── SecureCache ──────────────────────────────────────────────────────────────
 
-/// Encrypted cache handle returned by [`CacheKit::secure()`].
+/// Encrypted cache handle returned by [`CacheKit::secure_cache()`].
 ///
 /// All values are serialized, then encrypted with AES-256-GCM before storage.
 /// L1 stores ciphertext to maintain zero-knowledge guarantees.
@@ -1068,7 +1072,7 @@ impl CacheKitBuilder {
     /// [`crate::reliability`].
     ///
     /// Enabled by default with production settings by the `production`,
-    /// `encrypted`, and `io` intent presets; off for `minimal` and for
+    /// `secure`, and `io` intent presets; off for `minimal` and for
     /// manually-built clients. To opt a preset out, pass
     /// [`ReliabilityConfig::disabled()`](crate::reliability::ReliabilityConfig::disabled)
     /// — a disabled config applies no wrapping at all.
