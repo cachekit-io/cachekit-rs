@@ -872,6 +872,14 @@ impl SecureCache<'_> {
     /// Retrieve, decrypt, and deserialize a value stored under `key`.
     ///
     /// Checks L1 (which holds ciphertext) before the backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CachekitError::Encryption`] if the stored entry fails
+    /// decryption. The key's L1 copy is dropped first and the backend entry
+    /// is left in place, so the next read reaches the backend: a hit once the
+    /// entry is replaced with ciphertext this client can decrypt, a miss once
+    /// it expires or is deleted.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, CachekitError> {
         match self.get_plaintext(key).await? {
             Some(plaintext) => Ok(Some(serializer::deserialize(&plaintext)?)),
@@ -912,7 +920,8 @@ impl SecureCache<'_> {
     /// # Errors
     ///
     /// Same as [`Self::interop_get`] — the secure path fails closed on every
-    /// backend and decryption error.
+    /// backend and decryption error. A decryption failure also drops the
+    /// key's L1 copy; the backend entry is left in place.
     pub async fn interop_get_swr<T: DeserializeOwned>(
         &self,
         key: &str,
@@ -920,10 +929,10 @@ impl SecureCache<'_> {
         self.client.reject_namespaced_interop()?;
         match self.client.get_bytes_swr(key).await? {
             SwrRead::Fresh(ct) => Ok(SwrRead::Fresh(crate::interop::deserialize(
-                &self.encryption.decrypt(&ct, key)?,
+                &self.decrypt_or_evict(&ct, key)?,
             )?)),
             SwrRead::Stale(ct, token) => Ok(SwrRead::Stale(
-                crate::interop::deserialize(&self.encryption.decrypt(&ct, key)?)?,
+                crate::interop::deserialize(&self.decrypt_or_evict(&ct, key)?)?,
                 token,
             )),
             SwrRead::Miss => Ok(SwrRead::Miss),
@@ -937,9 +946,27 @@ impl SecureCache<'_> {
     /// ciphertext, so decrypt receives the same bytes the backend holds.
     async fn get_plaintext(&self, key: &str) -> Result<Option<Vec<u8>>, CachekitError> {
         match self.client.get_bytes(key).await? {
-            Some(ciphertext) => Ok(Some(self.encryption.decrypt(&ciphertext, key)?)),
+            Some(ciphertext) => Ok(Some(self.decrypt_or_evict(&ciphertext, key)?)),
             None => Ok(None),
         }
+    }
+
+    /// Decrypt ciphertext read for `key`; on failure, drop the key's L1 copy
+    /// before propagating the error.
+    ///
+    /// An L2 hit is backfilled into L1 before it is decrypted, so an entry
+    /// that fails authentication would otherwise keep failing from L1 after
+    /// the backend entry is fixed or deleted. The backend entry itself is
+    /// left untouched as evidence.
+    fn decrypt_or_evict(&self, ciphertext: &[u8], key: &str) -> Result<Vec<u8>, CachekitError> {
+        self.encryption.decrypt(ciphertext, key).inspect_err(|_| {
+            // The read that produced `ciphertext` already resolved this key,
+            // so `resolve_key` cannot fail here.
+            #[cfg(feature = "l1")]
+            if let Ok(full_key) = self.client.resolve_key(key) {
+                self.client.l1_delete(&full_key);
+            }
+        })
     }
 
     /// Delete an encrypted key. Behaves identically to [`CacheKit::delete`].
