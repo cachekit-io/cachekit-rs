@@ -876,9 +876,10 @@ impl SecureCache<'_> {
     /// # Errors
     ///
     /// Returns [`CachekitError::Encryption`] if the stored entry fails
-    /// decryption. The key's L1 copy is dropped first; the backend entry is
-    /// left in place, and once it expires or is deleted the next read is a
-    /// miss.
+    /// decryption. The key's L1 copy is dropped first and the backend entry
+    /// is left in place, so the next read reaches the backend: a hit once the
+    /// entry is replaced with ciphertext this client can decrypt, a miss once
+    /// it expires or is deleted.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, CachekitError> {
         match self.get_plaintext(key).await? {
             Some(plaintext) => Ok(Some(serializer::deserialize(&plaintext)?)),

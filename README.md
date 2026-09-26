@@ -394,7 +394,7 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 | **Backfill on miss** | L2 hits populate L1 with a capped 30s TTL |
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
 | **Encrypted L1** | `SecureCache` stores ciphertext in L1 (never plaintext) |
-| **Evict on decrypt failure** | A `SecureCache` read that fails decryption drops the key's L1 copy and returns the error; the backend entry is kept, and once it expires or is deleted the next read is a miss |
+| **Evict on decrypt failure** | A `SecureCache` read that fails decryption drops the key's L1 copy and returns the error; the backend entry is kept, so the next read reaches the backend: a hit once the entry is replaced with ciphertext the client can decrypt, a miss once it expires or is deleted |
 | **Default capacity** | 1,000 entries (configurable via `.l1_capacity()`) |
 | **Live counters** | `cache.stats()` reports L1 hits / L2 hits / misses; `cache.l1_entry_count()` the current occupancy — see [Observability](#observability) |
 | **Stale-while-revalidate** | On by default (native): `#[cachekit]` serves an L1 hit past `swr_threshold_ratio` × entry TTL (default 0.5, ±10% jitter) immediately and refreshes it in the background — see below |

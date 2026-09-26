@@ -206,8 +206,9 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   decode failures: an entry that fails AES-GCM authentication raises
 ///   `CachekitError::Encryption`, which propagates (fail-closed). The failed
 ///   read drops the key's L1 copy and leaves the backend entry in place, so
-///   the call keeps failing until the backend entry expires or is deleted —
-///   from any process — and the next call is then a miss.
+///   the next call reads the backend again: it fails while that entry
+///   remains, succeeds once any process replaces it with ciphertext this
+///   client can decrypt, and is a miss once it expires or is deleted.
 ///
 /// # Requirements (continued)
 ///
