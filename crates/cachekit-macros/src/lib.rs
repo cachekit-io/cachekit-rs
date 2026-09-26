@@ -204,8 +204,10 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   (`CachekitError::Serialization`) is treated as a miss and overwritten
 ///   (self-healing). On `secure` functions this covers only post-decrypt
 ///   decode failures: an entry that fails AES-GCM authentication raises
-///   `CachekitError::Encryption`, which propagates (fail-closed) until the
-///   entry expires or is deleted.
+///   `CachekitError::Encryption`, which propagates (fail-closed). The failed
+///   read drops the key's L1 copy and leaves the backend entry in place, so
+///   the call keeps failing until the backend entry expires or is deleted —
+///   from any process — and the next call is then a miss.
 ///
 /// # Requirements (continued)
 ///

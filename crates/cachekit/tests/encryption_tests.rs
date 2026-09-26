@@ -285,6 +285,65 @@ async fn secure_l1_stores_ciphertext_not_plaintext() {
     );
 }
 
+/// Write a real ciphertext for `key` through an L1-less client, then flip its
+/// last byte in the backend so it fails AES-GCM authentication. Returns the
+/// planted bytes.
+async fn plant_tampered(shared: SharedBackend, backend: &MockBackend, key: &str) -> Vec<u8> {
+    let writer = make_encrypted_client(shared);
+    writer
+        .secure_cache()
+        .unwrap()
+        .set(key, &"authentic")
+        .await
+        .unwrap();
+    let mut store = backend.store.lock().await;
+    let bytes = store.get_mut(key).expect("writer stored the entry");
+    *bytes.last_mut().unwrap() ^= 0x01;
+    bytes.clone()
+}
+
+#[tokio::test]
+async fn secure_get_evicts_l1_after_decrypt_failure() {
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = make_encrypted_client_with_l1(shared.clone());
+    let secure = client.secure_cache().unwrap();
+    let planted = plant_tampered(shared, &backend, "poisoned").await;
+
+    let err = secure.get::<String>("poisoned").await.unwrap_err();
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+    // The failed read must not remove or rewrite the backend entry.
+    assert_eq!(backend.store.lock().await.get("poisoned"), Some(&planted));
+
+    // Remove the entry behind the client's back: a surviving L1 copy would
+    // keep failing; an evicted one yields a miss.
+    backend.store.lock().await.remove("poisoned");
+    assert_eq!(secure.get::<String>("poisoned").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn secure_interop_get_swr_evicts_l1_after_decrypt_failure() {
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = make_encrypted_client_with_l1(shared.clone());
+    let secure = client.secure_cache().unwrap();
+    let planted = plant_tampered(shared, &backend, "poisoned-swr").await;
+
+    let err = secure
+        .interop_get_swr::<String>("poisoned-swr")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+    assert_eq!(
+        backend.store.lock().await.get("poisoned-swr"),
+        Some(&planted)
+    );
+
+    backend.store.lock().await.remove("poisoned-swr");
+    assert!(matches!(
+        secure.interop_get_swr::<String>("poisoned-swr").await,
+        Ok(cachekit::SwrRead::Miss)
+    ));
+}
+
 #[tokio::test]
 async fn secure_with_namespace() {
     let (shared, backend) = MockBackend::new_with_handle();
