@@ -167,7 +167,8 @@ let cache = CacheKit::builder()
 Call `.secure_cache()` to get an encrypted cache handle. All values are encrypted client-side with AES-256-GCM before hitting any backend. The backend only ever sees ciphertext.
 
 ```rust
-let cache = CacheKit::from_env()?.build()?;
+// Env: CACHEKIT_MASTER_KEY=<64 hex chars>
+let cache = CacheKit::secure_from_env("redis://localhost:6379").await?.build()?;
 let secure = cache.secure_cache()?;
 
 // Encrypt → store (backend sees only ciphertext)

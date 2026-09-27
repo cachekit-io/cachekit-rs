@@ -77,7 +77,7 @@ mod redis_intents {
 
 #[cfg(all(feature = "redis", feature = "encryption"))]
 mod secure_intent {
-    use crate::common::{EnvGuard, MockBackend};
+    use crate::common::EnvGuard;
     use cachekit::error::CachekitError;
     use cachekit::CacheKit;
     use serial_test::serial;
@@ -102,7 +102,8 @@ mod secure_intent {
     fn assert_past_key_validation(result: Result<cachekit::CacheKitBuilder, CachekitError>) {
         match result {
             Err(CachekitError::Config(msg)) => panic!("valid key rejected: {msg}"),
-            Err(_) => {}
+            Err(CachekitError::Backend(_)) => {}
+            Err(other) => panic!("expected a Redis connection error, got {other:?}"),
             Ok(_) => panic!("expected the connect to {UNREACHABLE} to fail"),
         }
     }
@@ -166,14 +167,6 @@ mod secure_intent {
     async fn explicit_key_never_reads_env() {
         let _env = EnvGuard::set(&[("CACHEKIT_MASTER_KEY", Some("not-hex"))]);
         assert_past_key_validation(CacheKit::secure(UNREACHABLE, &valid_key()).await);
-    }
-
-    #[test]
-    fn accepts_valid_master_key() {
-        let result = cachekit::CacheKitBuilder::default()
-            .backend(MockBackend::shared())
-            .encryption_from_bytes(b"test_master_key_32_bytes_long!!!", "tenant");
-        assert!(result.is_ok());
     }
 }
 

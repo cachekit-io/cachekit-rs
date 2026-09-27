@@ -241,7 +241,11 @@ impl CacheKit {
         redis_url: &str,
         master_key_hex: &str,
     ) -> Result<CacheKitBuilder, CachekitError> {
-        connect_secure(redis_url, secure_defaults(master_key_hex, "master_key")?).await
+        connect_secure(
+            redis_url,
+            secure_defaults(master_key_hex, "master_key_hex")?,
+        )
+        .await
     }
 
     /// **Secure**, master key from the environment — [`CacheKit::secure`]
@@ -249,7 +253,8 @@ impl CacheKit {
     ///
     /// Identical preset to [`secure`](CacheKit::secure), same hex decoding,
     /// so the same `CACHEKIT_MASTER_KEY` value derives the same key bytes as
-    /// every other CacheKit SDK. Never falls back to plaintext.
+    /// every other CacheKit SDK. Use exactly **32 bytes (64 hex chars)**, the
+    /// only length every SDK accepts. Never falls back to plaintext.
     ///
     /// # Errors
     ///
@@ -416,7 +421,7 @@ mod secure_tests {
     #[test]
     fn hex_path_decrypts_default_tenant_vector() {
         assert_decrypts_default_tenant_vector(
-            super::secure_defaults(MASTER_KEY_HEX, "master_key").expect("valid key"),
+            super::secure_defaults(MASTER_KEY_HEX, "master_key_hex").expect("valid key"),
         );
     }
 

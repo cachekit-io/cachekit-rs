@@ -1126,12 +1126,12 @@ impl CacheKitBuilder {
 
     /// Configure encryption from a hex-encoded master key string.
     ///
-    /// Convenience wrapper that hex-decodes then delegates to
+    /// Convenience wrapper that hex-decodes (the same decoder as
+    /// [`CacheKit::from_env`] and the `secure` preset) then delegates to
     /// [`Self::encryption_from_bytes`].
     #[cfg(feature = "encryption")]
     pub fn encryption(self, hex_key: &str, tenant_id: &str) -> Result<Self, CachekitError> {
-        let bytes = hex::decode(hex_key)
-            .map_err(|e| CachekitError::Config(format!("master key is not valid hex: {e}")))?;
+        let bytes = crate::config::decode_master_key_hex(hex_key, "master key")?;
         self.encryption_from_bytes(&bytes, tenant_id)
     }
 
