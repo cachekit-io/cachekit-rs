@@ -14,7 +14,7 @@
 //! |------------|-----------|------|------------|-----------------|--------------|-------------|
 //! | `CacheKit::minimal`³ | Redis | On (no SWR) | No | No | Off | 300 s |
 //! | `CacheKit::production`³ | Redis | On | No | Yes | On | 600 s |
-//! | `CacheKit::secure`³ | Redis | On | AES-256-GCM | Yes | On | 600 s |
+//! | `CacheKit::secure`³ ⁵ | Redis | On | AES-256-GCM | Yes | On | 600 s |
 //! | [`io`](CacheKit::io)⁴ | cachekit.io | On | No | n/a (HTTP) | On | 3 600 s |
 //!
 //! ¹ Retry with backoff + jitter, a circuit breaker, and backpressure around
@@ -34,6 +34,12 @@
 //! [`io_from_env`](CacheKit::io_from_env). Neither reads
 //! `CACHEKIT_MASTER_KEY`; unlike [`from_env`](CacheKit::from_env), the `io`
 //! preset never activates encryption from the environment.
+//! ⁵ Master key as a hex string, `secure(url, master_key_hex)`, or from
+//! `CACHEKIT_MASTER_KEY` via `secure_from_env(url)` — the same hex decoding
+//! either way, so one key value derives the same key bytes in every CacheKit
+//! SDK. Use exactly 32 bytes (64 hex chars), the only length every SDK
+//! accepts. A missing, non-hex or short key fails at construction, before
+//! any Redis I/O; `secure` never falls back to plaintext.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {

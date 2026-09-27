@@ -292,16 +292,27 @@ impl CachekitConfigBuilder {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Hex-decode a master key and require at least 32 bytes. Shared by the
-/// current-key and previous-key paths so validation cannot drift.
+/// current-key and previous-key paths and the `secure` preset so validation
+/// cannot drift.
 ///
 /// Returns `Zeroizing` so the decoded key material is wiped on drop for its
 /// whole lifetime — including the early-drop paths where a caller's later
 /// validation step fails.
-fn decode_master_key_hex(hex_key: &str, what: &str) -> Result<Zeroizing<Vec<u8>>, CachekitError> {
-    let bytes = Zeroizing::new(
-        hex::decode(hex_key)
-            .map_err(|e| CachekitError::Config(format!("{what} is not valid hex: {e}")))?,
-    );
+pub(crate) fn decode_master_key_hex(
+    hex_key: &str,
+    what: &str,
+) -> Result<Zeroizing<Vec<u8>>, CachekitError> {
+    let bytes = Zeroizing::new(hex::decode(hex_key).map_err(|e| {
+        // `FromHexError`'s Display quotes the offending character — one
+        // character of the key in an error string (CWE-532). Name the class.
+        // Exhaustive on purpose: a new variant must be reviewed for the same leak.
+        let reason = match e {
+            hex::FromHexError::InvalidHexCharacter { .. } => "contains a non-hex character",
+            hex::FromHexError::OddLength => "odd number of hex digits",
+            hex::FromHexError::InvalidStringLength => "invalid length",
+        };
+        CachekitError::Config(format!("{what} is not valid hex: {reason}"))
+    })?);
     if bytes.len() < 32 {
         return Err(CachekitError::Config(format!(
             "{what} must be at least 32 bytes (64 hex chars); got {} bytes",

@@ -736,14 +736,15 @@ impl CacheKit {
     /// Returns `CachekitError::Config` if no encryption layer is configured.
     /// Configure encryption via [`CacheKitBuilder::encryption`] /
     /// [`CacheKitBuilder::encryption_from_bytes`], or start from the
-    /// `CacheKit::secure` preset (`redis` feature).
+    /// `CacheKit::secure(url, master_key_hex)` /
+    /// `CacheKit::secure_from_env(url)` preset (`redis` feature).
     #[cfg(feature = "encryption")]
     pub fn secure_cache(&self) -> Result<SecureCache<'_>, CachekitError> {
         let enc = self.encryption.as_ref().ok_or_else(|| {
             CachekitError::Config(
-                "encryption not configured: call .encryption() on the builder, \
-                 use the CacheKit::secure(url, key) preset, or set \
-                 CACHEKIT_MASTER_KEY for CacheKit::from_env()"
+                "encryption not configured: use the CacheKit::secure(url, master_key_hex) \
+                 preset, CacheKit::secure_from_env(url) to read the hex key from \
+                 CACHEKIT_MASTER_KEY, or call .encryption() on the builder"
                     .to_owned(),
             )
         })?;
@@ -976,8 +977,9 @@ pub struct CacheKitBuilder {
     #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
     swr_threshold_ratio: Option<f64>,
 
+    // pub(crate): the `secure` preset's key-path tests read the layer.
     #[cfg(feature = "encryption")]
-    encryption: Option<SharedEncryption>,
+    pub(crate) encryption: Option<SharedEncryption>,
 
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
     reliability: Option<crate::reliability::ReliabilityConfig>,

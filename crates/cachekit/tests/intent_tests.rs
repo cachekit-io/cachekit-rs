@@ -2,8 +2,10 @@
 //!
 //! The async Redis intents (minimal, production, secure) connect eagerly,
 //! so their success paths need a live Redis and are not tested here. Their
-//! error paths (invalid URL, invalid key) are deterministic and local — those
-//! are exercised through the public factories directly. The sync io() intent
+//! error paths (invalid URL, invalid or missing key) are deterministic and
+//! local — those are exercised through the public factories directly; the
+//! `secure` key path's byte-level vector test lives beside it in
+//! `src/intents.rs`. The sync io() intent
 //! can be tested end-to-end.
 //!
 //! Run with:
@@ -75,20 +77,95 @@ mod redis_intents {
 
 #[cfg(all(feature = "redis", feature = "encryption"))]
 mod secure_intent {
-    use crate::common::MockBackend;
+    use crate::common::{EnvGuard, MockBackend};
     use cachekit::error::CachekitError;
     use cachekit::CacheKit;
+    use serial_test::serial;
+
+    // Unreachable on purpose: key validation must fire first, so a bad key
+    // gets the deterministic Config error — never a Backend (connection)
+    // error. A valid key gets past validation and fails on the connect.
+    const UNREACHABLE: &str = "redis://127.0.0.1:1";
+
+    fn valid_key() -> String {
+        "a1".repeat(32) // 64 hex chars = 32 bytes
+    }
+
+    fn expect_config_err(result: Result<cachekit::CacheKitBuilder, CachekitError>) -> String {
+        match result {
+            Err(CachekitError::Config(msg)) => msg,
+            Err(other) => panic!("expected Config, got {other:?}"),
+            Ok(_) => panic!("expected Err, got a builder"),
+        }
+    }
+
+    fn assert_past_key_validation(result: Result<cachekit::CacheKitBuilder, CachekitError>) {
+        match result {
+            Err(CachekitError::Config(msg)) => panic!("valid key rejected: {msg}"),
+            Err(_) => {}
+            Ok(_) => panic!("expected the connect to {UNREACHABLE} to fail"),
+        }
+    }
 
     #[tokio::test]
-    async fn rejects_short_master_key_before_connecting() {
-        // The URL points at an unreachable Redis on purpose: key validation
-        // must fire first, so we get the deterministic Config error (a short
-        // key is a configuration mistake) — never a Backend (connection) error.
-        let result = CacheKit::secure("redis://127.0.0.1:1", b"too_short").await;
-        assert!(
-            matches!(result, Err(CachekitError::Config(_))),
-            "short master key must be rejected before any Redis I/O"
-        );
+    async fn rejects_invalid_hex_keys_before_connecting() {
+        let short_31_bytes = "a1".repeat(31);
+        let odd_63_chars = format!("{}a", "a1".repeat(31));
+        let not_hex = format!("{}zz", "a1".repeat(31));
+        for key in [&short_31_bytes, &odd_63_chars, &not_hex] {
+            expect_config_err(CacheKit::secure(UNREACHABLE, key).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn non_hex_error_does_not_quote_the_key() {
+        // hex's own error Display names the offending character — key
+        // material in an error string (CWE-532).
+        let key = format!("{}Q9", "a1".repeat(31));
+        let msg = expect_config_err(CacheKit::secure(UNREACHABLE, &key).await);
+        assert!(!msg.contains('Q'), "error quotes key material: {msg}");
+    }
+
+    #[tokio::test]
+    async fn valid_hex_key_passes_validation() {
+        assert_past_key_validation(CacheKit::secure(UNREACHABLE, &valid_key()).await);
+    }
+
+    // ── CACHEKIT_MASTER_KEY fallback (protocol intent-presets.md § Master Key Input)
+
+    #[tokio::test]
+    #[serial]
+    async fn secure_from_env_fails_when_unset_or_empty() {
+        for value in [None, Some("")] {
+            let _env = EnvGuard::set(&[("CACHEKIT_MASTER_KEY", value)]);
+            let msg = expect_config_err(CacheKit::secure_from_env(UNREACHABLE).await);
+            assert!(msg.contains("CACHEKIT_MASTER_KEY"), "{msg}");
+            assert!(msg.contains("CacheKit::secure"), "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn secure_from_env_rejects_invalid_hex_naming_the_variable() {
+        let short = "a1".repeat(31);
+        let _env = EnvGuard::set(&[("CACHEKIT_MASTER_KEY", Some(&short))]);
+        let msg = expect_config_err(CacheKit::secure_from_env(UNREACHABLE).await);
+        assert!(msg.contains("CACHEKIT_MASTER_KEY"), "{msg}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn secure_from_env_valid_hex_passes_validation() {
+        let key = valid_key();
+        let _env = EnvGuard::set(&[("CACHEKIT_MASTER_KEY", Some(&key))]);
+        assert_past_key_validation(CacheKit::secure_from_env(UNREACHABLE).await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_key_never_reads_env() {
+        let _env = EnvGuard::set(&[("CACHEKIT_MASTER_KEY", Some("not-hex"))]);
+        assert_past_key_validation(CacheKit::secure(UNREACHABLE, &valid_key()).await);
     }
 
     #[test]

@@ -135,8 +135,10 @@ async fn secure_without_master_key_fails() {
     );
     let msg = err.to_string();
     assert!(
-        msg.contains("CacheKit::secure") && msg.contains("CACHEKIT_MASTER_KEY"),
-        "error should name the secure preset and CACHEKIT_MASTER_KEY: {msg}"
+        msg.contains("CacheKit::secure(url, master_key_hex)")
+            && msg.contains("CacheKit::secure_from_env(url)")
+            && msg.contains("CACHEKIT_MASTER_KEY"),
+        "error should name both secure preset forms and CACHEKIT_MASTER_KEY: {msg}"
     );
 }
 
