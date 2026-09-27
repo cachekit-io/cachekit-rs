@@ -83,7 +83,7 @@ One call that names your use case. Each preset returns a pre-configured builder 
 
 | Preset | When to use | Backend | L1 | Encryption | Reliability¹ | Auto-reconnect² | Default TTL |
 |:-------|:------------|:--------|:--:|:----------:|:------------:|:---------------:|:-----------:|
-| `CacheKit::minimal(url)` | Development, public data, product catalogs — speed first, no extras | Redis³ | ❌ | ❌ | ❌ | ❌ | 300 s |
+| `CacheKit::minimal(url)` | Development, public data, product catalogs — speed first, no extras | Redis³ | ✅ (no SWR) | ❌ | ❌ | ❌ | 300 s |
 | `CacheKit::production(url)` | User sessions, API responses, production services | Redis³ | ✅ | ❌ | ✅ | ✅ | 600 s |
 | `CacheKit::secure(url, key)` | PII, payments, GDPR/HIPAA-sensitive data — zero-knowledge AES-256-GCM | Redis³ | ✅ | ✅ | ✅ | ✅ | 600 s |
 | `CacheKit::io(api_key)`⁴ | Serverless, edge compute, managed caching without running Redis | cachekit.io | ✅ | ❌ | ✅ | n/a (HTTP) | 3 600 s |
@@ -114,7 +114,7 @@ async fn main() -> Result<(), CachekitError> {
 **Resilience contract** — connection failures, at construction and mid-run:
 
 - `production` / `secure` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely.
-- `minimal` is **fail-fast**: a dropped connection is not re-established — every subsequent operation errors until you rebuild the client.
+- `minimal` is **fail-fast**: a dropped connection is not re-established — every subsequent operation that reaches Redis errors until you rebuild the client. Reads served from a warm L1 entry still return without contacting Redis.
 - **Initial** connections fail fast for every Redis preset: a bad URL or unreachable Redis errors immediately at construction, never enters a retry loop. `io` opens no connection at construction: an empty API key fails at construction, while an invalid key or unreachable endpoint surfaces at the first request.
 - `secure` validates the master key **before** any Redis connection is attempted — a bad key is a deterministic local error, never masked by (or paying for) network I/O.
 - Auto-reconnect is connection-level repair, distinct from the per-operation [reliability stack](#reliability) (retry, circuit breaker, backpressure) that `production` / `secure` / `io` also enable. `minimal` has neither — every failure is yours to handle.
@@ -396,7 +396,7 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 | **Encrypted L1** | `SecureCache` stores ciphertext in L1 (never plaintext) |
 | **Default capacity** | 1,000 entries (configurable via `.l1_capacity()`) |
 | **Live counters** | `cache.stats()` reports L1 hits / L2 hits / misses; `cache.l1_entry_count()` the current occupancy — see [Observability](#observability) |
-| **Stale-while-revalidate** | On by default (native): `#[cachekit]` serves an L1 hit past `swr_threshold_ratio` × entry TTL (default 0.5, ±10% jitter) immediately and refreshes it in the background — see below |
+| **Stale-while-revalidate** | On by default (native; `minimal` turns it off): `#[cachekit]` serves an L1 hit past `swr_threshold_ratio` × entry TTL (default 0.5, ±10% jitter) immediately and refreshes it in the background — see below |
 
 ### Stale-while-revalidate (SWR)
 
