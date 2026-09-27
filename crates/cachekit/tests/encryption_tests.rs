@@ -345,6 +345,40 @@ async fn secure_interop_get_swr_evicts_l1_after_decrypt_failure() {
 }
 
 #[tokio::test]
+async fn secure_interop_get_swr_evicts_stale_l1_after_decrypt_failure() {
+    // The Stale arm reads straight from L1, so the undecryptable bytes must
+    // already be there: a plain write puts plaintext in this client's L1.
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = CacheKit::builder()
+        .backend(shared)
+        .l1_capacity(100)
+        .swr_threshold_ratio(0.01)
+        .encryption_from_bytes(TEST_MASTER_KEY, "test-tenant")
+        .expect("encryption setup")
+        .build()
+        .expect("client builds");
+    client
+        .set_with_ttl("poisoned-stale", &"plaintext", Duration::from_secs(5))
+        .await
+        .unwrap();
+    // threshold = 0.01 × 5 s = 50 ms (±10%); hard expiry at 5 s.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let secure = client.secure_cache().unwrap();
+    let err = secure
+        .interop_get_swr::<String>("poisoned-stale")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+
+    backend.store.lock().await.remove("poisoned-stale");
+    assert!(matches!(
+        secure.interop_get_swr::<String>("poisoned-stale").await,
+        Ok(cachekit::SwrRead::Miss)
+    ));
+}
+
+#[tokio::test]
 async fn secure_with_namespace() {
     let (shared, backend) = MockBackend::new_with_handle();
     let client = CacheKit::builder()

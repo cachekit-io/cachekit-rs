@@ -899,7 +899,9 @@ impl SecureCache<'_> {
     /// # Errors
     ///
     /// Returns [`CachekitError::Config`] on a namespace-prefixed client — see
-    /// [`CacheKit::interop_get`].
+    /// [`CacheKit::interop_get`] — and [`CachekitError::Encryption`] if the
+    /// stored entry fails decryption, with the key's L1 copy dropped as for
+    /// [`Self::get`].
     pub async fn interop_get<T: DeserializeOwned>(
         &self,
         key: &str,
@@ -920,8 +922,7 @@ impl SecureCache<'_> {
     /// # Errors
     ///
     /// Same as [`Self::interop_get`] — the secure path fails closed on every
-    /// backend and decryption error. A decryption failure also drops the
-    /// key's L1 copy; the backend entry is left in place.
+    /// backend and decryption error.
     pub async fn interop_get_swr<T: DeserializeOwned>(
         &self,
         key: &str,
