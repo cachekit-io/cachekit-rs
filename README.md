@@ -633,10 +633,9 @@ definition (`security.yml`) from the PR head, so a PR could weaken the gate it
 is being graded by — delete a `[bans]` entry, or drop `--all-features` while
 keeping the job name green. Two properties defend against that:
 
-- **Deletion fails closed.** `supply-chain` is a required status check, so a
-  PR that deletes the workflow leaves the context unreported and the PR
-  permanently unmergeable. An API-posted commit status cannot impersonate the
-  check: it is pinned to the GitHub Actions app.
+- **Deletion fails closed.** `supply-chain` is a required status check, and a
+  required check that never reports blocks merge. An API-posted commit status
+  cannot impersonate the check: it is pinned to the GitHub Actions app.
 - **Modification trips a wire.** The job's final step fails the required check
   when a PR changes `deny.toml` or `security.yml` relative to its base, or
   changes any other workflow file that mentions `supply-chain`, unless the PR
