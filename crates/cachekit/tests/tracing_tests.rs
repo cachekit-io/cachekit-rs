@@ -1,4 +1,4 @@
-//! `tracing` feature (LAB-521): every completed cache operation emits one
+//! `tracing` feature: every completed cache operation emits one
 //! debug event on the `cachekit` target carrying `key_hash` — never the key —
 //! and circuit-breaker transitions emit on `cachekit::reliability`.
 //!

@@ -1,4 +1,4 @@
-//! Integration tests for L1 stale-while-revalidate (LAB-728).
+//! Integration tests for L1 stale-while-revalidate.
 //!
 //! Run with:
 //!   cargo test --test swr_tests --features macros,l1
@@ -56,7 +56,7 @@ async fn swr_probe(cache: &CacheKit, id: u64) -> Result<String, CachekitError> {
     Ok(format!("u{id}-c{n}"))
 }
 
-/// The core LAB-728 contract in one scenario: a read past the SWR threshold
+/// The core SWR contract in one scenario: a read past the SWR threshold
 /// (but before hard expiry) returns the stale value without blocking on the
 /// origin; N concurrent stale readers trigger exactly ONE background
 /// re-execution (single-flight dedup); the next read sees the refreshed value

@@ -97,7 +97,7 @@ impl EncryptionLayer {
         }
         // Key-length and tenant checks are configuration errors, kept in the
         // same class as the previous-key and Keyring construction checks
-        // below (LAB-683: config errors must not fold into crypto failures).
+        // below (config errors must not fold into crypto failures).
         if master_key_bytes.len() < 32 {
             return Err(CachekitError::Config(format!(
                 "master key must be at least 32 bytes; got {}",
@@ -125,7 +125,7 @@ impl EncryptionLayer {
         let encryptor = ZeroKnowledgeEncryptor::new()
             .map_err(|e| CachekitError::Encryption(format!("encryptor init failed: {e}")))?;
 
-        // The shared multi-key decrypt helper (cachekit-core, LAB-683) owns
+        // The shared multi-key decrypt helper (cachekit-core) owns
         // the keyring invariants: cap of 3, forward-only self-collision,
         // sequential current-first attempts. Its construction failures are
         // configuration errors, not crypto failures.
@@ -171,7 +171,7 @@ impl EncryptionLayer {
             .keyring
             .decrypt_indexed(&self.encryptor, ciphertext, &self.tenant_id, &aad)
             .map_err(|e| match e {
-                // Config-class errors stay config-class (LAB-683 decision):
+                // Config-class errors stay config-class:
                 // a derivation failure or caller bug must never masquerade as
                 // a decrypt failure that fail-open callers read as a miss.
                 cachekit_core::EncryptionError::KeyDerivation(_)
@@ -278,7 +278,7 @@ impl EncryptionLayer {
     /// requires `compressed` to describe the actual plaintext, and claiming `"False"`
     /// over compressed bytes is the cachekit-py#166 conformance bug (round-trips
     /// in-process, fails authentication for every correct second reader). A compressed
-    /// cross-SDK profile is a versioned protocol change (interop/v2, Multica LAB-1135),
+    /// cross-SDK profile is a versioned protocol change (interop/v2),
     /// not an SDK flag.
     ///
     /// The `"True"`/`"False"` tokens are frozen byte-level protocol constants —
@@ -514,7 +514,7 @@ mod tests {
         assert!(matches!(result, Err(CachekitError::Config(_))));
     }
 
-    // ── Rotation drain signal (LAB-1678) ─────────────────────────────────────
+    // ── Rotation drain signal ────────────────────────────────────────────────
 
     #[test]
     fn current_key_hit_is_not_counted() {

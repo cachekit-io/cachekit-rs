@@ -224,7 +224,7 @@ pub(crate) async fn run_blocking<T>(
 /// whose encoded form is one of the **five reserved path segments** — `.`,
 /// `..`, `health`, `ttl`, `lock` — which is **rejected** with a permanent
 /// [`BackendError`] rather than sent. This is the client's half of the protocol
-/// `spec/saas-api.md` § Cache-Key Path Encoding, rule 2 (LAB-2879).
+/// `spec/saas-api.md` § Cache-Key Path Encoding, rule 2.
 ///
 /// Two distinct hazards, both landing the app's bearer token on a route the SaaS
 /// `cache-key-validator` never vets (CWE-22):
@@ -249,8 +249,8 @@ pub(crate) async fn run_blocking<T>(
 /// inert and sent per rule 1 with their dots raw. Canonical and interop keys
 /// always contain `:` and never meet this rule, so for every non-reserved key
 /// the output is byte-identical to `urlencoding::encode` — preserving cross-SDK
-/// wire parity. rust-url's uniform rejection matches the cachekit-ts twin
-/// (LAB-2877); it diverges from cachekit-py's older `%2E` rewrite
+/// wire parity. rust-url's uniform rejection matches the cachekit-ts twin;
+/// it diverges from cachekit-py's older `%2E` rewrite
 /// (`src/cachekit/backends/cachekitio/backend.py:247-250` @ `f000ba3`), whose
 /// RFC-3986 client kept `%2E%2E` on the wire — the spec now mandates uniform
 /// client-side rejection on every stack.
