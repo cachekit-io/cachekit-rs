@@ -344,6 +344,8 @@ async fn secure_interop_get_swr_evicts_l1_after_decrypt_failure() {
     ));
 }
 
+// SWR staleness exists only on native builds with L1 (see swr_tests.rs).
+#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
 #[tokio::test]
 async fn secure_interop_get_swr_evicts_stale_l1_after_decrypt_failure() {
     // The Stale arm reads straight from L1, so the undecryptable bytes must
@@ -352,16 +354,18 @@ async fn secure_interop_get_swr_evicts_stale_l1_after_decrypt_failure() {
     let client = CacheKit::builder()
         .backend(shared)
         .l1_capacity(100)
-        .swr_threshold_ratio(0.01)
+        .swr_threshold_ratio(0.001)
         .encryption_from_bytes(TEST_MASTER_KEY, "test-tenant")
         .expect("encryption setup")
         .build()
         .expect("client builds");
     client
-        .set_with_ttl("poisoned-stale", &"plaintext", Duration::from_secs(5))
+        .set_with_ttl("poisoned-stale", &"plaintext", Duration::from_secs(60))
         .await
         .unwrap();
-    // threshold = 0.01 × 5 s = 50 ms (±10%); hard expiry at 5 s.
+    // Real time, not tokio's paused clock: L1 ages entries by std Instant, so
+    // a paused sleep leaves the entry Fresh. threshold = 0.001 × 60 s = 60 ms
+    // (±10%); hard expiry at 60 s.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let secure = client.secure_cache().unwrap();
@@ -370,6 +374,9 @@ async fn secure_interop_get_swr_evicts_stale_l1_after_decrypt_failure() {
         .await
         .unwrap_err();
     assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+    // Served from L1, so the entry had not hard-expired into the L2 path.
+    let stats = client.stats();
+    assert_eq!((stats.l1_hits, stats.l2_hits), (1, 0), "{stats:?}");
 
     backend.store.lock().await.remove("poisoned-stale");
     assert!(matches!(
