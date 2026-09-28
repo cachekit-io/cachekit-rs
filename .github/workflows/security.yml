@@ -159,16 +159,12 @@ jobs:
 
       - name: Gate tamper check (deny.toml / security.yml vs base)
         # This job reads its own policy (deny.toml) and its own definition
-        # (this file) from the PR head, so the PR being gated can weaken the
-        # gate while keeping the required `supply-chain` context green — drop
-        # --all-features, append `|| true`, or delete the [bans] entries the
-        # command faithfully enforces. Outright deletion fails closed: a
-        # required context that never reports blocks merge. This step makes
-        # modification fail closed: gate-file diffs turn this required check
-        # red without the approval marker in the PR body (see README "Gate
-        # tamper-evidence"). The second diff below also flags any other
-        # changed workflow file that mentions `supply-chain`, where a
-        # same-named replacement check would live.
+        # (this file) from the PR head, so the PR being gated could weaken the
+        # gate while keeping the required `supply-chain` context green. This
+        # step flags that: it fails the required check when the PR changes
+        # deny.toml, this file, or any other workflow file that mentions
+        # `supply-chain`, unless the PR body carries the approval marker
+        # (README "Gate tamper-evidence").
         #
         # HEAD is the PR merge commit, so HEAD^1 is the base tip it was
         # computed against — exact PR effect, no network, no base-drift

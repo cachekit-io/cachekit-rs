@@ -631,19 +631,17 @@ adding or bumping a dependency.
 The `supply-chain` check reads both its policy (`deny.toml`) and its own
 definition (`security.yml`) from the PR head, so a PR could weaken the gate it
 is being graded by — delete a `[bans]` entry, or drop `--all-features` while
-keeping the job name green. Two properties defend against that:
+keeping the job name green. Two properties make that visible:
 
-- **Deletion fails closed.** `supply-chain` is a required status check, and a
-  required check that never reports blocks merge. An API-posted commit status
-  cannot impersonate the check: it is pinned to the GitHub Actions app.
+- **Deletion fails closed.** `supply-chain` is a required status check: if
+  nothing reports it, the PR cannot merge. The check is pinned to the GitHub
+  Actions app, so a status posted from outside Actions cannot satisfy it.
 - **Modification trips a wire.** The job's final step fails the required check
   when a PR changes `deny.toml` or `security.yml` relative to its base, or
   changes any other workflow file that mentions `supply-chain`, unless the PR
   body contains the exact, case-sensitive string `[gate-change-approved]` (add
   it after human sign-off, *then* push a commit — the marker is read from the
-  push-time event, so a body edit alone does not re-trigger). Legitimate
-  policy updates therefore stay possible, but only as a conscious,
-  loudly-marked act.
+  push-time event, so a body edit alone does not re-trigger).
 
 ## Minimum Supported Rust Version
 
