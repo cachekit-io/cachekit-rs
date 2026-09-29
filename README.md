@@ -85,13 +85,14 @@ One call that names your use case. Each preset returns a pre-configured builder 
 |:-------|:------------|:--------|:--:|:----------:|:------------:|:---------------:|:-----------:|
 | `CacheKit::minimal(url)` | Development, public data, product catalogs — speed first, no extras | Redis³ | ✅ (no SWR) | ❌ | ❌ | ❌ | 300 s |
 | `CacheKit::production(url)` | User sessions, API responses, production services | Redis³ | ✅ | ❌ | ✅ | ✅ | 600 s |
-| `CacheKit::secure(url, key)` | PII, payments, GDPR/HIPAA-sensitive data — zero-knowledge AES-256-GCM | Redis³ | ✅ | ✅ | ✅ | ✅ | 600 s |
+| `CacheKit::secure(url, master_key_hex)`⁵ | PII, payments, GDPR/HIPAA-sensitive data — zero-knowledge AES-256-GCM | Redis³ | ✅ | ✅ | ✅ | ✅ | 600 s |
 | `CacheKit::io(api_key)`⁴ | Serverless, edge compute, managed caching without running Redis | cachekit.io | ✅ | ❌ | ✅ | n/a (HTTP) | 3 600 s |
 
 ¹ Retry with backoff + jitter, circuit breaker, backpressure — the [reliability stack](#reliability). Requires the default-on `reliability` feature.
 ² See the resilience contract below.
 ³ Requires the `redis` feature flag; `secure` also needs the default-on `encryption` feature.
 ⁴ Or `CacheKit::io_from_env()` to read `CACHEKIT_API_KEY`.
+⁵ Or `CacheKit::secure_from_env(url)` to read `CACHEKIT_MASTER_KEY`. Both take the key as a hex string and decode it the same way every CacheKit SDK does. Use exactly 32 bytes (64 hex chars, `openssl rand -hex 32`) — the only length every SDK accepts.
 
 ```rust
 use cachekit::prelude::*;
@@ -116,7 +117,7 @@ async fn main() -> Result<(), CachekitError> {
 - `production` / `secure` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely.
 - `minimal` is **fail-fast**: a dropped connection is not re-established — every subsequent operation that reaches Redis errors until you rebuild the client. Reads served from a warm L1 entry still return without contacting Redis.
 - **Initial** connections fail fast for every Redis preset: a bad URL or unreachable Redis errors immediately at construction, never enters a retry loop. `io` opens no connection at construction: an empty API key fails at construction, while an invalid key or unreachable endpoint surfaces at the first request.
-- `secure` validates the master key **before** any Redis connection is attempted — a bad key is a deterministic local error, never masked by (or paying for) network I/O.
+- `secure` / `secure_from_env` validate the master key **before** any Redis connection is attempted — a missing, non-hex or short key is a deterministic local error, never masked by (or paying for) network I/O, and never a fallback to plaintext.
 - Auto-reconnect is connection-level repair, distinct from the per-operation [reliability stack](#reliability) (retry, circuit breaker, backpressure) that `production` / `secure` / `io` also enable. `minimal` has neither — every failure is yours to handle.
 
 ### From Environment Variables
@@ -166,7 +167,8 @@ let cache = CacheKit::builder()
 Call `.secure_cache()` to get an encrypted cache handle. All values are encrypted client-side with AES-256-GCM before hitting any backend. The backend only ever sees ciphertext.
 
 ```rust
-let cache = CacheKit::from_env()?.build()?;
+// Env: CACHEKIT_MASTER_KEY=<64 hex chars>
+let cache = CacheKit::secure_from_env("redis://localhost:6379").await?.build()?;
 let secure = cache.secure_cache()?;
 
 // Encrypt → store (backend sees only ciphertext)
@@ -542,7 +544,7 @@ Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rus
 |:---------|:--------:|:------------|
 | `CACHEKIT_API_KEY` | ✅ | API key for cachekit.io (`from_env()` and `CacheKit::io_from_env()`) |
 | `CACHEKIT_API_URL` | ❌ | Override API endpoint (default: `https://api.cachekit.io`) |
-| `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key (min 32 bytes) for encryption |
+| `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and `from_env()`); use exactly 32 bytes (64 hex chars) — shorter is rejected |
 | `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (max 3; a blank value is treated as unset) |
 | `CACHEKIT_DEFAULT_TTL` | ❌ | Default TTL in seconds (min 1, default: 300) |
 

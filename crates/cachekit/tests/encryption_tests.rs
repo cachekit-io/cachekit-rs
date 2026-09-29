@@ -135,8 +135,10 @@ async fn secure_without_master_key_fails() {
     );
     let msg = err.to_string();
     assert!(
-        msg.contains("CacheKit::secure") && msg.contains("CACHEKIT_MASTER_KEY"),
-        "error should name the secure preset and CACHEKIT_MASTER_KEY: {msg}"
+        msg.contains("CacheKit::secure(url, master_key_hex)")
+            && msg.contains("CacheKit::secure_from_env(url)")
+            && msg.contains("CACHEKIT_MASTER_KEY"),
+        "error should name both secure preset forms and CACHEKIT_MASTER_KEY: {msg}"
     );
 }
 
@@ -240,6 +242,23 @@ async fn secure_hex_builder() {
 
     let val: u64 = secure.get("hex-test").await.unwrap().unwrap();
     assert_eq!(val, 42);
+}
+
+#[test]
+fn hex_builder_error_does_not_quote_the_key() {
+    // hex's own error Display names the offending character — key material
+    // in an error string (CWE-532).
+    let key = format!("{}Q9", "a1".repeat(31));
+    let err = CacheKit::builder()
+        .backend(MockBackend::shared())
+        .encryption(&key, "hex-tenant")
+        .err()
+        .expect("non-hex key must be rejected");
+    assert!(matches!(err, CachekitError::Config(_)), "got {err:?}");
+    assert!(
+        !err.to_string().contains('Q'),
+        "error quotes key material: {err}"
+    );
 }
 
 #[tokio::test]
