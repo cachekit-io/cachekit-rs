@@ -16,19 +16,34 @@ use crate::error::CachekitError;
 /// every profile and target (wasm32 included), and sits inside the protocol's
 /// required `32..=1024` window (`spec/interop-mode.md` → Decode bounds).
 ///
-/// Depth is only half the bound: see `check_structure` for the allocation
-/// half. `tests/decode_bounds_tests.rs` runs the shared `decode-bounds.json`
-/// vectors against both decode entry points so a dependency bump cannot move
-/// either silently.
+/// Enforced by `check_structure`, the header walk that runs before any value is
+/// decoded, so a too-deep document is rejected with a `decode bound:` error
+/// before `rmp-serde` recurses at all. Depth counts every collection header on
+/// the deepest path, empty collections included: exactly `MAX_DECODE_DEPTH`
+/// levels are accepted, one more is rejected. `tests/decode_bounds_tests.rs`
+/// runs the shared `decode-bounds.json` vectors through both decode entry
+/// points and the client read paths, asserting the guard's error, so a
+/// dependency bump cannot move the bound silently.
 pub const MAX_DECODE_DEPTH: usize = 100;
 
 /// Header-only structural walk over one MessagePack document.
 ///
-/// Proves that a complete document lies within `bytes` and that no header
-/// declares more elements or bytes than the remaining input can back — every
-/// element costs at least one input byte, so `pending ≤ remaining` at every
-/// step means Σ declared ≤ input. Allocates nothing; fails closed on the
-/// reserved marker, truncation, and length overflow.
+/// Proves that a complete document lies within `bytes`, that it nests no deeper
+/// than [`MAX_DECODE_DEPTH`], and that no header declares more elements or bytes
+/// than the remaining input can back — every element costs at least one input
+/// byte, so `pending ≤ remaining` at every step means Σ declared ≤ input.
+/// `pending` sums what every open header still owes, so nested headers that each
+/// fit the input after them but together overclaim are rejected too. All counts
+/// are `u64` and bounded by the input length (a map header adds at most
+/// 2 × (2³² − 1)), so no sum can overflow. Memory is fixed: a
+/// `[u64; MAX_DECODE_DEPTH]` stack of children still owed by each open
+/// collection, whatever the input. Fails closed on the reserved marker,
+/// truncation, excess depth, and length overflow, always with a message
+/// starting `decode bound:`.
+///
+/// Why depth is checked here and not only by `rmp-serde`: a guard that admits
+/// a document deeper than the bound leaves the rejection to the decoder,
+/// mid-recursion, after it has materialised the outer levels.
 ///
 /// Why it is needed even though `rmp-serde` reads str/bin lazily: serde's
 /// sequence visitors (`Vec<T>`, and the `Content` buffer that
@@ -48,6 +63,11 @@ pub(crate) fn check_structure(bytes: &[u8]) -> Result<(), CachekitError> {
         Ok(field.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b)))
     }
 
+    // Children still owed by each open collection, innermost last. Every frame on
+    // the stack is non-zero between elements: a collection is popped as soon as
+    // its last child is read, and an empty one never stays pushed.
+    let mut open = [0u64; MAX_DECODE_DEPTH];
+    let mut depth = 0usize;
     let mut pos = 0usize;
     let mut pending: u64 = 1; // elements still owed by open headers (the root counts as one)
     while pending > 0 {
@@ -56,6 +76,9 @@ pub(crate) fn check_structure(bytes: &[u8]) -> Result<(), CachekitError> {
             .ok_or_else(|| reject("input ends before the document is complete"))?;
         pos += 1;
         pending -= 1;
+        if let Some(parent) = depth.checked_sub(1) {
+            open[parent] -= 1;
+        }
         // (prefix bytes, payload bytes after the prefix, child elements)
         let (prefix, payload, children): (usize, u64, u64) = match marker {
             0x00..=0x7f | 0xc0 | 0xc2 | 0xc3 | 0xe0..=0xff => (0, 0, 0),
@@ -89,6 +112,19 @@ pub(crate) fn check_structure(bytes: &[u8]) -> Result<(), CachekitError> {
                 "header declares more elements than the input can back",
             ));
         }
+        if matches!(marker, 0x80..=0x9f | 0xdc..=0xdf) {
+            // Every collection header is a level, an empty one included.
+            if depth == MAX_DECODE_DEPTH {
+                return Err(reject(&format!(
+                    "nesting deeper than {MAX_DECODE_DEPTH} levels"
+                )));
+            }
+            open[depth] = children;
+            depth += 1;
+        }
+        while depth > 0 && open[depth - 1] == 0 {
+            depth -= 1;
+        }
     }
     Ok(())
 }
@@ -97,17 +133,19 @@ pub(crate) fn check_structure(bytes: &[u8]) -> Result<(), CachekitError> {
 ///
 /// Every decode of backend-supplied bytes (auto-mode [`deserialize`] and
 /// [`crate::interop::deserialize`]) MUST go through here so the bounds cannot
-/// drift between paths. Runs `check_structure` first, then applies
-/// [`MAX_DECODE_DEPTH`].
+/// drift between paths. Runs `check_structure` first, which enforces both the
+/// depth and the allocation bound, then sets `rmp-serde`'s own depth limit to
+/// the same [`MAX_DECODE_DEPTH`] as a backstop: its default (1024) is deep
+/// enough to overflow a debug-build thread stack.
 pub(crate) fn bounded_deserializer(
     bytes: &[u8],
 ) -> Result<rmp_serde::Deserializer<ReadReader<&[u8]>>, CachekitError> {
     check_structure(bytes)?;
     let mut de = rmp_serde::Deserializer::new(bytes);
     // rmp-serde decrements its counter on entry and errors when it reaches 0, so
-    // `set_max_depth(n)` admits n - 1 nested collections. +1 makes the constant mean
-    // what it says: exactly MAX_DECODE_DEPTH levels decode, MAX_DECODE_DEPTH + 1 is
-    // rejected (pinned by tests/decode_bounds_tests.rs).
+    // `set_max_depth(n)` admits n - 1 nested collections. +1 aligns the backstop
+    // with the walk: both admit exactly MAX_DECODE_DEPTH levels, so the walk's
+    // error is the one callers see (pinned by tests/decode_bounds_tests.rs).
     de.set_max_depth(MAX_DECODE_DEPTH + 1);
     Ok(de)
 }
@@ -117,8 +155,9 @@ pub fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, CachekitError> {
     rmp_serde::to_vec_named(value).map_err(|e| CachekitError::Serialization(e.to_string()))
 }
 
-/// Deserialize `bytes` from MessagePack into `T` under the decode bounds
-/// ([`MAX_DECODE_DEPTH`], `check_structure`). Trailing bytes are ignored
+/// Deserialize `bytes` from MessagePack into `T` under the decode bounds: the
+/// `check_structure` walk (depth ≤ [`MAX_DECODE_DEPTH`], no overclaim) runs
+/// before anything is decoded. Trailing bytes are ignored
 /// (auto mode is SDK-internal; interop mode's strict single-document read is
 /// [`crate::interop::deserialize`]).
 pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError> {

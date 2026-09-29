@@ -1,21 +1,33 @@
-//! Untrusted-decode bounds: the shared protocol `decode-bounds.json`
-//! vectors run against BOTH decode entry points, plus the depth-bound boundary.
+//! Untrusted-decode bounds: the shared protocol `decode-bounds.json` vectors run
+//! through every untrusted read path — both decode entry points, and one client
+//! read per decoder (`CacheKit::get`, `CacheKit::interop_get`) against a backend
+//! entry forged with the vector's bytes — plus the depth-bound boundary.
 //!
 //! Vectors: `tests/vectors/decode-bounds.json`, vendored verbatim from
-//! `cachekit-io/protocol` `test-vectors/decode-bounds.json`
-//! (sha256 `fa8bc750a4911fe3663b9ab68f13438a3e924b6bc742e9f6763ca35ad2407476`).
+//! `cachekit-io/protocol` `test-vectors/decode-bounds.json` v1.1.0
+//! (sha256 `907b025d2b270a0f60abd9296a8a1c864e69057c553ac7a70206b44256558916`).
 //! Do not edit the JSON here; regenerate upstream and re-vendor.
 //!
-//! Why 100 and not rmp-serde's 1024, and why a header walk is needed at all:
-//! see the rustdoc on `serializer::MAX_DECODE_DEPTH` and `check_structure`.
-//! This file fails if a dependency bump (or a new decode path bypassing
-//! `bounded_deserializer`) re-opens either bound.
+//! Every reject vector must fail with the structural guard's own error
+//! (`decode bound:` from `serializer::check_structure`), not merely fail: a
+//! stock decoder rejects the same bytes mid-decode, after it has materialised
+//! part of the document, so "it errored" cannot tell a guarded reader from an
+//! unguarded one. The client reads sit below the `#[cachekit]` macro's
+//! conversion of a `Serialization` error into a cache miss, so they still see
+//! the error itself. Why 100 and not rmp-serde's 1024, and why a header walk is
+//! needed at all: see the rustdoc on `serializer::MAX_DECODE_DEPTH` and
+//! `check_structure`. This file fails if a dependency bump (or a new decode
+//! path bypassing `bounded_deserializer`) re-opens either bound.
+
+mod common;
 
 use cachekit::interop;
 use cachekit::serializer::{self, MAX_DECODE_DEPTH};
-use cachekit::CachekitError;
+use cachekit::{CacheKit, CachekitError};
 use serde::Deserialize;
 use serde_json::Value as Json;
+
+use crate::common::MockBackend;
 
 const VECTORS_JSON: &str = include_str!("vectors/decode-bounds.json");
 
@@ -30,8 +42,10 @@ fn unhex(s: &str) -> Vec<u8> {
         .collect()
 }
 
+type Read = (&'static str, Result<Json, CachekitError>);
+
 /// Both untrusted decode entry points: auto-mode `get` and interop `interop_get`.
-fn decode_both(bytes: &[u8]) -> [(&'static str, Result<Json, CachekitError>); 2] {
+fn decode_both(bytes: &[u8]) -> [Read; 2] {
     [
         (
             "serializer::deserialize",
@@ -39,6 +53,53 @@ fn decode_both(bytes: &[u8]) -> [(&'static str, Result<Json, CachekitError>); 2]
         ),
         ("interop::deserialize", interop::deserialize::<Json>(bytes)),
     ]
+}
+
+/// Every untrusted read path for `bytes`: both decoders directly, then one
+/// client read per decoder of a backend entry holding exactly `bytes`. `get`
+/// stores plain MessagePack (no envelope), so the forged entry is the vector
+/// itself. L1 is off so each read reaches the backend and its decoder.
+fn read_every_path(bytes: &[u8]) -> Vec<Read> {
+    const KEY: &str = "decode:bounds:forged";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (backend, handle) = MockBackend::new_with_handle();
+    let client = CacheKit::builder()
+        .backend(backend)
+        .no_l1()
+        .build()
+        .expect("client builds");
+    let found = |r: Result<Option<Json>, CachekitError>| {
+        r.map(|v| v.expect("the forged entry must be found, not missed"))
+    };
+    let mut reads = Vec::from(decode_both(bytes));
+    runtime.block_on(async {
+        handle
+            .store
+            .lock()
+            .await
+            .insert(KEY.to_owned(), bytes.to_vec());
+        reads.push(("CacheKit::get", found(client.get::<Json>(KEY).await)));
+        reads.push((
+            "CacheKit::interop_get",
+            found(client.interop_get::<Json>(KEY).await),
+        ));
+    });
+    reads
+}
+
+/// The guard's rejection, and nothing else: a `Serialization` error whose
+/// message comes from `check_structure`.
+fn assert_guard_rejected(what: &str, path: &str, result: Result<Json, CachekitError>) {
+    let e = result
+        .err()
+        .unwrap_or_else(|| panic!("{what}: {path} decoded a document it must reject"));
+    assert!(
+        matches!(e, CachekitError::Serialization(ref m) if m.starts_with("decode bound:")),
+        "{what}: {path} must fail in the structural guard, got {e:?}"
+    );
 }
 
 /// Rejecting a document nested N deep unwinds N recursion frames. Run each case on
@@ -53,49 +114,60 @@ fn on_default_stack<F: FnOnce() + Send + 'static>(f: F) {
         .expect("decode must not panic or overflow the stack");
 }
 
+/// `[[...[null]...]]`, `depth` levels.
 fn nested_fixarray(depth: usize) -> Vec<u8> {
     let mut v = vec![0x91u8; depth];
     v.push(0xc0);
     v
 }
 
+/// `{"": {"": ... null}}`, `depth` levels.
+fn nested_fixmap(depth: usize) -> Vec<u8> {
+    let mut v = [0x81u8, 0xa0].repeat(depth);
+    v.push(0xc0);
+    v
+}
+
+/// `[[...[]...]]`, `depth` levels: the innermost level is an EMPTY array, which
+/// still counts as a level.
+fn nested_fixarray_empty_leaf(depth: usize) -> Vec<u8> {
+    let mut v = vec![0x91u8; depth - 1];
+    v.push(0x90);
+    v
+}
+
 #[test]
 fn vector_file_shape_is_the_vendored_one() {
     let v = vectors();
-    assert_eq!(v["reject_vectors"].as_array().map(Vec::len), Some(10));
-    assert_eq!(v["accept_vectors"].as_array().map(Vec::len), Some(2));
+    assert_eq!(v["version"], "1.1.0");
+    assert_eq!(v["reject_vectors"].as_array().map(Vec::len), Some(17));
+    assert_eq!(v["accept_vectors"].as_array().map(Vec::len), Some(3));
     assert_eq!(v["spec"], "spec/interop-mode.md#decode-bounds");
 }
 
 #[test]
-fn every_reject_vector_is_rejected_by_both_decoders() {
+fn every_reject_vector_is_rejected_by_the_guard_on_every_read_path() {
     on_default_stack(|| {
         for vector in vectors()["reject_vectors"].as_array().unwrap() {
             let name = vector["name"].as_str().unwrap();
             let bytes = unhex(vector["input_hex"].as_str().unwrap());
-            for (path, result) in decode_both(&bytes) {
-                let err = result
-                    .err()
-                    .unwrap_or_else(|| panic!("{name}: {path} decoded a reject vector"));
-                assert!(
-                    matches!(err, CachekitError::Serialization(_)),
-                    "{name}: {path} must fail as a catchable Serialization error, got {err:?}"
-                );
+            for (path, result) in read_every_path(&bytes) {
+                assert_guard_rejected(name, path, result);
             }
         }
     });
 }
 
 #[test]
-fn every_accept_vector_decodes_on_both_paths() {
+fn every_accept_vector_decodes_on_every_read_path() {
     on_default_stack(|| {
         for vector in vectors()["accept_vectors"].as_array().unwrap() {
             let name = vector["name"].as_str().unwrap();
             let bytes = unhex(vector["input_hex"].as_str().unwrap());
-            for (path, result) in decode_both(&bytes) {
+            let depth = vector["nesting_depth"].as_u64().unwrap();
+            for (path, result) in read_every_path(&bytes) {
                 let value = result
                     .unwrap_or_else(|e| panic!("{name}: {path} rejected an accept vector: {e}"));
-                let depth = vector["nesting_depth"].as_u64().unwrap();
                 assert_eq!(
                     nesting_depth(&value) as u64,
                     depth,
@@ -120,22 +192,56 @@ fn depth_bound_is_owned_and_matches_the_typescript_sdk() {
     // far below the stack-overflow region measured for debug builds (512..768).
     assert_eq!(MAX_DECODE_DEPTH, 100);
     on_default_stack(|| {
-        for (path, result) in decode_both(&nested_fixarray(MAX_DECODE_DEPTH)) {
-            assert_eq!(
-                nesting_depth(&result.unwrap()),
-                MAX_DECODE_DEPTH,
-                "{path}: depth == bound must decode"
-            );
+        for (shape, bytes) in [
+            ("fixarray", nested_fixarray(MAX_DECODE_DEPTH)),
+            ("fixmap", nested_fixmap(MAX_DECODE_DEPTH)),
+            (
+                "empty-leaf fixarray",
+                nested_fixarray_empty_leaf(MAX_DECODE_DEPTH),
+            ),
+        ] {
+            for (path, result) in read_every_path(&bytes) {
+                let value = result
+                    .unwrap_or_else(|e| panic!("{shape}: {path}: depth == bound must decode: {e}"));
+                assert_eq!(
+                    nesting_depth(&value),
+                    MAX_DECODE_DEPTH,
+                    "{shape}: {path}: decoded to the wrong shape"
+                );
+            }
         }
-        for (path, result) in decode_both(&nested_fixarray(MAX_DECODE_DEPTH + 1)) {
-            let msg = result
-                .err()
-                .unwrap_or_else(|| panic!("{path}: depth bound+1 decoded"))
-                .to_string();
-            assert!(
-                msg.contains("depth limit exceeded"),
-                "{path}: expected the depth-limit error, got {msg}"
-            );
+        for (shape, bytes) in [
+            ("fixarray", nested_fixarray(MAX_DECODE_DEPTH + 1)),
+            ("fixmap", nested_fixmap(MAX_DECODE_DEPTH + 1)),
+            // 0x91 x 100 + 0x90: the 101st level is empty and must still count.
+            (
+                "empty-leaf fixarray",
+                nested_fixarray_empty_leaf(MAX_DECODE_DEPTH + 1),
+            ),
+        ] {
+            for (path, result) in read_every_path(&bytes) {
+                assert_guard_rejected(&format!("{shape} at depth bound+1"), path, result);
+            }
+        }
+    });
+}
+
+/// Depth is the deepest path, not the number of collections: a closed empty
+/// collection must release its level, so many shallow siblings stay legal.
+#[test]
+fn closed_collections_release_their_depth() {
+    // [[], [], ... x 200] at depth 2, then [[[...]]] siblings at the bound.
+    let mut wide = vec![0xdc, 0x00, 0xc8];
+    wide.extend(std::iter::repeat_n(0x90, 200));
+    let mut siblings = vec![0x92];
+    siblings.extend(nested_fixarray(MAX_DECODE_DEPTH - 1));
+    siblings.extend(nested_fixarray_empty_leaf(MAX_DECODE_DEPTH - 1));
+    on_default_stack(move || {
+        for (shape, bytes, depth) in [("wide", wide, 2), ("siblings", siblings, MAX_DECODE_DEPTH)] {
+            for (path, result) in decode_both(&bytes) {
+                let value = result.unwrap_or_else(|e| panic!("{shape}: {path}: {e}"));
+                assert_eq!(nesting_depth(&value), depth, "{shape}: {path}");
+            }
         }
     });
 }
