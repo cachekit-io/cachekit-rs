@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.8.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.7.0...cachekit-rs-v0.8.0) (2026-09-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* **intents:** `CacheKit::secure` takes the master key as a hex string (`master_key_hex: &str`) instead of raw bytes (`master_key: &[u8]`). The key must decode to at least 32 bytes and is validated before any Redis connection is attempted. There is no longer a raw-bytes preset; decoded bytes go through `CacheKitBuilder::encryption_from_bytes`. The new `CacheKit::secure_from_env` reads the key from `CACHEKIT_MASTER_KEY`.
+* **interop:** reject reserved namespaces ns and nsapi (LAB-5876) ([#89](https://github.com/cachekit-io/cachekit-rs/issues/89))
+* **intents:** `CacheKit::minimal` now enables an in-process L1 cache (1000 entries, no stale-while-revalidate, no cross-process invalidation). A `minimal` read may serve an L1 entry for up to its 300 s TTL after another writer changed the value in Redis. Chain `.no_l1()` on the returned builder to restore read-through-every-time behaviour.
+* **intents:** `CacheKit::encrypted(url, key)` is now `CacheKit::secure(url, key)`, and the `SecureCache` accessor `cache.secure()` is now `cache.secure_cache()`. Migration: rename both call sites; behaviour, defaults and feature gates are unchanged.
+
+### Features
+
+* **encryption:** keyring rotation — previous_master_keys + sequential decrypt (LAB-686) ([#63](https://github.com/cachekit-io/cachekit-rs/issues/63)) ([8b9e7ac](https://github.com/cachekit-io/cachekit-rs/commit/8b9e7ac03f803b7e9f2979537f525136fdc59c40))
+* **encryption:** surface hardware-acceleration detection (LAB-523) ([fd03a12](https://github.com/cachekit-io/cachekit-rs/commit/fd03a12a1ddcd08f72c41522d26b4a0c989a3df9))
+* **intents:** CacheKit::io falls back to CACHEKIT_API_KEY via io_from_env (LAB-4647) ([#86](https://github.com/cachekit-io/cachekit-rs/issues/86)) ([464b9d2](https://github.com/cachekit-io/cachekit-rs/commit/464b9d29ad551be9e3d169f73a07a3748e8739b6))
+* **intents:** CacheKit::secure takes a hex master key, add secure_from_env (LAB-4645) ([#88](https://github.com/cachekit-io/cachekit-rs/issues/88)) ([50211d3](https://github.com/cachekit-io/cachekit-rs/commit/50211d32f4f7744e6e94fbc566ba4ef7d1e1257c))
+* **observability:** live read counters, auto-wired SaaS telemetry, tracing events (LAB-521) ([#81](https://github.com/cachekit-io/cachekit-rs/issues/81)) ([afe77ad](https://github.com/cachekit-io/cachekit-rs/commit/afe77add961601eb05772599ff9ef7d6d1947308))
+* **rs:** surface rotation drain signal via decrypt_indexed (LAB-1678) ([#74](https://github.com/cachekit-io/cachekit-rs/issues/74)) ([15b94cf](https://github.com/cachekit-io/cachekit-rs/commit/15b94cfb0ebab032af67b39363a3d5ef89a6c82c))
+
+
+### Bug Fixes
+
+* **cachekitio:** reject reserved cache-key segments in request path (LAB-2878) ([#76](https://github.com/cachekit-io/cachekit-rs/issues/76)) ([0ed7e1d](https://github.com/cachekit-io/cachekit-rs/commit/0ed7e1d0e75a21b8deffb59031897fe664b3dc6e))
+* **intents:** CacheKit::minimal enables L1 with SWR off per intent-preset contract (LAB-4644) ([#85](https://github.com/cachekit-io/cachekit-rs/issues/85)) ([e0d4388](https://github.com/cachekit-io/cachekit-rs/commit/e0d4388acb7536d3710845254de131d343fc2bf1))
+* **interop:** reject reserved namespaces ns and nsapi (LAB-5876) ([#89](https://github.com/cachekit-io/cachekit-rs/issues/89)) ([5e3aa2f](https://github.com/cachekit-io/cachekit-rs/commit/5e3aa2f3d9900d546d4e89d102f3c018b6e38215))
+* **secure:** evict L1 copy when decryption fails (LAB-5570) ([#87](https://github.com/cachekit-io/cachekit-rs/issues/87)) ([fe5170d](https://github.com/cachekit-io/cachekit-rs/commit/fe5170d8da12f201ea8cb431aa70b0dad66275ba))
+* **serializer:** enforce decode depth in the structural guard and vendor decode-bounds 1.1.0 (LAB-3481) ([b45be1a](https://github.com/cachekit-io/cachekit-rs/commit/b45be1a9423bb57e75b808b4f8bddf53c0858695))
+* **serializer:** own the msgpack decode depth bound and add a structural walk (LAB-2503) ([#73](https://github.com/cachekit-io/cachekit-rs/issues/73)) ([306c1b1](https://github.com/cachekit-io/cachekit-rs/commit/306c1b1529ddfa025d809bc465a1dedaa98e2139))
+
+
+### Code Refactoring
+
+* **intents:** rename CacheKit::encrypted to CacheKit::secure (LAB-4651) ([#82](https://github.com/cachekit-io/cachekit-rs/issues/82)) ([11802d9](https://github.com/cachekit-io/cachekit-rs/commit/11802d9c3a002f4782269222ff610d9f18331ca7))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.7.0 to 0.8.0
+
 ## [0.7.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.6.1...cachekit-rs-v0.7.0) (2026-08-07)
 
 

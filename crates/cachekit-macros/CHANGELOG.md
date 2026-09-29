@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.8.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.7.0...cachekit-macros-v0.8.0) (2026-09-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* **interop:** reject reserved namespaces ns and nsapi (LAB-5876) ([#89](https://github.com/cachekit-io/cachekit-rs/issues/89))
+* **intents:** `CacheKit::encrypted(url, key)` is now `CacheKit::secure(url, key)`, and the `SecureCache` accessor `cache.secure()` is now `cache.secure_cache()`. Migration: rename both call sites; behaviour, defaults and feature gates are unchanged.
+
+### Bug Fixes
+
+* **interop:** reject reserved namespaces ns and nsapi (LAB-5876) ([#89](https://github.com/cachekit-io/cachekit-rs/issues/89)) ([5e3aa2f](https://github.com/cachekit-io/cachekit-rs/commit/5e3aa2f3d9900d546d4e89d102f3c018b6e38215))
+* **secure:** evict L1 copy when decryption fails (LAB-5570) ([#87](https://github.com/cachekit-io/cachekit-rs/issues/87)) ([fe5170d](https://github.com/cachekit-io/cachekit-rs/commit/fe5170d8da12f201ea8cb431aa70b0dad66275ba))
+
+
+### Code Refactoring
+
+* **intents:** rename CacheKit::encrypted to CacheKit::secure (LAB-4651) ([#82](https://github.com/cachekit-io/cachekit-rs/issues/82)) ([11802d9](https://github.com/cachekit-io/cachekit-rs/commit/11802d9c3a002f4782269222ff610d9f18331ca7))
+
 ## [0.7.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.6.1...cachekit-macros-v0.7.0) (2026-08-07)
 
 
