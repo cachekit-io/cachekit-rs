@@ -214,7 +214,7 @@ Cross-SDK compatible — ciphertext produced by the Python SDK decrypts with the
 
 </details>
 
-**Is AES hardware-accelerated on this host?** `cache.secure()?.hardware_acceleration_enabled()` (also on `EncryptionLayer`) forwards cachekit-core's detection. Informational only: `ring`/`aes-gcm` pick their implementation independently, so use it to explain `.secure()` latency, not to change behaviour. The per-architecture semantics are core's — as of cachekit-core 0.6 a runtime AES-NI probe on x86/x86_64, `true` on every aarch64 build (it tests NEON, which all aarch64 targets enable, not the Crypto Extension — a Cortex-A72-class board reports `true` while running software AES), and `false` on wasm32.
+**Is AES hardware-accelerated on this host?** `cache.secure_cache()?.hardware_acceleration_enabled()` (also on `EncryptionLayer`) forwards cachekit-core's detection. Informational only: `ring`/`aes-gcm` pick their implementation independently, so use it to explain secure-cache latency, not to change behaviour. The per-architecture semantics are core's — as of cachekit-core 0.6.0 a runtime AES-NI probe on x86/x86_64, `true` on every aarch64 build (it tests NEON, which all aarch64 targets enable, not the Crypto Extension — a Raspberry Pi 4, a Cortex-A72 without the Crypto Extension, reports `true` while running software AES), and `false` on wasm32.
 
 ### Key Rotation
 
