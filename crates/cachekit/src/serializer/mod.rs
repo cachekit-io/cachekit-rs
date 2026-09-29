@@ -16,14 +16,7 @@ use crate::error::CachekitError;
 /// every profile and target (wasm32 included), and sits inside the protocol's
 /// required `32..=1024` window (`spec/interop-mode.md` → Decode bounds).
 ///
-/// Enforced by `check_structure`, the header walk that runs before any value is
-/// decoded, so a too-deep document is rejected with a `decode bound:` error
-/// before `rmp-serde` recurses at all. Depth counts every collection header on
-/// the deepest path, empty collections included: exactly `MAX_DECODE_DEPTH`
-/// levels are accepted, one more is rejected. `tests/decode_bounds_tests.rs`
-/// runs the shared `decode-bounds.json` vectors through both decode entry
-/// points and the client read paths, asserting the guard's error, so a
-/// dependency bump cannot move the bound silently.
+/// Enforced by `check_structure`, which defines how depth is counted.
 pub const MAX_DECODE_DEPTH: usize = 100;
 
 /// Header-only structural walk over one MessagePack document.
@@ -34,8 +27,12 @@ pub const MAX_DECODE_DEPTH: usize = 100;
 /// byte, so `pending ≤ remaining` at every step means Σ declared ≤ input.
 /// `pending` sums what every open header still owes, so nested headers that each
 /// fit the input after them but together overclaim are rejected too. All counts
-/// are `u64` and bounded by the input length (a map header adds at most
-/// 2 × (2³² − 1)), so no sum can overflow. Memory is fixed: a
+/// are `u64`: before each header is added `pending` is at most the remaining
+/// input, and one header adds less than 2³³ (a map32 declares 2 × (2³² − 1)
+/// children), so no sum can overflow. Depth counts every array and map header
+/// on the deepest path, empty ones included; scalars, str, bin and ext are
+/// leaves. Exactly `MAX_DECODE_DEPTH` levels are accepted, one more is rejected
+/// with a `decode bound:` error before `rmp-serde` recurses. Memory is fixed: a
 /// `[u64; MAX_DECODE_DEPTH]` stack of children still owed by each open
 /// collection, whatever the input. Fails closed on the reserved marker,
 /// truncation, excess depth, and length overflow, always with a message
@@ -63,9 +60,10 @@ pub(crate) fn check_structure(bytes: &[u8]) -> Result<(), CachekitError> {
         Ok(field.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b)))
     }
 
-    // Children still owed by each open collection, innermost last. Every frame on
-    // the stack is non-zero between elements: a collection is popped as soon as
-    // its last child is read, and an empty one never stays pushed.
+    // Children still owed by each open collection, innermost last. The top frame
+    // is non-zero between elements; an ancestor may reach 0 while its last child
+    // is still open, so the pop loop drains every finished frame, and an empty
+    // collection never stays pushed.
     let mut open = [0u64; MAX_DECODE_DEPTH];
     let mut depth = 0usize;
     let mut pos = 0usize;
@@ -134,19 +132,21 @@ pub(crate) fn check_structure(bytes: &[u8]) -> Result<(), CachekitError> {
 /// Every decode of backend-supplied bytes (auto-mode [`deserialize`] and
 /// [`crate::interop::deserialize`]) MUST go through here so the bounds cannot
 /// drift between paths. Runs `check_structure` first, which enforces both the
-/// depth and the allocation bound, then sets `rmp-serde`'s own depth limit to
-/// the same [`MAX_DECODE_DEPTH`] as a backstop: its default (1024) is deep
-/// enough to overflow a debug-build thread stack.
+/// depth and the allocation bound, then sets `rmp-serde`'s own depth limit as a
+/// backstop just above [`MAX_DECODE_DEPTH`]: its default (1024) is deep enough
+/// to overflow a debug-build thread stack.
 pub(crate) fn bounded_deserializer(
     bytes: &[u8],
 ) -> Result<rmp_serde::Deserializer<ReadReader<&[u8]>>, CachekitError> {
     check_structure(bytes)?;
     let mut de = rmp_serde::Deserializer::new(bytes);
     // rmp-serde decrements its counter on entry and errors when it reaches 0, so
-    // `set_max_depth(n)` admits n - 1 nested collections. +1 aligns the backstop
-    // with the walk: both admit exactly MAX_DECODE_DEPTH levels, so the walk's
-    // error is the one callers see (pinned by tests/decode_bounds_tests.rs).
-    de.set_max_depth(MAX_DECODE_DEPTH + 1);
+    // `set_max_depth(n)` admits n - 1 levels, and it counts an ext value as a
+    // level where the walk (and the spec) count it as a leaf. Ext is always a
+    // leaf, so +2 admits every document the walk admits, including an ext at the
+    // bound, and the walk's error is the one callers see for anything deeper
+    // (both pinned by tests/decode_bounds_tests.rs).
+    de.set_max_depth(MAX_DECODE_DEPTH + 2);
     Ok(de)
 }
 

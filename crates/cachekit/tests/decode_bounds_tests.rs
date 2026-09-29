@@ -1,7 +1,8 @@
 //! Untrusted-decode bounds: the shared protocol `decode-bounds.json` vectors run
-//! through every untrusted read path — both decode entry points, and one client
-//! read per decoder (`CacheKit::get`, `CacheKit::interop_get`) against a backend
-//! entry forged with the vector's bytes — plus the depth-bound boundary.
+//! through every untrusted read path — both decode entry points, and every
+//! client read (`CacheKit::get`, `CacheKit::interop_get`,
+//! `CacheKit::interop_get_swr`) against a backend entry forged with the
+//! vector's bytes — plus the depth-bound boundary.
 //!
 //! Vectors: `tests/vectors/decode-bounds.json`, vendored verbatim from
 //! `cachekit-io/protocol` `test-vectors/decode-bounds.json` v1.1.0
@@ -23,7 +24,8 @@ mod common;
 
 use cachekit::interop;
 use cachekit::serializer::{self, MAX_DECODE_DEPTH};
-use cachekit::{CacheKit, CachekitError};
+use cachekit::{CacheKit, CachekitError, SwrRead};
+use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::Value as Json;
 
@@ -55,8 +57,8 @@ fn decode_both(bytes: &[u8]) -> [Read; 2] {
     ]
 }
 
-/// Every untrusted read path for `bytes`: both decoders directly, then one
-/// client read per decoder of a backend entry holding exactly `bytes`. `get`
+/// Every untrusted read path for `bytes`: both decoders directly, then every
+/// client read of a backend entry holding exactly `bytes`. `get`
 /// stores plain MessagePack (no envelope), so the forged entry is the vector
 /// itself. L1 is off so each read reaches the backend and its decoder.
 fn read_every_path(bytes: &[u8]) -> Vec<Read> {
@@ -86,6 +88,16 @@ fn read_every_path(bytes: &[u8]) -> Vec<Read> {
             "CacheKit::interop_get",
             found(client.interop_get::<Json>(KEY).await),
         ));
+        reads.push((
+            "CacheKit::interop_get_swr",
+            client
+                .interop_get_swr::<Json>(KEY)
+                .await
+                .map(|read| match read {
+                    SwrRead::Fresh(v) => v,
+                    _ => panic!("with L1 off the forged entry must be a fresh hit"),
+                }),
+        ));
     });
     reads
 }
@@ -114,19 +126,29 @@ fn on_default_stack<F: FnOnce() + Send + 'static>(f: F) {
         .expect("decode must not panic or overflow the stack");
 }
 
-/// `[[...[null]...]]`, `depth` levels.
-fn nested_fixarray(depth: usize) -> Vec<u8> {
-    let mut v = vec![0x91u8; depth];
+/// `level` repeated `depth` times around `null`; `level` is one collection
+/// header of one child (plus the key, for a map).
+fn nest(level: &[u8], depth: usize) -> Vec<u8> {
+    let mut v = level.repeat(depth);
     v.push(0xc0);
     v
 }
 
-/// `{"": {"": ... null}}`, `depth` levels.
-fn nested_fixmap(depth: usize) -> Vec<u8> {
-    let mut v = [0x81u8, 0xa0].repeat(depth);
-    v.push(0xc0);
-    v
+/// `[[...[null]...]]`, `depth` levels.
+fn nested_fixarray(depth: usize) -> Vec<u8> {
+    nest(&[0x91], depth)
 }
+
+/// One level of every collection header width, each backed by exactly one child,
+/// so the overclaim check never fires and only depth can reject.
+const LEVELS: [(&str, &[u8]); 6] = [
+    ("fixarray", &[0x91]),
+    ("array16", &[0xdc, 0x00, 0x01]),
+    ("array32", &[0xdd, 0x00, 0x00, 0x00, 0x01]),
+    ("fixmap", &[0x81, 0xa0]),
+    ("map16", &[0xde, 0x00, 0x01, 0xa0]),
+    ("map32", &[0xdf, 0x00, 0x00, 0x00, 0x01, 0xa0]),
+];
 
 /// `[[...[]...]]`, `depth` levels: the innermost level is an EMPTY array, which
 /// still counts as a level.
@@ -191,15 +213,20 @@ fn depth_bound_is_owned_and_matches_the_typescript_sdk() {
     // The protocol requires 32 <= bound <= 1024; 100 matches cachekit-ts and stays
     // far below the stack-overflow region measured for debug builds (512..768).
     assert_eq!(MAX_DECODE_DEPTH, 100);
-    on_default_stack(|| {
-        for (shape, bytes) in [
-            ("fixarray", nested_fixarray(MAX_DECODE_DEPTH)),
-            ("fixmap", nested_fixmap(MAX_DECODE_DEPTH)),
-            (
-                "empty-leaf fixarray",
-                nested_fixarray_empty_leaf(MAX_DECODE_DEPTH),
-            ),
-        ] {
+    let at_depth = |depth: usize| {
+        let mut shapes: Vec<(String, Vec<u8>)> = LEVELS
+            .iter()
+            .map(|(shape, level)| (shape.to_string(), nest(level, depth)))
+            .collect();
+        // The innermost level is empty and must still count.
+        shapes.push((
+            "empty-leaf fixarray".into(),
+            nested_fixarray_empty_leaf(depth),
+        ));
+        shapes
+    };
+    on_default_stack(move || {
+        for (shape, bytes) in at_depth(MAX_DECODE_DEPTH) {
             for (path, result) in read_every_path(&bytes) {
                 let value = result
                     .unwrap_or_else(|e| panic!("{shape}: {path}: depth == bound must decode: {e}"));
@@ -210,18 +237,58 @@ fn depth_bound_is_owned_and_matches_the_typescript_sdk() {
                 );
             }
         }
-        for (shape, bytes) in [
-            ("fixarray", nested_fixarray(MAX_DECODE_DEPTH + 1)),
-            ("fixmap", nested_fixmap(MAX_DECODE_DEPTH + 1)),
-            // 0x91 x 100 + 0x90: the 101st level is empty and must still count.
-            (
-                "empty-leaf fixarray",
-                nested_fixarray_empty_leaf(MAX_DECODE_DEPTH + 1),
-            ),
-        ] {
+        for (shape, bytes) in at_depth(MAX_DECODE_DEPTH + 1) {
             for (path, result) in read_every_path(&bytes) {
                 assert_guard_rejected(&format!("{shape} at depth bound+1"), path, result);
             }
+        }
+    });
+}
+
+/// An ext value is a leaf, not a level: `rmp-serde` counts it as one, so its
+/// backstop must sit high enough that an ext at the bound still decodes, while
+/// one level more is still the walk's rejection.
+#[test]
+fn ext_leaf_at_the_bound_decodes() {
+    const FIXEXT1: [u8; 3] = [0xd4, 0x01, 0x02];
+    let ext_at = |depth: usize| {
+        let mut v = vec![0x91u8; depth];
+        v.extend_from_slice(&FIXEXT1);
+        v
+    };
+    on_default_stack(move || {
+        let bytes = ext_at(MAX_DECODE_DEPTH);
+        for (path, result) in [
+            (
+                "serializer::deserialize",
+                serializer::deserialize::<IgnoredAny>(&bytes),
+            ),
+            (
+                "interop::deserialize",
+                interop::deserialize::<IgnoredAny>(&bytes),
+            ),
+        ] {
+            result
+                .unwrap_or_else(|e| panic!("{path}: ext leaf at depth == bound must decode: {e}"));
+        }
+        let bytes = ext_at(MAX_DECODE_DEPTH + 1);
+        for (path, result) in [
+            (
+                "serializer::deserialize",
+                serializer::deserialize::<IgnoredAny>(&bytes),
+            ),
+            (
+                "interop::deserialize",
+                interop::deserialize::<IgnoredAny>(&bytes),
+            ),
+        ] {
+            let e = result
+                .err()
+                .unwrap_or_else(|| panic!("{path}: ext leaf at depth bound+1 decoded"));
+            assert!(
+                matches!(e, CachekitError::Serialization(ref m) if m.starts_with("decode bound:")),
+                "{path}: must fail in the structural guard, got {e:?}"
+            );
         }
     });
 }
