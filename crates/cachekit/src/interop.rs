@@ -11,7 +11,9 @@
 //! ```
 //!
 //! `namespace` and `operation` are user-supplied, validated against
-//! `^[a-z0-9][a-z0-9._-]{0,63}$` (full-string). `args_hash` is the Blake2b-256
+//! `^[a-z0-9][a-z0-9._-]{0,63}$` (full-string). `namespace` must also not be
+//! exactly `ns` or `nsapi`: the CachekitIO server parses a key starting `ns:`
+//! or `nsapi:` as namespace-prefixed. `args_hash` is the Blake2b-256
 //! digest (lowercase hex) of the canonical MessagePack encoding of the flat
 //! argument array. Unlike auto mode, there is no `func:` segment — the
 //! operation identity is explicit, so every SDK computes the same key for the
@@ -246,15 +248,21 @@ impl TryFrom<std::time::SystemTime> for InteropValue {
 // ── Segment validation ───────────────────────────────────────────────────────
 
 /// Validate a key segment against `^[a-z0-9][a-z0-9._-]{0,63}$` as a
-/// full-string match.
+/// full-string match, and reject the reserved namespaces `ns` and `nsapi`.
 ///
 /// Byte-wise iteration over the whole string makes this a full match by
 /// construction — a trailing `\n` (which Python's `re.match` + `$` would
 /// accept) fails here, as the `reject_trailing_newline` vector requires.
 ///
-/// NOTE: `cachekit-macros` carries a compile-time mirror of this grammar
-/// (`segment_is_valid`) — proc-macro crates cannot depend on this crate.
-/// If you change the grammar here, change it there in the same diff.
+/// The reservation is exact-match and applies only when `kind` is
+/// `"namespace"`: the CachekitIO server parses a key starting `ns:` or
+/// `nsapi:` as namespace-prefixed, so such an interop key would be rejected or
+/// misrouted there. `ns` and `nsapi` stay valid operations.
+///
+/// NOTE: `cachekit-macros` carries a compile-time mirror of this grammar and
+/// the reservation (`segment_is_valid` / `parse_segment`) — proc-macro crates
+/// cannot depend on this crate. If you change either here, change it there in
+/// the same diff.
 fn validate_segment(kind: &str, segment: &str) -> Result<(), CachekitError> {
     let bytes = segment.as_bytes();
     let valid = matches!(bytes.first(), Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit())
@@ -262,14 +270,19 @@ fn validate_segment(kind: &str, segment: &str) -> Result<(), CachekitError> {
         && bytes[1..].iter().all(|b| {
             b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
         });
-    if valid {
-        Ok(())
-    } else {
-        Err(CachekitError::InvalidKey(format!(
+    if !valid {
+        return Err(CachekitError::InvalidKey(format!(
             "interop {kind} {segment:?} must match ^[a-z0-9][a-z0-9._-]{{0,63}}$ \
              (lowercase ASCII letters, digits, '.', '_', '-'; 1-64 chars)"
-        )))
+        )));
     }
+    if kind == "namespace" && matches!(segment, "ns" | "nsapi") {
+        return Err(CachekitError::InvalidKey(format!(
+            "interop namespace {segment:?} is reserved: the CachekitIO server parses a key \
+             starting \"{segment}:\" as namespace-prefixed"
+        )));
+    }
+    Ok(())
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -283,7 +296,8 @@ fn validate_segment(kind: &str, segment: &str) -> Result<(), CachekitError> {
 /// # Errors
 ///
 /// - [`CachekitError::InvalidKey`] if `namespace` or `operation` fails the
-///   segment grammar (rejected, never normalized).
+///   segment grammar (rejected, never normalized), or `namespace` is the
+///   reserved `ns` or `nsapi`.
 /// - [`CachekitError::Serialization`] if any argument is outside the interop
 ///   data model's ranges (non-finite float, integer outside `[-2^63, 2^64-1]`).
 pub fn interop_key(
@@ -691,6 +705,31 @@ mod tests {
         assert!(interop_key(".users", "op", &[]).is_err());
         assert!(interop_key("-users", "op", &[]).is_err());
         assert!(interop_key("users.v2_x-y", "op", &[]).is_ok());
+    }
+
+    #[test]
+    fn namespace_rejects_reserved_ns_and_nsapi() {
+        for reserved in ["ns", "nsapi"] {
+            let err = interop_key(reserved, "get_user", &[]).unwrap_err();
+            assert!(
+                matches!(err, CachekitError::InvalidKey(_)),
+                "{reserved:?} must be InvalidKey, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reservation_is_exact_match_and_namespace_only() {
+        // Reserved names stay valid operations...
+        assert!(interop_key("users", "ns", &[]).is_ok());
+        assert!(interop_key("users", "nsapi", &[]).is_ok());
+        // ...and near-miss namespaces stay valid.
+        for ok in ["nsx", "nsapi2", "nsfw", "n", "ns-api"] {
+            assert!(
+                interop_key(ok, "op", &[]).is_ok(),
+                "{ok:?} should be accepted"
+            );
+        }
     }
 
     #[test]
