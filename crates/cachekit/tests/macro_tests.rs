@@ -298,7 +298,7 @@ async fn macro_key_delegates_to_interop_key() {
     assert_eq!(keys, vec![expected]);
 }
 
-// ── Reliability behaviour (LAB-518) ──────────────────────────────────────────
+// ── Reliability behaviour ────────────────────────────────────────────────────
 
 /// Backend where every data operation fails with a transient error.
 #[derive(Debug, Default, Clone)]
@@ -518,7 +518,7 @@ async fn auth_fail_op(cache: &CacheKit, id: u64) -> Result<User, CachekitError> 
 async fn macro_propagates_permanent_backend_errors_on_plain_path() {
     // Fail-open covers OUTAGES (transient/timeout/circuit-open). A wrong API
     // key is not an outage: silently falling open would run uncached forever
-    // with zero signal while looking healthy (expert-panel finding).
+    // with zero signal while looking healthy.
     let cache = CacheKit::builder()
         .backend(AuthFailBackend::shared())
         .no_l1()
@@ -601,7 +601,7 @@ async fn macro_fails_open_when_circuit_is_open() {
     );
 }
 
-// ── Backpressure fail-open (LAB-729) ─────────────────────────────────────────
+// ── Backpressure fail-open ───────────────────────────────────────────────────
 
 /// Backend whose `get` never completes — parks a caller on the single
 /// backpressure permit so every subsequent data op is shed.
@@ -680,7 +680,7 @@ async fn shed_op(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
     })
 }
 
-/// A backpressure shed is outage-class (LAB-729): like `CircuitOpen`, the
+/// A backpressure shed is outage-class: like `CircuitOpen`, the
 /// call never reached the backend, so the plain path must run the body
 /// uncached instead of surfacing the `Backpressure` error.
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]

@@ -36,8 +36,8 @@
 //!
 //! The previously used `async-memcached 0.6` ships `toxiproxy_rust` (a fault
 //! injection test proxy) as a non-optional *runtime* dependency, dragging
-//! openssl/native-tls/hyper-0.14 into a rustls-only SDK — rejected by the
-//! LAB-429 expert panel. rust-memcache with `default-features = false` has a
+//! openssl/native-tls/hyper-0.14 into a rustls-only SDK — so it was
+//! rejected. rust-memcache with `default-features = false` has a
 //! lean tree, a connection pool (one hung connection doesn't wedge the
 //! backend), per-socket timeouts, and `touch`.
 
@@ -113,7 +113,7 @@ fn memcached_err(e: MemcacheError) -> BackendError {
         // Pool exhaustion / connection acquisition — retryable.
         MemcacheError::PoolError(_) => BackendErrorKind::Transient,
         // Oversized items must NOT be retried — the same payload fails
-        // forever (expert-panel finding: Transient here means infinite retry
+        // forever (Transient here means infinite retry
         // loops upstream). The ASCII protocol reports it as a SERVER_ERROR
         // string ("SERVER_ERROR object too large for cache", verified live);
         // the binary protocol as CommandError::ValueTooLarge.
@@ -405,9 +405,8 @@ impl MemcachedBackendBuilder {
     /// - `timeout=<secs>`: the ONLY spelling that applies socket read/write
     ///   timeouts to **every** pooled connection at creation.
     ///   `ClientBuilder::with_read_timeout` reaches exactly one checked-out
-    ///   connection and none of the replacements r2d2 creates later (expert
-    ///   panel, LAB-429 round 2 — a hung server wedged the backend despite
-    ///   configured timeouts).
+    ///   connection and none of the replacements r2d2 creates later (a hung
+    ///   server wedged the backend despite configured timeouts).
     ///
     /// Explicit user-supplied `protocol=`/`timeout=` params win.
     fn with_connection_params(url: &str, timeout: Duration) -> String {
@@ -468,7 +467,7 @@ impl MemcachedBackendBuilder {
                 // test-ping times out gets a fresh eagerly-created connection
                 // on every loop iteration and r2d2's deadline is never
                 // consulted — a wedged-but-accepting server live-loops the
-                // checkout forever (panel round 2, reproduced). With 0, a
+                // checkout forever (reproduced). With 0, a
                 // failed test leaves no idle connection, the loop parks on
                 // the condvar, and the connection_timeout deadline fires.
                 .with_min_idle_conns(0)
@@ -478,7 +477,7 @@ impl MemcachedBackendBuilder {
                 // leaving these unset would CLEAR the URL-applied socket
                 // timeout on that (LIFO-hot) connection. The URL param covers
                 // every connection r2d2 creates later; these cover the one
-                // build() strips (panel round 2 re-verification, reproduced).
+                // build() strips (re-verified and reproduced).
                 .with_read_timeout(timeout)
                 .with_write_timeout(timeout)
                 .build()
@@ -627,7 +626,7 @@ mod tests {
     #[test]
     fn connection_params_pin_ascii_and_per_connection_timeout() {
         // `timeout=` on the URL is the only spelling that reaches EVERY
-        // pooled connection (panel round 2); `protocol=ascii` is deliberate.
+        // pooled connection; `protocol=ascii` is deliberate.
         assert_eq!(
             MemcachedBackendBuilder::with_connection_params(
                 "memcache://h:11211",

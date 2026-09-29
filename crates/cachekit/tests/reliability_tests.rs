@@ -1,4 +1,4 @@
-//! Integration tests for the reliability tier (LAB-518): retry, circuit
+//! Integration tests for the reliability tier: retry, circuit
 //! breaker, and single-flight distributed-lock wiring.
 //!
 //! Run with:
@@ -517,7 +517,7 @@ async fn single_flight_contested_lock_polls_and_finds_remote_fill() {
     );
 }
 
-// ── Cancel-safety (panel CRIT: probe slot must survive cancellation) ─────────
+// ── Cancel-safety (probe slot must survive cancellation) ─────────────────────
 
 /// Scripted per call index: fail (opens the breaker), hang (the probe that
 /// gets cancelled), then succeed.
@@ -621,7 +621,7 @@ async fn cancelled_probe_does_not_wedge_the_breaker() {
     );
 }
 
-// ── Backpressure (LAB-729) ───────────────────────────────────────────────────
+// ── Backpressure ─────────────────────────────────────────────────────────────
 
 fn bp(max_concurrent: usize, max_queue: usize, acquire_timeout: Duration) -> BackpressureConfig {
     BackpressureConfig {
@@ -790,7 +790,7 @@ async fn wait_for_backend_entry(handle: &GateBackend) {
 
 #[tokio::test]
 async fn backpressure_caps_concurrent_backend_ops() {
-    // AC (LAB-729): with the cap at K, no more than K backend ops are ever in
+    // With the cap at K, no more than K backend ops are ever in
     // flight under a burst of ≫K concurrent callers — and nobody is shed as
     // long as the waiting queue and timeout absorb the burst.
     let (shared, handle) = ConcurrencyProbeBackend::new_with_handle();
@@ -1004,7 +1004,7 @@ async fn backpressure_permit_released_after_error() {
     assert_eq!(handle.calls(), 2);
 }
 
-// ── Breaker state accessor (LAB-521) ─────────────────────────────────────────
+// ── Breaker state accessor ───────────────────────────────────────────────────
 
 #[tokio::test]
 async fn circuit_state_tracks_the_breaker() {

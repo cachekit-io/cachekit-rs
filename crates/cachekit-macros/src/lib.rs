@@ -426,9 +426,9 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
         }
     }
 
-    // Graceful degradation (LAB-518): on an OUTAGE-class backend failure —
+    // Graceful degradation: on an OUTAGE-class backend failure —
     // retryable (transient/timeout), a fast-failing open circuit breaker,
-    // or a backpressure shed (LAB-729) — the plain path fails OPEN: the
+    // or a backpressure shed — the plain path fails OPEN: the
     // wrapped function runs uncached, so a cache outage costs performance,
     // not availability. A shed is the same class as CircuitOpen (the call
     // never reached the backend), and failing open adds no work a cold-miss
@@ -436,7 +436,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     // not origin executions, and single-flight still dedupes those.
     // Permanent and authentication errors PROPAGATE even on the plain path:
     // a wrong API key that silently fell open would run uncached forever
-    // with zero signal while looking healthy (expert-panel finding). The
+    // with zero signal while looking healthy. The
     // `secure` path stays fail-CLOSED on everything: backend and decryption
     // errors reach the caller, so an encrypted workload never silently
     // degrades.
@@ -585,7 +585,7 @@ mod tests {
 
     /// A sync fn must fail at decoration time with a clear, actionable error
     /// — never a cascade of "await is only allowed inside async" diagnostics,
-    /// and never a silent no-op (LAB-728 acceptance criterion).
+    /// and never a silent no-op.
     #[test]
     fn sync_fn_is_a_clear_decoration_time_error() {
         let args: MacroArgs = syn::parse_quote!(

@@ -1,4 +1,4 @@
-//! Live read statistics (LAB-521): `CacheKit::stats`, `l1_entry_count`, and
+//! Live read statistics: `CacheKit::stats`, `l1_entry_count`, and
 //! the telemetry provider the builder attaches to the backend.
 //!
 //! Run with:

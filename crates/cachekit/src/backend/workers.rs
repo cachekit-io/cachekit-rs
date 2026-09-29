@@ -300,7 +300,7 @@ impl LockableBackend for WorkersCachekitIO {
         }
 
         // Contested acquire is `200 {"lock_id": null}` — branch on the body,
-        // never on a 409 status (protocol#22 / LAB-240).
+        // never on a 409 status (protocol#22).
         let bytes = resp.bytes().await.map_err(|e| {
             BackendError::transient(BackendError::sanitize_message(
                 &format!("failed to read lock response: {e}"),

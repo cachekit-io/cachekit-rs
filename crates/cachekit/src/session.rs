@@ -11,7 +11,7 @@ static SESSION: OnceLock<SessionInfo> = OnceLock::new();
 ///
 /// `std::time::SystemTime::now()` panics on `wasm32-unknown-unknown` ("time
 /// not implemented on this platform"), which trapped every Workers request
-/// (LAB-1079) — so wasm32 builds must read `js_sys::Date::now()` instead.
+/// — so wasm32 builds must read `js_sys::Date::now()` instead.
 #[cfg(target_arch = "wasm32")]
 fn now_epoch_millis() -> u64 {
     // Saturating float→int cast: NaN → 0, negative → 0, overflow → u64::MAX.

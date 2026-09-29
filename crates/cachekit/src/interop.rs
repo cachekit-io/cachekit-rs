@@ -345,7 +345,7 @@ pub fn serialize_value(value: &InteropValue) -> Result<Vec<u8>, CachekitError> {
 /// document and rejecting trailing bytes (spec MUST).
 ///
 /// Decode bounds: [`crate::serializer::MAX_DECODE_DEPTH`] and the header walk in
-/// `crate::serializer::check_structure` (LAB-2503).
+/// `crate::serializer::check_structure`.
 ///
 /// `rmp_serde::from_slice` silently ignores trailing bytes. That leniency is
 /// dangerous here: a Python-SDK-internal CK frame begins `0x43` (`'C'`), which
