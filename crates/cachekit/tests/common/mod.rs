@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
+use zeroize::Zeroizing;
 
 use cachekit::backend::{Backend, HealthStatus};
 use cachekit::client::SharedBackend;
@@ -81,6 +82,103 @@ impl Backend for MockBackend {
             is_healthy: true,
             latency_ms: 0.0,
             backend_type: "mock".to_owned(),
+            details: HashMap::new(),
+        })
+    }
+}
+
+/// RAII guard for `#[serial]` env tests: records each variable's pre-test
+/// value and restores it on drop — including on assertion failure — so a
+/// test can never destroy state the surrounding shell exported.
+pub struct EnvGuard {
+    /// `Zeroizing` because the saved set includes `CACHEKIT_MASTER_KEY` and
+    /// `CACHEKIT_PREVIOUS_MASTER_KEYS` — a pre-test shell value is real key
+    /// material, so the copy this guard holds is wiped on drop.
+    saved: Vec<(&'static str, Option<Zeroizing<String>>)>,
+}
+
+impl EnvGuard {
+    /// Apply `(name, value)` pairs: `Some` sets the variable, `None` removes
+    /// it. The prior value of every named variable is restored on drop.
+    ///
+    /// Panics — before touching any variable — if one holds a non-UTF-8
+    /// value: it could not be restored as a `String`, and treating it as
+    /// absent would make drop delete it.
+    pub fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(name, _)| match std::env::var(name) {
+                Ok(v) => (*name, Some(Zeroizing::new(v))),
+                Err(std::env::VarError::NotPresent) => (*name, None),
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    panic!("EnvGuard: {name} holds a non-UTF-8 value; refusing to clobber it")
+                }
+            })
+            .collect();
+        for (name, value) in vars {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.saved {
+            match value {
+                Some(v) => std::env::set_var(name, v.as_str()),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+/// Backend whose every data operation fails with a transient error — the
+/// "backend is down" fixture for breaker and not-counted-read tests.
+#[derive(Debug, Default, Clone)]
+pub struct FailingBackend;
+
+impl FailingBackend {
+    /// Wrap as a [`SharedBackend`].
+    pub fn shared() -> SharedBackend {
+        #[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
+        {
+            std::sync::Arc::new(Self)
+        }
+        #[cfg(any(target_arch = "wasm32", feature = "unsync"))]
+        {
+            std::rc::Rc::new(Self)
+        }
+    }
+}
+
+#[cfg_attr(not(any(target_arch = "wasm32", feature = "unsync")), async_trait)]
+#[cfg_attr(any(target_arch = "wasm32", feature = "unsync"), async_trait(?Send))]
+impl Backend for FailingBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        Err(BackendError::transient("down"))
+    }
+
+    async fn set(&self, _: &str, _: Vec<u8>, _: Option<Duration>) -> Result<(), BackendError> {
+        Err(BackendError::transient("down"))
+    }
+
+    async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+        Err(BackendError::transient("down"))
+    }
+
+    async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+        Err(BackendError::transient("down"))
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Ok(HealthStatus {
+            is_healthy: false,
+            latency_ms: 0.0,
+            backend_type: "failing".to_owned(),
             details: HashMap::new(),
         })
     }

@@ -121,6 +121,16 @@ impl L1Cache {
         self.store.invalidate(key);
     }
 
+    /// Number of entries currently held.
+    ///
+    /// Runs moka's pending housekeeping first, so expired and evicted entries
+    /// are already gone from the count — the exact figure at the time of the
+    /// call, not moka's eventually-consistent estimate.
+    pub fn entry_count(&self) -> u64 {
+        self.store.run_pending_tasks();
+        self.store.entry_count()
+    }
+
     /// Drive moka's internal eviction machinery. Useful in tests to force
     /// pending invalidations and expiry checks to complete synchronously.
     pub fn run_pending_tasks(&self) {

@@ -64,8 +64,8 @@ async fn secure_set_and_get() {
     };
 
     let secure = client
-        .secure()
-        .expect("secure() should work with encryption configured");
+        .secure_cache()
+        .expect("secure_cache() should work with encryption configured");
     secure.set("secret:42", &secret).await.expect("secure set");
 
     let retrieved: Secret = secure
@@ -87,7 +87,7 @@ async fn secure_data_is_encrypted_in_backend() {
         user_id: 999,
     };
 
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
     secure.set("secret:999", &secret).await.unwrap();
 
     // Read raw bytes from the backend
@@ -122,24 +122,28 @@ async fn secure_without_master_key_fails() {
         .build()
         .expect("client builds without encryption");
 
-    let result = client.secure();
-    assert!(result.is_err(), "secure() without encryption should fail");
+    let result = client.secure_cache();
+    assert!(
+        result.is_err(),
+        "secure_cache() without encryption should fail"
+    );
 
     let err = result.unwrap_err();
     assert!(
         matches!(err, CachekitError::Config(_)),
         "expected Config error, got: {err:?}"
     );
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("CACHEKIT_MASTER_KEY"),
-        "error should mention CACHEKIT_MASTER_KEY: {err}"
+        msg.contains("CacheKit::secure") && msg.contains("CACHEKIT_MASTER_KEY"),
+        "error should name the secure preset and CACHEKIT_MASTER_KEY: {msg}"
     );
 }
 
 #[tokio::test]
 async fn secure_get_missing_returns_none() {
     let client = make_encrypted_client(MockBackend::shared());
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
 
     let result: Option<String> = secure.get("nonexistent").await.expect("get should succeed");
     assert!(result.is_none());
@@ -148,7 +152,7 @@ async fn secure_get_missing_returns_none() {
 #[tokio::test]
 async fn secure_delete() {
     let client = make_encrypted_client(MockBackend::shared());
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
 
     secure.set("to-delete", &"temporary").await.unwrap();
     assert!(secure.exists("to-delete").await.unwrap());
@@ -165,7 +169,7 @@ async fn secure_wrong_key_fails_decryption() {
     let (shared, backend) = MockBackend::new_with_handle();
     let client = make_encrypted_client(shared);
 
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
     secure.set("key-a", &"secret data").await.unwrap();
 
     // Manually swap the value to a different key in the backend
@@ -206,14 +210,15 @@ async fn secure_different_tenants_cant_decrypt() {
         .unwrap();
 
     client_a
-        .secure()
+        .secure_cache()
         .unwrap()
         .set("shared-key", &"tenant-a-secret")
         .await
         .unwrap();
 
     // Tenant B should fail to decrypt tenant A's data
-    let result: Result<Option<String>, _> = client_b.secure().unwrap().get("shared-key").await;
+    let result: Result<Option<String>, _> =
+        client_b.secure_cache().unwrap().get("shared-key").await;
     assert!(
         result.is_err(),
         "cross-tenant decryption must fail (different derived keys)"
@@ -230,7 +235,7 @@ async fn secure_hex_builder() {
         .build()
         .unwrap();
 
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
     secure.set("hex-test", &42u64).await.unwrap();
 
     let val: u64 = secure.get("hex-test").await.unwrap().unwrap();
@@ -242,7 +247,7 @@ async fn secure_with_l1_roundtrip() {
     let (shared, backend) = MockBackend::new_with_handle();
     let client = make_encrypted_client_with_l1(shared);
 
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
     secure.set("l1-test", &"encrypted in L1").await.unwrap();
 
     // First get populates L1 (already done by set write-through)
@@ -262,7 +267,7 @@ async fn secure_l1_stores_ciphertext_not_plaintext() {
     let (shared, backend) = MockBackend::new_with_handle();
     let client = make_encrypted_client_with_l1(shared);
 
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
     secure.set("l1-cipher", &"PLAINTEXT_VALUE").await.unwrap();
 
     // The backend should have ciphertext, not the msgpack encoding of "PLAINTEXT_VALUE".
@@ -280,6 +285,106 @@ async fn secure_l1_stores_ciphertext_not_plaintext() {
     );
 }
 
+/// Write a real ciphertext for `key` through an L1-less client, then flip its
+/// last byte in the backend so it fails AES-GCM authentication. Returns the
+/// planted bytes.
+async fn plant_tampered(shared: SharedBackend, backend: &MockBackend, key: &str) -> Vec<u8> {
+    let writer = make_encrypted_client(shared);
+    writer
+        .secure_cache()
+        .unwrap()
+        .set(key, &"authentic")
+        .await
+        .unwrap();
+    let mut store = backend.store.lock().await;
+    let bytes = store.get_mut(key).expect("writer stored the entry");
+    *bytes.last_mut().unwrap() ^= 0x01;
+    bytes.clone()
+}
+
+#[tokio::test]
+async fn secure_get_evicts_l1_after_decrypt_failure() {
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = make_encrypted_client_with_l1(shared.clone());
+    let secure = client.secure_cache().unwrap();
+    let planted = plant_tampered(shared, &backend, "poisoned").await;
+
+    let err = secure.get::<String>("poisoned").await.unwrap_err();
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+    // The failed read must not remove or rewrite the backend entry.
+    assert_eq!(backend.store.lock().await.get("poisoned"), Some(&planted));
+
+    // Remove the entry behind the client's back: a surviving L1 copy would
+    // keep failing; an evicted one yields a miss.
+    backend.store.lock().await.remove("poisoned");
+    assert_eq!(secure.get::<String>("poisoned").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn secure_interop_get_swr_evicts_l1_after_decrypt_failure() {
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = make_encrypted_client_with_l1(shared.clone());
+    let secure = client.secure_cache().unwrap();
+    let planted = plant_tampered(shared, &backend, "poisoned-swr").await;
+
+    let err = secure
+        .interop_get_swr::<String>("poisoned-swr")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+    assert_eq!(
+        backend.store.lock().await.get("poisoned-swr"),
+        Some(&planted)
+    );
+
+    backend.store.lock().await.remove("poisoned-swr");
+    assert!(matches!(
+        secure.interop_get_swr::<String>("poisoned-swr").await,
+        Ok(cachekit::SwrRead::Miss)
+    ));
+}
+
+// SWR staleness exists only on native builds with L1 (see swr_tests.rs).
+#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+#[tokio::test]
+async fn secure_interop_get_swr_evicts_stale_l1_after_decrypt_failure() {
+    // The Stale arm reads straight from L1, so the undecryptable bytes must
+    // already be there: a plain write puts plaintext in this client's L1.
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = CacheKit::builder()
+        .backend(shared)
+        .l1_capacity(100)
+        .swr_threshold_ratio(0.001)
+        .encryption_from_bytes(TEST_MASTER_KEY, "test-tenant")
+        .expect("encryption setup")
+        .build()
+        .expect("client builds");
+    client
+        .set_with_ttl("poisoned-stale", &"plaintext", Duration::from_secs(60))
+        .await
+        .unwrap();
+    // Real time, not tokio's paused clock: L1 ages entries by std Instant, so
+    // a paused sleep leaves the entry Fresh. threshold = 0.001 × 60 s = 60 ms
+    // (±10%); hard expiry at 60 s.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let secure = client.secure_cache().unwrap();
+    let err = secure
+        .interop_get_swr::<String>("poisoned-stale")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+    // Served from L1, so the entry had not hard-expired into the L2 path.
+    let stats = client.stats();
+    assert_eq!((stats.l1_hits, stats.l2_hits), (1, 0), "{stats:?}");
+
+    backend.store.lock().await.remove("poisoned-stale");
+    assert!(matches!(
+        secure.interop_get_swr::<String>("poisoned-stale").await,
+        Ok(cachekit::SwrRead::Miss)
+    ));
+}
+
 #[tokio::test]
 async fn secure_with_namespace() {
     let (shared, backend) = MockBackend::new_with_handle();
@@ -292,7 +397,7 @@ async fn secure_with_namespace() {
         .build()
         .unwrap();
 
-    let secure = client.secure().unwrap();
+    let secure = client.secure_cache().unwrap();
     secure.set("namespaced", &"value").await.unwrap();
 
     // Backend should have the namespaced key
@@ -321,7 +426,7 @@ async fn secure_set_rejects_payload_whose_ciphertext_exceeds_limit() {
         .expect("encryption setup")
         .build()
         .expect("client builds");
-    let secure = client.secure().expect("secure handle");
+    let secure = client.secure_cache().expect("secure handle");
 
     // 50 serialized bytes: under the 64-byte limit as plaintext, over it as
     // ciphertext (50 + 28 = 78). Must fail at write time, not become
@@ -344,7 +449,7 @@ async fn secure_set_rejects_payload_whose_ciphertext_exceeds_limit() {
 
 // ── Key rotation (keyring) ────────────────────────────────────────────────────
 
-/// End-to-end rotation round-trip (LAB-686 acceptance):
+/// End-to-end rotation round-trip:
 /// value written under k1 → k2 promoted with k1 decrypt-only → read succeeds
 /// without re-encryption → k1 dropped → read fails as an error.
 #[tokio::test]
@@ -368,8 +473,8 @@ async fn rotation_round_trip_without_reencryption() {
         user_id: 7,
     };
     writer
-        .secure()
-        .expect("secure()")
+        .secure_cache()
+        .expect("secure_cache()")
         .set("secret:7", &secret)
         .await
         .expect("secure set under k1");
@@ -386,8 +491,8 @@ async fn rotation_round_trip_without_reencryption() {
         .build()
         .expect("client builds");
     let read_back: Secret = rotated
-        .secure()
-        .expect("secure()")
+        .secure_cache()
+        .expect("secure_cache()")
         .get("secret:7")
         .await
         .expect("secure get after rotation")
@@ -410,15 +515,18 @@ async fn rotation_round_trip_without_reencryption() {
         .expect("keyring setup")
         .build()
         .expect("client builds");
-    let result: Result<Option<Secret>, _> =
-        cut_over.secure().expect("secure()").get("secret:7").await;
+    let result: Result<Option<Secret>, _> = cut_over
+        .secure_cache()
+        .expect("secure_cache()")
+        .get("secret:7")
+        .await;
     assert!(
         matches!(result, Err(CachekitError::Encryption(_))),
         "dropped-key read must surface as an encryption error, got {result:?}"
     );
 }
 
-/// Rotation drain signal (LAB-1678): the builder wires the counters into the
+/// Rotation drain signal: the builder wires the counters into the
 /// user-held secure handle, so a read served by the retiring key is visible
 /// there. Index-0 silence is owned and tested at the layer (`encryption.rs`).
 #[tokio::test]
@@ -437,8 +545,8 @@ async fn rotation_drain_signal_is_visible_on_secure_cache() {
         .build()
         .expect("client builds");
     writer
-        .secure()
-        .expect("secure()")
+        .secure_cache()
+        .expect("secure_cache()")
         .set("drain:old", &"written under k1")
         .await
         .expect("secure set under k1");
@@ -451,7 +559,7 @@ async fn rotation_drain_signal_is_visible_on_secure_cache() {
         .expect("keyring setup")
         .build()
         .expect("client builds");
-    let secure = rotated.secure().expect("secure()");
+    let secure = rotated.secure_cache().expect("secure_cache()");
     assert_eq!(secure.previous_key_hits(), vec![0], "nothing read yet");
 
     // The k1-era entry is served by previous[0]: the grace window is still live.

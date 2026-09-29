@@ -228,7 +228,7 @@ impl RedisBackendBuilder {
     /// Initial connections still fail fast — fred's `fail_fast` default stays
     /// on, so the policy only governs reconnecting a connection that was
     /// previously established. Used by the reliability-first intent presets
-    /// (`CacheKit::production`, `CacheKit::encrypted`).
+    /// (`CacheKit::production`, `CacheKit::secure`).
     pub(crate) fn auto_reconnect(mut self) -> Self {
         self.reconnect = Some(ReconnectPolicy::new_exponential(0, 100, 30_000, 2));
         self

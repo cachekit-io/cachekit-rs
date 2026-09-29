@@ -53,12 +53,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use blake2::{digest::consts::U16, Blake2b, Digest};
 
 use crate::backend::{run_blocking, Backend, HealthStatus, TtlInspectable};
 use crate::error::{BackendError, BackendErrorKind};
-
-type Blake2b128 = Blake2b<U16>;
 
 // Header layout — byte-identical to cachekit-py's `backends/file/backend.py`.
 const MAGIC: &[u8; 2] = b"CK";
@@ -459,10 +456,10 @@ impl FileBackend {
         &self.cache_dir
     }
 
+    /// Blake2b-128 hex of the key — the same digest `tracing` events carry as
+    /// `key_hash`, so a log line names the file it touched.
     fn entry_path(&self, key: &str) -> PathBuf {
-        let mut hasher = Blake2b128::new();
-        hasher.update(key.as_bytes());
-        self.cache_dir.join(hex::encode(hasher.finalize()))
+        self.cache_dir.join(crate::metrics::key_hash(key))
     }
 
     /// Run `f` on the blocking pool holding the backend-wide lock.
@@ -899,7 +896,7 @@ mod tests {
         assert!(entry.exists(), "cache entries must never be swept");
     }
 
-    // ── Expert-panel hardening (LAB-429 round 2) ─────────────────────────────
+    // ── Hardening ────────────────────────────────────────────────────────────
 
     #[cfg(unix)]
     #[test]
@@ -940,7 +937,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stale_unlink_decision_spares_replaced_entry() {
-        // Panel finding #1: a get() that decided "expired" must not delete
+        // Stale-unlink race: a get() that decided "expired" must not delete
         // the fresh entry a concurrent set() renamed over the path.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write_raw(
@@ -993,7 +990,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_read_racing_fresh_set_never_loses_the_write() {
-        // Panel finding #1, end to end through the public API: an expired
+        // The stale-unlink race, end to end through the public API: an expired
         // entry is read (deciding to unlink) while a fresh set replaces it.
         // Whatever the interleaving, the fresh value must survive.
         let dir = tempfile::tempdir().expect("tempdir");

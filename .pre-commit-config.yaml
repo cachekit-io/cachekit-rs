@@ -52,5 +52,6 @@ repos:
           (?x)^(
             .*\.lock$|
             target/.*|
-            tests/fixtures/.*
+            tests/fixtures/.*|
+            crates/cachekit/tests/vectors/.*
           )$

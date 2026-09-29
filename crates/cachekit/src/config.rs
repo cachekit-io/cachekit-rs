@@ -146,7 +146,7 @@ impl CachekitConfig {
                 }
                 // Previous keys without a current key is a broken rotation
                 // deploy: nothing would ever consume them, and the operator
-                // would only find out at the first secure() call. Fail at load.
+                // would only find out at the first secure_cache() call. Fail at load.
                 if config.master_key.is_none() {
                     return Err(CachekitError::Config(
                         "CACHEKIT_PREVIOUS_MASTER_KEYS requires CACHEKIT_MASTER_KEY to be set"

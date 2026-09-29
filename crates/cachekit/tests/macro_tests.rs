@@ -109,7 +109,7 @@ async fn get_user(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
     })
 }
 
-#[cachekit(client = cache, ttl = 120, interop = "users.fetch_by_id", namespace = "ns")]
+#[cachekit(client = cache, ttl = 120, interop = "users.fetch_by_id", namespace = "app")]
 async fn get_user_namespaced(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
     Ok(User {
         name: format!("Namespaced {id}"),
@@ -227,7 +227,7 @@ async fn macro_key_pinned_end_to_end() {
     // keying. Independently verified (Python): canonical args msgpack [42]
     // = 0x912a; blake2b-256(0x912a) = 6159...8875.
     let key =
-        "ns:users.fetch_by_id:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875"; // pragma: allowlist secret
+        "app:users.fetch_by_id:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875"; // pragma: allowlist secret
     let store = backend.inner.store.lock().await;
     let keys: Vec<&String> = store.keys().collect();
     assert_eq!(keys, vec![key]);
@@ -255,7 +255,7 @@ async fn macro_self_heals_undecodable_entry() {
     // miss and OVERWRITTEN — not brick the function until TTL expiry.
     let (cache, backend) = mock_client_counting();
     let key =
-        "ns:users.fetch_by_id:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875"; // pragma: allowlist secret
+        "app:users.fetch_by_id:61598716255080080f6456eb065c2e51badfaa4320b0efe97469c29cffee8875"; // pragma: allowlist secret
     backend
         .inner
         .store
@@ -298,7 +298,7 @@ async fn macro_key_delegates_to_interop_key() {
     assert_eq!(keys, vec![expected]);
 }
 
-// ── Reliability behaviour (LAB-518) ──────────────────────────────────────────
+// ── Reliability behaviour ────────────────────────────────────────────────────
 
 /// Backend where every data operation fails with a transient error.
 #[derive(Debug, Default, Clone)]
@@ -414,6 +414,67 @@ async fn macro_secure_fails_closed_when_backend_down() {
     );
 }
 
+#[cfg(feature = "encryption")]
+static POISONED_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(feature = "encryption")]
+#[cachekit(client = cache, ttl = 60, interop = "poisoned_op", namespace = "reliab", secure)]
+async fn poisoned_op(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
+    POISONED_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(User {
+        name: format!("secret {id}"),
+    })
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn macro_secure_evicts_l1_after_decrypt_failure() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let secure_client = |backend: SharedBackend, l1: bool| {
+        let builder = CacheKit::builder()
+            .backend(backend)
+            .encryption_from_bytes(&[7u8; 32], "default")
+            .expect("encryption configures");
+        let builder = if l1 { builder } else { builder.no_l1() };
+        builder.build().expect("client builds")
+    };
+    let (shared, backend) = common::MockBackend::new_with_handle();
+    let cache = secure_client(shared.clone(), true);
+    let key = interop_key("reliab", "poisoned_op", &[InteropValue::from(1u64)]).unwrap();
+
+    // Plant a real ciphertext (written through an L1-less client, so the
+    // client under test holds no L1 copy yet), then break its GCM tag.
+    let writer = secure_client(shared, false);
+    writer
+        .secure_cache()
+        .unwrap()
+        .set(&key, &"authentic")
+        .await
+        .unwrap();
+    let planted = {
+        let mut store = backend.store.lock().await;
+        let bytes = store.get_mut(&key).expect("writer stored the entry");
+        *bytes.last_mut().unwrap() ^= 0x01;
+        bytes.clone()
+    };
+
+    let err = poisoned_op(&cache, 1)
+        .await
+        .expect_err("fail-closed: decrypt error propagates");
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+    assert_eq!(POISONED_RUNS.load(SeqCst), 0, "body must not run");
+    // The failed read must not remove or rewrite the backend entry.
+    assert_eq!(backend.store.lock().await.get(&key), Some(&planted));
+
+    // Remove the entry behind the client's back: with the L1 copy evicted,
+    // the next call is a miss that runs the body.
+    backend.store.lock().await.remove(&key);
+    let user = poisoned_op(&cache, 1).await.expect("miss runs the body");
+    assert_eq!(user.name, "secret 1");
+    assert_eq!(POISONED_RUNS.load(SeqCst), 1);
+}
+
 static SLOW_OP_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[cachekit(client = cache, ttl = 60, interop = "slow_op", namespace = "flight")]
@@ -518,7 +579,7 @@ async fn auth_fail_op(cache: &CacheKit, id: u64) -> Result<User, CachekitError> 
 async fn macro_propagates_permanent_backend_errors_on_plain_path() {
     // Fail-open covers OUTAGES (transient/timeout/circuit-open). A wrong API
     // key is not an outage: silently falling open would run uncached forever
-    // with zero signal while looking healthy (expert-panel finding).
+    // with zero signal while looking healthy.
     let cache = CacheKit::builder()
         .backend(AuthFailBackend::shared())
         .no_l1()
@@ -601,7 +662,7 @@ async fn macro_fails_open_when_circuit_is_open() {
     );
 }
 
-// ── Backpressure fail-open (LAB-729) ─────────────────────────────────────────
+// ── Backpressure fail-open ───────────────────────────────────────────────────
 
 /// Backend whose `get` never completes — parks a caller on the single
 /// backpressure permit so every subsequent data op is shed.
@@ -680,7 +741,7 @@ async fn shed_op(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
     })
 }
 
-/// A backpressure shed is outage-class (LAB-729): like `CircuitOpen`, the
+/// A backpressure shed is outage-class: like `CircuitOpen`, the
 /// call never reached the backend, so the plain path must run the body
 /// uncached instead of surfacing the `Backpressure` error.
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]

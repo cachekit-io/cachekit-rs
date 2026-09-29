@@ -1,4 +1,4 @@
-//! Untrusted-decode bounds (LAB-2503): the shared protocol `decode-bounds.json`
+//! Untrusted-decode bounds: the shared protocol `decode-bounds.json`
 //! vectors run against BOTH decode entry points, plus the depth-bound boundary.
 //!
 //! Vectors: `tests/vectors/decode-bounds.json`, vendored verbatim from

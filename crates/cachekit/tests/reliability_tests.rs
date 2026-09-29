@@ -1,4 +1,4 @@
-//! Integration tests for the reliability tier (LAB-518): retry, circuit
+//! Integration tests for the reliability tier: retry, circuit
 //! breaker, and single-flight distributed-lock wiring.
 //!
 //! Run with:
@@ -20,7 +20,7 @@ use cachekit::backend::{Backend, HealthStatus, LockableBackend};
 use cachekit::client::SharedBackend;
 use cachekit::error::{BackendError, BackendErrorKind};
 use cachekit::reliability::{
-    BackpressureConfig, CircuitBreakerConfig, ReliabilityConfig, RetryConfig,
+    BackpressureConfig, CircuitBreakerConfig, CircuitState, ReliabilityConfig, RetryConfig,
 };
 use cachekit::{CacheKit, CachekitError};
 
@@ -517,7 +517,7 @@ async fn single_flight_contested_lock_polls_and_finds_remote_fill() {
     );
 }
 
-// ── Cancel-safety (panel CRIT: probe slot must survive cancellation) ─────────
+// ── Cancel-safety (probe slot must survive cancellation) ─────────────────────
 
 /// Scripted per call index: fail (opens the breaker), hang (the probe that
 /// gets cancelled), then succeed.
@@ -621,7 +621,7 @@ async fn cancelled_probe_does_not_wedge_the_breaker() {
     );
 }
 
-// ── Backpressure (LAB-729) ───────────────────────────────────────────────────
+// ── Backpressure ─────────────────────────────────────────────────────────────
 
 fn bp(max_concurrent: usize, max_queue: usize, acquire_timeout: Duration) -> BackpressureConfig {
     BackpressureConfig {
@@ -790,7 +790,7 @@ async fn wait_for_backend_entry(handle: &GateBackend) {
 
 #[tokio::test]
 async fn backpressure_caps_concurrent_backend_ops() {
-    // AC (LAB-729): with the cap at K, no more than K backend ops are ever in
+    // With the cap at K, no more than K backend ops are ever in
     // flight under a burst of ≫K concurrent callers — and nobody is shed as
     // long as the waiting queue and timeout absorb the burst.
     let (shared, handle) = ConcurrencyProbeBackend::new_with_handle();
@@ -1002,4 +1002,62 @@ async fn backpressure_permit_released_after_error() {
         );
     }
     assert_eq!(handle.calls(), 2);
+}
+
+// ── Breaker state accessor ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn circuit_state_tracks_the_breaker() {
+    // One failure opens the circuit; after open_timeout the accessor reads
+    // the lazy open → half-open transition; one successful probe closes it.
+    let (shared, _handle) = ScriptedBackend::new_with_handle(1, BackendErrorKind::Transient);
+    let client = client_with(
+        shared,
+        ReliabilityConfig {
+            retry: None,
+            circuit_breaker: Some(CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold: 1,
+                open_timeout: Duration::from_millis(20),
+                ..CircuitBreakerConfig::default()
+            }),
+            backpressure: None,
+        },
+    );
+    assert_eq!(client.circuit_state(), Some(CircuitState::Closed));
+
+    client
+        .get::<u32>("k")
+        .await
+        .expect_err("first call fails and opens the circuit");
+    assert_eq!(client.circuit_state(), Some(CircuitState::Open));
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        client.circuit_state(),
+        Some(CircuitState::HalfOpen),
+        "open_timeout elapsed: the accessor reads the live state"
+    );
+
+    let value: Option<u32> = client.get("k").await.expect("probe succeeds");
+    assert_eq!(value, Some(7));
+    assert_eq!(client.circuit_state(), Some(CircuitState::Closed));
+}
+
+#[tokio::test]
+async fn circuit_state_is_none_without_a_breaker() {
+    let (shared, _) = ScriptedBackend::new_with_handle(0, BackendErrorKind::Transient);
+    let retry_only = client_with(
+        shared,
+        ReliabilityConfig {
+            retry: Some(fast_retry(2)),
+            circuit_breaker: None,
+            backpressure: None,
+        },
+    );
+    assert_eq!(retry_only.circuit_state(), None);
+
+    let (shared, _) = ScriptedBackend::new_with_handle(0, BackendErrorKind::Transient);
+    let disabled = client_with(shared, ReliabilityConfig::disabled());
+    assert_eq!(disabled.circuit_state(), None);
 }
