@@ -896,7 +896,7 @@ mod tests {
         assert!(entry.exists(), "cache entries must never be swept");
     }
 
-    // ── Expert-panel hardening (LAB-429 round 2) ─────────────────────────────
+    // ── Hardening ────────────────────────────────────────────────────────────
 
     #[cfg(unix)]
     #[test]
@@ -937,7 +937,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stale_unlink_decision_spares_replaced_entry() {
-        // Panel finding #1: a get() that decided "expired" must not delete
+        // Stale-unlink race: a get() that decided "expired" must not delete
         // the fresh entry a concurrent set() renamed over the path.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write_raw(
@@ -990,7 +990,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_read_racing_fresh_set_never_loses_the_write() {
-        // Panel finding #1, end to end through the public API: an expired
+        // The stale-unlink race, end to end through the public API: an expired
         // entry is read (deciding to unlink) while a fresh set replaces it.
         // Whatever the interleaving, the fresh value must survive.
         let dir = tempfile::tempdir().expect("tempdir");

@@ -22,7 +22,7 @@ use crate::error::CachekitError;
 /// either silently.
 pub const MAX_DECODE_DEPTH: usize = 100;
 
-/// Header-only structural walk over one MessagePack document (LAB-2503).
+/// Header-only structural walk over one MessagePack document.
 ///
 /// Proves that a complete document lies within `bytes` and that no header
 /// declares more elements or bytes than the remaining input can back — every

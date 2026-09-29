@@ -28,7 +28,7 @@ mod memcached_tests {
 
     #[tokio::test]
     async fn wedged_server_fails_fast_instead_of_hanging() {
-        // Panel round 2 (#5): an accepting-but-silent server must surface as
+        // An accepting-but-silent server must surface as
         // a bounded error, never wedge callers. The listener accepts TCP
         // connects and never writes a byte; connect()'s eager version ping
         // must fail via the per-connection socket timeout pinned on the URL,

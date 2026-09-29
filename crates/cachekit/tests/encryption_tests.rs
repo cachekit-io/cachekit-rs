@@ -368,7 +368,7 @@ async fn secure_set_rejects_payload_whose_ciphertext_exceeds_limit() {
 
 // ── Key rotation (keyring) ────────────────────────────────────────────────────
 
-/// End-to-end rotation round-trip (LAB-686 acceptance):
+/// End-to-end rotation round-trip:
 /// value written under k1 → k2 promoted with k1 decrypt-only → read succeeds
 /// without re-encryption → k1 dropped → read fails as an error.
 #[tokio::test]
@@ -445,7 +445,7 @@ async fn rotation_round_trip_without_reencryption() {
     );
 }
 
-/// Rotation drain signal (LAB-1678): the builder wires the counters into the
+/// Rotation drain signal: the builder wires the counters into the
 /// user-held secure handle, so a read served by the retiring key is visible
 /// there. Index-0 silence is owned and tested at the layer (`encryption.rs`).
 #[tokio::test]

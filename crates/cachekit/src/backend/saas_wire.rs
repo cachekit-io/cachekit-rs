@@ -2,8 +2,8 @@
 //!
 //! The wire contract is snake_case — `{"timeout_ms": N}` in, `{"lock_id":
 //! "uuid" | null}` out. Do NOT add `#[serde(rename_all = "camelCase")]`:
-//! that rename silently breaks every field against the deployed server
-//! (LAB-411). The round-trip tests below pin the literal wire JSON so a
+//! that rename silently breaks every field against the deployed server.
+//! The round-trip tests below pin the literal wire JSON so a
 //! rename regression fails in CI instead of in production.
 
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     fn lock_acquire_response_parses_contested_null() {
-        // LAB-240: contested = 200 {"lock_id": null}, never a 409 branch.
+        // Contested = 200 {"lock_id": null}, never a 409 branch.
         let resp: LockAcquireResponse =
             serde_json::from_str(r#"{"lock_id":null}"#).expect("parses");
         assert!(resp.lock_id.is_none());
@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn lock_acquire_response_rejects_camel_case() {
-        // LAB-411 tripwire: a camelCase rename must fail loudly here.
+        // Tripwire: a camelCase rename must fail loudly here.
         assert!(serde_json::from_str::<LockAcquireResponse>(r#"{"lockId":"x"}"#).is_err());
     }
 
