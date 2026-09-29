@@ -8,7 +8,7 @@ CARGO := cargo
 # crates/cachekit/src/lib.rs), so --all-features can never compile. `deny`
 # keeps --all-features on purpose: cargo-deny resolves the graph without
 # compiling (see README).
-NATIVE_FEATURES := cachekitio,redis,encryption,l1,macros,memcached,file
+NATIVE_FEATURES := cachekitio,redis,encryption,l1,macros,memcached,file,tracing
 
 quick-check: fmt clippy test
 
