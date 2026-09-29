@@ -12,12 +12,12 @@ keywords = ["cache", "redis", "encryption", "moka", "cloudflare-workers"]
 categories = ["caching", "web-programming", "cryptography"]
 
 # docs.rs builds with default features only unless told otherwise; without this
-# the Redis intent presets (minimal/production/encrypted) and the optional
+# the Redis intent presets (minimal/production/secure) and the optional
 # backends never appear in the rendered docs. `workers` stays off — mutually
 # exclusive with redis/l1/reliability/memcached/file (the five compile_error
 # guards in lib.rs).
 [package.metadata.docs.rs]
-features = ["cachekitio", "redis", "encryption", "l1", "reliability", "macros", "memcached", "file"]
+features = ["cachekitio", "redis", "encryption", "l1", "reliability", "macros", "memcached", "file", "tracing"]
 
 [lib]
 name = "cachekit"
@@ -38,7 +38,7 @@ workers = ["dep:worker", "dep:js-sys", "dep:getrandom", "dep:serde_json"]
 # cachekit-core's `encryption` feature folds aes-gcm in automatically on wasm32
 # (`wasm` is a pure alias for `encryption`). No separate `cachekit-core/wasm`
 # activation needed. Deliberately version-free: the fact is version-independent,
-# and a pinned version in prose is the only part that rots (LAB-866 precedent).
+# and a pinned version in prose is the only part that rots.
 encryption = ["cachekit-core/encryption"]
 # tokio/rt provides Handle::try_current + spawn for the L1 stale-while-
 # revalidate background refresh (native only — `workers`+`l1` is a compile
@@ -51,9 +51,14 @@ reliability = ["tokio/time"]
 # Opt into ?Send / Rc on native targets (for tokio::task::LocalSet, single-threaded
 # runtimes, etc.). Same code paths that wasm32 already uses.
 unsync = []
+# Structured `tracing` events: one debug event per get/set/delete on the
+# `cachekit` target, and circuit-breaker transitions on `cachekit::reliability`.
+# Events carry `key_hash` (Blake2b-128), never the key (CWE-532). Off by
+# default — with no subscriber the callsites are a disabled-check each.
+tracing = ["dep:tracing"]
 
 [dependencies]
-cachekit-core = { version = "0.5", features = ["messagepack"] }
+cachekit-core = { version = "0.6", features = ["messagepack"] }
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
 thiserror = "2.0"
@@ -82,7 +87,7 @@ fred = { version = "9", optional = true, features = ["i-scripts"] }
 # Optional: Memcached backend. rust-memcache with no default features — the
 # `tls` feature would pull openssl into a rustls-only SDK (and the previously
 # used async-memcached 0.6 shipped toxiproxy_rust/openssl as runtime deps,
-# which is why it was dropped — expert panel, LAB-429). Held at 0.19: 0.20.0
+# which is why it was dropped). Held at 0.19: 0.20.0
 # uses `is_multiple_of`/let-chains and breaks this workspace's 1.85 MSRV.
 memcache = { version = "0.19", optional = true, default-features = false }
 
@@ -97,6 +102,11 @@ getrandom = { version = "0.2", optional = true, features = ["js"] }
 # Optional: proc-macro decorator
 cachekit-macros = { version = "0.7.0", path = "../cachekit-macros", optional = true }
 
+# Optional: structured events. `std` only — no `attributes`: the crate uses no
+# `#[instrument]`, so users don't pay for the proc-macro build. Already in the
+# lockfile transitively via reqwest/fred, so this adds no new crate to the graph.
+tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
+
 # Optional (file backend, unix only): libc for the O_NOFOLLOW/ELOOP constants
 # (std has no portable spelling); rustix for safe flock/geteuid wrappers —
 # this workspace forbids `unsafe`, so raw libc calls are off the table.
@@ -105,8 +115,8 @@ libc = { version = "0.2", optional = true }
 rustix = { version = "1", optional = true, default-features = false, features = ["fs", "process", "std"] }
 
 # Non-optional on wasm32, regardless of features: `SystemTime::now()` panics on
-# wasm32-unknown-unknown, so session.rs reads `js_sys::Date::now()` there
-# (LAB-1079). Target-gated rather than feature-gated so every wasm32 build of
+# wasm32-unknown-unknown, so session.rs reads `js_sys::Date::now()` there.
+# Target-gated rather than feature-gated so every wasm32 build of
 # session_headers() — workers AND cachekitio — gets the safe clock.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3"
@@ -123,7 +133,7 @@ serial_test = "3"
 tempfile = "3"
 
 # wasm32 runtime tests (tests/wasm_session_tests.rs) — compile-only CI let the
-# SystemTime::now() trap ship in five releases (LAB-1079). Exact-pinned because
+# SystemTime::now() trap ship in five releases. Exact-pinned because
 # wasm-bindgen-test releases in lockstep with wasm-bindgen, and CI's
 # wasm-bindgen-test-runner binary must match the locked wasm-bindgen version
 # byte-for-byte (bump this, the lockfile, and the runner pin in ci.yml together).

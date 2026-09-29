@@ -1,6 +1,6 @@
 //! Tests for intent-based cache presets.
 //!
-//! The async Redis intents (minimal, production, encrypted) connect eagerly,
+//! The async Redis intents (minimal, production, secure) connect eagerly,
 //! so their success paths need a live Redis and are not tested here. Their
 //! error paths (invalid URL, invalid key) are deterministic and local — those
 //! are exercised through the public factories directly. The sync io() intent
@@ -71,10 +71,10 @@ mod redis_intents {
     }
 }
 
-// ── encrypted (factory key validation, no network) ───────────────────────────
+// ── secure (factory key validation, no network) ──────────────────────────────
 
 #[cfg(all(feature = "redis", feature = "encryption"))]
-mod encrypted_intent {
+mod secure_intent {
     use crate::common::MockBackend;
     use cachekit::error::CachekitError;
     use cachekit::CacheKit;
@@ -84,7 +84,7 @@ mod encrypted_intent {
         // The URL points at an unreachable Redis on purpose: key validation
         // must fire first, so we get the deterministic Config error (a short
         // key is a configuration mistake) — never a Backend (connection) error.
-        let result = CacheKit::encrypted("redis://127.0.0.1:1", b"too_short").await;
+        let result = CacheKit::secure("redis://127.0.0.1:1", b"too_short").await;
         assert!(
             matches!(result, Err(CachekitError::Config(_))),
             "short master key must be rejected before any Redis I/O"
@@ -105,7 +105,10 @@ mod encrypted_intent {
 #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
 mod io_intent {
     use super::*;
+    use cachekit::error::CachekitError;
     use cachekit::CacheKit;
+    use common::EnvGuard;
+    use serial_test::serial;
 
     #[test]
     fn builds_with_valid_key() {
@@ -128,5 +131,60 @@ mod io_intent {
             .no_l1()
             .build();
         assert!(cache.is_ok());
+    }
+
+    // ── CACHEKIT_API_KEY fallback (protocol intent-presets.md § io Credentials)
+
+    #[test]
+    #[serial]
+    fn io_from_env_reads_api_key() {
+        let _env = EnvGuard::set(&[("CACHEKIT_API_KEY", Some("ck_live_env"))]);
+        assert!(CacheKit::io_from_env().unwrap().build().is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn io_from_env_fails_when_unset_naming_both_sources() {
+        let _env = EnvGuard::set(&[("CACHEKIT_API_KEY", None)]);
+        let msg = match CacheKit::io_from_env() {
+            Err(CachekitError::Config(msg)) => msg,
+            Err(other) => panic!("expected Config, got {other:?}"),
+            Ok(_) => panic!("expected Err, got a builder"),
+        };
+        assert!(msg.contains("CACHEKIT_API_KEY"), "{msg}");
+        assert!(msg.contains("CacheKit::io"), "{msg}");
+    }
+
+    #[test]
+    #[serial]
+    fn io_explicit_argument_beats_env() {
+        // Empty env is unset for io_from_env, and must not shadow an
+        // explicit argument.
+        let _env = EnvGuard::set(&[("CACHEKIT_API_KEY", Some(""))]);
+        assert!(matches!(
+            CacheKit::io_from_env(),
+            Err(CachekitError::Config(_))
+        ));
+        assert!(CacheKit::io("ck_live_explicit").unwrap().build().is_ok());
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    #[serial]
+    fn io_never_activates_encryption_from_master_key_env() {
+        let master_hex = "22".repeat(32);
+        let _env = EnvGuard::set(&[
+            ("CACHEKIT_API_KEY", Some("ck_live_env")),
+            ("CACHEKIT_MASTER_KEY", Some(&master_hex)),
+        ]);
+        for cache in [
+            CacheKit::io("ck_live_explicit").unwrap().build().unwrap(),
+            CacheKit::io_from_env().unwrap().build().unwrap(),
+        ] {
+            assert!(
+                matches!(cache.secure_cache(), Err(CachekitError::Config(_))),
+                "io preset must not read CACHEKIT_MASTER_KEY"
+            );
+        }
     }
 }

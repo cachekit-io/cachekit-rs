@@ -36,12 +36,31 @@ fn wrap(b: impl crate::backend::Backend + 'static) -> SharedBackend {
 
 // ── Intent presets ───────────────────────────────────────────────────────────
 
+/// `minimal` builder defaults, split from the eager Redis connect so the
+/// L1-on / SWR-off contract (`protocol/spec/intent-presets.md` § L1 Posture)
+/// is unit-testable without a live server.
+#[cfg(feature = "redis")]
+fn minimal_defaults(backend: SharedBackend) -> CacheKitBuilder {
+    let builder = CacheKitBuilder::default()
+        .backend(backend)
+        .default_ttl(Duration::from_secs(300))
+        .l1_capacity(1000);
+    // Builder default is SWR-on; spec § L1 Posture says minimal MUST NOT.
+    #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+    let builder = builder.swr_enabled(false);
+    builder
+}
+
 impl CacheKit {
     /// **Minimal** — speed-first Redis cache, no extras.
     ///
     /// * Backend: Redis (connects eagerly; **fails fast** — a dropped
     ///   connection is not re-established)
-    /// * L1 cache: **off**
+    /// * L1 cache: **on** (1 000 entries, **no SWR / invalidation**) — an L1
+    ///   hit is served as-is until it expires, so a read may return an entry
+    ///   up to its TTL (300 s by default) after another process changed it
+    ///   in Redis. Chain
+    ///   [`.no_l1()`](CacheKitBuilder::no_l1) to read through every time.
     /// * Encryption: **no**
     /// * Reliability: **off** — no retry, no circuit breaker, no
     ///   backpressure; every backend error propagates on first failure and
@@ -71,10 +90,7 @@ impl CacheKit {
             .build()?;
         drop(backend.connect().await?);
 
-        Ok(CacheKitBuilder::default()
-            .backend(wrap(backend))
-            .default_ttl(Duration::from_secs(300))
-            .no_l1())
+        Ok(minimal_defaults(wrap(backend)))
     }
 
     /// **Production** — reliability-first Redis cache with L1.
@@ -121,7 +137,7 @@ impl CacheKit {
         Ok(builder)
     }
 
-    /// **Encrypted** — zero-knowledge encrypted Redis cache.
+    /// **Secure** — zero-knowledge encrypted Redis cache.
     ///
     /// * Backend: Redis (connects eagerly, failing fast if unreachable;
     ///   **auto-reconnects** after a dropped connection with exponential
@@ -150,14 +166,14 @@ impl CacheKit {
     /// ```no_run
     /// # async fn example() -> Result<(), cachekit::CachekitError> {
     /// let key = b"my_32_byte_production_key_here!!";
-    /// let cache = cachekit::CacheKit::encrypted("redis://localhost:6379", key).await?
+    /// let cache = cachekit::CacheKit::secure("redis://localhost:6379", key).await?
     ///     .build()?;
-    /// let encrypted = cache.secure()?;
+    /// let secure = cache.secure_cache()?;
     /// # Ok(())
     /// # }
     /// ```
     #[cfg(all(feature = "redis", feature = "encryption"))]
-    pub async fn encrypted(
+    pub async fn secure(
         redis_url: &str,
         master_key: &[u8],
     ) -> Result<CacheKitBuilder, CachekitError> {
@@ -191,9 +207,11 @@ impl CacheKit {
     ///
     /// Good for: serverless, edge compute, managed caching without Redis.
     ///
+    /// Use [`CacheKit::io_from_env`] to read the key from `CACHEKIT_API_KEY`.
+    ///
     /// # Errors
     ///
-    /// Returns [`CachekitError`] if `api_key` is empty.
+    /// Returns [`CachekitError::Config`] if `api_key` is empty.
     ///
     /// # Example
     ///
@@ -219,5 +237,69 @@ impl CacheKit {
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         let builder = builder.reliability(crate::reliability::ReliabilityConfig::default());
         Ok(builder)
+    }
+
+    /// **CachekitIO**, API key from the environment — [`CacheKit::io`] with
+    /// the key read from `CACHEKIT_API_KEY`.
+    ///
+    /// Identical preset to [`io`](CacheKit::io). Reads **only**
+    /// `CACHEKIT_API_KEY` — unlike [`CacheKit::from_env`], never
+    /// `CACHEKIT_MASTER_KEY`, so no encryption is activated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CachekitError::Config`] when `CACHEKIT_API_KEY` is unset or
+    /// empty.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # fn example() -> Result<(), cachekit::CachekitError> {
+    /// let cache = cachekit::CacheKit::io_from_env()?
+    ///     .namespace("edge")
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
+    pub fn io_from_env() -> Result<CacheKitBuilder, CachekitError> {
+        let api_key = std::env::var("CACHEKIT_API_KEY")
+            .ok()
+            .map(zeroize::Zeroizing::new)
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| {
+                CachekitError::Config(
+                    "CACHEKIT_API_KEY is unset or empty: set it or pass the key to CacheKit::io(api_key)"
+                        .to_owned(),
+                )
+            })?;
+        Self::io(&api_key)
+    }
+}
+
+#[cfg(all(test, feature = "redis", feature = "l1"))]
+#[allow(clippy::expect_used)] // test-only: a failing build here should panic loudly
+mod tests {
+    /// `RedisBackend::build()` does not connect, so the preset's defaults
+    /// are observable without a live server.
+    #[test]
+    fn minimal_enables_l1_without_swr() {
+        let backend = crate::backend::redis::RedisBackend::builder()
+            .url("redis://localhost:6379")
+            .build()
+            .expect("valid URL");
+        let cache = super::minimal_defaults(super::wrap(backend))
+            .build()
+            .expect("minimal defaults must build");
+
+        assert!(
+            cache.l1.is_some(),
+            "spec/intent-presets.md § L1 Posture: minimal MUST enable L1"
+        );
+        #[cfg(all(not(feature = "unsync"), not(target_arch = "wasm32")))]
+        assert!(
+            !cache.swr_enabled,
+            "spec/intent-presets.md § L1 Posture: minimal MUST NOT enable SWR"
+        );
     }
 }

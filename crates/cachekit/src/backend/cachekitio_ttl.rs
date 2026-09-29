@@ -95,4 +95,15 @@ mod tests {
             _assert_ttl_inspectable(backend);
         }
     }
+
+    /// The server answers `{"ttl": null}` for a live key with no expiry.
+    /// That must decode to `None`, never a parse error.
+    #[test]
+    fn ttl_response_decodes_null_ttl_as_none() {
+        let decode = |json: &str| serde_json::from_str::<TtlResponse>(json).map(|r| r.ttl);
+
+        assert!(matches!(decode(r#"{"ttl":null}"#), Ok(None)));
+        assert!(matches!(decode(r#"{"ttl":42}"#), Ok(Some(42))));
+        assert!(decode(r#"{"ttl":null,"extra":1}"#).is_err());
+    }
 }
