@@ -285,6 +285,106 @@ async fn secure_l1_stores_ciphertext_not_plaintext() {
     );
 }
 
+/// Write a real ciphertext for `key` through an L1-less client, then flip its
+/// last byte in the backend so it fails AES-GCM authentication. Returns the
+/// planted bytes.
+async fn plant_tampered(shared: SharedBackend, backend: &MockBackend, key: &str) -> Vec<u8> {
+    let writer = make_encrypted_client(shared);
+    writer
+        .secure_cache()
+        .unwrap()
+        .set(key, &"authentic")
+        .await
+        .unwrap();
+    let mut store = backend.store.lock().await;
+    let bytes = store.get_mut(key).expect("writer stored the entry");
+    *bytes.last_mut().unwrap() ^= 0x01;
+    bytes.clone()
+}
+
+#[tokio::test]
+async fn secure_get_evicts_l1_after_decrypt_failure() {
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = make_encrypted_client_with_l1(shared.clone());
+    let secure = client.secure_cache().unwrap();
+    let planted = plant_tampered(shared, &backend, "poisoned").await;
+
+    let err = secure.get::<String>("poisoned").await.unwrap_err();
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+    // The failed read must not remove or rewrite the backend entry.
+    assert_eq!(backend.store.lock().await.get("poisoned"), Some(&planted));
+
+    // Remove the entry behind the client's back: a surviving L1 copy would
+    // keep failing; an evicted one yields a miss.
+    backend.store.lock().await.remove("poisoned");
+    assert_eq!(secure.get::<String>("poisoned").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn secure_interop_get_swr_evicts_l1_after_decrypt_failure() {
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = make_encrypted_client_with_l1(shared.clone());
+    let secure = client.secure_cache().unwrap();
+    let planted = plant_tampered(shared, &backend, "poisoned-swr").await;
+
+    let err = secure
+        .interop_get_swr::<String>("poisoned-swr")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+    assert_eq!(
+        backend.store.lock().await.get("poisoned-swr"),
+        Some(&planted)
+    );
+
+    backend.store.lock().await.remove("poisoned-swr");
+    assert!(matches!(
+        secure.interop_get_swr::<String>("poisoned-swr").await,
+        Ok(cachekit::SwrRead::Miss)
+    ));
+}
+
+// SWR staleness exists only on native builds with L1 (see swr_tests.rs).
+#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+#[tokio::test]
+async fn secure_interop_get_swr_evicts_stale_l1_after_decrypt_failure() {
+    // The Stale arm reads straight from L1, so the undecryptable bytes must
+    // already be there: a plain write puts plaintext in this client's L1.
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = CacheKit::builder()
+        .backend(shared)
+        .l1_capacity(100)
+        .swr_threshold_ratio(0.001)
+        .encryption_from_bytes(TEST_MASTER_KEY, "test-tenant")
+        .expect("encryption setup")
+        .build()
+        .expect("client builds");
+    client
+        .set_with_ttl("poisoned-stale", &"plaintext", Duration::from_secs(60))
+        .await
+        .unwrap();
+    // Real time, not tokio's paused clock: L1 ages entries by std Instant, so
+    // a paused sleep leaves the entry Fresh. threshold = 0.001 × 60 s = 60 ms
+    // (±10%); hard expiry at 60 s.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let secure = client.secure_cache().unwrap();
+    let err = secure
+        .interop_get_swr::<String>("poisoned-stale")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+    // Served from L1, so the entry had not hard-expired into the L2 path.
+    let stats = client.stats();
+    assert_eq!((stats.l1_hits, stats.l2_hits), (1, 0), "{stats:?}");
+
+    backend.store.lock().await.remove("poisoned-stale");
+    assert!(matches!(
+        secure.interop_get_swr::<String>("poisoned-stale").await,
+        Ok(cachekit::SwrRead::Miss)
+    ));
+}
+
 #[tokio::test]
 async fn secure_with_namespace() {
     let (shared, backend) = MockBackend::new_with_handle();

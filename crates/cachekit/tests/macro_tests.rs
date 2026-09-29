@@ -414,6 +414,67 @@ async fn macro_secure_fails_closed_when_backend_down() {
     );
 }
 
+#[cfg(feature = "encryption")]
+static POISONED_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(feature = "encryption")]
+#[cachekit(client = cache, ttl = 60, interop = "poisoned_op", namespace = "reliab", secure)]
+async fn poisoned_op(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
+    POISONED_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(User {
+        name: format!("secret {id}"),
+    })
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn macro_secure_evicts_l1_after_decrypt_failure() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let secure_client = |backend: SharedBackend, l1: bool| {
+        let builder = CacheKit::builder()
+            .backend(backend)
+            .encryption_from_bytes(&[7u8; 32], "default")
+            .expect("encryption configures");
+        let builder = if l1 { builder } else { builder.no_l1() };
+        builder.build().expect("client builds")
+    };
+    let (shared, backend) = common::MockBackend::new_with_handle();
+    let cache = secure_client(shared.clone(), true);
+    let key = interop_key("reliab", "poisoned_op", &[InteropValue::from(1u64)]).unwrap();
+
+    // Plant a real ciphertext (written through an L1-less client, so the
+    // client under test holds no L1 copy yet), then break its GCM tag.
+    let writer = secure_client(shared, false);
+    writer
+        .secure_cache()
+        .unwrap()
+        .set(&key, &"authentic")
+        .await
+        .unwrap();
+    let planted = {
+        let mut store = backend.store.lock().await;
+        let bytes = store.get_mut(&key).expect("writer stored the entry");
+        *bytes.last_mut().unwrap() ^= 0x01;
+        bytes.clone()
+    };
+
+    let err = poisoned_op(&cache, 1)
+        .await
+        .expect_err("fail-closed: decrypt error propagates");
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+    assert_eq!(POISONED_RUNS.load(SeqCst), 0, "body must not run");
+    // The failed read must not remove or rewrite the backend entry.
+    assert_eq!(backend.store.lock().await.get(&key), Some(&planted));
+
+    // Remove the entry behind the client's back: with the L1 copy evicted,
+    // the next call is a miss that runs the body.
+    backend.store.lock().await.remove(&key);
+    let user = poisoned_op(&cache, 1).await.expect("miss runs the body");
+    assert_eq!(user.name, "secret 1");
+    assert_eq!(POISONED_RUNS.load(SeqCst), 1);
+}
+
 static SLOW_OP_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[cachekit(client = cache, ttl = 60, interop = "slow_op", namespace = "flight")]
