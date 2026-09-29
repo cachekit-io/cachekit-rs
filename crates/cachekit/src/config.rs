@@ -146,7 +146,7 @@ impl CachekitConfig {
                 }
                 // Previous keys without a current key is a broken rotation
                 // deploy: nothing would ever consume them, and the operator
-                // would only find out at the first secure() call. Fail at load.
+                // would only find out at the first secure_cache() call. Fail at load.
                 if config.master_key.is_none() {
                     return Err(CachekitError::Config(
                         "CACHEKIT_PREVIOUS_MASTER_KEYS requires CACHEKIT_MASTER_KEY to be set"
@@ -291,17 +291,31 @@ impl CachekitConfigBuilder {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Hex-decode a master key and require at least 32 bytes. Shared by the
-/// current-key and previous-key paths so validation cannot drift.
+/// Hex-decode a master key and require at least 32 bytes. Shared by every
+/// master-key hex path — the current and previous keys here, the `secure`
+/// preset and the builder's `.encryption()` — so validation cannot drift.
 ///
 /// Returns `Zeroizing` so the decoded key material is wiped on drop for its
 /// whole lifetime — including the early-drop paths where a caller's later
 /// validation step fails.
-fn decode_master_key_hex(hex_key: &str, what: &str) -> Result<Zeroizing<Vec<u8>>, CachekitError> {
-    let bytes = Zeroizing::new(
-        hex::decode(hex_key)
-            .map_err(|e| CachekitError::Config(format!("{what} is not valid hex: {e}")))?,
-    );
+pub(crate) fn decode_master_key_hex(
+    hex_key: &str,
+    what: &str,
+) -> Result<Zeroizing<Vec<u8>>, CachekitError> {
+    // Decode straight into zeroizing storage sized once: `hex::decode` grows
+    // its Vec by reallocation and frees each outgrown buffer unwiped.
+    let mut bytes = Zeroizing::new(vec![0u8; hex_key.len() / 2]);
+    hex::decode_to_slice(hex_key, &mut bytes).map_err(|e| {
+        // `FromHexError`'s Display quotes the offending character — one
+        // character of the key in an error string (CWE-532). Name the class.
+        // Exhaustive on purpose: a new variant must be reviewed for the same leak.
+        let reason = match e {
+            hex::FromHexError::InvalidHexCharacter { .. } => "contains a non-hex character",
+            hex::FromHexError::OddLength => "odd number of hex digits",
+            hex::FromHexError::InvalidStringLength => "invalid length",
+        };
+        CachekitError::Config(format!("{what} is not valid hex: {reason}"))
+    })?;
     if bytes.len() < 32 {
         return Err(CachekitError::Config(format!(
             "{what} must be at least 32 bytes (64 hex chars); got {} bytes",

@@ -21,7 +21,7 @@
 
 ## Overview
 
-`cachekit-rs` is the Rust SDK for [cachekit.io](https://cachekit.io). Pick an [intent preset](#intent-presets-recommended) — `minimal`, `production`, `encrypted`, or `io` — and get a pre-configured cache in one call, from bare Redis speed to dual-layer with client-side encryption. Pick `encrypted` and bytes never leave your process in plaintext.
+`cachekit-rs` is the Rust SDK for [cachekit.io](https://cachekit.io). Pick an [intent preset](#intent-presets-recommended) — `minimal`, `production`, `secure`, or `io` — and get a pre-configured cache in one call, from bare Redis speed to dual-layer with client-side encryption. Pick `secure` and bytes never leave your process in plaintext.
 
 | Component | What it does |
 |:----------|:-------------|
@@ -49,19 +49,20 @@
 | `file` | ❌ | Local filesystem backend, byte-compatible with cachekit-py's File backend (native only) |
 | `workers` | ❌ | Cloudflare Workers backend via [worker](https://crates.io/crates/worker) |
 | `macros` | ❌ | `#[cachekit]` proc-macro decorator (mints [interop/v1](#cross-sdk-interop-mode) keys) |
+| `tracing` | ❌ | [`tracing`](https://crates.io/crates/tracing) events per cache operation and breaker transition — see [Observability](#observability) |
 
 ```toml
 # Defaults: SaaS + encryption + L1
 [dependencies]
-cachekit-rs = "0.7"
+cachekit-rs = "0.8"
 
 # With Redis backend
 [dependencies]
-cachekit-rs = { version = "0.7", features = ["redis"] }
+cachekit-rs = { version = "0.8", features = ["redis"] }
 
 # For Cloudflare Workers (no L1, no Redis)
 [dependencies]
-cachekit-rs = { version = "0.7", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.8", default-features = false, features = ["workers", "encryption"] }
 ```
 
 > [!WARNING]
@@ -82,21 +83,23 @@ One call that names your use case. Each preset returns a pre-configured builder 
 
 | Preset | When to use | Backend | L1 | Encryption | Reliability¹ | Auto-reconnect² | Default TTL |
 |:-------|:------------|:--------|:--:|:----------:|:------------:|:---------------:|:-----------:|
-| `CacheKit::minimal(url)` | Development, public data, product catalogs — speed first, no extras | Redis³ | ❌ | ❌ | ❌ | ❌ | 300 s |
+| `CacheKit::minimal(url)` | Development, public data, product catalogs — speed first, no extras | Redis³ | ✅ (no SWR) | ❌ | ❌ | ❌ | 300 s |
 | `CacheKit::production(url)` | User sessions, API responses, production services | Redis³ | ✅ | ❌ | ✅ | ✅ | 600 s |
-| `CacheKit::encrypted(url, key)` | PII, payments, GDPR/HIPAA-sensitive data — zero-knowledge AES-256-GCM | Redis³ | ✅ | ✅ | ✅ | ✅ | 600 s |
-| `CacheKit::io(api_key)` | Serverless, edge compute, managed caching without running Redis | cachekit.io | ✅ | ❌ | ✅ | n/a (HTTP) | 3 600 s |
+| `CacheKit::secure(url, master_key_hex)`⁵ | PII, payments, GDPR/HIPAA-sensitive data — zero-knowledge AES-256-GCM | Redis³ | ✅ | ✅ | ✅ | ✅ | 600 s |
+| `CacheKit::io(api_key)`⁴ | Serverless, edge compute, managed caching without running Redis | cachekit.io | ✅ | ❌ | ✅ | n/a (HTTP) | 3 600 s |
 
 ¹ Retry with backoff + jitter, circuit breaker, backpressure — the [reliability stack](#reliability). Requires the default-on `reliability` feature.
 ² See the resilience contract below.
-³ Requires the `redis` feature flag; `encrypted` also needs the default-on `encryption` feature.
+³ Requires the `redis` feature flag; `secure` also needs the default-on `encryption` feature.
+⁴ Or `CacheKit::io_from_env()` to read `CACHEKIT_API_KEY`.
+⁵ Or `CacheKit::secure_from_env(url)` to read `CACHEKIT_MASTER_KEY`. Both take the key as a hex string and decode it the same way every CacheKit SDK does. Use exactly 32 bytes (64 hex chars, `openssl rand -hex 32`) — the only length every SDK accepts.
 
 ```rust
 use cachekit::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), CachekitError> {
-    // Needs: cachekit-rs = { version = "0.7", features = ["redis"] }
+    // Needs: cachekit-rs = { version = "0.8", features = ["redis"] }
     let cache = CacheKit::production("redis://localhost:6379").await?
         .namespace("api")
         .build()?;
@@ -111,11 +114,11 @@ async fn main() -> Result<(), CachekitError> {
 
 **Resilience contract** — connection failures, at construction and mid-run:
 
-- `production` / `encrypted` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely.
-- `minimal` is **fail-fast**: a dropped connection is not re-established — every subsequent operation errors until you rebuild the client.
+- `production` / `secure` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely.
+- `minimal` is **fail-fast**: a dropped connection is not re-established — every subsequent operation that reaches Redis errors until you rebuild the client. Reads served from a warm L1 entry still return without contacting Redis.
 - **Initial** connections fail fast for every Redis preset: a bad URL or unreachable Redis errors immediately at construction, never enters a retry loop. `io` opens no connection at construction: an empty API key fails at construction, while an invalid key or unreachable endpoint surfaces at the first request.
-- `encrypted` validates the master key **before** any Redis connection is attempted — a bad key is a deterministic local error, never masked by (or paying for) network I/O.
-- Auto-reconnect is connection-level repair, distinct from the per-operation [reliability stack](#reliability) (retry, circuit breaker, backpressure) that `production` / `encrypted` / `io` also enable. `minimal` has neither — every failure is yours to handle.
+- `secure` / `secure_from_env` validate the master key **before** any Redis connection is attempted — a missing, non-hex or short key is a deterministic local error, never masked by (or paying for) network I/O, and never a fallback to plaintext.
+- Auto-reconnect is connection-level repair, distinct from the per-operation [reliability stack](#reliability) (retry, circuit breaker, backpressure) that `production` / `secure` / `io` also enable. `minimal` has neither — every failure is yours to handle.
 
 ### From Environment Variables
 
@@ -161,11 +164,12 @@ let cache = CacheKit::builder()
 
 ## Zero-Knowledge Encryption
 
-Call `.secure()` to get an encrypted cache handle. All values are encrypted client-side with AES-256-GCM before hitting any backend. The backend only ever sees ciphertext.
+Call `.secure_cache()` to get an encrypted cache handle. All values are encrypted client-side with AES-256-GCM before hitting any backend. The backend only ever sees ciphertext.
 
 ```rust
-let cache = CacheKit::from_env()?.build()?;
-let secure = cache.secure()?;
+// Env: CACHEKIT_MASTER_KEY=<64 hex chars>
+let cache = CacheKit::secure_from_env("redis://localhost:6379").await?.build()?;
+let secure = cache.secure_cache()?;
 
 // Encrypt → store (backend sees only ciphertext)
 secure.set("user:42:ssn", &"123-45-6789").await?;
@@ -227,9 +231,9 @@ let cache = CacheKit::builder()
     .build()?;
 ```
 
-Rotation is forward-only: a retired key is never re-promoted (re-promoting would resume a used AES-GCM nonce budget), and a config listing the current key among the previous keys is rejected at load.
+Rotation is forward-only: a retired key is never re-promoted (re-promoting would resume a used AES-GCM nonce budget), and a config listing the current key among the previous keys is rejected at load. For the three-phase zero-miss rollout and compromise response, see the [key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/).
 
-**Knowing when to drop the old key.** Every read served by a previous key is counted against that key's position; `cache.secure()?.previous_key_hits()` returns the counts (`hits[i]` for `previous_keys[i]`, current-key reads not counted, no key material). The signal confirms a grace window has drained; it does not shorten one. Follow the protocol's [scheduled-rotation runbook](https://github.com/cachekit-io/protocol/blob/main/decisions/key-rotation.md#runbooks-normative-for-docs): audit for non-expiring entries, add the incoming key as decrypt-only fleet-wide, then promote it. The clock starts only when the promotion deploy has completed on every instance — a lagging instance still writes under the retiring key and reads it silently as *its* current key. From then, wait at least the longest TTL in use (including any explicit `set_with_ttl` values), aggregating counts across every instance (they are per process and reset on restart). Once the retiring key's count has stayed flat over that whole window, every live entry has aged out or been re-encrypted on write, and the key can be dropped from `CACHEKIT_PREVIOUS_MASTER_KEYS` without a hard cut-over.
+**Knowing when to drop the old key.** Every read served by a previous key is counted against that key's position; `cache.secure_cache()?.previous_key_hits()` returns the counts (`hits[i]` for `previous_keys[i]`, current-key reads not counted, no key material). The signal confirms a grace window has drained; it does not shorten one. Follow the protocol's [scheduled-rotation runbook](https://github.com/cachekit-io/protocol/blob/main/decisions/key-rotation.md#runbooks-normative-for-docs): audit for non-expiring entries, add the incoming key as decrypt-only fleet-wide, then promote it. The clock starts only when the promotion deploy has completed on every instance — a lagging instance still writes under the retiring key and reads it silently as *its* current key. From then, wait at least the longest TTL in use (including any explicit `set_with_ttl` values), aggregating counts across every instance (they are per process and reset on restart). Once the retiring key's count has stayed flat over that whole window, every live entry has aged out or been re-encrypted on write, and the key can be dropped from `CACHEKIT_PREVIOUS_MASTER_KEYS` without a hard cut-over.
 
 ---
 
@@ -246,6 +250,8 @@ let key = interop_key("users", "get_user", &[InteropValue::from(42i64)])?;
 cache.set_with_ttl(&key, &user, ttl).await?;          // plain MessagePack — already interop
 let user: Option<User> = cache.interop_get(&key).await?; // strict read: exactly one document
 ```
+
+`ns` and `nsapi` are reserved as namespaces — the CachekitIO server parses a key starting `ns:` or `nsapi:` as namespace-prefixed — so `interop_key` rejects them with `InvalidKey` and `#[cachekit(namespace = ...)]` with a compile error; operations are unaffected.
 
 Argument hashing is byte-identical across SDKs (canonical MessagePack + Blake2b-256), verified against the shared [protocol](https://github.com/cachekit-io/protocol) test vectors ([`interop-mode.json`](crates/cachekit/tests/vectors/interop-mode.json), vendored) in this repo's test suite. `interop_get` (also on `SecureCache`) rejects trailing bytes and Python-internal CK frames instead of silently misreading them. Every decode of backend-supplied bytes (`get` and `interop_get` alike) runs under an explicit nesting-depth bound (`serializer::MAX_DECODE_DEPTH` = 100, matching the TypeScript SDK) and a header-only structural walk that rejects headers declaring more than the input can back, verified against the protocol's shared [`decode-bounds.json`](crates/cachekit/tests/vectors/decode-bounds.json) vectors (vendored) — a forged nested-header entry is a bounded `Serialization` error, not a memory blow-up or a stack overflow. Encryption works unchanged — interop keys are identical across SDKs, so the AAD verifies cross-SDK.
 
@@ -276,7 +282,7 @@ let backend = CachekitIO::builder()
 Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Requires the `redis` feature flag.
 
 ```toml
-cachekit-rs = { version = "0.7", features = ["redis"] }
+cachekit-rs = { version = "0.8", features = ["redis"] }
 ```
 
 ```rust
@@ -297,7 +303,7 @@ Memcached via [rust-memcache](https://crates.io/crates/memcache) (single server,
 TTLs above memcached's 30-day ceiling are clamped (larger values would be misread as absolute timestamps); values above the item-size limit (default 1 MiB) fail loudly client-side, and a server-side "object too large" classifies as permanent (never retried). Requires the `memcached` feature flag.
 
 ```toml
-cachekit-rs = { version = "0.7", features = ["memcached"] }
+cachekit-rs = { version = "0.8", features = ["memcached"] }
 ```
 
 ```rust
@@ -314,7 +320,7 @@ let backend = MemcachedBackend::builder()
 Local disk cache, **byte-compatible with cachekit-py's File backend** — a py and an rs process pointed at the same directory read each other's entries (Blake2b-128 hashed filenames, shared 14-byte header, atomic write-then-rename, lazy expiry). Implements `TtlInspectable` (TTL read off the on-disk header, in-place refresh). Concurrency matches py: same-process operations serialize on a backend-wide lock (py's `RLock`); on unix, reads and in-place TTL rewrites take advisory `flock` while writes stay lock-free via atomic rename; and expired-entry unlinks are inode-validated so a stale read decision doesn't delete a concurrent writer's fresh entry. On unix the cache directory must be owned by you and not group/other-writable. Not yet ported from py: LRU eviction and size caps — the directory grows until entries expire or you clear it. Requires the `file` feature flag and a tokio runtime (I/O runs via `spawn_blocking`).
 
 ```toml
-cachekit-rs = { version = "0.7", features = ["file"] }
+cachekit-rs = { version = "0.8", features = ["file"] }
 ```
 
 ```rust
@@ -330,7 +336,7 @@ let backend = FileBackend::builder()
 `wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. Requires the `workers` feature with default features disabled.
 
 ```toml
-cachekit-rs = { version = "0.7", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.8", default-features = false, features = ["workers", "encryption"] }
 ```
 
 <details>
@@ -394,8 +400,10 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 | **Backfill on miss** | L2 hits populate L1 with a capped 30s TTL |
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
 | **Encrypted L1** | `SecureCache` stores ciphertext in L1 (never plaintext) |
+| **Evict on decrypt failure** | A `SecureCache` read that fails decryption drops the key's L1 copy and returns the error; the backend entry is kept, so the next read reaches the backend: a hit once the entry is replaced with ciphertext the client can decrypt, a miss once it expires or is deleted |
 | **Default capacity** | 1,000 entries (configurable via `.l1_capacity()`) |
-| **Stale-while-revalidate** | On by default (native): `#[cachekit]` serves an L1 hit past `swr_threshold_ratio` × entry TTL (default 0.5, ±10% jitter) immediately and refreshes it in the background — see below |
+| **Live counters** | `cache.stats()` reports L1 hits / L2 hits / misses; `cache.l1_entry_count()` the current occupancy — see [Observability](#observability) |
+| **Stale-while-revalidate** | On by default (native; `minimal` turns it off): `#[cachekit]` serves an L1 hit past `swr_threshold_ratio` × entry TTL (default 0.5, ±10% jitter) immediately and refreshes it in the background — see below |
 
 ### Stale-while-revalidate (SWR)
 
@@ -456,14 +464,14 @@ fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
 
 ## Reliability
 
-With the `reliability` feature (default, native only), the `production`, `encrypted`, and `io` presets wrap every backend operation in a reliability stack; `minimal` stays bare for maximum throughput:
+With the `reliability` feature (default, native only), the `production`, `secure`, and `io` presets wrap every backend operation in a reliability stack; `minimal` stays bare for maximum throughput:
 
 | Layer | What it does | Defaults |
 |:------|:-------------|:---------|
 | **Retry** | Truncated exponential backoff + jitter on transient/timeout errors (`BackendErrorKind::is_retryable`); permanent and auth errors propagate immediately | 3 attempts, 100 ms base, 5 s cap, jitter ×[0.5, 1.5) |
 | **Circuit breaker** | closed → open after N retryable failures in a rolling window; fails fast (`BackendErrorKind::CircuitOpen`) while open; half-open probes recovery | threshold 5, window 60 s, open 5 s, 3 probes, close after 3 successes |
 | **Backpressure** | Bounds concurrent backend data ops with a semaphore + bounded waiting queue; over-limit calls are shed with `BackendErrorKind::Backpressure` before reaching the backend — a slow backend can't exhaust the caller's connection pool or memory | 100 concurrent, 1 000 queued, 100 ms wait (Python SDK parity) |
-| **Graceful degradation** | On outage-class backend failure (transient, timeout, open breaker, backpressure shed), `#[cachekit]`-wrapped functions run uncached (fail-open); permanent/auth errors propagate — a wrong API key fails loudly. `secure` paths fail **closed** on everything — encrypted workloads never silently degrade | built into the macro |
+| **Graceful degradation** | On outage-class backend failure (transient, timeout, open breaker, backpressure shed), `#[cachekit]`-wrapped functions run uncached (fail-open); permanent/auth errors propagate — a wrong API key fails loudly. `#[cachekit(secure)]` paths fail **closed** on everything — encrypted workloads never silently degrade | built into the macro |
 | **Single-flight** | Concurrent misses of one key collapse to a single execution: per-key in-process lock, plus a distributed fill lock across processes on lock-capable backends (cachekit.io, Redis) | in-process always on; cross-process 5 s lock, 100 ms polls |
 | **Stale-while-revalidate** | Stale-but-unexpired L1 hits are served immediately while one single-flight-deduplicated background task re-executes the function ([details](#stale-while-revalidate-swr)) | on by default with `l1` (native); threshold 0.5 × entry TTL ±10% jitter |
 
@@ -491,13 +499,54 @@ Requires a tokio runtime for backoff timers (the `redis` and `cachekitio` backen
 
 ---
 
+## Observability
+
+Every client counts its reads, with no configuration:
+
+```rust,ignore
+let stats = cache.stats();                 // cachekit::L1Stats — live, shared by all clones
+println!(
+    "L1 {} / L2 {} / miss {} — L1 hit rate {:.1}%",
+    stats.l1_hits, stats.l2_hits, stats.misses, stats.l1_hit_rate() * 100.0,
+);
+let occupancy = cache.l1_entry_count();    // Option<u64>: None when L1 is off
+let breaker = cache.circuit_state();       // Option<CircuitState>: Closed / Open / HalfOpen
+```
+
+| Surface | What you get |
+|:--------|:-------------|
+| `CacheKit::stats()` | `L1Stats { l1_hits, l2_hits, misses, l1_enabled }` for every value read (`get`, `interop_get`, SWR and `SecureCache` variants). `exists` and reads that fail with a backend error are not counted. |
+| `CacheKit::l1_entry_count()` | Exact L1 occupancy (runs moka's pending housekeeping first — poll it, don't put it on a hot path). |
+| `CacheKit::circuit_state()` | Live breaker state (`reliability` feature); `None` when the client has no breaker. |
+| SaaS telemetry headers | The cachekit.io backends send `X-CacheKit-L1-Hits` / `L2-Hits` / `Misses` / `L1-Hit-Rate` from the **same counters**, wired automatically by `CacheKitBuilder::build()`. A `.metrics_provider(..)` set on the backend builder still takes precedence. One backend instance reports one client — the first built over it; once that client is gone the headers fall back to `disabled`. |
+| `tracing` feature | One `debug` event per completed operation on the `cachekit` target, and breaker transitions on `cachekit::reliability` (`warn` on open, `info` for half-open / closed). |
+
+With the `tracing` feature, point your subscriber at the crate:
+
+```bash
+RUST_LOG=cachekit=debug cargo run
+```
+
+```text
+DEBUG cachekit: op=get key_hash=bcb35ae6f64fa65b2770ab3af631b1ce outcome=miss
+DEBUG cachekit: op=set key_hash=bcb35ae6f64fa65b2770ab3af631b1ce ttl_secs=3600
+DEBUG cachekit: op=get key_hash=bcb35ae6f64fa65b2770ab3af631b1ce outcome=l1_hit
+ WARN cachekit::reliability: circuit breaker opened breaker=1 seq=1 from=Closed to=Open
+```
+
+Fields: `op` (`get` | `set` | `delete`), `outcome` (`l1_hit` | `l1_stale` | `l2_hit` | `miss`), `ttl_secs`, `existed`. Breaker events carry `breaker`, `seq`, `from`, `to`, and **`(breaker, seq)` is the ordering key**: `breaker` is a process-unique id assigned when the breaker is built (stable for its lifetime, not a key or secret), `seq` counts that breaker's transitions and is assigned under the breaker lock. Events are emitted after the lock is released (so a subscriber may call `circuit_state()` safely), which means two transitions can arrive out of order under contention, and several clients in one process each restart `seq` at 1 — group by `breaker`, order by `seq`, never by arrival. For fleet-wide correlation combine the pair with the host/process fields your subscriber adds. Events carry `key_hash` — Blake2b-128 of the namespaced storage key (`cachekit::metrics::key_hash`) — **never the key itself**: keys routinely embed user identifiers (CWE-532). The digest is a correlator, not a redaction: it is unkeyed and deterministic, so it matches the [File backend](#file-local-filesystem)'s on-disk filename (a log line names the cache file it touched), and for the same reason a low-entropy key like `user:42` can be recovered from it by enumeration. Treat `cachekit=debug` output with the care you give the keys themselves.
+
+Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rust services bring their own registry and bridge `tracing` themselves.
+
+---
+
 ## Environment Variables
 
 | Variable | Required | Description |
 |:---------|:--------:|:------------|
-| `CACHEKIT_API_KEY` | ✅ | API key for cachekit.io |
+| `CACHEKIT_API_KEY` | ✅ | API key for cachekit.io (`from_env()` and `CacheKit::io_from_env()`) |
 | `CACHEKIT_API_URL` | ❌ | Override API endpoint (default: `https://api.cachekit.io`) |
-| `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key (min 32 bytes) for encryption |
+| `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and `from_env()`); use exactly 32 bytes (64 hex chars) — shorter is rejected |
 | `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (max 3; a blank value is treated as unset) |
 | `CACHEKIT_DEFAULT_TTL` | ❌ | Default TTL in seconds (min 1, default: 300) |
 
@@ -520,7 +569,7 @@ cachekit-rs/
 │   │       ├── encryption.rs  # AES-256-GCM + AAD v0x03
 │   │       ├── error.rs       # CachekitError, BackendError
 │   │       ├── interop.rs     # interop/v1 cross-SDK keys + strict reads
-│   │       ├── metrics.rs     # L1 hit-rate metrics headers
+│   │       ├── metrics.rs     # Live counters, SaaS telemetry headers, tracing events
 │   │       ├── session.rs     # SDK session tracking
 │   │       ├── url_validator.rs # SSRF-safe URL validation
 │   │       ├── serializer/    # MessagePack serialization
@@ -553,12 +602,14 @@ make build         # cargo build --release
 make build-wasm    # wasm32-unknown-unknown (workers feature)
 ```
 
-`make security` runs the same two commands as the `supply-chain` job in
-`.github/workflows/security.yml`, with `cargo audit` in its strictest CI form
-(`--deny yanked`) — so a local pass means a pass on every CI event, with one
-asymmetry: the weekly run additionally proves the yank check actually executed
-(see the guard in `security.yml`), so with crates.io unreachable a local run
-warns and passes where the weekly run goes red. It needs
+`make security` runs the same two enforcement commands as the `supply-chain`
+job in `.github/workflows/security.yml`, with `cargo audit` in its strictest CI
+form (`--deny yanked`) — so a local pass means a pass on every CI event, with
+two asymmetries: the weekly run additionally proves the yank check actually
+executed (see the guard in `security.yml`), so with crates.io unreachable a
+local run warns and passes where the weekly run goes red; and the job's final
+step, the gate tamper check below, is PR-context-only and has no local
+equivalent. It needs
 `cargo-deny` and `cargo-audit` installed, and it reaches the network to refresh
 the RustSec advisory database — which is why it is not folded into
 `quick-check`.
@@ -581,6 +632,45 @@ reintroduced behind an optional feature passes a bare `cargo deny check`.
 `deny.toml` is the policy — notably a hard ban on `openssl-sys`, `native-tls`
 and `toxiproxy_rust`, because this SDK is rustls-only. Run `make deny` before
 adding or bumping a dependency.
+
+### Gate tamper-evidence
+
+The `supply-chain` check reads both its policy (`deny.toml`) and its own
+definition (`security.yml`) from the PR head, so a PR could weaken the gate it
+is being graded by — delete a `[bans]` entry, or drop `--all-features` while
+keeping the job name green. Two properties defend against that:
+
+- **Deletion fails closed.** `supply-chain` is a required status check with no
+  bypass actors; a PR that deletes the workflow leaves the context unreported
+  and the PR permanently unmergeable. A replacement check shipped under the
+  same name trips the wire below (it fires on any other changed workflow file
+  mentioning `supply-chain`) — but the wire lives in `security.yml`, so it
+  only fires while that file still runs. Deleting it and shipping the
+  replacement in the same commit removes the wire with it; that
+  self-protection gap is the first residual listed below. Either way an
+  API-posted commit status cannot impersonate the check: it is pinned to the
+  GitHub Actions app.
+- **Modification trips a wire.** The job's final step diffs `deny.toml` and
+  `security.yml` against the PR's base and fails the required check on any
+  change, unless the PR body contains the exact, case-sensitive string
+  `[gate-change-approved]` (add it after human sign-off, *then* push a commit
+  — the marker is read from the push-time event, so a body edit alone does
+  not re-trigger). Legitimate policy updates therefore stay possible, but
+  only as a conscious, loudly-marked act.
+
+What this does **not** defend against: a PR that removes the tamper-check
+step in the same commit — by editing it out, or by deleting `security.yml`
+outright while shipping a same-named replacement check that reports the
+required context; an author who self-serves the marker without
+sign-off; and a marker hidden inside an HTML comment, which satisfies the
+check but is invisible in the rendered body — when reviewing a gate-file
+diff, check the raw PR body, not just the rendered view. All are deliberate
+evasion, not the lazy path — each leaves an explicit trail in a reviewed
+diff or the PR body source. Closing the first mechanically requires an
+org-ruleset `workflows` rule pinning `security.yml` to an out-of-tree ref
+(an org-scope decision, tracked on LAB-1151), which would still not protect
+`deny.toml` — the wire above remains the only guard on the policy file
+itself.
 
 ## Minimum Supported Rust Version
 

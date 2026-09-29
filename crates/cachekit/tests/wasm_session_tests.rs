@@ -1,4 +1,4 @@
-//! wasm32 runtime regression tests for the session clock (LAB-1079).
+//! wasm32 runtime regression tests for the session clock.
 //!
 //! `SystemTime::now()` / `Instant::now()` panic on `wasm32-unknown-unknown`,
 //! and the compile-only wasm CI check shipped that trap in five releases —
@@ -14,7 +14,7 @@
 use cachekit::session::session_headers;
 use wasm_bindgen_test::wasm_bindgen_test;
 
-/// The exact panic site of LAB-1079: building session headers on wasm32.
+/// The exact panic site: building session headers on wasm32.
 /// Reaching the asserts at all proves the clock (and uuid's js entropy) did
 /// not trap; the value asserts are AC-2 (non-zero, plausible epoch millis —
 /// bounds mirror the native tests in src/session.rs, keep them in lockstep).
@@ -54,14 +54,14 @@ async fn workers_backend_get_reaches_fetch_without_trapping() {
 
     let backend = WorkersCachekitIO::builder()
         .api_key("test-key-never-sent")
-        .api_url("https://cachekit-lab-1079.invalid")
+        .api_url("https://cachekit-wasm-clock.invalid")
         .allow_custom_host(true)
         .build()
         .expect("builder should accept a syntactically valid https URL");
 
     // Err(transient network failure) is the expected outcome; the regression
     // this guards is a wasm trap *before* the request is even built.
-    let result = backend.get("lab-1079-regression-key").await;
+    let result = backend.get("wasm-clock-regression-key").await;
     assert!(
         result.is_err(),
         ".invalid must not resolve — expected a network error, got {result:?}"
