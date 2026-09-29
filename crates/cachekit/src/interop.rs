@@ -358,8 +358,10 @@ pub fn serialize_value(value: &InteropValue) -> Result<Vec<u8>, CachekitError> {
 /// Deserialize an interop-mode MessagePack document, consuming **exactly one**
 /// document and rejecting trailing bytes (spec MUST).
 ///
-/// Decode bounds: [`crate::serializer::MAX_DECODE_DEPTH`] and the header walk in
-/// `crate::serializer::check_structure`.
+/// Decode bounds: the header walk in `crate::serializer::check_structure` runs
+/// first and rejects, with a `decode bound:` error, any document nested deeper
+/// than [`crate::serializer::MAX_DECODE_DEPTH`] or declaring more than the input
+/// can back.
 ///
 /// `rmp_serde::from_slice` silently ignores trailing bytes. That leniency is
 /// dangerous here: a Python-SDK-internal CK frame begins `0x43` (`'C'`), which
