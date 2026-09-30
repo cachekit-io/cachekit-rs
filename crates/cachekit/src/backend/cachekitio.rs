@@ -58,14 +58,8 @@ impl CachekitIO {
     /// Build the full URL for a cache key path segment.
     ///
     /// Keys are percent-encoded via [`encode_key`](crate::backend::encode_key) so
-    /// slashes or special characters do not break the URL structure. An empty key,
-    /// or one whose encoded form is a reserved segment (`.`, `..`, `health`,
-    /// `ttl`, `lock`), is **rejected** (fallible return) rather than sent: the
-    /// empty key builds `/v1/cache/`, which addresses no stored entry, the dot
-    /// segments are stripped by `reqwest`'s WHATWG URL parser, and the route
-    /// tokens collide with the health/sub-resource routes, all leaving
-    /// `/v1/cache/{key}` (CWE-22, spec rule 2) — see
-    /// [`encode_key`](crate::backend::encode_key).
+    /// slashes or special characters do not break the URL structure. Fallible: it
+    /// rejects exactly the keys `encode_key` rejects (CWE-22, spec rule 2).
     fn url(&self, key: &str) -> Result<String, BackendError> {
         Ok(format!("{}/v1/cache/{}", self.api_url, encode_key(key)?))
     }
@@ -447,7 +441,7 @@ mod path_encoding_tests {
             .expect("builder should succeed for the canonical host")
     }
 
-    /// AC-0 — Repro. Before any guard, a raw-encoded `.`/`..` key collapses in
+    /// Repro. Before any guard, a raw-encoded `.`/`..` key collapses in
     /// rust-url (the parser `reqwest` uses) *before* the request leaves the
     /// process: the segment is stripped and the path escapes `/v1/cache/`.
     /// `%2E%2E` collapses identically, which is why the fix rejects rather than

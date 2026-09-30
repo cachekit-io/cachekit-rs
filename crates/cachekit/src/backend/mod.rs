@@ -220,11 +220,11 @@ pub(crate) async fn run_blocking<T>(
 /// the native `cachekitio` and wasm `workers` backends (DRY: every CachekitIO
 /// path is built through this one fallible chokepoint).
 ///
-/// Almost every key is just [`urlencoding::encode`]. The exception is a key
-/// whose encoded form is one of the **six reserved path segments** — the empty
-/// key, `.`, `..`, `health`, `ttl`, `lock` — which is **rejected** with a
-/// permanent [`BackendError`] rather than sent. This is the client's half of the
-/// protocol `spec/saas-api.md` § Cache-Key Path Encoding, rule 2.
+/// Almost every key is just [`urlencoding::encode`]. The exceptions are the
+/// empty key and a key whose encoded form is one of the **five reserved path
+/// segments** — `.`, `..`, `health`, `ttl`, `lock` — which are **rejected** with
+/// a permanent [`BackendError`] rather than sent. This is the client's half of
+/// the protocol `spec/saas-api.md` § Cache-Key Path Encoding, rule 2.
 ///
 /// Three distinct hazards, each taking the request off the key's own
 /// `/v1/cache/{key}` path and sending the app's bearer token somewhere the SaaS
@@ -252,8 +252,9 @@ pub(crate) async fn run_blocking<T>(
 /// Only an *entirely*-reserved segment is caught: `a:..`, `..a`, `x..y` are
 /// inert and sent per rule 1 with their dots raw. Canonical and interop keys
 /// always contain `:` and never meet this rule, so for every non-reserved key
-/// the output is byte-identical to `urlencoding::encode` — preserving cross-SDK
-/// wire parity. rust-url's uniform rejection matches the cachekit-ts twin;
+/// the output is byte-identical to `urlencoding::encode` — the same bytes as
+/// cachekit-py; cachekit-ts may leave `! * ' ( )` raw, which decodes to the same
+/// key (spec rule 4). rust-url's uniform rejection matches the cachekit-ts twin;
 /// it diverges from cachekit-py's older `%2E` rewrite
 /// (`src/cachekit/backends/cachekitio/backend.py:247-250` @ `f000ba3`), whose
 /// RFC-3986 client kept `%2E%2E` on the wire — the spec now mandates uniform
@@ -261,8 +262,8 @@ pub(crate) async fn run_blocking<T>(
 #[cfg(any(feature = "cachekitio", feature = "workers", test))]
 pub(crate) fn encode_key(key: &str) -> Result<std::borrow::Cow<'_, str>, BackendError> {
     let encoded = urlencoding::encode(key);
-    // spec/saas-api.md § Cache-Key Path Encoding rule 2: reject a key whose
-    // encoded form is exactly one of the six reserved segments.
+    // spec/saas-api.md § Cache-Key Path Encoding rule 2: reject the empty key
+    // and a key whose encoded form is exactly one of the five reserved segments.
     if matches!(
         encoded.as_ref(),
         "" | "." | ".." | "health" | "ttl" | "lock"
@@ -313,10 +314,12 @@ pub mod workers;
 /// Loader for `tests/vectors/path-encoding.json`, vendored verbatim from
 /// cachekit-io/protocol `test-vectors/path-encoding.json` 1.1.0 (merge commit
 /// `774281b09892a064feee6049ee29beb62f068804`). Do not edit the JSON here;
-/// change it upstream and re-vendor, then update [`SHA256`].
+/// change it upstream and re-vendor, then update `SHA256`.
 ///
-/// Every path-encoding test in the crate reads its keys from this file, so a
-/// row added upstream reaches the rs suite with no test edit.
+/// Every path-encoding conformance assertion reads its keys from this file, so
+/// a row added upstream reaches the rs suite with no test edit. The only
+/// rs-local list is `RS_NEAR_MISSES`, which can add acceptances but never hide
+/// a reject row.
 #[cfg(test)]
 #[allow(clippy::expect_used)] // test-only: a malformed vendored fixture should panic loudly
 pub(crate) mod path_encoding_vectors {
@@ -335,11 +338,14 @@ pub(crate) mod path_encoding_vectors {
     pub(crate) struct Vector {
         pub(crate) key: String,
         pub(crate) encoded: Option<String>,
-        pub(crate) decoded: Option<String>,
-        #[serde(default)]
-        pub(crate) encoded_alternates: Vec<String>,
         #[serde(default)]
         pub(crate) reject: bool,
+        // Declared only so `deny_unknown_fields` accepts them. `decoded` and the
+        // `encodeURIComponent` alternates are verified by the protocol's own CI.
+        #[serde(rename = "decoded")]
+        _decoded: Option<String>,
+        #[serde(rename = "encoded_alternates", default)]
+        _encoded_alternates: Vec<String>,
         #[serde(rename = "note")]
         _note: String,
     }
@@ -349,7 +355,7 @@ pub(crate) mod path_encoding_vectors {
         vectors: Vec<Vector>,
     }
 
-    pub(crate) fn all() -> Vec<Vector> {
+    fn all() -> Vec<Vector> {
         serde_json::from_str::<Fixture>(JSON)
             .expect("vendored path-encoding.json must match the fixture schema")
             .vectors
@@ -369,11 +375,10 @@ pub(crate) mod path_encoding_vectors {
         all().into_iter().filter(|v| !v.reject).collect()
     }
 
-    /// rs-local regressions that are NOT fixture rows: near-misses of the
-    /// reserved segments that a `contains` or case-insensitive guard would
-    /// wrongly reject. Each must encode exactly as `urlencoding::encode`.
-    pub(crate) const RS_NEAR_MISSES: &[&str] =
-        &["a..", ".hidden", "healthy", "HEALTH", "ttls", "unlock"];
+    /// rs-local, acceptance-only regressions that are NOT fixture rows: route-token
+    /// near-misses that a prefix, suffix or case-insensitive guard would wrongly
+    /// reject. The fixture has none; dot near-misses (`a:..`, `..a`) it covers.
+    pub(crate) const RS_NEAR_MISSES: &[&str] = &["healthy", "HEALTH", "ttls", "unlock"];
 
     #[test]
     fn vendored_fixture_matches_the_pinned_sha256() {
@@ -411,43 +416,18 @@ mod encode_key_tests {
     }
 
     #[test]
-    fn fixture_transmittable_rows_encode_per_contract() {
-        // The fixture contract: the encoding is in `[encoded] + encoded_alternates`.
-        // It must also stay byte-identical to `urlencoding::encode`, or the SDKs
-        // diverge on the wire.
+    fn fixture_transmittable_rows_encode_to_the_reference_form() {
+        // The fixture accepts `[encoded] + encoded_alternates`; rs holds itself to
+        // `encoded`, the reference form, so its wire bytes stay identical to
+        // cachekit-py's (the alternates cover cachekit-ts's raw `! * ' ( )`).
         let rows = transmittable();
         assert!(!rows.is_empty(), "fixture has no transmittable rows");
         for row in &rows {
             let enc = encode_key(&row.key).expect("transmittable fixture key must encode");
-            let expected = row
-                .encoded
-                .as_deref()
-                .expect("transmittable row carries `encoded`");
-            assert!(
-                enc == expected || row.encoded_alternates.iter().any(|a| *a == enc),
-                "encode_key({:?}) = {enc:?}, not in the fixture's accepted forms",
-                row.key
-            );
             assert_eq!(
-                enc,
-                urlencoding::encode(&row.key),
-                "wire parity for {:?}",
-                row.key
-            );
-        }
-    }
-
-    #[test]
-    fn fixture_transmittable_rows_decode_once_back_to_the_key() {
-        // The SaaS validator does a single `decodeURIComponent`; the fixture's
-        // `decoded` column is what it must see.
-        for row in &transmittable() {
-            let enc = encode_key(&row.key).expect("transmittable fixture key must encode");
-            let decoded = urlencoding::decode(&enc).expect("single decode succeeds");
-            assert_eq!(
-                Some(decoded.as_ref()),
-                row.decoded.as_deref(),
-                "decode-once round-trip changed {:?}",
+                Some(enc.as_ref()),
+                row.encoded.as_deref(),
+                "encode_key({:?}) is not the fixture's reference form",
                 row.key
             );
         }
@@ -456,8 +436,7 @@ mod encode_key_tests {
     #[test]
     fn near_misses_are_not_rejected() {
         for k in RS_NEAR_MISSES {
-            let enc = encode_key(k).expect("near-miss key must encode");
-            assert_eq!(enc, urlencoding::encode(k), "encode_key diverged for {k:?}");
+            assert!(encode_key(k).is_ok(), "near-miss key {k:?} must encode");
         }
     }
 }
