@@ -227,7 +227,8 @@ let cache = CacheKit::from_env()?.build()?;
 // The Redis `secure` preset reads the same two variables:
 let cache = CacheKit::secure_from_env("redis://localhost:6379").await?.build()?;
 
-// Or explicitly on the client builder:
+// Or explicitly on the client builder, with exactly 32 raw bytes per key
+// (decoded, never the ASCII of a hex string; any other length is an error):
 let cache = CacheKit::builder()
     .backend(backend)
     .encryption_from_bytes_with_previous(&k2_bytes, &[&k1_bytes], "tenant")?

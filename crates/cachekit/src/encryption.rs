@@ -24,6 +24,10 @@ use crate::error::CachekitError;
 /// AAD protocol version byte.
 const AAD_VERSION: u8 = 0x03;
 
+/// Required length of a raw-bytes master key (`spec/intent-presets.md`
+/// § Master Key Input rule 4).
+const RAW_KEY_LEN: usize = 32;
+
 /// Zero-knowledge encryption layer with per-tenant key derivation.
 ///
 /// Holds a derived encryption key (zeroized on drop), a [`Keyring`] of master
@@ -57,11 +61,11 @@ impl EncryptionLayer {
     /// Equivalent to [`Self::with_previous_keys`] with no previous keys.
     ///
     /// # Arguments
-    /// * `master_key_bytes` — Raw master key (minimum 32 bytes for AES-256)
+    /// * `master_key_bytes` — Raw master key, exactly 32 bytes
     /// * `tenant_id` — Tenant identifier for cryptographic isolation
     ///
     /// # Errors
-    /// - Master key too short (< 32 bytes)
+    /// - Master key not exactly 32 bytes ([`CachekitError::Config`])
     /// - HKDF derivation failure
     /// - Encryptor initialization failure
     pub fn new(master_key_bytes: &[u8], tenant_id: &str) -> Result<Self, CachekitError> {
@@ -74,8 +78,14 @@ impl EncryptionLayer {
     /// attempt order. Writes always use `master_key_bytes`; reads attempt it
     /// first, then each previous key sequentially.
     ///
+    /// Every key, current and previous, must be **exactly 32 raw bytes** —
+    /// the only length every CacheKit SDK accepts. Pass the decoded key, never
+    /// the ASCII bytes of a hex string (64 bytes, which would derive a key no
+    /// other SDK derives); hex keys go through
+    /// [`CacheKitBuilder::encryption`](crate::client::CacheKitBuilder::encryption).
+    ///
     /// # Errors
-    /// - Any key too short (< 32 bytes)
+    /// - Any key not exactly 32 bytes ([`CachekitError::Config`])
     /// - More than 3 previous keys ([`CachekitError::Config`] — rejected,
     ///   never truncated)
     /// - The current master key also present in `previous_keys`
@@ -83,6 +93,36 @@ impl EncryptionLayer {
     /// - HKDF derivation failure
     /// - Encryptor initialization failure
     pub fn with_previous_keys(
+        master_key_bytes: &[u8],
+        previous_keys: &[&[u8]],
+        tenant_id: &str,
+    ) -> Result<Self, CachekitError> {
+        // Raw bytes carry no encoding to check, so length is the only guard
+        // against a hex string passed as bytes. Hex paths are floored at
+        // `>= 32` by `decode_master_key_hex`; `from_hex_decoded_keys`
+        // re-checks that floor at the crypto layer for its internal callers.
+        for (i, key) in previous_keys.iter().enumerate() {
+            if key.len() != RAW_KEY_LEN {
+                return Err(CachekitError::Config(format!(
+                    "previous master key {i} must be exactly {RAW_KEY_LEN} bytes; got {}",
+                    key.len()
+                )));
+            }
+        }
+        if master_key_bytes.len() != RAW_KEY_LEN {
+            return Err(CachekitError::Config(format!(
+                "master key must be exactly {RAW_KEY_LEN} bytes; got {} \
+                 (pass hex-encoded keys to `.encryption()`, not their ASCII bytes)",
+                master_key_bytes.len()
+            )));
+        }
+        Self::from_hex_decoded_keys(master_key_bytes, previous_keys, tenant_id)
+    }
+
+    /// Build from hex-decoded keys, which may be longer than 32 bytes
+    /// (`spec/intent-presets.md` § Master Key Input rule 3). Crate-private:
+    /// only the hex paths reach it, after `decode_master_key_hex`.
+    pub(crate) fn from_hex_decoded_keys(
         master_key_bytes: &[u8],
         previous_keys: &[&[u8]],
         tenant_id: &str,
@@ -402,7 +442,58 @@ mod tests {
         let result = EncryptionLayer::new(b"short", "tenant");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("at least 32 bytes"), "got: {msg}");
+        assert!(msg.contains("exactly 32 bytes"), "got: {msg}");
+    }
+
+    fn assert_config_err(result: &Result<EncryptionLayer, CachekitError>, what: &str) {
+        assert!(
+            matches!(result, Err(CachekitError::Config(_))),
+            "{what}: expected Config error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn new_requires_exactly_32_bytes() {
+        assert_config_err(&EncryptionLayer::new(&[7; 31], TEST_TENANT), "31 bytes");
+        assert_config_err(&EncryptionLayer::new(&[7; 33], TEST_TENANT), "33 bytes");
+        assert!(EncryptionLayer::new(&[7; 32], TEST_TENANT).is_ok());
+    }
+
+    #[test]
+    fn with_previous_keys_requires_exactly_32_byte_current_key() {
+        for len in [31, 33, 48] {
+            let current = vec![7u8; len];
+            assert_config_err(
+                &EncryptionLayer::with_previous_keys(&current, &[K1], TEST_TENANT),
+                &format!("{len}-byte current key"),
+            );
+        }
+        assert!(EncryptionLayer::with_previous_keys(K2, &[K1], TEST_TENANT).is_ok());
+    }
+
+    #[test]
+    fn with_previous_keys_requires_exactly_32_byte_previous_keys() {
+        for len in [31, 33] {
+            let previous = vec![7u8; len];
+            assert_config_err(
+                &EncryptionLayer::with_previous_keys(K2, &[K1, &previous], TEST_TENANT),
+                &format!("{len}-byte previous key"),
+            );
+        }
+    }
+
+    #[test]
+    fn hex_decoded_keys_accept_longer_than_32_bytes() {
+        // Rule 3: the hex path accepts >= 32 decoded bytes.
+        let long = [7u8; 48];
+        let layer =
+            EncryptionLayer::from_hex_decoded_keys(&long, &[&long[..33]], TEST_TENANT).unwrap();
+        let ct = layer.encrypt(b"v", "k").unwrap();
+        assert_eq!(layer.decrypt(&ct, "k").unwrap(), b"v");
+        assert_config_err(
+            &EncryptionLayer::from_hex_decoded_keys(&long[..31], &[], TEST_TENANT),
+            "hex path keeps its 32-byte floor",
+        );
     }
 
     #[test]
@@ -519,7 +610,7 @@ mod tests {
 
     #[test]
     fn short_previous_key_is_config_error() {
-        let short = [0x01u8; 16]; // core would accept 16; the rs SDK contract is 32
+        let short = [0x01u8; 16]; // core would accept 16; raw keys must be exactly 32
         let result = EncryptionLayer::with_previous_keys(K2, &[&short], TEST_TENANT);
         assert!(matches!(result, Err(CachekitError::Config(_))));
     }
