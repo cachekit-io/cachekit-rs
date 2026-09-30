@@ -85,13 +85,14 @@ One call that names your use case. Each preset returns a pre-configured builder 
 |:-------|:------------|:--------|:--:|:----------:|:------------:|:---------------:|:-----------:|
 | `CacheKit::minimal(url)` | Development, public data, product catalogs — speed first, no extras | Redis³ | ✅ (no SWR) | ❌ | ❌ | ❌ | 300 s |
 | `CacheKit::production(url)` | User sessions, API responses, production services | Redis³ | ✅ | ❌ | ✅ | ✅ | 600 s |
-| `CacheKit::secure(url, key)` | PII, payments, GDPR/HIPAA-sensitive data — zero-knowledge AES-256-GCM | Redis³ | ✅ | ✅ | ✅ | ✅ | 600 s |
+| `CacheKit::secure(url, master_key_hex)`⁵ | PII, payments, GDPR/HIPAA-sensitive data — zero-knowledge AES-256-GCM | Redis³ | ✅ | ✅ | ✅ | ✅ | 600 s |
 | `CacheKit::io(api_key)`⁴ | Serverless, edge compute, managed caching without running Redis | cachekit.io | ✅ | ❌ | ✅ | n/a (HTTP) | 3 600 s |
 
 ¹ Retry with backoff + jitter, circuit breaker, backpressure — the [reliability stack](#reliability). Requires the default-on `reliability` feature.
 ² See the resilience contract below.
 ³ Requires the `redis` feature flag; `secure` also needs the default-on `encryption` feature.
 ⁴ Or `CacheKit::io_from_env()` to read `CACHEKIT_API_KEY`.
+⁵ Or `CacheKit::secure_from_env(url)` to read `CACHEKIT_MASTER_KEY`. Both take the key as a hex string and decode it the same way every CacheKit SDK does. Use exactly 32 bytes (64 hex chars, `openssl rand -hex 32`) — the only length every SDK accepts.
 
 ```rust
 use cachekit::prelude::*;
@@ -116,7 +117,7 @@ async fn main() -> Result<(), CachekitError> {
 - `production` / `secure` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely.
 - `minimal` is **fail-fast**: a dropped connection is not re-established — every subsequent operation that reaches Redis errors until you rebuild the client. Reads served from a warm L1 entry still return without contacting Redis.
 - **Initial** connections fail fast for every Redis preset: a bad URL or unreachable Redis errors immediately at construction, never enters a retry loop. `io` opens no connection at construction: an empty API key fails at construction, while an invalid key or unreachable endpoint surfaces at the first request.
-- `secure` validates the master key **before** any Redis connection is attempted — a bad key is a deterministic local error, never masked by (or paying for) network I/O.
+- `secure` / `secure_from_env` validate the master key **before** any Redis connection is attempted — a missing, non-hex or short key is a deterministic local error, never masked by (or paying for) network I/O, and never a fallback to plaintext.
 - Auto-reconnect is connection-level repair, distinct from the per-operation [reliability stack](#reliability) (retry, circuit breaker, backpressure) that `production` / `secure` / `io` also enable. `minimal` has neither — every failure is yours to handle.
 
 ### From Environment Variables
@@ -166,7 +167,8 @@ let cache = CacheKit::builder()
 Call `.secure_cache()` to get an encrypted cache handle. All values are encrypted client-side with AES-256-GCM before hitting any backend. The backend only ever sees ciphertext.
 
 ```rust
-let cache = CacheKit::from_env()?.build()?;
+// Env: CACHEKIT_MASTER_KEY=<64 hex chars>
+let cache = CacheKit::secure_from_env("redis://localhost:6379").await?.build()?;
 let secure = cache.secure_cache()?;
 
 // Encrypt → store (backend sees only ciphertext)
@@ -212,6 +214,8 @@ Cross-SDK compatible — ciphertext produced by the Python SDK decrypts with the
 
 </details>
 
+**Is AES hardware-accelerated on this host?** `cache.secure_cache()?.hardware_acceleration_enabled()` (also on `EncryptionLayer`) forwards cachekit-core's detection. Informational only: `ring`/`aes-gcm` pick their implementation independently, so use it to explain secure-cache latency, not to change behaviour. The per-architecture semantics are core's — as of cachekit-core 0.6.0 a runtime AES-NI probe on x86/x86_64, `true` on every aarch64 build (it tests NEON, which all aarch64 targets enable, not the Crypto Extension — a Raspberry Pi 4, a Cortex-A72 without the Crypto Extension, reports `true` while running software AES), and `false` on wasm32.
+
 ### Key Rotation
 
 Rotate the master key without invalidating existing entries: promote the new key to current and keep the old one as a decrypt-only previous key during a grace window (max 3, per the [protocol keyring spec](https://github.com/cachekit-io/protocol/blob/main/spec/encryption.md)). Writes always use the current key; reads attempt the current key first, then each previous key in order. Old entries age out via TTL or re-encrypt on the next write — no bulk re-encryption.
@@ -247,7 +251,9 @@ cache.set_with_ttl(&key, &user, ttl).await?;          // plain MessagePack — a
 let user: Option<User> = cache.interop_get(&key).await?; // strict read: exactly one document
 ```
 
-Argument hashing is byte-identical across SDKs (canonical MessagePack + Blake2b-256), verified against the shared [protocol](https://github.com/cachekit-io/protocol) test vectors ([`interop-mode.json`](crates/cachekit/tests/vectors/interop-mode.json), vendored) in this repo's test suite. `interop_get` (also on `SecureCache`) rejects trailing bytes and Python-internal CK frames instead of silently misreading them. Every decode of backend-supplied bytes (`get` and `interop_get` alike) runs under an explicit nesting-depth bound (`serializer::MAX_DECODE_DEPTH` = 100, matching the TypeScript SDK) and a header-only structural walk that rejects headers declaring more than the input can back, verified against the protocol's shared [`decode-bounds.json`](crates/cachekit/tests/vectors/decode-bounds.json) vectors (vendored) — a forged nested-header entry is a bounded `Serialization` error, not a memory blow-up or a stack overflow. Encryption works unchanged — interop keys are identical across SDKs, so the AAD verifies cross-SDK.
+`ns` and `nsapi` are reserved as namespaces — the CachekitIO server parses a key starting `ns:` or `nsapi:` as namespace-prefixed — so `interop_key` rejects them with `InvalidKey` and `#[cachekit(namespace = ...)]` with a compile error; operations are unaffected.
+
+Argument hashing is byte-identical across SDKs (canonical MessagePack + Blake2b-256), verified against the shared [protocol](https://github.com/cachekit-io/protocol) test vectors ([`interop-mode.json`](crates/cachekit/tests/vectors/interop-mode.json), vendored) in this repo's test suite. `interop_get` (also on `SecureCache`) rejects trailing bytes and Python-internal CK frames instead of silently misreading them. Every decode of backend-supplied bytes (`get` and `interop_get` alike) first passes a header-only structural walk that rejects, before anything is decoded, a document nested deeper than `serializer::MAX_DECODE_DEPTH` (100 levels, matching the TypeScript SDK; every collection header counts, empty ones included) or declaring more elements or bytes than the input can back, verified against the protocol's shared [`decode-bounds.json`](crates/cachekit/tests/vectors/decode-bounds.json) vectors (vendored) — a forged nested-header entry is a bounded `Serialization` error, not a memory blow-up or a stack overflow. Encryption works unchanged — interop keys are identical across SDKs, so the AAD verifies cross-SDK.
 
 > [!IMPORTANT]
 > Use interop keys on a client **without** `.namespace()` — a client prefix would rewrite the storage key to `{prefix}:{interop_key}`, which no other SDK computes. `interop_get` fails closed with a config error rather than silently missing; interop keys already carry their own namespace segment.
@@ -394,6 +400,7 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 | **Backfill on miss** | L2 hits populate L1 with a capped 30s TTL |
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
 | **Encrypted L1** | `SecureCache` stores ciphertext in L1 (never plaintext) |
+| **Evict on decrypt failure** | A `SecureCache` read that fails decryption drops the key's L1 copy and returns the error; the backend entry is kept, so the next read reaches the backend: a hit once the entry is replaced with ciphertext the client can decrypt, a miss once it expires or is deleted |
 | **Default capacity** | 1,000 entries (configurable via `.l1_capacity()`) |
 | **Live counters** | `cache.stats()` reports L1 hits / L2 hits / misses; `cache.l1_entry_count()` the current occupancy — see [Observability](#observability) |
 | **Stale-while-revalidate** | On by default (native; `minimal` turns it off): `#[cachekit]` serves an L1 hit past `swr_threshold_ratio` × entry TTL (default 0.5, ±10% jitter) immediately and refreshes it in the background — see below |
@@ -539,7 +546,7 @@ Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rus
 |:---------|:--------:|:------------|
 | `CACHEKIT_API_KEY` | ✅ | API key for cachekit.io (`from_env()` and `CacheKit::io_from_env()`) |
 | `CACHEKIT_API_URL` | ❌ | Override API endpoint (default: `https://api.cachekit.io`) |
-| `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key (min 32 bytes) for encryption |
+| `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and `from_env()`); use exactly 32 bytes (64 hex chars) — shorter is rejected |
 | `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (max 3; a blank value is treated as unset) |
 | `CACHEKIT_DEFAULT_TTL` | ❌ | Default TTL in seconds (min 1, default: 300) |
 
@@ -590,7 +597,7 @@ cachekit-rs/
 ```bash
 make quick-check   # fmt + clippy + test (run before every commit)
 make security      # cargo deny + cargo audit (the CI supply-chain gate)
-make test          # cargo test --all-features
+make test          # cargo test --features $(NATIVE_FEATURES) (CI's list; see Makefile)
 make build         # cargo build --release
 make build-wasm    # wasm32-unknown-unknown (workers feature)
 ```
@@ -631,39 +638,17 @@ adding or bumping a dependency.
 The `supply-chain` check reads both its policy (`deny.toml`) and its own
 definition (`security.yml`) from the PR head, so a PR could weaken the gate it
 is being graded by — delete a `[bans]` entry, or drop `--all-features` while
-keeping the job name green. Two properties defend against that:
+keeping the job name green. Two properties make that visible:
 
-- **Deletion fails closed.** `supply-chain` is a required status check with no
-  bypass actors; a PR that deletes the workflow leaves the context unreported
-  and the PR permanently unmergeable. A replacement check shipped under the
-  same name trips the wire below (it fires on any other changed workflow file
-  mentioning `supply-chain`) — but the wire lives in `security.yml`, so it
-  only fires while that file still runs. Deleting it and shipping the
-  replacement in the same commit removes the wire with it; that
-  self-protection gap is the first residual listed below. Either way an
-  API-posted commit status cannot impersonate the check: it is pinned to the
-  GitHub Actions app.
-- **Modification trips a wire.** The job's final step diffs `deny.toml` and
-  `security.yml` against the PR's base and fails the required check on any
-  change, unless the PR body contains the exact, case-sensitive string
-  `[gate-change-approved]` (add it after human sign-off, *then* push a commit
-  — the marker is read from the push-time event, so a body edit alone does
-  not re-trigger). Legitimate policy updates therefore stay possible, but
-  only as a conscious, loudly-marked act.
-
-What this does **not** defend against: a PR that removes the tamper-check
-step in the same commit — by editing it out, or by deleting `security.yml`
-outright while shipping a same-named replacement check that reports the
-required context; an author who self-serves the marker without
-sign-off; and a marker hidden inside an HTML comment, which satisfies the
-check but is invisible in the rendered body — when reviewing a gate-file
-diff, check the raw PR body, not just the rendered view. All are deliberate
-evasion, not the lazy path — each leaves an explicit trail in a reviewed
-diff or the PR body source. Closing the first mechanically requires an
-org-ruleset `workflows` rule pinning `security.yml` to an out-of-tree ref
-(an org-scope decision, tracked on LAB-1151), which would still not protect
-`deny.toml` — the wire above remains the only guard on the policy file
-itself.
+- **Deletion fails closed.** `supply-chain` is a required status check: if
+  nothing reports it, the PR cannot merge. The check is pinned to the GitHub
+  Actions app, so a status posted from outside Actions cannot satisfy it.
+- **Modification trips a wire.** The job's final step fails the required check
+  when a PR changes `deny.toml` or `security.yml` relative to its base, or
+  changes any other workflow file that mentions `supply-chain`, unless the PR
+  body contains the exact, case-sensitive string `[gate-change-approved]` (add
+  it after human sign-off, *then* push a commit — the marker is read from the
+  push-time event, so a body edit alone does not re-trigger).
 
 ## Minimum Supported Rust Version
 

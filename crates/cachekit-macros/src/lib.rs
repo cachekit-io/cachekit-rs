@@ -22,7 +22,8 @@ struct MacroArgs {
 /// (`^[a-z0-9][a-z0-9._-]{0,63}$` — see `cachekit::interop`'s
 /// `validate_segment`, the canonical implementation). Duplicated because a
 /// proc-macro crate cannot depend on the runtime crate; `interop_key`
-/// re-validates at runtime, so drift fails loudly, never silently.
+/// re-validates at runtime, so drift fails loudly, never silently. The
+/// reserved-namespace check is mirrored in `parse_segment`.
 fn segment_is_valid(segment: &str) -> bool {
     let bytes = segment.as_bytes();
     matches!(bytes.first(), Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit())
@@ -34,20 +35,32 @@ fn segment_is_valid(segment: &str) -> bool {
 
 /// Extract and validate an interop segment from a string literal, spanning
 /// the error to the literal.
+///
+/// Mirrors `validate_segment`'s namespace reservation: a `namespace` of exactly
+/// `ns` or `nsapi` is rejected (the CachekitIO server parses a key starting
+/// `ns:` / `nsapi:` as namespace-prefixed); both stay valid as `interop`.
 fn parse_segment(kind: &str, lit: &LitStr) -> syn::Result<String> {
     let value = lit.value();
-    if segment_is_valid(&value) {
-        Ok(value)
-    } else {
-        Err(syn::Error::new(
+    if !segment_is_valid(&value) {
+        return Err(syn::Error::new(
             lit.span(),
             format!(
                 "`{kind}` {value:?} is not a valid interop/v1 key segment: must match \
                  ^[a-z0-9][a-z0-9._-]{{0,63}}$ (lowercase ASCII letters, digits, '.', '_', \
                  '-'; 1-64 chars)"
             ),
-        ))
+        ));
     }
+    if kind == "namespace" && matches!(value.as_str(), "ns" | "nsapi") {
+        return Err(syn::Error::new(
+            lit.span(),
+            format!(
+                "`namespace` {value:?} is reserved: the CachekitIO server parses a key \
+                 starting \"{value}:\" as namespace-prefixed"
+            ),
+        ));
+    }
+    Ok(value)
 }
 
 impl Parse for MacroArgs {
@@ -182,7 +195,9 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   segment (`^[a-z0-9][a-z0-9._-]{0,63}$`) — same meaning as Python's
 ///   `interop=` / TypeScript's `interop:`.
 /// - `namespace = "<string>"` (required): interop/v1 namespace segment,
-///   same grammar.
+///   same grammar. `ns` and `nsapi` are reserved as namespaces (a compile
+///   error — the CachekitIO server parses those key prefixes); operations are
+///   unaffected.
 /// - `secure` (optional flag): Use encrypted cache via `cache.secure_cache()`.
 ///
 /// # Requirements
@@ -204,8 +219,11 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   (`CachekitError::Serialization`) is treated as a miss and overwritten
 ///   (self-healing). On `secure` functions this covers only post-decrypt
 ///   decode failures: an entry that fails AES-GCM authentication raises
-///   `CachekitError::Encryption`, which propagates (fail-closed) until the
-///   entry expires or is deleted.
+///   `CachekitError::Encryption`, which propagates (fail-closed). The failed
+///   read drops the key's L1 copy and leaves the backend entry in place, so
+///   the next call reads the backend again: it fails while that entry
+///   remains, succeeds once any process replaces it with ciphertext this
+///   client can decrypt, and is a miss once it expires or is deleted.
 ///
 /// # Requirements (continued)
 ///
@@ -676,5 +694,31 @@ mod tests {
         ] {
             assert!(!segment_is_valid(bad), "{bad:?} should be rejected");
         }
+    }
+
+    /// Mirror of interop.rs's namespace reservation: `ns` / `nsapi` are a
+    /// compile error as `namespace`, but stay valid as the operation.
+    #[test]
+    fn reserved_namespace_is_a_compile_error() {
+        let attr = |interop: &str, namespace: &str| {
+            syn::parse_str::<MacroArgs>(&format!(
+                "client = cache, ttl = 60, interop = {interop:?}, namespace = {namespace:?}"
+            ))
+        };
+        for reserved in ["ns", "nsapi"] {
+            let Err(err) = attr("get_user", reserved) else {
+                panic!("namespace {reserved:?} must be rejected");
+            };
+            assert!(
+                err.to_string().contains("reserved"),
+                "error must name the reservation, got: {err}"
+            );
+            assert!(
+                attr(reserved, "users").is_ok(),
+                "operation {reserved:?} must be accepted"
+            );
+        }
+        assert!(attr("get_user", "nsx").is_ok());
+        assert!(attr("get_user", "nsapi2").is_ok());
     }
 }
