@@ -16,6 +16,13 @@
       "matchUpdateTypes": ["minor", "major"],
       "groupName": null,
       "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Hold js-sys and wasm-bindgen-test. wasm-bindgen-test is pinned exactly, it pins js-sys and wasm-bindgen exactly in turn, and CI's wasm-bindgen-test-runner must match the locked wasm-bindgen, so these move together by hand with the runner pin in ci.yml. A Renovate update to either one fails the Cargo.lock update and takes its whole group with it, so it waits under Pending Approval on the Dependency Dashboard instead. Vulnerability updates are not held.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["js-sys", "wasm-bindgen-test"],
+      "groupName": null,
+      "dependencyDashboardApproval": true
     }
   ]
 }
