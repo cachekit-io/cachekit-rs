@@ -11,9 +11,10 @@
 //! ```
 //!
 //! `namespace` and `operation` are user-supplied, validated against
-//! `^[a-z0-9][a-z0-9._-]{0,63}$` (full-string). `namespace` must also not be
-//! exactly `ns` or `nsapi`: the CachekitIO server parses a key starting `ns:`
-//! or `nsapi:` as namespace-prefixed. `args_hash` is the Blake2b-256
+//! `^[a-z0-9][a-z0-9._-]{0,63}$` (full-string), and neither may contain `..`
+//! (the CachekitIO server rejects `..` anywhere in a key). `namespace` must
+//! also not be exactly `ns` or `nsapi`: the CachekitIO server parses a key
+//! starting `ns:` or `nsapi:` as namespace-prefixed. `args_hash` is the Blake2b-256
 //! digest (lowercase hex) of the canonical MessagePack encoding of the flat
 //! argument array. Unlike auto mode, there is no `func:` segment — the
 //! operation identity is explicit, so every SDK computes the same key for the
@@ -248,7 +249,8 @@ impl TryFrom<std::time::SystemTime> for InteropValue {
 // ── Segment validation ───────────────────────────────────────────────────────
 
 /// Validate a key segment against `^[a-z0-9][a-z0-9._-]{0,63}$` as a
-/// full-string match, and reject the reserved namespaces `ns` and `nsapi`.
+/// full-string match, reject `..` inside it, and reject the reserved
+/// namespaces `ns` and `nsapi`.
 ///
 /// Byte-wise iteration over the whole string makes this a full match by
 /// construction — a trailing `\n` (which Python's `re.match` + `$` would
@@ -259,8 +261,13 @@ impl TryFrom<std::time::SystemTime> for InteropValue {
 /// `nsapi:` as namespace-prefixed, so such an interop key would be rejected or
 /// misrouted there. `ns` and `nsapi` stay valid operations.
 ///
-/// NOTE: `cachekit-macros` carries a compile-time mirror of this grammar and
-/// the reservation (`segment_is_valid` / `parse_segment`) — proc-macro crates
+/// The grammar admits `..`, but the server rejects `..` anywhere in a key, so
+/// such a key would fail on every CachekitIO request. The `:` delimiters
+/// separate the segments and the hash is hex, so any `..` in a key lies
+/// inside one segment. A lone `.` stays valid.
+///
+/// NOTE: `cachekit-macros` carries a compile-time mirror of this grammar, the
+/// `..` ban and the reservation (`segment_is_valid` / `parse_segment`) — proc-macro crates
 /// cannot depend on this crate. If you change either here, change it there in
 /// the same diff.
 fn validate_segment(kind: &str, segment: &str) -> Result<(), CachekitError> {
@@ -274,6 +281,12 @@ fn validate_segment(kind: &str, segment: &str) -> Result<(), CachekitError> {
         return Err(CachekitError::InvalidKey(format!(
             "interop {kind} {segment:?} must match ^[a-z0-9][a-z0-9._-]{{0,63}}$ \
              (lowercase ASCII letters, digits, '.', '_', '-'; 1-64 chars)"
+        )));
+    }
+    if segment.contains("..") {
+        return Err(CachekitError::InvalidKey(format!(
+            "interop {kind} {segment:?} must not contain \"..\": the CachekitIO server \
+             rejects \"..\" anywhere in a key"
         )));
     }
     if kind == "namespace" && matches!(segment, "ns" | "nsapi") {
@@ -296,8 +309,8 @@ fn validate_segment(kind: &str, segment: &str) -> Result<(), CachekitError> {
 /// # Errors
 ///
 /// - [`CachekitError::InvalidKey`] if `namespace` or `operation` fails the
-///   segment grammar (rejected, never normalized), or `namespace` is the
-///   reserved `ns` or `nsapi`.
+///   segment grammar (rejected, never normalized), contains `..`, or
+///   `namespace` is the reserved `ns` or `nsapi`.
 /// - [`CachekitError::Serialization`] if any argument is outside the interop
 ///   data model's ranges (non-finite float, integer outside `[-2^63, 2^64-1]`).
 pub fn interop_key(
@@ -707,6 +720,30 @@ mod tests {
         assert!(interop_key(".users", "op", &[]).is_err());
         assert!(interop_key("-users", "op", &[]).is_err());
         assert!(interop_key("users.v2_x-y", "op", &[]).is_ok());
+    }
+
+    #[test]
+    fn segment_rejects_double_dot() {
+        for (namespace, operation) in [
+            ("a..b", "get_user"),
+            ("users", "x..y"),
+            ("users", "x.."),
+            ("ab..", "get_user"),
+            ("a...b", "get_user"),
+        ] {
+            let err = interop_key(namespace, operation, &[]).unwrap_err();
+            assert!(
+                matches!(&err, CachekitError::InvalidKey(msg) if msg.contains("must not contain")),
+                "{namespace:?}/{operation:?} must be rejected for '..', got: {err}"
+            );
+        }
+        // Lone dots, including a trailing one, stay valid.
+        for (namespace, operation) in [("app.", "users.fetch.by_id"), ("app.v1", "get.")] {
+            assert!(
+                interop_key(namespace, operation, &[]).is_ok(),
+                "{namespace:?}/{operation:?} should be accepted"
+            );
+        }
     }
 
     #[test]

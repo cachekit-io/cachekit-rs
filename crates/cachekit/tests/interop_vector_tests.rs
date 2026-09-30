@@ -2,9 +2,9 @@
 //! byte-verification of the shared cross-SDK vectors.
 //!
 //! Vectors: `tests/vectors/interop-mode.json`, vendored verbatim from
-//! cachekit-io/protocol test-vectors/interop-mode.json 1.1.0
-//! (<https://github.com/cachekit-io/protocol/pull/78>)
-//! (sha256 `9b1855851d888c479e37a8fff9e9bbe5738737a9a408e749d9126c7678b9e7bc`).
+//! cachekit-io/protocol test-vectors/interop-mode.json 1.2.0
+//! (<https://github.com/cachekit-io/protocol/pull/94>)
+//! (sha256 `702613766d1b92bc3a337627a96b9aedc89abfeb4d9208c2bb00c9539a0a1f40`).
 //! Do not edit the JSON here; regenerate upstream and re-vendor.
 //!
 //! Vector inputs use the tagged-JSON convention documented in the file header
@@ -215,7 +215,7 @@ fn iso8601_to_unix_micros(s: &str) -> Result<i64, String> {
 fn key_vectors_all_pass() {
     let doc = vectors();
     let key_vectors = doc["key_vectors"].as_array().expect("key_vectors array");
-    assert_eq!(key_vectors.len(), 34, "expected 34 key vectors");
+    assert_eq!(key_vectors.len(), 35, "expected 35 key vectors");
 
     for vector in key_vectors {
         let name = vector["name"].as_str().expect("vector name");
@@ -290,7 +290,7 @@ fn value_vectors_all_pass() {
 fn error_vectors_all_reject() {
     let doc = vectors();
     let error_vectors = doc["error_vectors"].as_array().expect("error_vectors");
-    assert_eq!(error_vectors.len(), 11, "expected 11 error vectors");
+    assert_eq!(error_vectors.len(), 13, "expected 13 error vectors");
 
     for vector in error_vectors {
         let name = vector["name"].as_str().expect("vector name");
