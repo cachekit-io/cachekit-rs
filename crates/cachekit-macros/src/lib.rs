@@ -22,8 +22,8 @@ struct MacroArgs {
 /// (`^[a-z0-9][a-z0-9._-]{0,63}$` — see `cachekit::interop`'s
 /// `validate_segment`, the canonical implementation). Duplicated because a
 /// proc-macro crate cannot depend on the runtime crate; `interop_key`
-/// re-validates at runtime, so drift fails loudly, never silently. The
-/// reserved-namespace check is mirrored in `parse_segment`.
+/// re-validates at runtime, so drift fails loudly, never silently. The `..`
+/// ban and the reserved-namespace check are mirrored in `parse_segment`.
 fn segment_is_valid(segment: &str) -> bool {
     let bytes = segment.as_bytes();
     matches!(bytes.first(), Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit())
@@ -36,9 +36,11 @@ fn segment_is_valid(segment: &str) -> bool {
 /// Extract and validate an interop segment from a string literal, spanning
 /// the error to the literal.
 ///
-/// Mirrors `validate_segment`'s namespace reservation: a `namespace` of exactly
-/// `ns` or `nsapi` is rejected (the CachekitIO server parses a key starting
-/// `ns:` / `nsapi:` as namespace-prefixed); both stay valid as `interop`.
+/// Mirrors `validate_segment`'s `..` ban (either segment; the CachekitIO
+/// server rejects `..` anywhere in a key) and its namespace reservation: a
+/// `namespace` of exactly `ns` or `nsapi` is rejected (the server parses a key
+/// starting `ns:` / `nsapi:` as namespace-prefixed); both stay valid as
+/// `interop`.
 fn parse_segment(kind: &str, lit: &LitStr) -> syn::Result<String> {
     let value = lit.value();
     if !segment_is_valid(&value) {
@@ -48,6 +50,15 @@ fn parse_segment(kind: &str, lit: &LitStr) -> syn::Result<String> {
                 "`{kind}` {value:?} is not a valid interop/v1 key segment: must match \
                  ^[a-z0-9][a-z0-9._-]{{0,63}}$ (lowercase ASCII letters, digits, '.', '_', \
                  '-'; 1-64 chars)"
+            ),
+        ));
+    }
+    if value.contains("..") {
+        return Err(syn::Error::new(
+            lit.span(),
+            format!(
+                "`{kind}` {value:?} must not contain \"..\": the CachekitIO server rejects \
+                 \"..\" anywhere in a key"
             ),
         ));
     }
@@ -197,7 +208,8 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 /// - `namespace = "<string>"` (required): interop/v1 namespace segment,
 ///   same grammar. `ns` and `nsapi` are reserved as namespaces (a compile
 ///   error — the CachekitIO server parses those key prefixes); operations are
-///   unaffected.
+///   unaffected. Neither segment may contain `..` (a compile error — the
+///   server rejects `..` anywhere in a key); a lone `.` is fine.
 /// - `secure` (optional flag): Use encrypted cache via `cache.secure_cache()`.
 ///
 /// # Requirements
@@ -720,5 +732,26 @@ mod tests {
         }
         assert!(attr("get_user", "nsx").is_ok());
         assert!(attr("get_user", "nsapi2").is_ok());
+    }
+
+    /// Mirror of interop.rs's `..` ban: a compile error in either segment,
+    /// while lone dots, including a trailing one, stay valid.
+    #[test]
+    fn double_dot_segment_is_a_compile_error() {
+        let attr = |interop: &str, namespace: &str| {
+            syn::parse_str::<MacroArgs>(&format!(
+                "client = cache, ttl = 60, interop = {interop:?}, namespace = {namespace:?}"
+            ))
+        };
+        for (interop, namespace) in [("get_user", "a..b"), ("x..y", "users"), ("x..", "users")] {
+            let Err(err) = attr(interop, namespace) else {
+                panic!("{interop:?}/{namespace:?} must be rejected");
+            };
+            assert!(
+                err.to_string().contains("must not contain"),
+                "error must name the '..' ban, got: {err}"
+            );
+        }
+        assert!(attr("users.fetch.by_id", "app.").is_ok());
     }
 }
