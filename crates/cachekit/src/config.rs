@@ -14,7 +14,12 @@ pub const MAX_PREVIOUS_MASTER_KEYS: usize = 3;
 
 // ── CachekitConfig ────────────────────────────────────────────────────────────
 
-/// Runtime configuration for a [`crate::client::CacheKit`] instance.
+/// Configuration values for a CacheKit client.
+///
+/// A client reads a `CachekitConfig` on one path only: `CacheKit::from_env()`
+/// builds one with [`CachekitConfig::from_env`] and applies it. No `CacheKit`
+/// constructor takes a `CachekitConfig` value, so a config made with
+/// [`CachekitConfigBuilder`] configures no client.
 pub struct CachekitConfig {
     /// API key for cachekit.io authentication.
     pub api_key: Option<Zeroizing<String>>,
@@ -22,10 +27,12 @@ pub struct CachekitConfig {
     pub api_url: String,
     /// Master key used for zero-knowledge encryption (AES-256-GCM).
     pub master_key: Option<Zeroizing<Vec<u8>>>,
-    /// Decrypt-only previous master keys retained during a rotation grace
-    /// window, in attempt order. Writes always use `master_key`; reads
-    /// attempt it first, then these, sequentially. At most
-    /// [`MAX_PREVIOUS_MASTER_KEYS`] entries.
+    /// Decrypt-only previous master keys for a rotation grace window, in
+    /// attempt order. At most [`MAX_PREVIOUS_MASTER_KEYS`] entries.
+    ///
+    /// These hold key material only. See
+    /// [`CachekitConfigBuilder::previous_master_keys`] for the paths that
+    /// apply previous keys to a client.
     pub previous_master_keys: Vec<Zeroizing<Vec<u8>>>,
     /// Default TTL for cache entries when none is specified at call site.
     pub default_ttl: Duration,
@@ -143,7 +150,12 @@ impl CachekitConfig {
 
 // ── CachekitConfigBuilder ─────────────────────────────────────────────────────
 
-/// Fluent builder for [`CachekitConfig`].
+/// Fluent builder for a [`CachekitConfig`] value.
+///
+/// The builder validates and holds values. No `CacheKit` constructor takes
+/// the [`CachekitConfig`] it builds, so nothing set here (keys, namespace,
+/// TTL, capacity) reaches a client. To configure a client, use
+/// `CacheKit::builder()` or `CacheKit::from_env()`.
 #[derive(Default)]
 #[must_use]
 pub struct CachekitConfigBuilder {
@@ -185,8 +197,17 @@ impl CachekitConfigBuilder {
     }
 
     /// Set decrypt-only previous master keys from hex strings, in attempt
-    /// order. Retained during a key-rotation grace window: reads attempt the
-    /// current master key first, then each of these sequentially.
+    /// order, on the [`CachekitConfig`] value.
+    ///
+    /// No client reads keys set here. These paths apply previous keys to a
+    /// client; each one decrypts with the current key first, then each
+    /// previous key in order:
+    ///
+    /// * `CacheKit::from_env()` and `CacheKit::secure_from_env()` read them
+    ///   from `CACHEKIT_PREVIOUS_MASTER_KEYS`.
+    /// * `CacheKitBuilder::encryption_from_bytes_with_previous()` takes them
+    ///   as arguments. It requires every key to be exactly 32 raw bytes,
+    ///   while this method accepts hex that decodes to 32 bytes or more.
     ///
     /// Validation is identical to [`Self::master_key`] per entry (valid hex,
     /// at least 32 bytes). At most [`MAX_PREVIOUS_MASTER_KEYS`] entries —
@@ -199,7 +220,7 @@ impl CachekitConfigBuilder {
     /// ```
     /// use cachekit::config::CachekitConfigBuilder;
     ///
-    /// // k2 is current after rotation; k1 stays readable during the grace window.
+    /// // k2 is current after rotation; k1 is kept as a decrypt-only previous key.
     /// let k1 = "11".repeat(32);
     /// let k2 = "22".repeat(32);
     ///
