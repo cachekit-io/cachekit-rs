@@ -479,7 +479,9 @@ mod path_encoding_tests {
     #[test]
     fn reserved_segments_rejected_by_every_builder() {
         let b = backend();
-        for key in &reject_keys() {
+        let keys = reject_keys();
+        assert!(!keys.is_empty(), "fixture has no reject rows");
+        for key in &keys {
             assert!(b.url(key).is_err(), "url({key:?}) must be rejected");
             assert!(b.ttl_url(key).is_err(), "ttl_url({key:?}) must be rejected");
             assert!(

@@ -376,8 +376,9 @@ pub(crate) mod path_encoding_vectors {
     }
 
     /// rs-local, acceptance-only regressions that are NOT fixture rows: route-token
-    /// near-misses that a prefix, suffix or case-insensitive guard would wrongly
-    /// reject. The fixture has none; dot near-misses (`a:..`, `..a`) it covers.
+    /// near-misses that a prefix, case-insensitive or `contains` guard would
+    /// wrongly reject. The fixture has none of those; its `x/../../health` row
+    /// covers the suffix case, and `a:..` / `..a` cover the dot cases.
     pub(crate) const RS_NEAR_MISSES: &[&str] = &["healthy", "HEALTH", "ttls", "unlock"];
 
     #[test]
