@@ -221,14 +221,18 @@ pub(crate) async fn run_blocking<T>(
 /// path is built through this one fallible chokepoint).
 ///
 /// Almost every key is just [`urlencoding::encode`]. The exception is a key
-/// whose encoded form is one of the **five reserved path segments** — `.`,
-/// `..`, `health`, `ttl`, `lock` — which is **rejected** with a permanent
-/// [`BackendError`] rather than sent. This is the client's half of the protocol
-/// `spec/saas-api.md` § Cache-Key Path Encoding, rule 2.
+/// whose encoded form is one of the **six reserved path segments** — the empty
+/// key, `.`, `..`, `health`, `ttl`, `lock` — which is **rejected** with a
+/// permanent [`BackendError`] rather than sent. This is the client's half of the
+/// protocol `spec/saas-api.md` § Cache-Key Path Encoding, rule 2.
 ///
-/// Two distinct hazards, both landing the app's bearer token on a route the SaaS
+/// Three distinct hazards, each taking the request off the key's own
+/// `/v1/cache/{key}` path and sending the app's bearer token somewhere the SaaS
 /// `cache-key-validator` never vets (CWE-22):
 ///
+/// - **The empty key.** It encodes to an empty segment, so `/v1/cache/{key}`
+///   becomes `/v1/cache/` and `/v1/cache/{key}/ttl` becomes `/v1/cache//ttl`,
+///   neither of which addresses a stored entry.
 /// - **Dot segments (`.`, `..`).** A dot is RFC-3986 *unreserved*, so
 ///   `urlencoding::encode("..") == ".."` unchanged, and `reqwest`'s WHATWG URL
 ///   parser (rust-url) removes that dot-segment **before the request leaves the
@@ -258,13 +262,15 @@ pub(crate) async fn run_blocking<T>(
 pub(crate) fn encode_key(key: &str) -> Result<std::borrow::Cow<'_, str>, BackendError> {
     let encoded = urlencoding::encode(key);
     // spec/saas-api.md § Cache-Key Path Encoding rule 2: reject a key whose
-    // encoded form is exactly one of the five reserved segments.
-    if matches!(encoded.as_ref(), "." | ".." | "health" | "ttl" | "lock") {
+    // encoded form is exactly one of the six reserved segments.
+    if matches!(
+        encoded.as_ref(),
+        "" | "." | ".." | "health" | "ttl" | "lock"
+    ) {
         return Err(BackendError::permanent(
-            "cache key must not be a reserved path segment (`.`, `..`, `health`, \
-             `ttl`, `lock`): the client URL parser or the SaaS router would route \
-             it off the `/v1/cache/{key}` path (CWE-22), so it cannot be \
-             addressed on the wire",
+            "cache key must not be empty or a reserved path segment (`.`, `..`, \
+             `health`, `ttl`, `lock`): the request path would leave \
+             `/v1/cache/{key}` (CWE-22), so it cannot be addressed on the wire",
         ));
     }
     Ok(encoded)
@@ -302,79 +308,156 @@ pub mod file;
 #[cfg(feature = "workers")]
 pub mod workers;
 
+// ── Path-encoding protocol vectors (test-only) ───────────────────────────────
+
+/// Loader for `tests/vectors/path-encoding.json`, vendored verbatim from
+/// cachekit-io/protocol `test-vectors/path-encoding.json` 1.1.0 (merge commit
+/// `774281b09892a064feee6049ee29beb62f068804`). Do not edit the JSON here;
+/// change it upstream and re-vendor, then update [`SHA256`].
+///
+/// Every path-encoding test in the crate reads its keys from this file, so a
+/// row added upstream reaches the rs suite with no test edit.
+#[cfg(test)]
+#[allow(clippy::expect_used)] // test-only: a malformed vendored fixture should panic loudly
+pub(crate) mod path_encoding_vectors {
+    use serde::Deserialize;
+
+    const JSON: &str = include_str!("../../tests/vectors/path-encoding.json");
+
+    /// sha256 of the vendored file, pinned so a local edit cannot drift from the
+    /// protocol copy unnoticed.
+    const SHA256: &str = "8f6fd4be5440da9cf4bbb1a112cb89c410c4e46734c7d8a9c023eaa034727ee3"; // pragma: allowlist secret
+
+    /// One fixture row. `deny_unknown_fields` makes a new row field upstream
+    /// fail loudly here rather than be silently ignored by the tests.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct Vector {
+        pub(crate) key: String,
+        pub(crate) encoded: Option<String>,
+        pub(crate) decoded: Option<String>,
+        #[serde(default)]
+        pub(crate) encoded_alternates: Vec<String>,
+        #[serde(default)]
+        pub(crate) reject: bool,
+        #[serde(rename = "note")]
+        _note: String,
+    }
+
+    #[derive(Deserialize)]
+    struct Fixture {
+        vectors: Vec<Vector>,
+    }
+
+    pub(crate) fn all() -> Vec<Vector> {
+        serde_json::from_str::<Fixture>(JSON)
+            .expect("vendored path-encoding.json must match the fixture schema")
+            .vectors
+    }
+
+    /// Keys spec rule 2 reserves: a conformant client refuses to build a URL.
+    pub(crate) fn reject_keys() -> Vec<String> {
+        all()
+            .into_iter()
+            .filter(|v| v.reject)
+            .map(|v| v.key)
+            .collect()
+    }
+
+    /// Rows a conformant client sends.
+    pub(crate) fn transmittable() -> Vec<Vector> {
+        all().into_iter().filter(|v| !v.reject).collect()
+    }
+
+    /// rs-local regressions that are NOT fixture rows: near-misses of the
+    /// reserved segments that a `contains` or case-insensitive guard would
+    /// wrongly reject. Each must encode exactly as `urlencoding::encode`.
+    pub(crate) const RS_NEAR_MISSES: &[&str] =
+        &["a..", ".hidden", "healthy", "HEALTH", "ttls", "unlock"];
+
+    #[test]
+    fn vendored_fixture_matches_the_pinned_sha256() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            hex::encode(Sha256::digest(JSON.as_bytes())),
+            SHA256,
+            "tests/vectors/path-encoding.json differs from the pinned protocol copy: \
+             re-vendor it from protocol and update SHA256"
+        );
+    }
+}
+
 // ── encode_key unit tests (CWE-22) ───────────────────────────────────────────
 
 #[cfg(test)]
 #[allow(clippy::expect_used)] // test-only: an encoding failure on a safe key should panic loudly
 mod encode_key_tests {
     use super::encode_key;
-
-    /// The five reserved path segments of spec rule 2 — no wire form is
-    /// transmittable, so a conformant client rejects before building the URL.
-    const RESERVED_SEGMENTS: &[&str] = &[".", "..", "health", "ttl", "lock"];
-
-    /// Non-reserved vectors: canonical key, dot near-misses (`..` embedded, not a
-    /// whole segment), route-token near-misses (`healthy`, `HEALTH`, embedded
-    /// `x/../../health`), reserved chars, `%`, sub-delims, spaces, empty. Mirrors
-    /// the transmittable rows of `protocol/test-vectors/path-encoding.json`.
-    const SAFE_VECTORS: &[&str] = &[
-        "a:..",
-        "..a",
-        "a..",
-        ".hidden",
-        "default:../../admin",
-        "x/../../health",
-        "healthy",
-        "HEALTH",
-        "ttls",
-        "unlock",
-        "ns:default:func:m.f:args:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:",
-        "a b",
-        "k?x=1#f",
-        "100%",
-        "f(x)!*'",
-        "",
-    ];
+    use super::path_encoding_vectors::{reject_keys, transmittable, RS_NEAR_MISSES};
 
     #[test]
-    fn reserved_segments_are_rejected() {
-        // spec/saas-api.md rule 2: `.`/`..` collapse in the URL parser and
-        // `health`/`ttl`/`lock` are route tokens; none is addressable on the
-        // `/v1/cache/{key}` path (see
+    fn fixture_reject_rows_are_rejected() {
+        // spec/saas-api.md rule 2: the empty key, `.`/`..` and the route tokens
+        // are not addressable on `/v1/cache/{key}` (builder-level coverage:
         // `cachekitio::path_encoding_tests::reserved_segments_rejected_by_every_builder`).
-        for k in RESERVED_SEGMENTS {
+        let keys = reject_keys();
+        assert!(!keys.is_empty(), "fixture has no reject rows");
+        for k in &keys {
             assert!(
                 encode_key(k).is_err(),
-                "reserved segment {k:?} must be rejected"
+                "reserved key {k:?} must be rejected"
             );
         }
-        // Near-miss acceptance (`healthy`, `HEALTH`, `x/../../health`, …) is
-        // covered by `SAFE_VECTORS` in the two tests below — a `contains`/
-        // case-insensitive regression there panics on `.expect`.
     }
 
     #[test]
-    fn safe_keys_are_byte_identical_to_urlencoding() {
-        // AC-1: nothing but an exact `.`/`..` segment may change encoding, or the
-        // SDKs diverge on the wire.
-        for k in SAFE_VECTORS {
-            let enc = encode_key(k).expect("safe key must encode");
+    fn fixture_transmittable_rows_encode_per_contract() {
+        // The fixture contract: the encoding is in `[encoded] + encoded_alternates`.
+        // It must also stay byte-identical to `urlencoding::encode`, or the SDKs
+        // diverge on the wire.
+        let rows = transmittable();
+        assert!(!rows.is_empty(), "fixture has no transmittable rows");
+        for row in &rows {
+            let enc = encode_key(&row.key).expect("transmittable fixture key must encode");
+            let expected = row
+                .encoded
+                .as_deref()
+                .expect("transmittable row carries `encoded`");
+            assert!(
+                enc == expected || row.encoded_alternates.iter().any(|a| *a == enc),
+                "encode_key({:?}) = {enc:?}, not in the fixture's accepted forms",
+                row.key
+            );
             assert_eq!(
                 enc,
-                urlencoding::encode(k),
-                "encode_key diverged from urlencoding for {k:?}"
+                urlencoding::encode(&row.key),
+                "wire parity for {:?}",
+                row.key
             );
         }
     }
 
     #[test]
-    fn safe_keys_decode_once_back_to_the_original() {
-        // AC-3: the SaaS validator does a single `decodeURIComponent`; every safe
-        // vector must survive that exact round-trip untouched.
-        for k in SAFE_VECTORS {
-            let enc = encode_key(k).expect("safe key must encode");
+    fn fixture_transmittable_rows_decode_once_back_to_the_key() {
+        // The SaaS validator does a single `decodeURIComponent`; the fixture's
+        // `decoded` column is what it must see.
+        for row in &transmittable() {
+            let enc = encode_key(&row.key).expect("transmittable fixture key must encode");
             let decoded = urlencoding::decode(&enc).expect("single decode succeeds");
-            assert_eq!(decoded, *k, "decode-once round-trip changed {k:?}");
+            assert_eq!(
+                Some(decoded.as_ref()),
+                row.decoded.as_deref(),
+                "decode-once round-trip changed {:?}",
+                row.key
+            );
+        }
+    }
+
+    #[test]
+    fn near_misses_are_not_rejected() {
+        for k in RS_NEAR_MISSES {
+            let enc = encode_key(k).expect("near-miss key must encode");
+            assert_eq!(enc, urlencoding::encode(k), "encode_key diverged for {k:?}");
         }
     }
 }
