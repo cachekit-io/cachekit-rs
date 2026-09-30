@@ -121,45 +121,8 @@ impl CachekitConfig {
             config.master_key = Some(decode_master_key_hex(&val, "CACHEKIT_MASTER_KEY")?);
         }
 
-        // Previous master keys — comma-separated hex, decrypt-only, max 3.
-        // A wholly blank value retires the variable (the common way to disable
-        // it in shell profiles, Compose files, and k8s manifests) and is
-        // treated as unset; a blank entry inside a non-blank list is still an
-        // operator mistake.
-        if let Ok(val) = std::env::var("CACHEKIT_PREVIOUS_MASTER_KEYS") {
-            // Same reasoning as CACHEKIT_MASTER_KEY above: wipe the owned copy
-            // of the hex list on drop.
-            let val = Zeroizing::new(val);
-            if !val.trim().is_empty() {
-                let mut previous = Vec::new();
-                for entry in val.split(',') {
-                    let entry = entry.trim();
-                    if entry.is_empty() {
-                        return Err(CachekitError::Config(
-                            "CACHEKIT_PREVIOUS_MASTER_KEYS contains an empty entry".to_owned(),
-                        ));
-                    }
-                    previous.push(decode_master_key_hex(
-                        entry,
-                        "CACHEKIT_PREVIOUS_MASTER_KEYS entry",
-                    )?);
-                }
-                // Previous keys without a current key is a broken rotation
-                // deploy: nothing would ever consume them, and the operator
-                // would only find out at the first secure_cache() call. Fail at load.
-                if config.master_key.is_none() {
-                    return Err(CachekitError::Config(
-                        "CACHEKIT_PREVIOUS_MASTER_KEYS requires CACHEKIT_MASTER_KEY to be set"
-                            .to_owned(),
-                    ));
-                }
-                validate_previous_master_keys(
-                    config.master_key.as_deref().map(Vec::as_slice),
-                    &previous,
-                )?;
-                config.previous_master_keys = previous;
-            }
-        }
+        config.previous_master_keys =
+            previous_master_keys_from_env(config.master_key.as_deref().map(Vec::as_slice))?;
 
         // Default TTL — minimum 1 second
         if let Ok(val) = std::env::var("CACHEKIT_DEFAULT_TTL") {
@@ -323,6 +286,53 @@ pub(crate) fn decode_master_key_hex(
         )));
     }
     Ok(bytes)
+}
+
+/// `CACHEKIT_PREVIOUS_MASTER_KEYS`, decoded and validated against the
+/// decoded current key. The one reader of the variable, shared by
+/// [`CachekitConfig::from_env`] and `CacheKit::secure_from_env` so the two
+/// env paths cannot drift. Unset or blank yields no keys.
+pub(crate) fn previous_master_keys_from_env(
+    master_key: Option<&[u8]>,
+) -> Result<Vec<Zeroizing<Vec<u8>>>, CachekitError> {
+    // Same reasoning as CACHEKIT_MASTER_KEY in `from_env`: wipe the owned
+    // copy of the hex list on drop.
+    let Some(val) = std::env::var("CACHEKIT_PREVIOUS_MASTER_KEYS")
+        .ok()
+        .map(Zeroizing::new)
+    else {
+        return Ok(Vec::new());
+    };
+    // A wholly blank value retires the variable (the common way to disable
+    // it in shell profiles, Compose files, and k8s manifests) and is treated
+    // as unset; a blank entry inside a non-blank list is still an operator
+    // mistake.
+    if val.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut previous = Vec::new();
+    for entry in val.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(CachekitError::Config(
+                "CACHEKIT_PREVIOUS_MASTER_KEYS contains an empty entry".to_owned(),
+            ));
+        }
+        previous.push(decode_master_key_hex(
+            entry,
+            "CACHEKIT_PREVIOUS_MASTER_KEYS entry",
+        )?);
+    }
+    // Previous keys without a current key is a broken rotation deploy:
+    // nothing would ever consume them, and the operator would only find out
+    // at the first secure_cache() call. Fail at load.
+    let Some(master_key) = master_key else {
+        return Err(CachekitError::Config(
+            "CACHEKIT_PREVIOUS_MASTER_KEYS requires CACHEKIT_MASTER_KEY to be set".to_owned(),
+        ));
+    };
+    validate_previous_master_keys(Some(master_key), &previous)?;
+    Ok(previous)
 }
 
 /// Enforce the keyring config invariants: at most [`MAX_PREVIOUS_MASTER_KEYS`]

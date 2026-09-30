@@ -92,7 +92,7 @@ One call that names your use case. Each preset returns a pre-configured builder 
 ² See the resilience contract below.
 ³ Requires the `redis` feature flag; `secure` also needs the default-on `encryption` feature.
 ⁴ Or `CacheKit::io_from_env()` to read `CACHEKIT_API_KEY`.
-⁵ Or `CacheKit::secure_from_env(url)` to read `CACHEKIT_MASTER_KEY`. Both take the key as a hex string and decode it the same way every CacheKit SDK does. Use exactly 32 bytes (64 hex chars, `openssl rand -hex 32`) — the only length every SDK accepts.
+⁵ Or `CacheKit::secure_from_env(url)` to read `CACHEKIT_MASTER_KEY`, plus the decrypt-only rotation keys in `CACHEKIT_PREVIOUS_MASTER_KEYS` (see [Key Rotation](#key-rotation)). Both take the key as a hex string and decode it the same way every CacheKit SDK does. Use exactly 32 bytes (64 hex chars, `openssl rand -hex 32`) — the only length every SDK accepts.
 
 ```rust
 use cachekit::prelude::*;
@@ -117,7 +117,7 @@ async fn main() -> Result<(), CachekitError> {
 - `production` / `secure` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely.
 - `minimal` is **fail-fast**: a dropped connection is not re-established — every subsequent operation that reaches Redis errors until you rebuild the client. Reads served from a warm L1 entry still return without contacting Redis.
 - **Initial** connections fail fast for every Redis preset: a bad URL or unreachable Redis errors immediately at construction, never enters a retry loop. `io` opens no connection at construction: an empty API key fails at construction, while an invalid key or unreachable endpoint surfaces at the first request.
-- `secure` / `secure_from_env` validate the master key **before** any Redis connection is attempted — a missing, non-hex or short key is a deterministic local error, never masked by (or paying for) network I/O, and never a fallback to plaintext.
+- `secure` / `secure_from_env` validate the master key (and `secure_from_env` any previous keys) **before** any Redis connection is attempted — a missing, non-hex or short key, or a malformed `CACHEKIT_PREVIOUS_MASTER_KEYS`, is a deterministic local error, never masked by (or paying for) network I/O, and never a fallback to plaintext.
 - Auto-reconnect is connection-level repair, distinct from the per-operation [reliability stack](#reliability) (retry, circuit breaker, backpressure) that `production` / `secure` / `io` also enable. `minimal` has neither — every failure is yours to handle.
 
 ### From Environment Variables
@@ -223,6 +223,9 @@ Rotate the master key without invalidating existing entries: promote the new key
 ```rust
 // Env: CACHEKIT_MASTER_KEY=<k2-hex> CACHEKIT_PREVIOUS_MASTER_KEYS=<k1-hex>
 let cache = CacheKit::from_env()?.build()?;
+
+// The Redis `secure` preset reads the same two variables:
+let cache = CacheKit::secure_from_env("redis://localhost:6379").await?.build()?;
 
 // Or explicitly on the client builder:
 let cache = CacheKit::builder()
@@ -547,7 +550,7 @@ Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rus
 | `CACHEKIT_API_KEY` | ✅ | API key for cachekit.io (`from_env()` and `CacheKit::io_from_env()`) |
 | `CACHEKIT_API_URL` | ❌ | Override API endpoint (default: `https://api.cachekit.io`) |
 | `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and `from_env()`); use exactly 32 bytes (64 hex chars) — shorter is rejected |
-| `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (max 3; a blank value is treated as unset) |
+| `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (`CacheKit::secure_from_env()` and `from_env()`; max 3; a blank value is treated as unset) |
 | `CACHEKIT_DEFAULT_TTL` | ❌ | Default TTL in seconds (min 1, default: 300) |
 
 > [!CAUTION]

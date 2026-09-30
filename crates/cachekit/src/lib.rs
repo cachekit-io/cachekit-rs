@@ -38,8 +38,10 @@
 //! `CACHEKIT_MASTER_KEY` via `secure_from_env(url)` — the same hex decoding
 //! either way, so one key value derives the same key bytes in every CacheKit
 //! SDK. Use exactly 32 bytes (64 hex chars), the only length every SDK
-//! accepts. A missing, non-hex or short key fails at construction, before
-//! any Redis I/O; `secure` never falls back to plaintext.
+//! accepts. `secure_from_env` also reads decrypt-only rotation keys from
+//! `CACHEKIT_PREVIOUS_MASTER_KEYS`, validated as `from_env` validates them.
+//! A missing, non-hex or short key fails at construction, before any Redis
+//! I/O; `secure` never falls back to plaintext.
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
