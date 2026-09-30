@@ -58,12 +58,8 @@ impl CachekitIO {
     /// Build the full URL for a cache key path segment.
     ///
     /// Keys are percent-encoded via [`encode_key`](crate::backend::encode_key) so
-    /// slashes or special characters do not break the URL structure. A key whose
-    /// encoded form is a reserved segment (`.`, `..`, `health`, `ttl`, `lock`) is
-    /// **rejected** (fallible return) rather than sent: the dot segments are
-    /// stripped by `reqwest`'s WHATWG URL parser and the route tokens collide
-    /// with the health/sub-resource routes, both escaping `/v1/cache/{key}`
-    /// (CWE-22, spec rule 2) — see [`encode_key`](crate::backend::encode_key).
+    /// slashes or special characters do not break the URL structure. Fallible: it
+    /// rejects exactly the keys `encode_key` rejects (CWE-22, spec rule 2).
     fn url(&self, key: &str) -> Result<String, BackendError> {
         Ok(format!("{}/v1/cache/{}", self.api_url, encode_key(key)?))
     }
@@ -432,6 +428,7 @@ mod metrics_wiring_tests {
 #[allow(clippy::expect_used)] // test-only: a builder/parse failure on a fixture should panic loudly
 mod path_encoding_tests {
     use super::CachekitIO;
+    use crate::backend::path_encoding_vectors::{reject_keys, transmittable, RS_NEAR_MISSES};
     use url::Url;
 
     const API: &str = "https://api.cachekit.io";
@@ -444,7 +441,7 @@ mod path_encoding_tests {
             .expect("builder should succeed for the canonical host")
     }
 
-    /// AC-0 — Repro. Before any guard, a raw-encoded `.`/`..` key collapses in
+    /// Repro. Before any guard, a raw-encoded `.`/`..` key collapses in
     /// rust-url (the parser `reqwest` uses) *before* the request leaves the
     /// process: the segment is stripped and the path escapes `/v1/cache/`.
     /// `%2E%2E` collapses identically, which is why the fix rejects rather than
@@ -476,13 +473,15 @@ mod path_encoding_tests {
         }
     }
 
-    /// AC-2 / spec rule 2 — all five reserved segments (`.`, `..`, `health`,
-    /// `ttl`, `lock`) are rejected by every builder (base, ttl, lock): no URL is
-    /// produced, so no rewritten or mis-routed request can ever be sent.
+    /// Spec rule 2 — every fixture reject row (the empty key, `.`, `..`,
+    /// `health`, `ttl`, `lock`) is rejected by every builder (base, ttl, lock):
+    /// no URL is produced, so no rewritten or mis-routed request can be sent.
     #[test]
     fn reserved_segments_rejected_by_every_builder() {
         let b = backend();
-        for key in [".", "..", "health", "ttl", "lock"] {
+        let keys = reject_keys();
+        assert!(!keys.is_empty(), "fixture has no reject rows");
+        for key in &keys {
             assert!(b.url(key).is_err(), "url({key:?}) must be rejected");
             assert!(b.ttl_url(key).is_err(), "ttl_url({key:?}) must be rejected");
             assert!(
@@ -492,22 +491,19 @@ mod path_encoding_tests {
         }
     }
 
-    /// AC-2 — every non-dot vector builds a URL whose *parsed* path (the real
-    /// wire path, post-normalisation) stays inside `/v1/cache/`. Asserting on the
-    /// unparsed `format!` output would pass while still shipping a traversal, so
-    /// we parse with the same `url` crate `reqwest` uses.
+    /// Every transmittable fixture row, plus the rs near-misses, builds a URL
+    /// whose *parsed* path (the real wire path, post-normalisation) stays inside
+    /// `/v1/cache/`. Asserting on the unparsed `format!` output would pass while
+    /// still shipping a traversal, so we parse with the same `url` crate
+    /// `reqwest` uses.
     #[test]
     fn safe_keys_never_escape_the_cache_prefix() {
         let b = backend();
-        let vectors = [
-            "a:..",
-            "default:../../admin",
-            "k?x=1#f",
-            "a b",
-            "healthy",        // route-token near-miss: not reserved, must build fine
-            "x/../../health", // embedded route token, `/`→`%2F` keeps it one segment
-            "ns:default:func:m.f:args:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:",
-        ];
+        let fixture_keys: Vec<String> = transmittable().into_iter().map(|v| v.key).collect();
+        let vectors = fixture_keys
+            .iter()
+            .map(String::as_str)
+            .chain(RS_NEAR_MISSES.iter().copied());
         for key in vectors {
             let base = Url::parse(&b.url(key).expect("url")).expect("parse base");
             let ttl = Url::parse(&b.ttl_url(key).expect("ttl_url")).expect("parse ttl");
