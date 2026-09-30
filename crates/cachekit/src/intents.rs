@@ -284,8 +284,9 @@ impl CacheKit {
     ///
     /// Returns [`CachekitError::Config`] — all before any Redis I/O — when
     /// `CACHEKIT_MASTER_KEY` is unset, empty, not hex, or shorter than 32
-    /// bytes, or when a non-blank `CACHEKIT_PREVIOUS_MASTER_KEYS` has an empty
-    /// or invalid entry, more than 3 entries, or repeats the current key.
+    /// bytes, or when `CACHEKIT_PREVIOUS_MASTER_KEYS` is set but not valid
+    /// UTF-8, or is non-blank with an empty or invalid entry, more than 3
+    /// entries, or a repeat of the current key.
     /// Otherwise as [`secure`](CacheKit::secure).
     ///
     /// # Example
@@ -504,6 +505,40 @@ mod secure_tests {
     fn env_path_blank_previous_keys_is_unset() {
         assert_decrypts_default_tenant_vector(
             secure_env_defaults_with(Some(MASTER_KEY_HEX), Some("  ")).expect("blank is unset"),
+        );
+    }
+
+    /// Set but unreadable is not unset: a non-UTF-8 value must fail, never
+    /// silently drop the decrypt-only keys.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn env_path_rejects_non_utf8_previous_keys() {
+        use std::os::unix::ffi::OsStringExt;
+        let saved = std::env::var_os("CACHEKIT_PREVIOUS_MASTER_KEYS");
+        std::env::set_var(
+            "CACHEKIT_PREVIOUS_MASTER_KEYS",
+            std::ffi::OsString::from_vec(vec![0x31, 0xff, 0x31]),
+        );
+        let saved_master = std::env::var_os("CACHEKIT_MASTER_KEY");
+        std::env::set_var("CACHEKIT_MASTER_KEY", MASTER_KEY_HEX);
+        let resolved = super::secure_env_defaults();
+        for (var, val) in [
+            ("CACHEKIT_PREVIOUS_MASTER_KEYS", saved),
+            ("CACHEKIT_MASTER_KEY", saved_master),
+        ] {
+            match val {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        assert!(
+            matches!(
+                &resolved,
+                Err(crate::CachekitError::Config(msg)) if msg.contains("CACHEKIT_PREVIOUS_MASTER_KEYS")
+            ),
+            "non-UTF-8 previous keys must be a Config error naming the variable; got {:?}",
+            resolved.err()
         );
     }
 

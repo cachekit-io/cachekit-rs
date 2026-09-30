@@ -175,7 +175,11 @@ impl CachekitConfigBuilder {
     /// Set the master key from a hex string. Must decode to at least 32 bytes.
     pub fn master_key(mut self, hex_key: &str) -> Result<Self, CachekitError> {
         let bytes = decode_master_key_hex(hex_key, "master_key")?;
-        validate_previous_master_keys(Some(bytes.as_slice()), &self.inner.previous_master_keys)?;
+        validate_previous_master_keys(
+            Some(bytes.as_slice()),
+            &self.inner.previous_master_keys,
+            "previous_master_keys",
+        )?;
         self.inner.master_key = Some(bytes);
         Ok(self)
     }
@@ -218,6 +222,7 @@ impl CachekitConfigBuilder {
         validate_previous_master_keys(
             self.inner.master_key.as_deref().map(Vec::as_slice),
             &previous,
+            "previous_master_keys",
         )?;
         self.inner.previous_master_keys = previous;
         Ok(self)
@@ -297,11 +302,16 @@ pub(crate) fn previous_master_keys_from_env(
 ) -> Result<Vec<Zeroizing<Vec<u8>>>, CachekitError> {
     // Same reasoning as CACHEKIT_MASTER_KEY in `from_env`: wipe the owned
     // copy of the hex list on drop.
-    let Some(val) = std::env::var("CACHEKIT_PREVIOUS_MASTER_KEYS")
-        .ok()
-        .map(Zeroizing::new)
-    else {
-        return Ok(Vec::new());
+    let val = match std::env::var("CACHEKIT_PREVIOUS_MASTER_KEYS") {
+        Ok(val) => Zeroizing::new(val),
+        Err(std::env::VarError::NotPresent) => return Ok(Vec::new()),
+        // Set but unreadable is not unset: dropping it would silently strip
+        // the decrypt-only keys, and every old-key read would fail closed.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(CachekitError::Config(
+                "CACHEKIT_PREVIOUS_MASTER_KEYS is not valid UTF-8".to_owned(),
+            ))
+        }
     };
     // A wholly blank value retires the variable (the common way to disable
     // it in shell profiles, Compose files, and k8s manifests) and is treated
@@ -331,7 +341,7 @@ pub(crate) fn previous_master_keys_from_env(
             "CACHEKIT_PREVIOUS_MASTER_KEYS requires CACHEKIT_MASTER_KEY to be set".to_owned(),
         ));
     };
-    validate_previous_master_keys(Some(master_key), &previous)?;
+    validate_previous_master_keys(Some(master_key), &previous, "CACHEKIT_PREVIOUS_MASTER_KEYS")?;
     Ok(previous)
 }
 
@@ -347,20 +357,20 @@ pub(crate) fn previous_master_keys_from_env(
 fn validate_previous_master_keys(
     master_key: Option<&[u8]>,
     previous: &[Zeroizing<Vec<u8>>],
+    source: &str,
 ) -> Result<(), CachekitError> {
     if previous.len() > MAX_PREVIOUS_MASTER_KEYS {
         return Err(CachekitError::Config(format!(
-            "previous_master_keys accepts at most {MAX_PREVIOUS_MASTER_KEYS} entries; got {}",
+            "{source} accepts at most {MAX_PREVIOUS_MASTER_KEYS} entries; got {}",
             previous.len()
         )));
     }
     if let Some(master) = master_key {
         if previous.iter().any(|key| key.as_slice() == master) {
-            return Err(CachekitError::Config(
-                "the current master key must not appear in previous_master_keys \
+            return Err(CachekitError::Config(format!(
+                "the current master key must not appear in {source} \
                  (rotation is forward-only; retired keys are never re-promoted)"
-                    .to_owned(),
-            ));
+            )));
         }
     }
     Ok(())
