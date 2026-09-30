@@ -199,15 +199,21 @@ impl CachekitConfigBuilder {
     /// Set decrypt-only previous master keys from hex strings, in attempt
     /// order, on the [`CachekitConfig`] value.
     ///
-    /// No client reads keys set here. These paths apply previous keys to a
-    /// client; each one decrypts with the current key first, then each
-    /// previous key in order:
+    /// No client reads keys set here. With the `encryption` feature enabled,
+    /// these paths apply previous keys to a client; each one decrypts with
+    /// the current key first, then each previous key in order:
     ///
     /// * `CacheKit::from_env()` and `CacheKit::secure_from_env()` read them
     ///   from `CACHEKIT_PREVIOUS_MASTER_KEYS`.
     /// * `CacheKitBuilder::encryption_from_bytes_with_previous()` takes them
     ///   as arguments. It requires every key to be exactly 32 raw bytes,
     ///   while this method accepts hex that decodes to 32 bytes or more.
+    ///
+    /// Without the `encryption` feature no path applies any master key:
+    /// `CacheKit::secure_from_env()` does not exist,
+    /// `CacheKit::from_env()` still succeeds but applies no key, and
+    /// `CacheKitBuilder::encryption_from_bytes_with_previous()` succeeds and
+    /// discards its keys.
     ///
     /// Validation is identical to [`Self::master_key`] per entry (valid hex,
     /// at least 32 bytes). At most [`MAX_PREVIOUS_MASTER_KEYS`] entries —
