@@ -53,7 +53,8 @@ fn minimal_defaults(backend: SharedBackend) -> CacheKitBuilder {
 
 /// `secure` builder defaults, split from the eager Redis connect so the key
 /// path is unit-testable without a live server. Takes hex-decoded key bytes
-/// only (so `>= 32`, not the raw-bytes exactly-32 rule) and reads no environment: [`CacheKit::secure`] passes no previous keys.
+/// only (so `>= 32`, not the raw-bytes exactly-32 rule) and reads no
+/// environment: [`CacheKit::secure`] passes no previous keys.
 #[cfg(all(feature = "redis", feature = "encryption"))]
 fn secure_defaults(
     master_key: &[u8],
@@ -223,10 +224,10 @@ impl CacheKit {
     /// `openssl rand -hex 32`.
     ///
     /// Use [`CacheKit::secure_from_env`] to read the key from
-    /// `CACHEKIT_MASTER_KEY`. There is no raw-bytes preset: decoded key bytes
-    /// go to [`CacheKitBuilder::encryption_from_bytes`], and the ASCII bytes
-    /// of a hex string must never go there — they derive a key no other SDK
-    /// derives.
+    /// `CACHEKIT_MASTER_KEY`. There is no raw-bytes preset: exactly 32
+    /// decoded key bytes go to [`CacheKitBuilder::encryption_from_bytes`],
+    /// which rejects any other length — including the 64 ASCII bytes of a
+    /// hex string, which would derive a key no other SDK derives.
     ///
     /// The key is validated **before** any Redis connection is attempted — a
     /// bad key is a deterministic local error, never masked by (or paying

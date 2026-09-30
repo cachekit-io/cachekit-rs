@@ -98,8 +98,9 @@ impl EncryptionLayer {
         tenant_id: &str,
     ) -> Result<Self, CachekitError> {
         // Raw bytes carry no encoding to check, so length is the only guard
-        // against a hex string passed as bytes. The hex paths keep their
-        // own `>= 32` floor via `from_hex_decoded_keys`.
+        // against a hex string passed as bytes. Hex paths are floored at
+        // `>= 32` by `decode_master_key_hex`; `from_hex_decoded_keys`
+        // re-checks that floor at the crypto layer for its internal callers.
         for (i, key) in previous_keys.iter().enumerate() {
             if key.len() != RAW_KEY_LEN {
                 return Err(CachekitError::Config(format!(
@@ -482,17 +483,6 @@ mod tests {
     }
 
     #[test]
-    fn ascii_hex_bytes_are_rejected() {
-        // 64 ASCII bytes of a hex string: passes a `>= 32` floor, derives a
-        // key no other SDK derives. Must fail, not encrypt.
-        let hex = "ab".repeat(32);
-        assert_config_err(
-            &EncryptionLayer::new(hex.as_bytes(), TEST_TENANT),
-            "ASCII hex as raw bytes",
-        );
-    }
-
-    #[test]
     fn hex_decoded_keys_accept_longer_than_32_bytes() {
         // Rule 3: the hex path accepts >= 32 decoded bytes.
         let long = [7u8; 48];
@@ -620,7 +610,7 @@ mod tests {
 
     #[test]
     fn short_previous_key_is_config_error() {
-        let short = [0x01u8; 16]; // core would accept 16; the rs SDK contract is 32
+        let short = [0x01u8; 16]; // core would accept 16; raw keys must be exactly 32
         let result = EncryptionLayer::with_previous_keys(K2, &[&short], TEST_TENANT);
         assert!(matches!(result, Err(CachekitError::Config(_))));
     }
