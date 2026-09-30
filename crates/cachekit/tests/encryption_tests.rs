@@ -589,3 +589,89 @@ async fn rotation_drain_signal_is_visible_on_secure_cache() {
         "previous-key hit is counted"
     );
 }
+
+// ── Master-key length (spec/intent-presets.md § Master Key Input) ─────────────
+
+fn assert_builder_config_err(result: Result<cachekit::CacheKitBuilder, CachekitError>, what: &str) {
+    match result {
+        Err(CachekitError::Config(_)) => {}
+        Err(e) => panic!("{what}: expected Config error, got {e:?}"),
+        Ok(_) => panic!("{what}: expected Config error, got Ok"),
+    }
+}
+
+/// Rule 4: a raw-bytes entry point takes exactly 32 bytes.
+#[test]
+fn encryption_from_bytes_requires_exactly_32_bytes() {
+    for len in [31, 33] {
+        assert_builder_config_err(
+            CacheKit::builder().encryption_from_bytes(&vec![7u8; len], "t"),
+            &format!("{len}-byte key"),
+        );
+    }
+    assert!(CacheKit::builder()
+        .encryption_from_bytes(&[7u8; 32], "t")
+        .is_ok());
+}
+
+/// The ASCII bytes of a 64-char hex string pass a `>= 32` check and derive a
+/// silently different key — they must be rejected, not accepted.
+#[test]
+fn encryption_from_bytes_rejects_ascii_hex() {
+    let hex = "ab".repeat(32);
+    assert_builder_config_err(
+        CacheKit::builder().encryption_from_bytes(hex.as_bytes(), "t"),
+        "ASCII hex as raw bytes",
+    );
+}
+
+#[test]
+fn encryption_from_bytes_with_previous_requires_exactly_32_bytes() {
+    const K1: &[u8] = &[0x11; 32];
+    const K2: &[u8] = &[0x22; 32];
+    for len in [31, 33] {
+        let bad = vec![7u8; len];
+        assert_builder_config_err(
+            CacheKit::builder().encryption_from_bytes_with_previous(&bad, &[K1], "t"),
+            &format!("{len}-byte current key"),
+        );
+        assert_builder_config_err(
+            CacheKit::builder().encryption_from_bytes_with_previous(K2, &[&bad], "t"),
+            &format!("{len}-byte previous key"),
+        );
+    }
+    assert!(CacheKit::builder()
+        .encryption_from_bytes_with_previous(K2, &[K1], "t")
+        .is_ok());
+}
+
+/// Rule 3: the hex path accepts any key decoding to >= 32 bytes.
+#[test]
+fn encryption_hex_accepts_32_and_48_byte_keys() {
+    for bytes in [32, 48] {
+        assert!(
+            CacheKit::builder()
+                .encryption(&"ab".repeat(bytes), "t")
+                .is_ok(),
+            "{bytes}-byte hex key must be accepted"
+        );
+    }
+}
+
+#[cfg(feature = "cachekitio")]
+#[test]
+#[serial_test::serial]
+fn from_env_accepts_32_and_48_byte_hex_keys() {
+    for bytes in [32, 48] {
+        let (current, previous) = ("22".repeat(bytes), "11".repeat(bytes));
+        let _env = common::EnvGuard::set(&[
+            ("CACHEKIT_API_KEY", Some("test-key")),
+            ("CACHEKIT_API_URL", None),
+            ("CACHEKIT_MASTER_KEY", Some(current.as_str())),
+            ("CACHEKIT_PREVIOUS_MASTER_KEYS", Some(previous.as_str())),
+        ]);
+        let builder = CacheKit::from_env()
+            .unwrap_or_else(|e| panic!("{bytes}-byte hex keys must be accepted: {e}"));
+        assert!(builder.build().unwrap().secure_cache().is_ok());
+    }
+}

@@ -244,8 +244,7 @@ impl CacheKit {
                 .iter()
                 .map(|key| key.as_slice())
                 .collect();
-            builder =
-                builder.encryption_from_bytes_with_previous(master_key, &previous, namespace)?;
+            builder = builder.encryption_from_hex_decoded(master_key, &previous, namespace)?;
         }
 
         Ok(builder)
@@ -1120,7 +1119,9 @@ impl CacheKitBuilder {
 
     /// Configure encryption from raw master key bytes and tenant ID.
     ///
-    /// The master key must be at least 32 bytes.
+    /// The master key must be exactly 32 raw bytes; anything else is a
+    /// [`CachekitError::Config`]. Hex-encoded keys go to [`Self::encryption`]
+    /// — their ASCII bytes are 64 bytes long and rejected here.
     /// Keys are derived per-tenant via HKDF-SHA256.
     #[cfg(feature = "encryption")]
     pub fn encryption_from_bytes(
@@ -1141,7 +1142,7 @@ impl CacheKitBuilder {
     /// At most 3 previous keys; supplying more is a config error, never
     /// truncated. See [`crate::encryption::EncryptionLayer::with_previous_keys`].
     ///
-    /// Every key, current and previous, must be at least 32 bytes.
+    /// Every key, current and previous, must be exactly 32 raw bytes.
     #[cfg(feature = "encryption")]
     pub fn encryption_from_bytes_with_previous(
         mut self,
@@ -1160,13 +1161,32 @@ impl CacheKitBuilder {
 
     /// Configure encryption from a hex-encoded master key string.
     ///
-    /// Convenience wrapper that hex-decodes (the same decoder as
-    /// [`CacheKit::from_env`] and the `secure` preset) then delegates to
-    /// [`Self::encryption_from_bytes`].
+    /// Hex-decodes with the same decoder as [`CacheKit::from_env`] and the
+    /// `secure` preset. The key must decode to at least 32 bytes; use exactly
+    /// 32 (64 hex chars), the only length every SDK accepts.
     #[cfg(feature = "encryption")]
     pub fn encryption(self, hex_key: &str, tenant_id: &str) -> Result<Self, CachekitError> {
         let bytes = crate::config::decode_master_key_hex(hex_key, "master key")?;
-        self.encryption_from_bytes(&bytes, tenant_id)
+        self.encryption_from_hex_decoded(&bytes, &[], tenant_id)
+    }
+
+    /// Shared tail of the hex paths: keys already validated by
+    /// `decode_master_key_hex`, so the `>= 32` floor applies, not the
+    /// raw-bytes exactly-32 rule.
+    #[cfg(feature = "encryption")]
+    pub(crate) fn encryption_from_hex_decoded(
+        mut self,
+        master_key: &[u8],
+        previous_keys: &[&[u8]],
+        tenant_id: &str,
+    ) -> Result<Self, CachekitError> {
+        let layer = crate::encryption::EncryptionLayer::from_hex_decoded_keys(
+            master_key,
+            previous_keys,
+            tenant_id,
+        )?;
+        self.encryption = Some(SharedEncryption::new(layer));
+        Ok(self)
     }
 
     // Stub for when encryption feature is disabled.
