@@ -121,7 +121,8 @@ pub(crate) enum ReadOutcome {
     /// Served from L1 past the SWR freshness threshold: still an L1 hit for
     /// the counters, but the caller is about to refresh it in the background.
     L1Stale,
-    /// Served from the L2 backend (and backfilled into L1 when enabled).
+    /// Served from the L2 backend (and backfilled into L1 when enabled, unless
+    /// the server marked the read stale or its freshness exhausted).
     L2Hit,
     /// Neither layer had the key.
     Miss,
