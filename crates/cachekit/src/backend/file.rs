@@ -20,8 +20,9 @@
 //!   64 mutexes (`LOCK_STRIPES`), picked by the first byte of the entry's
 //!   Blake2b-128 filename. This closes the expire-unlink vs. concurrent-set
 //!   lost-write race within a process: that race only ever involves one entry
-//!   path, so one key always maps to one stripe. Operations on different keys
-//!   do not wait on each other's fsync (cachekit-py serializes everything on
+//!   path, so one key always maps to one stripe. Keys on different stripes
+//!   do not wait on each other's fsync; two keys share a stripe about 1 time
+//!   in 64 and then still serialize (cachekit-py serializes everything on
 //!   one `threading.RLock`, because its RLock also guards LRU and size
 //!   bookkeeping; rs has none yet — porting eviction or size caps adds shared
 //!   cross-key state, and these stripes must be revisited then).
