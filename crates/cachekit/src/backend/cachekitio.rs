@@ -5,7 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use zeroize::Zeroizing;
 
-use crate::backend::{encode_key, Backend, HealthStatus, LockableBackend};
+use crate::backend::{encode_key, Backend, Freshness, HealthStatus, LockableBackend};
 use crate::error::{BackendError, BackendErrorKind};
 use crate::metrics::{metrics_headers, MetricsProvider};
 use crate::session::session_headers;
@@ -131,6 +131,50 @@ pub(crate) fn from_http_status_sanitized(status: u16, body: &[u8], api_key: &str
     BackendError::from_http_status(status, sanitized.as_bytes())
 }
 
+// ── Freshness headers ────────────────────────────────────────────────────────
+
+/// Read a `GET 200`'s [`Freshness`] from its headers (`spec/saas-api.md`
+/// § Stale-While-Revalidate, § Remaining Freshness).
+///
+/// An absent `X-CacheKit-Freshness` means fresh (a pre-SWR server). Any value
+/// other than exactly `fresh` means stale, because revalidating is the safe
+/// reading of a token the client does not know; every copy of a repeated
+/// header must say `fresh`. An absent `X-CacheKit-Fresh-For` means no server
+/// bound. A repeated one has no single bound, so it counts as `0`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn freshness_from_headers(headers: &reqwest::header::HeaderMap) -> Freshness {
+    let is_stale = headers
+        .get_all("x-cachekit-freshness")
+        .iter()
+        .any(|value| value != "fresh");
+    let mut fresh_for = headers.get_all("x-cachekit-fresh-for").iter();
+    let fresh_for = match (fresh_for.next(), fresh_for.next()) {
+        (None, _) => None,
+        (Some(value), None) => Some(parse_fresh_for(value.as_bytes())),
+        (Some(_), Some(_)) => Some(Duration::ZERO),
+    };
+    Freshness {
+        is_stale,
+        fresh_for,
+    }
+}
+
+/// `X-CacheKit-Fresh-For` must be 1–7 ASCII digits and at most 2,592,000 (the
+/// 30-day TTL cap); anything else counts as `0`. The length check runs first,
+/// so the range check never sees a value that a fixed-width parse could wrap
+/// back into range (`4297559296` as a `u32` is `2592000`).
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_fresh_for(value: &[u8]) -> Duration {
+    const MAX_FRESH_FOR_SECS: u64 = 2_592_000;
+    if !(1..=7).contains(&value.len()) || !value.iter().all(u8::is_ascii_digit) {
+        return Duration::ZERO;
+    }
+    match std::str::from_utf8(value).map(str::parse::<u64>) {
+        Ok(Ok(secs)) if secs <= MAX_FRESH_FOR_SECS => Duration::from_secs(secs),
+        _ => Duration::ZERO,
+    }
+}
+
 // ── Backend impl ──────────────────────────────────────────────────────────────
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -143,6 +187,13 @@ impl Backend for CachekitIO {
     }
 
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        Ok(self.get_with_freshness(key).await?.map(|(bytes, _)| bytes))
+    }
+
+    async fn get_with_freshness(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, Freshness)>, BackendError> {
         let req = self.with_standard_headers(
             self.client
                 .get(self.url(key)?)
@@ -156,11 +207,12 @@ impl Backend for CachekitIO {
 
         match resp.status().as_u16() {
             200 => {
+                let freshness = freshness_from_headers(resp.headers());
                 let bytes = resp
                     .bytes()
                     .await
                     .map_err(|e| reqwest_err_sanitized(e, self.api_key.as_str()))?;
-                Ok(Some(bytes.to_vec()))
+                Ok(Some((bytes.to_vec(), freshness)))
             }
             404 => Ok(None),
             _ => Err(self.error_from_response(resp).await),
@@ -361,6 +413,116 @@ impl CachekitIOBuilder {
                 .metrics_provider
                 .map_or_else(OnceLock::new, OnceLock::from),
         })
+    }
+}
+
+// ── Freshness-header parsing tests ───────────────────────────────────────────
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::expect_used)] // test-only: a malformed fixture header should panic loudly
+mod freshness_header_tests {
+    use std::time::Duration;
+
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    use super::freshness_from_headers;
+    use crate::backend::Freshness;
+
+    /// Build a header map with the wire's mixed-case names; `append` keeps
+    /// repeats, as a proxy that duplicates a header would.
+    fn headers(pairs: &[(&str, &[u8])]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(
+                HeaderName::from_bytes(name.as_bytes()).expect("valid header name"),
+                HeaderValue::from_bytes(value).expect("valid header value"),
+            );
+        }
+        map
+    }
+
+    fn label(values: &[&[u8]]) -> bool {
+        let pairs: Vec<_> = values
+            .iter()
+            .map(|v| ("X-CacheKit-Freshness", *v))
+            .collect();
+        freshness_from_headers(&headers(&pairs)).is_stale
+    }
+
+    fn fresh_for(values: &[&[u8]]) -> Option<Duration> {
+        let pairs: Vec<_> = values
+            .iter()
+            .map(|v| ("X-CacheKit-Fresh-For", *v))
+            .collect();
+        freshness_from_headers(&headers(&pairs)).fresh_for
+    }
+
+    #[test]
+    fn absent_headers_are_a_fresh_unbounded_read() {
+        assert_eq!(
+            freshness_from_headers(&HeaderMap::new()),
+            Freshness::default()
+        );
+    }
+
+    #[test]
+    fn only_an_exact_fresh_label_is_fresh() {
+        assert!(!label(&[b"fresh"]));
+        assert!(!label(&[b"fresh", b"fresh"]));
+        // (d) `stale`, an unknown token, a case variant, an empty value, or any
+        // non-`fresh` copy of a repeated header all read as stale.
+        for stale in [&b"stale"[..], b"revalidating", b"Fresh", b"", b"fresh "] {
+            assert!(
+                label(&[stale]),
+                "{:?} must read as stale",
+                String::from_utf8_lossy(stale)
+            );
+        }
+        assert!(label(&[b"fresh", b"stale"]));
+    }
+
+    #[test]
+    fn fresh_for_in_grammar_parses() {
+        for (value, secs) in [
+            (&b"0"[..], 0),
+            (b"1", 1),
+            (b"0000005", 5),
+            (b"2592000", 2_592_000),
+        ] {
+            assert_eq!(fresh_for(&[value]), Some(Duration::from_secs(secs)));
+        }
+    }
+
+    /// (d) Outside 1–7 ASCII digits, or over 2,592,000, is `0`. `4297559296` is
+    /// the value a wrapping `u32` parse would turn into `2592000`.
+    #[test]
+    fn fresh_for_outside_grammar_is_zero() {
+        let invalid: [&[u8]; 11] = [
+            b"",
+            b"-1",
+            b"+5",
+            b" 5",
+            b"5s",
+            b"1.5",
+            "\u{0663}".as_bytes(), // ARABIC-INDIC DIGIT THREE: a digit, not ASCII
+            b"12345678",
+            b"2592001",
+            b"9999999",
+            b"4297559296",
+        ];
+        for value in invalid {
+            assert_eq!(
+                fresh_for(&[value]),
+                Some(Duration::ZERO),
+                "{:?} must count as 0",
+                String::from_utf8_lossy(value)
+            );
+        }
+        assert_eq!(
+            fresh_for(&[b"10", b"10"]),
+            Some(Duration::ZERO),
+            "a repeated bound counts as 0"
+        );
     }
 }
 

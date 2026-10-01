@@ -21,6 +21,25 @@ pub struct HealthStatus {
     pub details: HashMap<String, String>,
 }
 
+// ── Freshness ────────────────────────────────────────────────────────────────
+
+/// The server's freshness for one read: the protocol's `X-CacheKit-Freshness`
+/// label and `X-CacheKit-Fresh-For` bound (`spec/saas-api.md` § Remaining
+/// Freshness). The client reads it to bound the L1 backfill.
+///
+/// The default is a fresh read with no server bound, which leaves the client's
+/// configured local TTL unchanged.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Freshness {
+    /// The read was labelled stale, or with a token the client does not know.
+    /// The L1 must not backfill it.
+    pub is_stale: bool,
+    /// Remaining server freshness, or `None` when the header was absent. Zero
+    /// forbids the backfill.
+    pub fresh_for: Option<Duration>,
+}
+
 // ── Backend trait ─────────────────────────────────────────────────────────────
 
 /// Async cache backend abstraction.
@@ -33,6 +52,23 @@ pub struct HealthStatus {
 pub trait Backend: Send + Sync {
     /// Retrieve the raw bytes stored under `key`, or `None` if absent.
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError>;
+
+    /// Retrieve `key` together with the server's [`Freshness`] for it.
+    ///
+    /// Client plumbing for the L1 backfill, not part of the documented surface.
+    /// The default wraps [`Self::get`] as a fresh read with no bound, so a
+    /// backend without a freshness signal keeps today's behaviour. A backend
+    /// that wraps another must forward this method, or the signal is lost.
+    #[doc(hidden)]
+    async fn get_with_freshness(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, Freshness)>, BackendError> {
+        Ok(self
+            .get(key)
+            .await?
+            .map(|bytes| (bytes, Freshness::default())))
+    }
 
     /// Store `value` under `key`, optionally expiring after `ttl`.
     async fn set(
@@ -85,6 +121,23 @@ pub trait Backend: Send + Sync {
 pub trait Backend {
     /// Retrieve the raw bytes stored under `key`, or `None` if absent.
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError>;
+
+    /// Retrieve `key` together with the server's [`Freshness`] for it.
+    ///
+    /// Client plumbing for the L1 backfill, not part of the documented surface.
+    /// The default wraps [`Self::get`] as a fresh read with no bound, so a
+    /// backend without a freshness signal keeps today's behaviour. A backend
+    /// that wraps another must forward this method, or the signal is lost.
+    #[doc(hidden)]
+    async fn get_with_freshness(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, Freshness)>, BackendError> {
+        Ok(self
+            .get(key)
+            .await?
+            .map(|bytes| (bytes, Freshness::default())))
+    }
 
     /// Store `value` under `key`, optionally expiring after `ttl`.
     async fn set(
