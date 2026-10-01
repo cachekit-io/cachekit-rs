@@ -31,12 +31,16 @@
 //!   (exit 3). Other 5xx are recorded and the run goes on, up to 5 of them, so
 //!   a server's sporadic errors are counted rather than ending the run.
 //!   Nothing is retried, so a limiter verdict is never retried into;
-//! - total requests are capped (`--max-ops`, at most 2000) and paced under
-//!   `--max-per-min`; a burst is at most 32 concurrent requests.
+//! - total requests, warm-ups and trace probes included, are capped
+//!   (`--max-ops`, at most 2000) and paced under `--max-per-min`; a burst is at
+//!   most 32 concurrent requests. A `#[cachekit]` cold miss counts as the five
+//!   requests it can send (GET, a re-check GET, lock, PUT, unlock), and every
+//!   one it sent is checked against the stop rules: the macro itself swallows
+//!   backend errors.
 //!
 //! ```text
 //! CACHEKIT_API_KEY=… CACHEKIT_API_URL=https://… cargo run --release \
-//!   --example wall_time_probe -- --run R1 --phase aa-warm --out rows.jsonl \
+//!   --example wall_time_probe --features macros -- --run R1 --phase aa-warm --out rows.jsonl \
 //!   --ledger keys.txt --arms sdk,sdk --samples 40 --block 10 --ops put,get,delete
 //! ```
 
@@ -52,7 +56,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cachekit::backend::cachekitio::CachekitIO;
-use cachekit::backend::{Backend, HealthStatus};
+use cachekit::backend::{Backend, HealthStatus, LockableBackend};
 use cachekit::interop::{interop_key, InteropValue};
 use cachekit::metrics::{metrics_headers, MetricsProvider};
 use cachekit::session::session_headers;
@@ -66,10 +70,10 @@ const MAX_OPS: usize = 2000;
 const MAX_CONCURRENCY: usize = 32;
 /// 5xx responses (503 excepted) a run records before it stops.
 const MAX_SERVER_ERRORS: usize = 5;
+/// Most requests one `#[cachekit]` cold miss sends: GET miss, lock, PUT and
+/// unlock, plus the re-check GET a fill sometimes makes (8 of 40 calls on dev).
+const MACRO_REQUESTS: usize = 5;
 const ABBA: [usize; 4] = [0, 1, 1, 0];
-/// Namespace and operation of the macro regime's interop keys.
-const MACRO_NS: &str = "wall-time-probe";
-const MACRO_OP: &str = "cold-miss";
 
 // ── Arguments ────────────────────────────────────────────────────────────────
 
@@ -127,6 +131,25 @@ const USAGE: &str = "usage: wall_time_probe --run ID --phase NAME --out FILE --l
 [--max-per-min N] [--max-ops N]
 env: CACHEKIT_API_KEY, CACHEKIT_API_URL";
 
+const VALUE_FLAGS: [&str; 16] = [
+    "run",
+    "env",
+    "phase",
+    "out",
+    "ledger",
+    "key-prefix",
+    "arms",
+    "samples",
+    "block",
+    "gap-ms",
+    "concurrency",
+    "ops",
+    "size",
+    "ttl-s",
+    "max-per-min",
+    "max-ops",
+];
+
 fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut kv: HashMap<&str, &str> = HashMap::new();
     let mut flags: HashSet<&str> = HashSet::new();
@@ -140,6 +163,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         }
         if matches!(name, "fresh-conn" | "macro-cold-miss") {
             flags.insert(name);
+        } else if !VALUE_FLAGS.contains(&name) {
+            return Err(format!("unknown flag --{name}"));
         } else {
             kv.insert(
                 name,
@@ -232,19 +257,30 @@ fn validate(a: &Args) -> Result<(), String> {
             "--max-ops must be at most {MAX_OPS}, --max-per-min positive"
         ));
     }
+    if a.macro_cold_miss && a.concurrency > 1 {
+        return Err("--macro-cold-miss runs serially; drop --concurrency".into());
+    }
     if a.macro_cold_miss && a.arms.contains(&Kind::Transport) {
         // The cold-miss path takes the distributed lock, which only the real
         // backend implements; a transport arm would time a different call shape.
         return Err("--macro-cold-miss runs on sdk arms only".into());
     }
-    let per_sample = if a.macro_cold_miss { 1 } else { a.ops.len() };
+    let per_sample = if a.macro_cold_miss {
+        MACRO_REQUESTS
+    } else {
+        a.ops.len()
+    };
     // Bursts run each step twice (cold, then warm on the same pool).
     let steps = if a.concurrency > 1 { 2 } else { 1 };
-    // Plus one warm-up GET per block.
-    let total = 2 * a.samples * per_sample * steps + 2 * a.samples / a.block;
+    let blocks_per_arm = a.samples / a.block;
+    let transport_arms = a.arms.iter().filter(|k| **k == Kind::Transport).count();
+    // Plus one warm-up GET per block, and two trace probes per transport block.
+    let total = 2 * a.samples * per_sample * steps
+        + 2 * blocks_per_arm
+        + 2 * transport_arms * blocks_per_arm;
     if total > a.max_ops {
         return Err(format!(
-            "this run sends {total} cache requests, over --max-ops {}",
+            "this run sends {total} requests, over --max-ops {}",
             a.max_ops
         ));
     }
@@ -461,6 +497,95 @@ impl Backend for Transport {
     }
 }
 
+// ── Macro arm: the real backend, with every request's result recorded ───────
+
+/// One request the backend sent: method and HTTP status (`None` = no response).
+type Part = (&'static str, Option<u16>);
+
+/// The real `CachekitIO`, recording each request's outcome. `#[cachekit]`
+/// fails open — it passes over GET errors and drops PUT and lock errors — so
+/// without this record a 429 would be timed as a fast success and nothing
+/// would stop the run.
+struct Recorded {
+    inner: CachekitIO,
+    parts: Mutex<Vec<(Part, Option<String>)>>,
+}
+
+impl Recorded {
+    fn note<T>(&self, method: &'static str, r: &Result<T, BackendError>, ok: impl Fn(&T) -> u16) {
+        let entry = match r {
+            Ok(v) => ((method, Some(ok(v))), None),
+            Err(e) => ((method, http_status(&e.to_string())), Some(e.to_string())),
+        };
+        if let Ok(mut parts) = self.parts.lock() {
+            parts.push(entry);
+        }
+    }
+
+    fn drain(&self) -> Vec<(Part, Option<String>)> {
+        self.parts
+            .lock()
+            .map(|mut p| std::mem::take(&mut *p))
+            .unwrap_or_default()
+    }
+}
+
+#[async_trait]
+impl Backend for Recorded {
+    fn attach_metrics(&self, provider: MetricsProvider) {
+        self.inner.attach_metrics(provider);
+    }
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        let r = self.inner.get(key).await;
+        self.note("GET", &r, |v| if v.is_some() { 200 } else { 404 });
+        r
+    }
+    async fn set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        let r = self.inner.set(key, value, ttl).await;
+        self.note("PUT", &r, |()| 200);
+        r
+    }
+    async fn delete(&self, key: &str) -> Result<bool, BackendError> {
+        let r = self.inner.delete(key).await;
+        self.note("DELETE", &r, |hit| if *hit { 200 } else { 404 });
+        r
+    }
+    async fn exists(&self, key: &str) -> Result<bool, BackendError> {
+        let r = self.inner.exists(key).await;
+        self.note("HEAD", &r, |hit| if *hit { 200 } else { 404 });
+        r
+    }
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        self.inner.health().await
+    }
+    fn as_lockable(&self) -> Option<&dyn LockableBackend> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl LockableBackend for Recorded {
+    async fn acquire_lock(
+        &self,
+        key: &str,
+        timeout_ms: u64,
+    ) -> Result<Option<String>, BackendError> {
+        let r = self.inner.acquire_lock(key, timeout_ms).await;
+        self.note("LOCK", &r, |_| 200);
+        r
+    }
+    async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError> {
+        let r = self.inner.release_lock(key, lock_id).await;
+        self.note("UNLOCK", &r, |_| 200);
+        r
+    }
+}
+
 // ── Arms ─────────────────────────────────────────────────────────────────────
 
 struct Arm {
@@ -468,26 +593,41 @@ struct Arm {
     slot: &'static str,
     cache: CacheKit,
     wire: Option<Arc<Transport>>,
+    recorded: Option<Arc<Recorded>>,
 }
 
+/// `record` wraps the sdk arm's backend in [`Recorded`]; only the macro
+/// regime needs it, so the plain sdk arm stays the bare SDK.
 fn build_arm(
     kind: Kind,
     slot: &'static str,
     api_key: &str,
     api_url: &str,
+    record: bool,
 ) -> Result<Arm, CachekitError> {
-    let (backend, wire): (cachekit::SharedBackend, _) = match kind {
+    let (mut wire, mut recorded) = (None, None);
+    let backend: cachekit::SharedBackend = match kind {
         Kind::Sdk => {
             let io = CachekitIO::builder()
                 .api_key(api_key)
                 .api_url(api_url)
                 .allow_custom_host(true)
                 .build()?;
-            (Arc::new(io), None)
+            if record {
+                let r = Arc::new(Recorded {
+                    inner: io,
+                    parts: Mutex::new(Vec::new()),
+                });
+                recorded = Some(r.clone());
+                r
+            } else {
+                Arc::new(io)
+            }
         }
         Kind::Transport => {
             let t = Arc::new(Transport::new(api_key, api_url)?);
-            (t.clone(), Some(t))
+            wire = Some(t.clone());
+            t
         }
     };
     // No L1, so every call reaches the network; no reliability, so nothing retries.
@@ -497,8 +637,14 @@ fn build_arm(
         slot,
         cache,
         wire,
+        recorded,
     })
 }
+
+/// Must equal the `namespace` and `interop` literals in the attribute below:
+/// the ledger, and so cleanup, is built from these copies.
+const MACRO_NS: &str = "wall-time-probe";
+const MACRO_OP: &str = "cold-miss";
 
 #[cachekit::cachekit(client = cache, ttl = 900, interop = "cold-miss", namespace = "wall-time-probe")]
 async fn cold_miss(cache: &CacheKit, id: String) -> Result<String, CachekitError> {
@@ -519,6 +665,8 @@ struct Timed {
     new_conn: Option<bool>,
     resolves: Option<u64>,
     exchange: Option<Exchange>,
+    /// Each request a macro call sent, when the arm records them.
+    parts: Vec<Part>,
 }
 
 /// Established TCP sockets of this process to port 443, by inode.
@@ -606,6 +754,7 @@ async fn timed_op(arm: &Arm, op: Op, key: &str, value: &str, ttl: Duration, seri
         new_conn: new_sockets(before.as_ref(), after.as_ref()).map(|n| n > 0),
         resolves,
         exchange: arm.wire.as_ref().and_then(|w| w.take(op.method(), key)),
+        parts: Vec::new(),
     }
 }
 
@@ -613,10 +762,16 @@ async fn timed_cold_miss(arm: &Arm, id: &str) -> Timed {
     let before = tls_sockets();
     let started = iso_now();
     let t0 = Instant::now();
-    let outcome = cold_miss(&arm.cache, id.to_owned()).await.map(|_| None);
+    let called = cold_miss(&arm.cache, id.to_owned()).await.map(|_| None);
     let total = t0.elapsed();
     let ended = iso_now();
     let after = tls_sockets();
+    let recorded = arm.recorded.as_ref().map(|r| r.drain()).unwrap_or_default();
+    // The first failed request decides the row, so the stop rules see it.
+    let outcome = match recorded.iter().find_map(|(_, err)| err.clone()) {
+        Some(err) => Err(err),
+        None => called.map_err(|e| e.to_string()),
+    };
     Timed {
         op: "macro-cold-miss",
         method: "CALL",
@@ -624,10 +779,11 @@ async fn timed_cold_miss(arm: &Arm, id: &str) -> Timed {
         started,
         ended,
         total,
-        outcome: outcome.map_err(|e| e.to_string()),
+        outcome,
         new_conn: new_sockets(before.as_ref(), after.as_ref()).map(|n| n > 0),
         resolves: None,
         exchange: None,
+        parts: recorded.into_iter().map(|(p, _)| p).collect(),
     }
 }
 
@@ -644,6 +800,9 @@ struct Sink {
     ledger: std::fs::File,
     loadavg: Value,
     server_errors: usize,
+    /// Distinguishes this process's rows from another run of the same phase
+    /// under one run id: block numbers restart at 0 in every process.
+    invocation: String,
 }
 
 fn ms(d: Duration) -> f64 {
@@ -658,7 +817,7 @@ impl Sink {
             .map_err(|e| format!("ledger: {e}"))
     }
 
-    /// Write one JSON row; return whether the run may continue.
+    /// Write one JSON row, then apply the stop rules to it.
     fn row(
         &mut self,
         arm: &Arm,
@@ -666,7 +825,7 @@ impl Sink {
         sample: usize,
         t: &Timed,
         burst: Option<(&str, usize)>,
-    ) -> Result<bool, String> {
+    ) -> Result<(), Stop> {
         let ex = t.exchange.as_ref();
         // The sdk arm sees no status; infer it the way the backend mapped it.
         let inferred = match &t.outcome {
@@ -718,9 +877,11 @@ impl Sink {
             "sample": sample,
             "size": self.args.size,
             "burst": burst.map(|(phase, n)| json!({"step": phase, "new_connections": n})),
+            "requests": (!t.parts.is_empty()).then(|| json!(t.parts)),
+            "invocation": self.invocation,
             "loadavg": self.loadavg,
         });
-        writeln!(self.out, "{row}").map_err(|e| format!("out: {e}"))?;
+        writeln!(self.out, "{row}").map_err(|e| Stop::Fault(format!("out: {e}")))?;
         println!(
             "  {:10} {} {:9} {:16} {:6} {:>4} new={:5} total={:7.1} ttfb={:>7} ray={}",
             self.args.phase,
@@ -735,15 +896,18 @@ impl Sink {
             row["ray_id"].as_str().unwrap_or("-"),
         );
         match status {
-            Some(s) if (200..300).contains(&s) || s == 404 => Ok(t.outcome.is_ok()),
+            Some(s) if ((200..300).contains(&s) || s == 404) && t.outcome.is_ok() => Ok(()),
             // A 503 is this service's limiter or fail-closed verdict: stop.
             // Any other 5xx is counted and the run goes on, so a server's
             // sporadic errors become a measured rate instead of ending it.
             Some(s) if s >= 500 && s != 503 && self.server_errors < MAX_SERVER_ERRORS => {
                 self.server_errors += 1;
-                Ok(true)
+                Ok(())
             }
-            _ => Ok(false),
+            _ => Err(Stop::Refused(format!(
+                "{} {}: status {status:?}, {:?}",
+                t.method, t.op, t.outcome
+            ))),
         }
     }
 }
@@ -828,7 +992,7 @@ async fn schedule(sink: &mut Sink, api_key: &str, api_url: &str) -> Result<(), S
     };
     let slots = ["A", "B"];
     let build = |i: usize| {
-        build_arm(arms[i], slots[i], api_key, api_url)
+        build_arm(arms[i], slots[i], api_key, api_url, macro_mode)
             .map(Arc::new)
             .map_err(|e| Stop::Fault(e.to_string()))
     };
@@ -848,9 +1012,7 @@ async fn schedule(sink: &mut Sink, api_key: &str, api_url: &str) -> Result<(), S
         let warm_key = format!("{prefix}:warmup{}:{}", slots[i], short_id());
         let mut t = timed_op(&pool[i], Op::Get, &warm_key, "", ttl, true).await;
         t.op = "warmup";
-        if !sink.row(&pool[i], b, 0, &t, None)? {
-            return Err(Stop::Refused(format!("warmup: {:?}", t.outcome)));
-        }
+        sink.row(&pool[i], b, 0, &t, None)?;
         let mut s = 0;
         while s < block {
             // Idle first, so an idle regime's sample is the first request after the gap.
@@ -886,14 +1048,7 @@ async fn schedule(sink: &mut Sink, api_key: &str, api_url: &str) -> Result<(), S
                     let new = new_sockets(before.as_ref(), tls_sockets().as_ref()).unwrap_or(0);
                     for (k, rows) in results {
                         for t in rows {
-                            if !sink.row(&pool[i], b, s + k, &t, Some((step, new)))? {
-                                return Err(Stop::Refused(format!(
-                                    "{}: {:?} {:?}",
-                                    t.op,
-                                    t.outcome,
-                                    t.exchange.map(|e| e.status)
-                                )));
-                            }
+                            sink.row(&pool[i], b, s + k, &t, Some((step, new)))?;
                         }
                     }
                 }
@@ -903,11 +1058,11 @@ async fn schedule(sink: &mut Sink, api_key: &str, api_url: &str) -> Result<(), S
                 if macro_mode {
                     let id = format!("{prefix}:{counter}:{}", short_id());
                     sink.ledger(&macro_key(&id).map_err(|e| e.to_string())?)?;
-                    pacer.wait(1).await;
+                    pacer
+                        .wait(u32::try_from(MACRO_REQUESTS).unwrap_or(u32::MAX))
+                        .await;
                     let t = timed_cold_miss(&pool[i], &id).await;
-                    if !sink.row(&pool[i], b, s, &t, None)? {
-                        return Err(Stop::Refused(format!("{}: {:?}", t.op, t.outcome)));
-                    }
+                    sink.row(&pool[i], b, s, &t, None)?;
                 } else {
                     let key = format!("{prefix}:rs{}{counter}:{}", slots[i], short_id());
                     for op in &ops {
@@ -916,14 +1071,7 @@ async fn schedule(sink: &mut Sink, api_key: &str, api_url: &str) -> Result<(), S
                         }
                         pacer.wait(1).await;
                         let t = timed_op(&pool[i], *op, &key, &value, ttl, true).await;
-                        if !sink.row(&pool[i], b, s, &t, None)? {
-                            return Err(Stop::Refused(format!(
-                                "{}: {:?} {:?}",
-                                t.op,
-                                t.outcome,
-                                t.exchange.map(|e| e.status)
-                            )));
-                        }
+                        sink.row(&pool[i], b, s, &t, None)?;
                     }
                 }
                 s += 1;
@@ -933,23 +1081,29 @@ async fn schedule(sink: &mut Sink, api_key: &str, api_url: &str) -> Result<(), S
         // the block so it never warms a sample.
         if let Some(wire) = pool[i].wire.clone() {
             for _ in 0..2 {
+                pacer.wait(1).await;
                 let before = tls_sockets();
+                let started = iso_now();
                 let t0 = Instant::now();
-                let (started, ex) = (
-                    iso_now(),
-                    wire.trace().await.map_err(|e| Stop::Fault(e.to_string()))?,
-                );
+                let traced = wire.trace().await;
+                let total = t0.elapsed();
+                // A failed trace is a row like any other, under the same rules.
+                let (outcome, exchange) = match traced {
+                    Ok(ex) => (Ok(None), Some(ex)),
+                    Err(e) => (Err(e.to_string()), None),
+                };
                 let t = Timed {
                     op: "trace",
                     method: "GET",
                     key: String::new(),
                     started,
                     ended: iso_now(),
-                    total: t0.elapsed(),
-                    outcome: Ok(None),
+                    total,
+                    outcome,
                     new_conn: new_sockets(before.as_ref(), tls_sockets().as_ref()).map(|n| n > 0),
                     resolves: None,
-                    exchange: Some(ex),
+                    exchange,
+                    parts: Vec::new(),
                 };
                 sink.row(&pool[i], b, block, &t, None)?;
             }
@@ -1029,6 +1183,14 @@ fn main() -> ExitCode {
         ledger,
         loadavg: Value::Null,
         server_errors: 0,
+        invocation: format!(
+            "{}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            std::process::id()
+        ),
     };
     match rt.block_on(schedule(&mut sink, &api_key, &api_url)) {
         Ok(()) => ExitCode::SUCCESS,

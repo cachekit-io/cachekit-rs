@@ -253,7 +253,9 @@ fn measured_warm(
     })
 }
 
-fn cases(filter: Option<&str>) -> Vec<(String, usize)> {
+/// Every case whose `<op>/<mode>/<size>` contains `filter`. A filter that
+/// matches nothing is an error: an empty gate would pass vacuously.
+fn cases(filter: Option<&str>) -> Result<Vec<(String, usize)>, String> {
     let mut out = Vec::new();
     for op in OPS {
         for mode in MODES {
@@ -265,7 +267,12 @@ fn cases(filter: Option<&str>) -> Vec<(String, usize)> {
             }
         }
     }
-    out
+    if out.is_empty() {
+        return Err(format!(
+            "no case matches {filter:?}; `bench_hot_path list` names them"
+        ));
+    }
+    Ok(out)
 }
 
 /// Iterations per callgrind run: enough that per-op counts dwarf any one-off
@@ -350,6 +357,7 @@ fn instr(args: &[String]) -> Result<bool, String> {
                     .ok_or("--runs needs a number")?
             }
             "--base" => base = Some(it.next().ok_or("--base needs a binary path")?.clone()),
+            f if f.starts_with("--") => return Err(format!("unknown flag {f}")),
             f => filter = Some(f.to_owned()),
         }
     }
@@ -360,6 +368,7 @@ fn instr(args: &[String]) -> Result<bool, String> {
         .map_err(|e| e.to_string())?
         .display()
         .to_string();
+    let all = cases(filter.as_deref())?;
     let mut regressed = false;
     let mut seq = 0;
     match &base {
@@ -369,7 +378,7 @@ fn instr(args: &[String]) -> Result<bool, String> {
             "case", "size", "base Ir/op", "cand Ir/op", "delta", "floor"
         ),
     }
-    for (case, size) in cases(filter.as_deref()) {
+    for (case, size) in all {
         let iters = instr_iters(size);
         let (mut a, mut b) = (Vec::new(), Vec::new());
         for r in 0..runs {
@@ -429,12 +438,12 @@ fn usage() -> ExitCode {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result: Result<bool, String> = match args.first().map(String::as_str) {
-        Some("list") => {
-            for (case, size) in cases(None) {
+        Some("list") => cases(None).map(|all| {
+            for (case, size) in all {
                 println!("{case}/{size}");
             }
-            Ok(true)
-        }
+            true
+        }),
         Some("run") if args.len() == 4 => {
             let (Ok(size), Ok(iters)) = (args[2].parse(), args[3].parse()) else {
                 return usage();
@@ -450,11 +459,13 @@ fn main() -> ExitCode {
                 "case", "size", "ns/op"
             );
             cases(args.get(1).map(String::as_str))
-                .into_iter()
-                .try_for_each(|(case, size)| {
-                    let ns = run(&case, size, 20 * instr_iters(size)).map_err(|e| e.to_string())?;
-                    println!("{case:16} {size:>6} {ns:>12.0}");
-                    Ok(())
+                .and_then(|all| {
+                    all.into_iter().try_for_each(|(case, size)| {
+                        let ns =
+                            run(&case, size, 20 * instr_iters(size)).map_err(|e| e.to_string())?;
+                        println!("{case:16} {size:>6} {ns:>12.0}");
+                        Ok(())
+                    })
                 })
                 .map(|()| true)
         }
