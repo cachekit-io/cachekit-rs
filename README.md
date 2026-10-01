@@ -665,7 +665,7 @@ slower by more than that. Most cases repeat within 0.4%; the `delete` cases
 spread more (up to about 2.5%), so their floor is wider.
 
 **Client wall time** — `examples/wall_time_probe.rs` times `CacheKit` calls
-against a cachekit.io endpoint and writes one JSON object per request. It runs
+against the cachekit.io dev endpoint and writes one JSON object per request. It runs
 two arms in one process, interleaved in ABBA blocks, with a new client
 (warmed by one GET miss) for every block: `sdk` is the real
 `CachekitIO` backend, and `transport` is a copy of it over the same `reqwest`
@@ -675,7 +675,8 @@ any later comparison has to clear. Then run `sdk,transport`, which must agree
 within that floor before the transport arm's extra fields are trusted. Both
 arms speak HTTP/1.1 (`reqwest` is built without HTTP/2).
 
-It writes and deletes keys, so it refuses `api.cachekit.io`, appends every key
+It writes and deletes keys, so it runs only against the dev endpoint
+(`api.dev.cachekit.io`, an allowlist in the example), appends every key
 to `--ledger` before the PUT that writes it, caps every TTL at 900 s, and never
 retries. A 429, a 503, any other 4xx but 404, or a transport error stops the run;
 other 5xx responses are recorded and the run goes on, up to five, so an
@@ -683,7 +684,7 @@ endpoint's sporadic errors become a counted rate rather than ending the run.
 
 ```bash
 cargo build --release --example wall_time_probe --features macros
-CACHEKIT_API_KEY=… CACHEKIT_API_URL=https://<non-production host> \
+CACHEKIT_API_KEY=… CACHEKIT_API_URL=https://api.dev.cachekit.io \
   target/release/examples/wall_time_probe --run r1 --phase warm \
   --out rows.jsonl --ledger keys.txt --arms sdk,sdk --samples 40 --block 10
 ```

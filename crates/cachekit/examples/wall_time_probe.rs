@@ -1,6 +1,6 @@
 //! Client wall time of cachekit.io operations, one JSON line per request.
 //!
-//! Times `CacheKit` calls against a non-production cachekit.io endpoint and
+//! Times `CacheKit` calls against the cachekit.io dev endpoint and
 //! appends one JSON object per request to `--out`. Two arms run in one process,
 //! interleaved in ABBA blocks. Each block gets a new client, warmed by one GET
 //! miss (a `warmup` row), so connection placement varies between blocks rather
@@ -23,7 +23,8 @@
 //! 443 before and after each request (`/proc`, Linux only; `null` elsewhere).
 //!
 //! Safety rails, enforced here:
-//! - the production endpoint (`api.cachekit.io`) is refused: this writes;
+//! - it writes, so it runs only against the hosts in `WRITABLE_HOSTS` (the dev
+//!   endpoint): an allowlist, so no second production hostname can slip by;
 //! - every key is appended (and synced) to `--ledger` before its PUT is sent,
 //!   and every PUT carries a TTL of at most 900 s, so a crash leaves only keys
 //!   the ledger names and the TTL removes;
@@ -64,7 +65,8 @@ use cachekit::url_validator::validate_cachekitio_url;
 use cachekit::{BackendError, CacheKit, CachekitError};
 use serde_json::{json, Value};
 
-const PROD_HOST: &str = "api.cachekit.io";
+/// The only hosts this harness may write to.
+const WRITABLE_HOSTS: [&str; 1] = ["api.dev.cachekit.io"];
 const MAX_TTL_S: u64 = 900;
 const MAX_OPS: usize = 2000;
 const MAX_CONCURRENCY: usize = 32;
@@ -1144,9 +1146,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // A trailing dot names the same host, and allow_custom_host would let it through.
-    if host.trim_end_matches('.') == PROD_HOST {
-        eprintln!("wall_time_probe: refusing {PROD_HOST}: this harness writes and deletes keys");
+    // A trailing dot names the same host; compare without it.
+    if !WRITABLE_HOSTS.contains(&host.trim_end_matches('.')) {
+        eprintln!(
+            "wall_time_probe: refusing {host}: this harness writes and deletes keys, \
+             so it runs only against {WRITABLE_HOSTS:?}"
+        );
         return ExitCode::from(2);
     }
     if let Err(e) = validate_cachekitio_url(&api_url, true) {
