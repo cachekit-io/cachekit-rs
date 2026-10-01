@@ -102,18 +102,26 @@ enum ParsedHeader {
     Corrupt,
     /// Past its expiry timestamp — unlink on sight.
     Expired,
+    /// Nonzero reserved byte or flags: a transform this reader does not
+    /// implement. A miss that MUST NOT delete, rewrite, or return the payload.
+    Unsupported,
     /// Readable entry; `expiry` is 0 for never-expires.
     Live { expiry: u64 },
 }
 
-fn parse_header(bytes: &[u8]) -> ParsedHeader {
+/// `now` is the reader clock in Unix seconds (a parameter so tests can pin it).
+fn parse_header(bytes: &[u8], now: u64) -> ParsedHeader {
     if bytes.len() < HEADER_SIZE || &bytes[0..2] != MAGIC || bytes[2] != FORMAT_VERSION {
         return ParsedHeader::Corrupt;
+    }
+    if bytes[3] != 0 || bytes[4..6] != [0, 0] {
+        return ParsedHeader::Unsupported;
     }
     let mut expiry_be = [0u8; 8];
     expiry_be.copy_from_slice(&bytes[6..14]);
     let expiry = u64::from_be_bytes(expiry_be);
-    if expiry > 0 && now_secs() > expiry {
+    // Expired once the clock reaches the deadline (spec: `now >= expiry`).
+    if expiry > 0 && now >= expiry {
         return ParsedHeader::Expired;
     }
     ParsedHeader::Live { expiry }
@@ -271,11 +279,12 @@ fn read_entry(path: &Path) -> Result<Option<Vec<u8>>, BackendError> {
     file.read_to_end(&mut data)
         .map_err(|e| file_err(e, "failed to read cache file"))?;
 
-    match parse_header(&data) {
+    match parse_header(&data, now_secs()) {
         ParsedHeader::Corrupt | ParsedHeader::Expired => {
             unlink_if_same_inode(path, &file);
             Ok(None)
         }
+        ParsedHeader::Unsupported => Ok(None),
         ParsedHeader::Live { .. } => Ok(Some(data.split_off(HEADER_SIZE))),
     }
 }
@@ -291,11 +300,12 @@ fn probe_header(path: &Path) -> Result<Option<u64>, BackendError> {
     flock_nb(&file, false)?;
     let (header, filled) =
         fill_header(&mut file).map_err(|e| file_err(e, "failed to read cache file header"))?;
-    match parse_header(&header[..filled]) {
+    match parse_header(&header[..filled], now_secs()) {
         ParsedHeader::Corrupt | ParsedHeader::Expired => {
             unlink_if_same_inode(path, &file);
             Ok(None)
         }
+        ParsedHeader::Unsupported => Ok(None),
         ParsedHeader::Live { expiry } => Ok(Some(expiry)),
     }
 }
@@ -360,12 +370,14 @@ fn rewrite_expiry(path: &Path, new_expiry: u64) -> Result<bool, BackendError> {
 
     let (header, filled) =
         fill_header(&mut file).map_err(|e| file_err(e, "failed to read cache file header"))?;
-    match parse_header(&header[..filled]) {
+    match parse_header(&header[..filled], now_secs()) {
         ParsedHeader::Corrupt | ParsedHeader::Expired => {
             // An expired entry is absent, not refreshable (py parity).
             unlink_if_same_inode(path, &file);
             return Ok(false);
         }
+        // Never rewrite an entry we cannot interpret.
+        ParsedHeader::Unsupported => return Ok(false),
         ParsedHeader::Live { .. } => {}
     }
 
@@ -845,6 +857,149 @@ mod tests {
         let short = write_raw(dir.path(), "short", "434b01");
         assert_eq!(read_entry(&short).expect("no error"), None);
         assert!(!short.exists());
+    }
+
+    // ── Protocol vectors ─────────────────────────────────────────────────────
+    //
+    // `tests/vectors/file-backend.json`, vendored verbatim from
+    // cachekit-io/protocol `test-vectors/file-backend.json` v1.1.0
+    // (sha256 `8d9d8c4709baf9ef3a8f2d71d21fb5a56207bc7a05c9bc7a967ac567f2604615`).
+    // Do not edit the JSON here; regenerate upstream and re-vendor. Lives in
+    // this module, not `tests/`, because `parse_header` is crate-private.
+
+    const FILE_BACKEND_VECTORS: &str = include_str!("../../tests/vectors/file-backend.json");
+
+    fn file_backend_vectors() -> Vec<serde_json::Value> {
+        let doc: serde_json::Value =
+            serde_json::from_str(FILE_BACKEND_VECTORS).expect("vector file parses");
+        assert_eq!(
+            doc["version"], "1.1.0",
+            "re-vendored vectors: update the pin"
+        );
+        doc["vectors"].as_array().expect("vectors array").clone()
+    }
+
+    #[test]
+    #[allow(clippy::panic)] // test-only: an unknown reader_action must fail loudly
+    fn file_backend_vectors_read_as_specified() {
+        let vectors = file_backend_vectors();
+        assert_eq!(vectors.len(), 5);
+        for v in &vectors {
+            let name = v["name"].as_str().expect("name");
+            let file_hex = v["file_hex"].as_str().expect("file_hex");
+            let original = hex::decode(file_hex).expect("file_hex is hex");
+            let action = v["reader_action"].as_str().expect("reader_action");
+
+            for probe in ["read_entry", "probe_header"] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let path = write_raw(dir.path(), "entry", file_hex);
+                let found = match probe {
+                    "read_entry" => {
+                        let got = read_entry(&path).expect("read should not error");
+                        if action == "return_payload" {
+                            let want = hex::decode(v["payload_hex"].as_str().unwrap()).unwrap();
+                            assert_eq!(got.as_deref(), Some(want.as_slice()), "{name}/{probe}");
+                        }
+                        got.is_some()
+                    }
+                    _ => probe_header(&path)
+                        .expect("probe should not error")
+                        .is_some(),
+                };
+                match action {
+                    "return_payload" | "miss_preserve" => {
+                        assert_eq!(found, action == "return_payload", "{name}/{probe}");
+                        assert_eq!(
+                            fs::read(&path).expect("file must remain"),
+                            original,
+                            "{name}/{probe}: file must be byte-for-byte unchanged"
+                        );
+                    }
+                    // The spec lets a reader lazily remove an expired entry.
+                    "miss_expired" => assert!(!found, "{name}/{probe}"),
+                    other => panic!("{name}: unknown reader_action {other}"),
+                }
+            }
+
+            // Evaluate at the vector's exact clock, where one is given.
+            if let Some(now) = v["reader_now_unix_seconds"].as_u64() {
+                let parsed = parse_header(&original, now);
+                match action {
+                    "miss_expired" => {
+                        assert!(matches!(parsed, ParsedHeader::Expired), "{name} at {now}")
+                    }
+                    "miss_preserve" => {
+                        assert!(
+                            matches!(parsed, ParsedHeader::Unsupported),
+                            "{name} at {now}"
+                        )
+                    }
+                    _ => assert!(
+                        matches!(parsed, ParsedHeader::Live { .. }),
+                        "{name} at {now}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_header_is_a_miss_on_every_path_and_never_touched() {
+        for v in file_backend_vectors() {
+            if v["reader_action"] != "miss_preserve" {
+                continue;
+            }
+            let name = v["name"].as_str().unwrap();
+            let file_hex = v["file_hex"].as_str().unwrap();
+            let original = hex::decode(file_hex).unwrap();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = write_raw(dir.path(), "entry", file_hex);
+
+            assert_eq!(read_entry(&path).expect("get"), None, "{name}: get");
+            assert_eq!(probe_header(&path).expect("exists"), None, "{name}: exists");
+            assert_eq!(entry_ttl(&path).expect("ttl"), None, "{name}: ttl");
+            assert!(
+                !rewrite_expiry(&path, now_secs() + 3600).expect("refresh_ttl"),
+                "{name}: refresh_ttl"
+            );
+            assert_eq!(
+                fs::read(&path).expect("file must remain"),
+                original,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn expiry_is_reached_at_the_deadline_second() {
+        let header = build_header(1_000);
+        assert!(matches!(
+            parse_header(&header, 999),
+            ParsedHeader::Live { expiry: 1_000 }
+        ));
+        assert!(matches!(
+            parse_header(&header, 1_000),
+            ParsedHeader::Expired
+        ));
+        assert!(matches!(
+            parse_header(&header, 1_001),
+            ParsedHeader::Expired
+        ));
+        // 0 = never expires, whatever the clock says.
+        assert!(matches!(
+            parse_header(&build_header(0), u64::MAX),
+            ParsedHeader::Live { expiry: 0 }
+        ));
+    }
+
+    #[test]
+    fn corrupt_header_wins_over_flags() {
+        // Wrong version with a nonzero flag is still corrupt (unlinkable):
+        // the flag check runs after magic and version.
+        let mut header = build_header(0);
+        header[2] = 2;
+        header[5] = 1;
+        assert!(matches!(parse_header(&header, 0), ParsedHeader::Corrupt));
     }
 
     #[test]
