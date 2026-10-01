@@ -204,6 +204,29 @@ impl LockableBackend for RedisBackend {
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
+/// Per-command deadline. fred's default is 0 (no timeout), so a stalled or
+/// black-holed server would hold every op until TCP gives up and the circuit
+/// breaker could never open. 5 s matches cachekit-py and cachekit-ts.
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// fred client options for [`RedisBackendBuilder::build`].
+///
+/// The unresponsive-connection check is enabled only with a reconnect policy:
+/// fred closes a connection it deems unresponsive, and without a policy it is
+/// never re-established, so one stall past the threshold would leave the
+/// client failing permanently.
+pub(crate) fn fred_options(reconnects: bool) -> (PerformanceConfig, ConnectionConfig) {
+    let perf = PerformanceConfig {
+        default_command_timeout: COMMAND_TIMEOUT,
+        ..Default::default()
+    };
+    let mut connection = ConnectionConfig::default();
+    if reconnects {
+        connection.unresponsive.max_timeout = Some(COMMAND_TIMEOUT);
+    }
+    (perf, connection)
+}
+
 /// Builder for [`RedisBackend`].
 #[derive(Default)]
 #[must_use]
@@ -255,7 +278,8 @@ impl RedisBackendBuilder {
             ))
         })?;
 
-        let client = RedisClient::new(config, None, None, self.reconnect);
+        let (perf, connection) = fred_options(self.reconnect.is_some());
+        let client = RedisClient::new(config, Some(perf), Some(connection), self.reconnect);
         Ok(RedisBackend { client })
     }
 }
@@ -282,5 +306,22 @@ mod tests {
             lock_key("ns:app:func:m.f:args:abc:v1"),
             "ns:app:func:m.f:args:abc:v1:lock"
         );
+    }
+
+    #[test]
+    fn command_timeout_is_five_seconds_on_every_build() {
+        assert_eq!(COMMAND_TIMEOUT, Duration::from_secs(5));
+        for reconnects in [false, true] {
+            let (perf, _) = fred_options(reconnects);
+            assert_eq!(perf.default_command_timeout, COMMAND_TIMEOUT);
+        }
+    }
+
+    #[test]
+    fn unresponsive_recycling_only_with_reconnect_policy() {
+        let (_, connection) = fred_options(false);
+        assert_eq!(connection.unresponsive.max_timeout, None);
+        let (_, connection) = fred_options(true);
+        assert_eq!(connection.unresponsive.max_timeout, Some(COMMAND_TIMEOUT));
     }
 }
