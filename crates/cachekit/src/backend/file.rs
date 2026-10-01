@@ -14,13 +14,18 @@
 //! - **Expiry is lazy**: expired and corrupt entries are unlinked when a
 //!   read touches them, exactly like cachekit-py.
 //!
-//! ## Concurrency model (py parity)
+//! ## Concurrency model
 //!
-//! - **In-process**: every operation serializes on a backend-wide mutex —
-//!   the equivalent of cachekit-py's `threading.RLock`. This closes the
-//!   expire-unlink vs. concurrent-set lost-write race within a process.
-//!   (ponytail: one backend-wide lock, matching py; shard per-key if
-//!   contention ever matters.)
+//! - **In-process**: operations on the same key serialize on one of
+//!   64 mutexes (`LOCK_STRIPES`), picked by the first byte of the entry's
+//!   Blake2b-128 filename. This closes the expire-unlink vs. concurrent-set
+//!   lost-write race within a process: that race only ever involves one entry
+//!   path, so one key always maps to one stripe. Keys on different stripes
+//!   do not wait on each other's fsync; two keys share a stripe about 1 time
+//!   in 64 and then still serialize (cachekit-py serializes everything on
+//!   one `threading.RLock`, because its RLock also guards LRU and size
+//!   bookkeeping; rs has none yet — porting eviction or size caps adds shared
+//!   cross-key state, and these stripes must be revisited then).
 //! - **Cross-process** (unix): advisory `flock` — shared on reads, exclusive
 //!   on the in-place expiry rewrite — matching py's `fcntl.flock` usage,
 //!   non-blocking with contention surfacing as a timeout error like py.
@@ -253,7 +258,7 @@ fn still_linked(path: &Path, opened: &fs::File) -> bool {
     }
 }
 
-// ── Sync cores (run on the blocking pool, under the backend-wide lock) ───────
+// ── Sync cores (run on the blocking pool, under the key's stripe lock) ───────
 
 fn read_entry(path: &Path) -> Result<Option<Vec<u8>>, BackendError> {
     let mut file = match open_opts(true, false).open(path) {
@@ -438,10 +443,30 @@ fn cleanup_temp_files(cache_dir: &Path) {
 #[derive(Debug, Clone)]
 pub struct FileBackend {
     cache_dir: PathBuf,
-    /// Backend-wide op serialization — py `RLock` parity. Clones share it.
+    /// Per-key op serialization, striped by filename. Clones share them.
     /// Async so contended waiters cost a queued future, not a parked
     /// blocking-pool thread (a hot backend must not monopolize the pool).
-    lock: Arc<tokio::sync::Mutex<()>>,
+    stripes: Arc<[Arc<tokio::sync::Mutex<()>>; LOCK_STRIPES]>,
+}
+
+/// Number of in-process lock stripes (a power of two, at most 256: the stripe
+/// is the low bits of the filename's first byte).
+const LOCK_STRIPES: usize = 64;
+
+fn new_stripes() -> Arc<[Arc<tokio::sync::Mutex<()>>; LOCK_STRIPES]> {
+    Arc::new(std::array::from_fn(|_| {
+        Arc::new(tokio::sync::Mutex::new(()))
+    }))
+}
+
+/// Stripe for an entry path: the first byte of its lowercase-hex Blake2b-128
+/// filename, so every op on one key takes the same stripe.
+fn stripe_of(path: &Path) -> usize {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.get(..2))
+        .and_then(|b| u8::from_str_radix(b, 16).ok())
+        .map_or(0, |b| usize::from(b) % LOCK_STRIPES)
 }
 
 impl FileBackend {
@@ -462,7 +487,8 @@ impl FileBackend {
         self.cache_dir.join(crate::metrics::key_hash(key))
     }
 
-    /// Run `f` on the blocking pool holding the backend-wide lock.
+    /// Run `f` on the blocking pool holding lock stripe `stripe` (see
+    /// [`stripe_of`]).
     ///
     /// The lock is acquired in async context BEFORE the hop to the blocking
     /// pool: N contended ops queue as futures instead of parking N blocking
@@ -471,9 +497,10 @@ impl FileBackend {
     /// releases when the I/O finishes.
     async fn locked<T: Send + 'static>(
         &self,
+        stripe: usize,
         f: impl FnOnce() -> Result<T, BackendError> + Send + 'static,
     ) -> Result<T, BackendError> {
-        let guard = Arc::clone(&self.lock).lock_owned().await;
+        let guard = Arc::clone(&self.stripes[stripe]).lock_owned().await;
         run_blocking(move || {
             let _guard = guard;
             f()
@@ -490,7 +517,8 @@ impl FileBackend {
 impl Backend for FileBackend {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
         let path = self.entry_path(key);
-        self.locked(move || read_entry(&path)).await
+        self.locked(stripe_of(&path), move || read_entry(&path))
+            .await
     }
 
     async fn set(
@@ -515,18 +543,21 @@ impl Backend for FileBackend {
         };
 
         let path = self.entry_path(key);
-        self.locked(move || write_entry(&path, build_header(expiry), &value))
-            .await
+        self.locked(stripe_of(&path), move || {
+            write_entry(&path, build_header(expiry), &value)
+        })
+        .await
     }
 
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
         let path = self.entry_path(key);
-        self.locked(move || delete_entry(&path)).await
+        self.locked(stripe_of(&path), move || delete_entry(&path))
+            .await
     }
 
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
         let path = self.entry_path(key);
-        self.locked(move || Ok(probe_header(&path)?.is_some()))
+        self.locked(stripe_of(&path), move || Ok(probe_header(&path)?.is_some()))
             .await
     }
 
@@ -572,7 +603,8 @@ impl Backend for FileBackend {
 impl TtlInspectable for FileBackend {
     async fn ttl(&self, key: &str) -> Result<Option<Duration>, BackendError> {
         let path = self.entry_path(key);
-        self.locked(move || entry_ttl(&path)).await
+        self.locked(stripe_of(&path), move || entry_ttl(&path))
+            .await
     }
 
     async fn refresh_ttl(&self, key: &str, ttl: Duration) -> Result<bool, BackendError> {
@@ -594,7 +626,8 @@ impl TtlInspectable for FileBackend {
 
         let new_expiry = now_secs().saturating_add(secs);
         let path = self.entry_path(key);
-        self.locked(move || rewrite_expiry(&path, new_expiry)).await
+        self.locked(stripe_of(&path), move || rewrite_expiry(&path, new_expiry))
+            .await
     }
 }
 
@@ -693,7 +726,7 @@ impl FileBackendBuilder {
 
         Ok(FileBackend {
             cache_dir,
-            lock: Arc::new(tokio::sync::Mutex::new(())),
+            stripes: new_stripes(),
         })
     }
 }
@@ -716,7 +749,7 @@ mod tests {
     fn backend_at(dir: &Path) -> FileBackend {
         FileBackend {
             cache_dir: dir.to_path_buf(),
-            lock: Arc::new(tokio::sync::Mutex::new(())),
+            stripes: new_stripes(),
         }
     }
 
@@ -986,6 +1019,124 @@ mod tests {
         // not block and does not misreport the entry as missing.
         let err = read_entry(&path).expect_err("contended read must error");
         assert_eq!(err.kind, BackendErrorKind::Timeout, "{err}");
+    }
+
+    /// A 0700 tempdir and a backend built on it through the public builder.
+    fn private_backend() -> (tempfile::TempDir, FileBackend) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        let backend = FileBackend::builder()
+            .cache_dir(dir.path())
+            .build()
+            .expect("build");
+        (dir, backend)
+    }
+
+    #[test]
+    fn stripe_is_the_filename_first_byte() {
+        // Pinned digest from filename_hash_matches_py_blake2b16_hex: 0xbc… → 0xbc % 64.
+        let backend = backend_at(Path::new("/cache"));
+        assert_eq!(
+            stripe_of(&backend.entry_path("ns:app:func:m.f:args:abc:v1")),
+            0xbc % LOCK_STRIPES
+        );
+        for i in 0..1000 {
+            let key = format!("k{i}");
+            let name = crate::metrics::key_hash(&key);
+            let first = u8::from_str_radix(&name[..2], 16).expect("hex");
+            assert_eq!(
+                stripe_of(&backend.entry_path(&key)),
+                usize::from(first) % LOCK_STRIPES
+            );
+        }
+    }
+
+    // A blocking op held mid-flight needs the blocking pool; `unsync` runs I/O inline.
+    #[cfg(not(feature = "unsync"))]
+    #[tokio::test]
+    async fn an_in_flight_op_blocks_its_key_and_no_other() {
+        let (_dir, backend) = private_backend();
+        let held = "held";
+        let held_stripe = stripe_of(&backend.entry_path(held));
+        let other = (0..)
+            .map(|i| format!("other{i}"))
+            .find(|k| stripe_of(&backend.entry_path(k)) != held_stripe)
+            .expect("a key on another stripe");
+        backend.set(held, b"h".to_vec(), None).await.expect("set");
+        backend.set(&other, b"o".to_vec(), None).await.expect("set");
+
+        // Stand in for a write to `held` stuck in its fsync: an op that takes
+        // whatever lock the backend uses for `held` and parks until released.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let in_flight = {
+            let b = backend.clone();
+            tokio::spawn(async move {
+                b.locked(held_stripe, move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(())
+                })
+                .await
+            })
+        };
+        started_rx.await.expect("in-flight op started");
+
+        let other_get = tokio::time::timeout(Duration::from_secs(5), backend.get(&other))
+            .await
+            .expect("a read of another key must not wait on an unrelated in-flight write");
+        assert_eq!(other_get.expect("get").as_deref(), Some(b"o".as_slice()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), backend.get(held))
+                .await
+                .is_err(),
+            "same-key ops must still serialize behind the in-flight op"
+        );
+
+        release_tx.send(()).expect("release");
+        in_flight.await.expect("join").expect("in-flight op");
+        assert_eq!(
+            backend.get(held).await.expect("get").as_deref(),
+            Some(b"h".as_slice())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn interleaved_cross_key_set_get_loses_no_update() {
+        // Many keys, so tasks land on shared and distinct stripes alike: every
+        // read sees its own task's latest write, and every final value is the
+        // last one written.
+        let (_dir, backend) = private_backend();
+        let tasks: Vec<_> = (0..16)
+            .map(|t| {
+                let b = backend.clone();
+                tokio::spawn(async move {
+                    let key = format!("task{t}");
+                    for round in 0..25u32 {
+                        let value = format!("{t}:{round}").into_bytes();
+                        b.set(&key, value.clone(), None).await.expect("set");
+                        assert_eq!(
+                            b.get(&key).await.expect("get"),
+                            Some(value),
+                            "task {t} round {round}: update lost"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.expect("join");
+        }
+        for t in 0..16 {
+            assert_eq!(
+                backend.get(&format!("task{t}")).await.expect("get"),
+                Some(format!("{t}:24").into_bytes())
+            );
+        }
     }
 
     #[tokio::test]
