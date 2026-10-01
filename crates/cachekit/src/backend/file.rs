@@ -541,6 +541,9 @@ impl Backend for FileBackend {
     ) -> Result<(), BackendError> {
         // None = never expires (expiry field 0). Sub-second TTLs round up to
         // 1s (Redis-backend parity); absurd TTLs are rejected like py.
+        // The deadline is stored in whole seconds rounded down, as the spec,
+        // py and ts write it, so an N-second TTL lives N-1 to N seconds.
+        // Rounding up here would make rs entries outlive py/ts ones by 1s.
         let expiry = match ttl {
             None => 0,
             Some(d) => {
