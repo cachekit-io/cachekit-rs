@@ -1,4 +1,4 @@
-.PHONY: quick-check test test-wasm build build-wasm fmt clippy security deny audit
+.PHONY: quick-check test test-wasm build build-wasm fmt clippy security deny audit bench bench-instr
 
 CARGO := cargo
 
@@ -33,6 +33,19 @@ build-wasm:
 test-wasm:
 	CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
 	$(CARGO) test -p cachekit-rs --target wasm32-unknown-unknown --no-default-features --features workers,cachekitio,encryption,macros --test wasm_session_tests
+
+# Hot-path CPU cost (examples/bench_hot_path.rs; README "Measuring performance").
+# `bench` prints wall time per op, which is indicative only. `bench-instr`
+# counts instructions per op under valgrind's callgrind: the number a change is
+# judged on. BASE=<a copy of the example built at the base commit> compares two
+# builds and exits 1 when a case regresses past its noise floor; FILTER=<text>
+# narrows the cases (e.g. FILTER=l2_hit).
+bench:
+	$(CARGO) run --release --example bench_hot_path -- wall $(FILTER)
+
+bench-instr:
+	$(CARGO) build --release --example bench_hot_path
+	target/release/examples/bench_hot_path instr $(if $(BASE),--base $(BASE)) $(FILTER)
 
 # Supply-chain gate — deny is identical to CI's; audit runs the strict form
 # (`--deny yanked`, which CI applies only on the weekly schedule run), so a

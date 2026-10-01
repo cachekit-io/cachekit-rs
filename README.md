@@ -637,6 +637,63 @@ reintroduced behind an optional feature passes a bare `cargo deny check`.
 and `toxiproxy_rust`, because this SDK is rustls-only. Run `make deny` before
 adding or bumping a dependency.
 
+### Measuring performance
+
+Two examples measure the client. Neither runs in the test suite, and neither
+adds a dependency.
+
+**CPU cost of the hot path** — `examples/bench_hot_path.rs` drives the public
+`CacheKit` API over an in-memory backend, so it measures the client's own work
+(key handling, MessagePack, L1, the reliability stack, AES-256-GCM) and no
+network. Cases are `l1_hit`, `l2_hit`, `set` and `delete`, each `plain`, with
+reliability (`rel`) or with encryption (`enc`), at 64 B, 1 KiB and 64 KiB.
+
+```bash
+make bench                                  # wall ns/op: indicative only
+make bench-instr                            # instructions/op + run-to-run spread (needs valgrind)
+make bench-instr BASE=../bench-base FILTER=l2_hit   # A/B against another build
+```
+
+Wall time on a shared machine moves by tens of percent between runs, so
+`bench-instr` is the number a change is judged on. It counts only the timed
+loop (`--toggle-collect`), on a single-threaded tokio runtime, five runs per
+case, and reports the median and the spread. For an A/B, build the example at
+the base commit, copy `target/release/examples/bench_hot_path` outside
+`target/`, and pass it as `BASE`; the runs interleave ABBA, a delta counts only
+when it beats `max(3 × spread, 0.5%)`, and the target exits 1 when a case got
+slower by more than that. Most cases repeat within 0.4%; the `delete` cases
+spread more (up to about 2.5%), so their floor is wider.
+
+**Client wall time** — `examples/wall_time_probe.rs` times `CacheKit` calls
+against a cachekit.io endpoint and writes one JSON object per request. It runs
+two arms in one process, interleaved in ABBA blocks, with a new client
+(warmed by one GET miss) for every block: `sdk` is the real
+`CachekitIO` backend, and `transport` is a copy of it over the same `reqwest`
+configuration that also reads `cf-ray`, status and time to first byte. Run
+`sdk,sdk` first: the difference between two identical arms is the noise floor
+any later comparison has to clear. Then run `sdk,transport`, which must agree
+within that floor before the transport arm's extra fields are trusted. Both
+arms speak HTTP/1.1 (`reqwest` is built without HTTP/2).
+
+It writes and deletes keys, so it refuses `api.cachekit.io`, appends every key
+to `--ledger` before the PUT that writes it, caps every TTL at 900 s, and never
+retries. A 429, a 503, any other 4xx but 404, or a transport error stops the run;
+other 5xx responses are recorded and the run goes on, up to five, so an
+endpoint's sporadic errors become a counted rate rather than ending the run.
+
+```bash
+cargo build --release --example wall_time_probe --features macros
+CACHEKIT_API_KEY=… CACHEKIT_API_URL=https://<non-production host> \
+  target/release/examples/wall_time_probe --run r1 --phase warm \
+  --out rows.jsonl --ledger keys.txt --arms sdk,sdk --samples 40 --block 10
+```
+
+`--fresh-conn` builds a new client per sample, `--gap-ms` idles between
+samples, `--concurrency N` sends bursts, and `--macro-cold-miss` times a
+`#[cachekit]` cold miss (GET, lock, origin, PUT, unlock); `--help` lists every
+flag. Delete the ledger's keys when the run ends;
+the TTL is the backstop.
+
 ### Gate tamper-evidence
 
 The `supply-chain` check reads both its policy (`deny.toml`) and its own

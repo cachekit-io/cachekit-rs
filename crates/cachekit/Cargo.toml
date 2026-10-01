@@ -121,6 +121,16 @@ rustix = { version = "1", optional = true, default-features = false, features = 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3"
 
+# Hot-path CPU bench, gated on instruction counts (`make bench-instr`).
+[[example]]
+name = "bench_hot_path"
+required-features = ["l1", "reliability", "encryption"]
+
+# Client wall time against a non-production cachekit.io endpoint, as JSONL.
+[[example]]
+name = "wall_time_probe"
+required-features = ["cachekitio", "macros"]
+
 [dev-dependencies]
 serde_json = "1"
 # Pins the sha256 of the vendored protocol vectors (tests/vectors/). Already in
