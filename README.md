@@ -119,6 +119,7 @@ async fn main() -> Result<(), CachekitError> {
 - **Initial** connections fail fast for every Redis preset: a bad URL or unreachable Redis errors immediately at construction, never enters a retry loop. `io` opens no connection at construction: an empty API key fails at construction, while an invalid key or unreachable endpoint surfaces at the first request.
 - `secure` / `secure_from_env` validate the master key (and `secure_from_env` any previous keys) **before** any Redis connection is attempted — a missing, non-hex or short key, or a malformed `CACHEKIT_PREVIOUS_MASTER_KEYS`, is a deterministic local error, never masked by (or paying for) network I/O, and never a fallback to plaintext.
 - Auto-reconnect is connection-level repair, distinct from the per-operation [reliability stack](#reliability) (retry, circuit breaker, backpressure) that `production` / `secure` / `io` also enable. `minimal` has neither — every failure is yours to handle.
+- Every Redis command has a **5 s timeout** (matching cachekit-py and cachekit-ts), so a stalled or unreachable server returns `BackendErrorKind::Timeout` instead of hanging. `minimal` fails after ~5 s. `production` / `secure` retry a timeout up to 3 attempts, so one op can take ~15 s before it errors, and those timeouts count toward opening the circuit breaker. Under `production` / `secure`, a connection that stops answering is also closed and re-established, typically 6-8 s after the stalled command was sent (fred checks every 2 s for a pending reply older than 5 s).
 
 ### From Environment Variables
 
@@ -283,7 +284,7 @@ let backend = CachekitIO::builder()
 
 ### Redis
 
-Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Requires the `redis` feature flag.
+Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Each command times out after 5 s with `BackendErrorKind::Timeout`. A timed-out command may still run on the server: harmless for `get`/`set`/`delete`, and a timed-out lock acquire leaves the lock to expire on its own TTL. Requires the `redis` feature flag.
 
 ```toml
 cachekit-rs = { version = "0.8", features = ["redis"] }
