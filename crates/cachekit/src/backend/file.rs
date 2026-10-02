@@ -78,7 +78,8 @@ const EXPIRY_OFFSET: u64 = 6;
 /// TTL ceiling (10 years), matching cachekit-py's `MAX_TTL_SECONDS` overflow guard.
 const MAX_TTL_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 
-/// Orphaned temp files older than this are swept at build time (py parity).
+/// Orphaned temp files older than this are swept by a backend's first `set`
+/// (py uses the same threshold, but sweeps at startup).
 const TEMP_FILE_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// Process-global sequence folded into temp-file names so two writes of the
