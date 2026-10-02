@@ -485,7 +485,6 @@ impl Backend for Transport {
             .await?;
         match resp.status().as_u16() {
             200 | 204 => Ok(true),
-            404 => Ok(false),
             s => Err(BackendError::from_http_status(s, &[])),
         }
     }
@@ -567,7 +566,7 @@ impl Backend for Recorded {
     }
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
         let r = self.inner.delete(key).await;
-        self.note("DELETE", &r, |hit| if *hit { 200 } else { 404 });
+        self.note("DELETE", &r, |_| 200);
         r
     }
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
