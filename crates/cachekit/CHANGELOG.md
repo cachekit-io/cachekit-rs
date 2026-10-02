@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.9.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.8.0...cachekit-rs-v0.9.0) (2026-10-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* **encryption:** the raw-bytes master-key APIs (`EncryptionLayer::new`, `EncryptionLayer::with_previous_keys`, `CacheKitBuilder::encryption_from_bytes` and `CacheKitBuilder::encryption_from_bytes_with_previous`) now require keys of exactly 32 bytes, current and previous, and return `CachekitError::Config` for any other length. Callers that pass longer keys to a raw-bytes API, including hex keys decoded manually, now get an error at construction. Use exactly 32-byte keys, the only length every SDK accepts (`openssl rand -hex 32`), or pass the hex string to `.encryption()` or use `CacheKit::from_env()`.
+* **interop:** an interop namespace or operation containing `..` now fails: `interop_key` returns `InvalidKey`, and `#[cachekit]` does not compile. Rename the segment; its keys become a full cache miss.
+
+### Bug Fixes
+
+* **cachekitio:** reject the empty cache key; test path encoding from the protocol fixture (LAB-6551) ([#100](https://github.com/cachekit-io/cachekit-rs/issues/100)) ([4d11fc1](https://github.com/cachekit-io/cachekit-rs/commit/4d11fc1e856dadddc53bc1fdcfc4ba5d8ff50668))
+* **encryption:** raw-bytes master keys must be exactly 32 bytes (LAB-4663) ([#103](https://github.com/cachekit-io/cachekit-rs/issues/103)) ([f85d121](https://github.com/cachekit-io/cachekit-rs/commit/f85d1210df3cf73af2656b57939f088cef9f3c48))
+* **file:** return a miss for entries with nonzero flags or reserved bytes (LAB-7153) ([#107](https://github.com/cachekit-io/cachekit-rs/issues/107)) ([6d48ece](https://github.com/cachekit-io/cachekit-rs/commit/6d48ecece00532d42755cd593da255a90ada7750))
+* **intents:** secure_from_env reads CACHEKIT_PREVIOUS_MASTER_KEYS (LAB-6591) ([#102](https://github.com/cachekit-io/cachekit-rs/issues/102)) ([dda7f42](https://github.com/cachekit-io/cachekit-rs/commit/dda7f42900bc9eabed8e932df783d279c55fa674))
+* **interop:** reject double-dot interop segments (LAB-5906) ([#98](https://github.com/cachekit-io/cachekit-rs/issues/98)) ([8480457](https://github.com/cachekit-io/cachekit-rs/commit/84804578390cefb2dd5ecf5cbcdef234b9b3b414))
+* **l1:** honour X-CacheKit-Freshness and Fresh-For before backfilling L1 (LAB-7155) ([#109](https://github.com/cachekit-io/cachekit-rs/issues/109)) ([658b198](https://github.com/cachekit-io/cachekit-rs/commit/658b198808092bea55d2ff1a5888065a52fc1b25))
+* **redis:** set a 5 s command timeout on the fred client (LAB-7154) ([#108](https://github.com/cachekit-io/cachekit-rs/issues/108)) ([72db7c7](https://github.com/cachekit-io/cachekit-rs/commit/72db7c74ef09442b98e0ce28b79ba068fd603486))
+
+
+### Performance Improvements
+
+* **bench:** instruction-gated hot-path bench and a client wall-time probe (LAB-7057) ([#110](https://github.com/cachekit-io/cachekit-rs/issues/110)) ([d561d70](https://github.com/cachekit-io/cachekit-rs/commit/d561d70e38b27382d62ebb4749e90590b93c0f80))
+* **file:** stripe the in-process lock per key so reads skip unrelated fsyncs (LAB-7086) ([#106](https://github.com/cachekit-io/cachekit-rs/issues/106)) ([e9980df](https://github.com/cachekit-io/cachekit-rs/commit/e9980dfb519e124c568ce47a45e7d996291f36b5))
+* **file:** sweep orphaned temp files on first set, not on build (LAB-7381) ([#113](https://github.com/cachekit-io/cachekit-rs/issues/113)) ([222a916](https://github.com/cachekit-io/cachekit-rs/commit/222a916cb16c7435d97bcd6c17415aa81455ebce))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.8.0 to 0.9.0
+
 ## [0.8.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.7.0...cachekit-rs-v0.8.0) (2026-09-29)
 
 
