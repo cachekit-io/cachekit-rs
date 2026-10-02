@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.9.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.8.0...cachekit-macros-v0.9.0) (2026-10-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* **interop:** an interop namespace or operation containing `..` now fails: `interop_key` returns `InvalidKey`, and `#[cachekit]` does not compile. Rename the segment; its keys become a full cache miss.
+
+### Bug Fixes
+
+* **interop:** reject double-dot interop segments (LAB-5906) ([#98](https://github.com/cachekit-io/cachekit-rs/issues/98)) ([8480457](https://github.com/cachekit-io/cachekit-rs/commit/84804578390cefb2dd5ecf5cbcdef234b9b3b414))
+
 ## [0.8.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.7.0...cachekit-macros-v0.8.0) (2026-09-29)
 
 
