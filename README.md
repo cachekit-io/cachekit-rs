@@ -691,7 +691,8 @@ CACHEKIT_API_KEY=… CACHEKIT_API_URL=https://api.dev.cachekit.io \
 ```
 
 `--fresh-conn` builds a new client per sample, `--gap-ms` idles between
-samples, `--concurrency N` sends bursts, and `--macro-cold-miss` times a
+samples, `--concurrency N` sends bursts (after one failed request, the burst
+sends nothing more), and `--macro-cold-miss` times a
 `#[cachekit]` cold miss (GET, lock, origin, PUT, unlock; each request it sends
 is checked, and a call sending more than five stops the run); `--help` lists every
 flag. Delete the ledger's keys when the run ends;

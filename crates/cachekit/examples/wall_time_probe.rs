@@ -31,7 +31,8 @@
 //! - a 429, a 503, any other 4xx but 404, or a transport error stops the run
 //!   (exit 3). Other 5xx are recorded and the run goes on, up to 5 of them, so
 //!   a server's sporadic errors are counted rather than ending the run.
-//!   Nothing is retried, so a limiter verdict is never retried into;
+//!   Nothing is retried, so a limiter verdict is never retried into, and once
+//!   one request in a burst fails, no task in that burst sends another;
 //! - total requests, warm-ups and trace probes included, are capped
 //!   (`--max-ops`, at most 2000) and paced under `--max-per-min`; a burst is at
 //!   most 32 concurrent requests. A `#[cachekit]` cold miss sends four requests
@@ -51,7 +52,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::net::ToSocketAddrs;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -931,9 +932,16 @@ impl Sink {
                 t.parts
             )));
         }
+        let mut failed = false;
         for (method, part_status) in &t.parts {
             let ok = part_status.is_some_and(|s| (200..300).contains(&s) || s == 404);
+            failed |= !ok;
             self.judge(method, *part_status, ok, t)?;
+        }
+        // A call that failed while every request it sent succeeded failed in
+        // the client, where no rule above looks: stop rather than time it.
+        if t.outcome.is_err() && !failed {
+            return Err(Stop::Refused(format!("{}: {:?}", t.op, t.outcome)));
         }
         Ok(())
     }
@@ -1079,6 +1087,9 @@ async fn schedule(sink: &mut Sink, api_key: &str, api_url: &str) -> Result<(), S
                         .wait(u32::try_from(concurrency * ops.len()).unwrap_or(u32::MAX))
                         .await;
                     let mut set = tokio::task::JoinSet::new();
+                    // The stop rules judge a burst only once it is in, so after
+                    // any failed request no task in the burst sends another.
+                    let halt = Arc::new(AtomicBool::new(false));
                     for k in 0..concurrency {
                         counter += 1;
                         let key = format!("{prefix}:rs{}{counter}:{}", slots[i], short_id());
@@ -1086,10 +1097,18 @@ async fn schedule(sink: &mut Sink, api_key: &str, api_url: &str) -> Result<(), S
                             sink.ledger(&key)?;
                         }
                         let (arm, ops, value) = (pool[i].clone(), ops.clone(), value.clone());
+                        let halt = halt.clone();
                         set.spawn(async move {
                             let mut out = Vec::new();
                             for op in ops {
-                                out.push(timed_op(&arm, op, &key, &value, ttl, false).await);
+                                if halt.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                let t = timed_op(&arm, op, &key, &value, ttl, false).await;
+                                if t.outcome.is_err() {
+                                    halt.store(true, Ordering::SeqCst);
+                                }
+                                out.push(t);
                             }
                             (k, out)
                         });

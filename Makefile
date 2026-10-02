@@ -42,11 +42,11 @@ test-wasm:
 # measured nothing: bad flag, empty filter, valgrind failure); FILTER=<text>
 # narrows the cases (e.g. FILTER=l2_hit).
 bench:
-	$(CARGO) run --release --example bench_hot_path -- wall $(FILTER)
+	$(CARGO) run --release --example bench_hot_path -- wall $(if $(FILTER),'$(FILTER)')
 
 bench-instr:
 	$(CARGO) build --release --example bench_hot_path
-	target/release/examples/bench_hot_path instr $(if $(BASE),--base $(BASE)) $(FILTER)
+	target/release/examples/bench_hot_path instr $(if $(BASE),--base '$(BASE)') $(if $(FILTER),'$(FILTER)')
 
 # Supply-chain gate — deny is identical to CI's; audit runs the strict form
 # (`--deny yanked`, which CI applies only on the weekly schedule run), so a
