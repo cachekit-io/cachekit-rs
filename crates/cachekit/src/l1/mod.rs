@@ -1,10 +1,13 @@
+use bytes::Bytes;
 use moka::sync::Cache;
 use moka::Expiry;
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 struct L1Entry {
-    data: Vec<u8>,
+    // Bytes, not Vec: moka's `get` clones the entry, and a refcount bump is
+    // cheaper than a deep copy of a payload of up to the 5 MiB cap.
+    data: Bytes,
     ttl: Duration,
     created_at: Instant,
     freshness_jitter: f64,
@@ -49,6 +52,13 @@ pub enum L1SwrRead {
     Miss,
 }
 
+/// [`L1SwrRead`] over a shared buffer: the client's copy-free read path.
+pub(crate) enum SharedSwrRead {
+    Fresh(Bytes),
+    Stale(Bytes),
+    Miss,
+}
+
 /// In-process LRU cache with per-entry TTL, backed by [`moka`].
 ///
 /// Used as the L1 layer in the dual-layer cache architecture. `Clone` is
@@ -71,7 +81,20 @@ impl L1Cache {
 
     /// Retrieve cached bytes by key, or `None` if absent or expired.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
-        self.store.get(key).map(|entry| entry.data.clone())
+        self.get_shared(key).map(|data| data.to_vec())
+    }
+
+    /// [`Self::get`] without the copy: the stored buffer, by refcount.
+    pub(crate) fn get_shared(&self, key: &str) -> Option<Bytes> {
+        self.store.get(key).map(|entry| entry.data)
+    }
+
+    /// Whether a live (unexpired) entry exists, without reading its value.
+    ///
+    /// Unlike [`Self::get`], this does not count as an access for moka's
+    /// eviction policy.
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.store.contains_key(key)
     }
 
     /// Retrieve cached bytes with stale-while-revalidate classification.
@@ -92,23 +115,37 @@ impl L1Cache {
     /// refresh scheduling and deduplication (the `#[cachekit]` macro uses
     /// `CacheKit::single_flight`).
     pub fn get_with_swr(&self, key: &str, threshold_ratio: f64) -> L1SwrRead {
+        match self.get_with_swr_shared(key, threshold_ratio) {
+            SharedSwrRead::Fresh(data) => L1SwrRead::Fresh(data.to_vec()),
+            SharedSwrRead::Stale(data) => L1SwrRead::Stale(data.to_vec()),
+            SharedSwrRead::Miss => L1SwrRead::Miss,
+        }
+    }
+
+    /// [`Self::get_with_swr`] without the copy: the stored buffer, by refcount.
+    pub(crate) fn get_with_swr_shared(&self, key: &str, threshold_ratio: f64) -> SharedSwrRead {
         let Some(entry) = self.store.get(key) else {
-            return L1SwrRead::Miss;
+            return SharedSwrRead::Miss;
         };
         let threshold = entry.ttl.as_secs_f64() * threshold_ratio * entry.freshness_jitter;
         if entry.created_at.elapsed().as_secs_f64() > threshold {
-            L1SwrRead::Stale(entry.data.clone())
+            SharedSwrRead::Stale(entry.data)
         } else {
-            L1SwrRead::Fresh(entry.data.clone())
+            SharedSwrRead::Fresh(entry.data)
         }
     }
 
     /// Insert or overwrite an entry with the given TTL.
     pub fn set(&self, key: &str, value: &[u8], ttl: Duration) {
+        self.set_shared(key, Bytes::copy_from_slice(value), ttl);
+    }
+
+    /// [`Self::set`] without the copy: L1 keeps `value`'s buffer.
+    pub(crate) fn set_shared(&self, key: &str, value: Bytes, ttl: Duration) {
         self.store.insert(
             key.to_string(),
             L1Entry {
-                data: value.to_vec(),
+                data: value,
                 ttl,
                 created_at: Instant::now(),
                 freshness_jitter: 0.9 + crate::random_unit() * 0.2,
@@ -135,5 +172,22 @@ impl L1Cache {
     /// pending invalidations and expiry checks to complete synchronously.
     pub fn run_pending_tasks(&self) {
         self.store.run_pending_tasks();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::L1Cache;
+    use std::time::Duration;
+
+    /// `contains` backs `CacheKit::exists`; it must honour per-entry TTL the
+    /// way `get` does, or a warm-key check would report an expired entry.
+    #[test]
+    fn contains_is_false_after_ttl_expiry() {
+        let cache = L1Cache::new(16);
+        cache.set("k", b"v", Duration::from_millis(50));
+        assert!(cache.contains("k"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!cache.contains("k"));
     }
 }

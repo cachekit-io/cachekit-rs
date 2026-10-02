@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::backend::Backend;
@@ -287,23 +289,23 @@ impl CacheKit {
 
     /// Try L1 cache first. Returns Some(bytes) on hit.
     #[cfg(feature = "l1")]
-    fn l1_get(&self, full_key: &str) -> Option<Vec<u8>> {
-        self.l1.as_ref().and_then(|l1| l1.get(full_key))
+    fn l1_get(&self, full_key: &str) -> Option<Bytes> {
+        self.l1.as_ref().and_then(|l1| l1.get_shared(full_key))
     }
 
     /// Populate L1 from an L2 hit, for no longer than [`l1_backfill_ttl`] allows.
     #[cfg(feature = "l1")]
-    fn l1_backfill(&self, full_key: &str, bytes: &[u8], freshness: Freshness) {
+    fn l1_backfill(&self, full_key: &str, bytes: Bytes, freshness: Freshness) {
         if let (Some(l1), Some(ttl)) = (&self.l1, l1_backfill_ttl(self.default_ttl, freshness)) {
-            l1.set(full_key, bytes, ttl);
+            l1.set_shared(full_key, bytes, ttl);
         }
     }
 
     /// Write-through to L1.
     #[cfg(feature = "l1")]
-    fn l1_set(&self, full_key: &str, bytes: &[u8], ttl: Duration) {
+    fn l1_set(&self, full_key: &str, bytes: Bytes, ttl: Duration) {
         if let Some(ref l1) = self.l1 {
-            l1.set(full_key, bytes, ttl);
+            l1.set_shared(full_key, bytes, ttl);
         }
     }
 
@@ -345,9 +347,9 @@ impl CacheKit {
         if !mutation.is_current(&token.state, token.version) {
             return Ok(false);
         }
-        let l1_bytes = bytes.clone();
+        let l1_bytes = Bytes::copy_from_slice(&bytes);
         self.backend.set(&full_key, bytes, Some(ttl)).await?;
-        self.l1_set(&full_key, &l1_bytes, ttl);
+        self.l1_set(&full_key, l1_bytes, ttl);
         mutation.advance();
         crate::metrics::trace_write(&full_key, ttl);
         Ok(true)
@@ -479,42 +481,42 @@ impl CacheKit {
     /// into fresh vs stale against the configured freshness window; on L1
     /// miss this defers to [`Self::get_bytes`] (L2 + backfill), whose hit is
     /// always fresh.
-    async fn get_bytes_swr(&self, key: &str) -> Result<SwrRead<Vec<u8>>, CachekitError> {
+    async fn get_bytes_swr(&self, key: &str) -> Result<SwrRead<Bytes>, CachekitError> {
         #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
         if self.swr_enabled {
             if let Some(ref l1) = self.l1 {
                 let full_key = self.resolve_key(key)?;
-                match l1.get_with_swr(&full_key, self.swr_threshold_ratio) {
-                    crate::l1::L1SwrRead::Fresh(bytes) => {
+                match l1.get_with_swr_shared(&full_key, self.swr_threshold_ratio) {
+                    crate::l1::SharedSwrRead::Fresh(bytes) => {
                         self.counters.record(ReadOutcome::L1Hit, &full_key);
                         self.check_payload_size(bytes.len())?;
                         return Ok(SwrRead::Fresh(bytes));
                     }
-                    crate::l1::L1SwrRead::Stale(_) => {
+                    crate::l1::SharedSwrRead::Stale(_) => {
                         // Token capture and the stale snapshot must be atomic
                         // relative to explicit mutations. Re-check after
                         // taking the per-key guard; a write may have landed
                         // between the optimistic classification and here.
                         let mutation = self.mutations.lock(&full_key).await;
-                        match l1.get_with_swr(&full_key, self.swr_threshold_ratio) {
-                            crate::l1::L1SwrRead::Fresh(bytes) => {
+                        match l1.get_with_swr_shared(&full_key, self.swr_threshold_ratio) {
+                            crate::l1::SharedSwrRead::Fresh(bytes) => {
                                 self.counters.record(ReadOutcome::L1Hit, &full_key);
                                 self.check_payload_size(bytes.len())?;
                                 return Ok(SwrRead::Fresh(bytes));
                             }
-                            crate::l1::L1SwrRead::Stale(bytes) => {
+                            crate::l1::SharedSwrRead::Stale(bytes) => {
                                 self.counters.record(ReadOutcome::L1Stale, &full_key);
                                 self.check_payload_size(bytes.len())?;
                                 let (state, version) = mutation.snapshot();
                                 return Ok(SwrRead::Stale(bytes, SwrToken { state, version }));
                             }
-                            crate::l1::L1SwrRead::Miss => {}
+                            crate::l1::SharedSwrRead::Miss => {}
                         }
                     }
                     // Absent or hard-expired: fall through to the normal
                     // read path (the redundant L1 re-check there is a cheap
                     // in-process miss).
-                    crate::l1::L1SwrRead::Miss => {}
+                    crate::l1::SharedSwrRead::Miss => {}
                 }
             }
         }
@@ -526,7 +528,7 @@ impl CacheKit {
     }
 
     /// Fetch raw payload bytes for `key` (L1, then L2 with L1 backfill).
-    async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, CachekitError> {
+    async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, CachekitError> {
         let full_key = self.resolve_key(key)?;
 
         // L1 hit
@@ -563,10 +565,12 @@ impl CacheKit {
         };
 
         self.check_payload_size(bytes.len())?;
+        // Takes over the Vec's allocation: no copy, and L1 shares it below.
+        let bytes = Bytes::from(bytes);
 
         // Populate L1 on L2 hit, bounded by the cap and the server's freshness
         #[cfg(feature = "l1")]
-        self.l1_backfill(&full_key, &bytes, freshness);
+        self.l1_backfill(&full_key, bytes.clone(), freshness);
         #[cfg(not(feature = "l1"))]
         let _ = freshness;
 
@@ -605,12 +609,12 @@ impl CacheKit {
             mutation.advance();
         }
 
-        // Only clone bytes when L1 needs a copy after the backend consumes them.
+        // L1 needs its own copy: the backend consumes the Vec.
         #[cfg(feature = "l1")]
         {
-            let l1_bytes = bytes.clone();
+            let l1_bytes = Bytes::copy_from_slice(&bytes);
             self.backend.set(&full_key, bytes, Some(ttl)).await?;
-            self.l1_set(&full_key, &l1_bytes, ttl);
+            self.l1_set(&full_key, l1_bytes, ttl);
         }
         #[cfg(not(feature = "l1"))]
         {
@@ -666,12 +670,15 @@ impl CacheKit {
     }
 
     /// Return `true` if `key` exists without fetching the value.
+    ///
+    /// A live L1 entry answers without a backend call. That check does not
+    /// count as a use of the entry for L1 eviction; only reads do.
     pub async fn exists(&self, key: &str) -> Result<bool, CachekitError> {
         let full_key = self.resolve_key(key)?;
 
         // Check L1 first — avoids a network round-trip for warm entries.
         #[cfg(feature = "l1")]
-        if self.l1_get(&full_key).is_some() {
+        if self.l1.as_ref().is_some_and(|l1| l1.contains(&full_key)) {
             return Ok(true);
         }
 
@@ -859,15 +866,15 @@ impl SecureCache<'_> {
             mutation.advance();
         }
 
-        // Only clone when L1 needs a copy after the backend consumes the data.
+        // L1 needs its own copy: the backend consumes the Vec.
         #[cfg(feature = "l1")]
         {
-            let l1_bytes = ciphertext.clone();
+            let l1_bytes = Bytes::copy_from_slice(&ciphertext);
             self.client
                 .backend
                 .set(&full_key, ciphertext, Some(ttl))
                 .await?;
-            self.client.l1_set(&full_key, &l1_bytes, ttl);
+            self.client.l1_set(&full_key, l1_bytes, ttl);
         }
         #[cfg(not(feature = "l1"))]
         {
