@@ -1,4 +1,4 @@
-use rmp_serde::decode::ReadReader;
+use rmp_serde::decode::ReadRefReader;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::error::CachekitError;
@@ -36,7 +36,8 @@ pub const MAX_DECODE_DEPTH: usize = 100;
 /// `[u64; MAX_DECODE_DEPTH]` stack of children still owed by each open
 /// collection, whatever the input. Fails closed on the reserved marker,
 /// truncation, excess depth, and length overflow, always with a message
-/// starting `decode bound:`.
+/// starting `decode bound:`. Returns the document's length in bytes: the walk
+/// covers exactly one document, so its end position is where the document ends.
 ///
 /// Why depth is checked here and not only by `rmp-serde`: a guard that admits
 /// a document deeper than the bound leaves the rejection to the decoder,
@@ -49,8 +50,9 @@ pub const MAX_DECODE_DEPTH: usize = 100;
 /// `size_hint`, so without this walk a 500-byte payload of nested
 /// `array32(0xFFFFFFFF)` headers requests `MAX_DECODE_DEPTH` MiB before the
 /// first EOF error — an OOM kill on a Cloudflare Workers isolate. Trailing
-/// bytes are left to the caller (auto mode ignores them; interop rejects them).
-pub(crate) fn check_structure(bytes: &[u8]) -> Result<(), CachekitError> {
+/// bytes are left to the caller (auto mode ignores them; interop rejects them
+/// by comparing the returned length with the input's).
+pub(crate) fn check_structure(bytes: &[u8]) -> Result<usize, CachekitError> {
     fn reject(what: &str) -> CachekitError {
         CachekitError::Serialization(format!("decode bound: {what}"))
     }
@@ -124,10 +126,14 @@ pub(crate) fn check_structure(bytes: &[u8]) -> Result<(), CachekitError> {
             depth -= 1;
         }
     }
-    Ok(())
+    Ok(pos)
 }
 
-/// Build a depth- and allocation-bounded `rmp_serde::Deserializer` over `bytes`.
+/// A decoder reading a byte slice in place.
+pub(crate) type SliceDeserializer<'a> = rmp_serde::Deserializer<ReadRefReader<'a, [u8]>>;
+
+/// Build a depth- and allocation-bounded `rmp_serde::Deserializer` over the
+/// first document in `bytes`, and return it with that document's length.
 ///
 /// Every decode of backend-supplied bytes (auto-mode [`deserialize`] and
 /// [`crate::interop::deserialize`]) MUST go through here so the bounds cannot
@@ -135,11 +141,17 @@ pub(crate) fn check_structure(bytes: &[u8]) -> Result<(), CachekitError> {
 /// depth and the allocation bound, then sets `rmp-serde`'s own depth limit as a
 /// backstop just above [`MAX_DECODE_DEPTH`]: its default (1024) is deep enough
 /// to overflow a debug-build thread stack.
+///
+/// The decoder reads the input in place (`from_read_ref`), so str and bin
+/// payloads are handed to serde as borrowed slices. The default `ReadReader`
+/// copies each one through an internal buffer first, one extra allocation and
+/// copy per field on every cache read. The decoder sees only the document the
+/// walk covered, so it can never read past it.
 pub(crate) fn bounded_deserializer(
     bytes: &[u8],
-) -> Result<rmp_serde::Deserializer<ReadReader<&[u8]>>, CachekitError> {
-    check_structure(bytes)?;
-    let mut de = rmp_serde::Deserializer::new(bytes);
+) -> Result<(SliceDeserializer<'_>, usize), CachekitError> {
+    let doc_len = check_structure(bytes)?;
+    let mut de = rmp_serde::Deserializer::from_read_ref(&bytes[..doc_len]);
     // rmp-serde decrements its counter on entry and errors when it reaches 0, so
     // `set_max_depth(n)` admits n - 1 levels, and it counts an ext value as a
     // level where the walk (and the spec) count it as a leaf. Ext is always a
@@ -147,7 +159,7 @@ pub(crate) fn bounded_deserializer(
     // bound, and the walk's error is the one callers see for anything deeper
     // (both pinned by tests/decode_bounds_tests.rs).
     de.set_max_depth(MAX_DECODE_DEPTH + 2);
-    Ok(de)
+    Ok((de, doc_len))
 }
 
 /// Serialize `value` to MessagePack bytes using named fields (map format).
@@ -161,6 +173,6 @@ pub fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, CachekitError> {
 /// (auto mode is SDK-internal; interop mode's strict single-document read is
 /// [`crate::interop::deserialize`]).
 pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError> {
-    T::deserialize(&mut bounded_deserializer(bytes)?)
+    T::deserialize(&mut bounded_deserializer(bytes)?.0)
         .map_err(|e| CachekitError::Serialization(e.to_string()))
 }
