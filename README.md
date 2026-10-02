@@ -246,6 +246,8 @@ Rotation is forward-only: a retired key is never re-promoted (re-promoting would
 
 Interop mode ([interop/v1](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md)) lets the Python, TypeScript, and Rust SDKs share cache entries: keys are `{namespace}:{operation}:{args_hash}` with an explicit operation name (no language-specific function path), and values are plain MessagePack — no envelope, readable by any MessagePack library.
 
+The cross-SDK rules — the opt-in for each SDK, what composes with interop, and the shared-entry contract — are in the [Using Interop Mode](https://docs.cachekit.io/concepts/using-interop-mode/) guide on docs.cachekit.io, with the [interop/v1 spec](https://github.com/cachekit-io/protocol/blob/main/spec/interop-mode.md) as the normative reference. Both win over this README on any conflict.
+
 ```rust
 use cachekit::interop::{interop_key, InteropValue};
 
@@ -259,6 +261,9 @@ let user: Option<User> = cache.interop_get(&key).await?; // strict read: exactly
 `ns` and `nsapi` are reserved as namespaces — the CachekitIO server parses a key starting `ns:` or `nsapi:` as namespace-prefixed — so `interop_key` rejects them with `InvalidKey` and `#[cachekit(namespace = ...)]` with a compile error; operations are unaffected. Neither segment may contain `..` (`a..b` is rejected the same two ways; a lone `.`, as in `app.v1`, is fine), because the server rejects `..` anywhere in a key.
 
 Argument hashing is byte-identical across SDKs (canonical MessagePack + Blake2b-256), verified against the shared [protocol](https://github.com/cachekit-io/protocol) test vectors ([`interop-mode.json`](crates/cachekit/tests/vectors/interop-mode.json), vendored) in this repo's test suite. `interop_get` (also on `SecureCache`) rejects trailing bytes and Python-internal CK frames instead of silently misreading them. Every decode of backend-supplied bytes (`get` and `interop_get` alike) first passes a header-only structural walk that rejects, before anything is decoded, a document nested deeper than `serializer::MAX_DECODE_DEPTH` (100 levels, matching the TypeScript SDK; every collection header counts, empty ones included) or declaring more elements or bytes than the input can back, verified against the protocol's shared [`decode-bounds.json`](crates/cachekit/tests/vectors/decode-bounds.json) vectors (vendored) — a forged nested-header entry is a bounded `Serialization` error, not a memory blow-up or a stack overflow. Encryption works unchanged — interop keys are identical across SDKs, so the AAD verifies cross-SDK.
+
+> [!WARNING]
+> Every service that binds one `(namespace, operation)` must use the same encryption config. With mismatched configs, values can end up **stored unencrypted** at the shared key: the plaintext side usually cannot decode the ciphertext, so it recomputes and re-stores the value in the clear. See [Shared entries are a contract](https://docs.cachekit.io/concepts/using-interop-mode/#shared-entries-are-a-contract).
 
 > [!IMPORTANT]
 > Use interop keys on a client **without** `.namespace()` — a client prefix would rewrite the storage key to `{prefix}:{interop_key}`, which no other SDK computes. `interop_get` fails closed with a config error rather than silently missing; interop keys already carry their own namespace segment.
