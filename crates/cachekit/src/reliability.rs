@@ -790,6 +790,9 @@ pub(crate) fn wrap_reliable(
 #[cfg(test)]
 #[allow(clippy::expect_used)] // test-only: failed acquire/probe should panic loudly
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
     use super::*;
     use crate::error::BackendErrorKind;
 
@@ -993,33 +996,43 @@ mod tests {
         );
     }
 
+    /// Polls `fut` exactly once, with a waker that does nothing. On a
+    /// saturated limiter, a caller that joins the waiting queue is `Pending`
+    /// after this poll and a queue-full shed is already `Ready`, so neither
+    /// outcome depends on a timer or on how the scheduler runs the test.
+    fn poll_once<F: Future>(fut: Pin<&mut F>) -> Poll<F::Output> {
+        fut.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
     #[tokio::test]
     async fn limiter_waiting_slot_released_on_cancelled_wait() {
         // A waiter cancelled mid-acquire (caller timeout / select!) must free
         // its queue slot via the QueueSlot drop guard. With max_queue: 1, a
-        // leaked slot would shed the next waiter instantly as queue-full;
-        // joining the queue (observable as waiting out the acquire_timeout)
-        // proves the slot was released.
+        // leaked slot would shed the next waiter as queue-full on its first
+        // poll; parking in the queue instead proves the slot was released.
         let limiter = ConcurrencyLimiter::new(BackpressureConfig {
             max_concurrent: 1,
             max_queue: 1,
             acquire_timeout: Duration::from_millis(100),
         });
         let _held = limiter.acquire().await.expect("first permit");
-        let cancelled = tokio::time::timeout(Duration::from_millis(20), limiter.acquire()).await;
-        assert!(cancelled.is_err(), "waiter cancelled from outside");
+        let mut cancelled = Box::pin(limiter.acquire());
+        assert!(
+            poll_once(cancelled.as_mut()).is_pending(),
+            "waiter parks in the queue"
+        );
+        drop(cancelled); // the caller gives up mid-wait
 
-        let start = Instant::now();
-        let err = limiter
-            .acquire()
+        let mut next = Box::pin(limiter.acquire());
+        assert!(
+            poll_once(next.as_mut()).is_pending(),
+            "next waiter must park in the queue — a queue-full shed means \
+             the cancelled waiter leaked its slot"
+        );
+        let err = next
             .await
             .expect_err("permit never frees, waiter times out");
         assert_eq!(err.kind, BackendErrorKind::Backpressure);
-        assert!(
-            start.elapsed() >= Duration::from_millis(80),
-            "must join the queue and wait out acquire_timeout — an instant \
-             queue-full shed means the cancelled waiter leaked its slot"
-        );
     }
 
     #[tokio::test]
@@ -1033,22 +1046,21 @@ mod tests {
             acquire_timeout: Duration::from_millis(200),
         });
         let _held = limiter.acquire().await.expect("first permit");
-        let waiter = async {
-            // Parks in the queue immediately and times out after 200 ms.
-            limiter.acquire().await
-        };
-        let third = async {
-            tokio::time::sleep(Duration::from_millis(50)).await; // waiter parked
-            let start = Instant::now();
-            let err = limiter.acquire().await.expect_err("queue of 1 is full");
-            assert_eq!(err.kind, BackendErrorKind::Backpressure);
-            assert!(
-                start.elapsed() < Duration::from_millis(100),
-                "queue-full sheds instantly, not after the wait timeout"
-            );
-        };
-        let (waited, ()) = tokio::join!(waiter, third);
-        waited.expect_err("the parked waiter itself times out");
+        let mut waiter = Box::pin(limiter.acquire());
+        assert!(
+            poll_once(waiter.as_mut()).is_pending(),
+            "waiter parks in the queue"
+        );
+        // Ready on the first poll is the queue-full shed: every other shed
+        // path is only reachable after parking.
+        let third = poll_once(Box::pin(limiter.acquire()).as_mut());
+        assert!(
+            matches!(&third, Poll::Ready(Err(err)) if err.kind == BackendErrorKind::Backpressure),
+            "queue of 1 is full, so the third caller sheds on its first poll: {third:?}"
+        );
+        waiter
+            .await
+            .expect_err("the parked waiter itself times out");
     }
 
     #[test]
