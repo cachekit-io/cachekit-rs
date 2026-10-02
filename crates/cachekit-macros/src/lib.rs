@@ -253,7 +253,7 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   Its version-checked commit rewrites both layers only if no newer set or
 ///   delete replaced the stale entry; a successful commit renews the L1 hard
 ///   expiry with the full write-path TTL. Refresh dedup rides
-///   [`CacheKit::single_flight`]: N concurrent stale readers trigger exactly
+///   `CacheKit::single_flight`: N concurrent stale readers trigger exactly
 ///   one re-execution per process (and, on lock-capable backends, per
 ///   fleet). Hard-expired entries always take the normal blocking miss path.
 ///   The refresh task needs a tokio runtime (skipped otherwise — the stale

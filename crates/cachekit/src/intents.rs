@@ -499,7 +499,7 @@ mod secure_tests {
         );
     }
 
-    /// LAB-6591: an entry written under k1 must still decrypt after the
+    /// An entry written under k1 must still decrypt after the
     /// env-var rotation runbook promotes k2 and moves k1 to the previous list.
     #[test]
     #[serial_test::serial]
