@@ -5,7 +5,7 @@
 # So the line below NARROWS unmaintained from its default. It is not a
 # redundant restatement, and deleting it would tighten this gate.
 #
-# Warn-vs-fail posture per class (LAB-1152, decided 2026-08-31):
+# Warn-vs-fail posture per class (decided 2026-08-31):
 # - yanked: warn here, ENFORCED by `cargo audit --deny yanked` on the weekly
 #   schedule run in .github/workflows/security.yml. Audit is the enforcement
 #   point because cargo-deny grades the feature-resolved graph, which prunes
@@ -47,8 +47,8 @@ confidence-threshold = 0.8
 multiple-versions = "warn"
 wildcards = "deny"
 # This SDK is rustls-only: openssl/native-tls must never re-enter the graph.
-# (async-memcached 0.6 once dragged them in via a toxiproxy_rust runtime dep —
-# expert panel, LAB-429. toxiproxy is a fault-injection *test* proxy; banned
+# (async-memcached 0.6 once dragged them in via a toxiproxy_rust runtime dep.
+# toxiproxy is a fault-injection *test* proxy; banned
 # outright so no future dependency smuggles it back as a runtime edge.)
 deny = [
     { name = "openssl-sys" },

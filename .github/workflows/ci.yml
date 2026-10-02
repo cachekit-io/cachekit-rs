@@ -61,7 +61,7 @@ jobs:
     name: redis lock integration
     # Without a live redis the lock acquire/release path has zero automated
     # coverage — the redis_lock_live_semantics test skips when
-    # CACHEKIT_TEST_REDIS_URL is unset (LAB-426: the AC requires locking exercised against a container).
+    # CACHEKIT_TEST_REDIS_URL is unset, and locking must be exercised against a container.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -101,7 +101,7 @@ jobs:
           cargo test --no-default-features --features redis --test redis_tests -- --nocapture 2>&1 | tee redis-test.log
           # False-green guard: this job exists so the live lock test actually
           # runs. If it silently skipped (env not seen), fail loudly instead of
-          # reporting a hollow green — the exact defect LAB-426 is fixing.
+          # reporting a hollow green — the exact defect this job was added to fix.
           if grep -q "skipping redis_lock_live_semantics" redis-test.log; then
             echo "::error::redis lock test skipped — CACHEKIT_TEST_REDIS_URL not seen by the test"
             exit 1
@@ -111,7 +111,7 @@ jobs:
     name: memcached integration
     # Without a live memcached the get/set/delete/ttl path has zero automated
     # coverage — the memcached_live_semantics test skips when
-    # CACHEKIT_TEST_MEMCACHED_URL is unset (LAB-429: the AC requires memcached exercised against a container).
+    # CACHEKIT_TEST_MEMCACHED_URL is unset, and memcached must be exercised against a container.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -163,7 +163,7 @@ jobs:
     env:
       # Must equal the wasm-bindgen version in Cargo.lock — the test runner
       # binary and the crate share a private ABI and mismatches refuse to run.
-      # Bump this, the sha256 below, and the Cargo.lock pin together (LAB-1079).
+      # Bump this, the sha256 below, and the Cargo.lock pin together.
       WASM_BINDGEN_VERSION: "0.2.121"
       # Public release-tarball checksum, not a credential.
       WASM_BINDGEN_SHA256: "3039f38f65fe237b640cf06a140c919ca8d717ec5012146d145d3f27bb4d6b28" # pragma: allowlist secret
@@ -183,7 +183,7 @@ jobs:
 
       # ── wasm32 runtime tests ────────────────────────────────────────────────
       # Compile-only coverage shipped a runtime trap (SystemTime::now() panics
-      # on wasm32) in five consecutive releases — LAB-1079. The steps below
+      # on wasm32) in five consecutive releases. The steps below
       # actually EXECUTE the session/fetch path in a wasm runtime.
 
       - name: Guard wasm-bindgen lockfile drift

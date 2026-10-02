@@ -5,7 +5,7 @@ on:
     branches:
       - main
   # Break-glass republish: dispatch when a release got tagged but the crates.io
-  # publish never ran (the v0.4.0 run died before the publish job — LAB-742).
+  # publish never ran (the v0.4.0 run died before the publish job).
   # The required tag input pins WHAT gets published: main can drift past an
   # unpublished tag within hours (it did for v0.4.0), and publishing main HEAD
   # would package that drift under the tagged version. cargo publish fails

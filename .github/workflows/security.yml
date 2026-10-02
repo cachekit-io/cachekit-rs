@@ -1,6 +1,6 @@
 name: Security
 
-# Runner for deny.toml, which shipped with no runner at all until LAB-1128 — its
+# Runner for deny.toml, which first shipped with no runner at all — its
 # presence implied an invariant CI did not enforce. The policy is unchanged.
 
 on:
@@ -94,7 +94,7 @@ jobs:
         # --all-features is load-bearing, not tidiness. cargo-deny builds a
         # feature-aware graph and this crate's default features exclude the
         # memcached, redis, file and macros backends — so a banned crate
-        # reintroduced behind an optional feature, which is exactly the LAB-429
+        # reintroduced behind an optional feature, which is exactly the memcached
         # regression shape, passes a bare `cargo deny check` while failing this
         # one. Verified by planting native-tls behind `memcached`. The flag
         # lives here rather than in deny.toml per cargo-deny's own guidance.
@@ -113,7 +113,7 @@ jobs:
         # consumer's feature unification can reach. This step is what fails the
         # build on a vulnerability in that pruned remainder.
         #
-        # Advisory posture (LAB-1152): vulnerabilities fail every run; yanked
+        # Advisory posture: vulnerabilities fail every run; yanked
         # fails only the weekly schedule run — a yank lands against an
         # unchanged lockfile and must not block unrelated PRs, and the
         # schedule run exists precisely for advisories no PR diff touches.
@@ -126,7 +126,7 @@ jobs:
           set -o pipefail
           cargo audit ${{ github.event_name == 'schedule' && '--deny yanked' || '' }} 2>&1 | tee "$RUNNER_TEMP/audit.log"
           # The yank check fails open (cargo-audit 0.22.1 auditor.rs; verified
-          # locally, LAB-1152). "Updating crates.io index" prints
+          # locally). "Updating crates.io index" prints
           # unconditionally BEFORE the fetch attempt — a warm index cache
           # cannot suppress it — so its presence proves only that the check
           # was attempted (enabled, not disabled by e.g. a future `-n`). On
