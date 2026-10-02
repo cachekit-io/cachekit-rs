@@ -75,13 +75,15 @@ mod file_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let backend = backend_in(&dir);
 
+        // A whole-second deadline gives an N-second TTL N-1 to N seconds of
+        // life, so 2s (not 1s) keeps the immediate exists() off a second
+        // boundary, and 2.1s guarantees the clock has reached the deadline.
         backend
-            .set("short-lived", b"x".to_vec(), Some(Duration::from_secs(1)))
+            .set("short-lived", b"x".to_vec(), Some(Duration::from_secs(2)))
             .await
             .expect("set");
         assert!(backend.exists("short-lived").await.expect("exists"));
 
-        // Expiry is whole-second granularity; 2.1s guarantees `now > expiry`.
         tokio::time::sleep(Duration::from_millis(2100)).await;
         assert_eq!(backend.get("short-lived").await.expect("get"), None);
         assert!(!backend.exists("short-lived").await.expect("exists"));
