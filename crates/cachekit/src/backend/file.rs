@@ -13,6 +13,13 @@
 //!   the new entry, never a torn one.
 //! - **Expiry is lazy**: expired and corrupt entries are unlinked when a
 //!   read touches them, exactly like cachekit-py.
+//! - **Orphan sweep on first write**: temp files older than 60 s, left by
+//!   crashed writers (py's or rs's — both use the `.tmp.` marker), are
+//!   removed by each backend instance's first `set`, once. cachekit-py sweeps
+//!   at startup instead; rs defers it because the sweep reads the whole
+//!   directory, and a short-lived reader of a large cache (a CLI hit) would
+//!   pay that on every run. Only writers leave orphans, so a reader-only
+//!   process never needs it.
 //!
 //! ## Concurrency model
 //!
@@ -53,7 +60,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -403,8 +410,8 @@ fn rewrite_expiry(path: &Path, new_expiry: u64) -> Result<bool, BackendError> {
 
 fn temp_path(target: &Path) -> PathBuf {
     // `{name}.tmp.{pid}.{nanos}.{seq}` — contains the `.tmp.` marker py's
-    // startup sweep globs for, so a shared directory gets cross-SDK orphan
-    // cleanup. The process-global sequence makes the name collision-proof
+    // startup sweep and rs's first-write sweep look for, so a shared
+    // directory gets cross-SDK orphan cleanup. The process-global sequence makes the name collision-proof
     // even for same-key writes landing in the same nanosecond tick.
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -459,6 +466,9 @@ pub struct FileBackend {
     /// Async so contended waiters cost a queued future, not a parked
     /// blocking-pool thread (a hot backend must not monopolize the pool).
     stripes: Arc<[Arc<tokio::sync::Mutex<()>>; LOCK_STRIPES]>,
+    /// Whether this backend has swept orphaned temp files yet; the first
+    /// `set` does it. Clones share it, so an instance sweeps once.
+    swept: Arc<AtomicBool>,
 }
 
 /// Number of in-process lock stripes (a power of two, at most 256: the stripe
@@ -558,7 +568,15 @@ impl Backend for FileBackend {
         };
 
         let path = self.entry_path(key);
+        let swept = Arc::clone(&self.swept);
         self.locked(stripe_of(&path), move || {
+            // Swapped here, not before the lock: a set cancelled while it
+            // waits for its stripe must not use up the sweep.
+            if !swept.swap(true, Ordering::Relaxed) {
+                if let Some(dir) = path.parent() {
+                    cleanup_temp_files(dir);
+                }
+            }
             write_entry(&path, build_header(expiry), &value)
         })
         .await
@@ -668,9 +686,10 @@ impl FileBackendBuilder {
     /// On unix, a **pre-existing** directory must be owned by the current
     /// user and not group/other-writable — a default like `/tmp/cachekit`
     /// pre-created by another local user would otherwise let them poison
-    /// plaintext cache entries (CWE-377). Also sweeps orphaned temp files
-    /// left by crashed writers (py parity). The one-time directory setup
-    /// does its I/O inline; per-operation I/O runs on the blocking pool.
+    /// plaintext cache entries (CWE-377). Does not scan the directory: the
+    /// sweep of orphaned temp files runs on the backend's first `set` (see the
+    /// [module docs](self)). The one-time directory setup does its I/O
+    /// inline; per-operation I/O runs on the blocking pool.
     ///
     /// # Errors
     ///
@@ -737,11 +756,10 @@ impl FileBackendBuilder {
             }
         }
 
-        cleanup_temp_files(&cache_dir);
-
         Ok(FileBackend {
             cache_dir,
             stripes: new_stripes(),
+            swept: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -765,6 +783,7 @@ mod tests {
         FileBackend {
             cache_dir: dir.to_path_buf(),
             stripes: new_stripes(),
+            swept: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1085,6 +1104,46 @@ mod tests {
         assert!(!stale.exists(), "stale temp file must be swept");
         assert!(fresh.exists(), "fresh temp file must be kept");
         assert!(entry.exists(), "cache entries must never be swept");
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_runs_on_first_set_not_on_build() {
+        // A short-lived reader (a CLI hit) must not pay a whole-directory
+        // scan: build and reads leave orphans alone, the first write sweeps.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = dir.path().join("cache");
+        let build = || {
+            FileBackend::builder()
+                .cache_dir(&cache_dir)
+                .build()
+                .expect("build")
+        };
+        drop(build()); // creates the directory owner-only
+
+        let stale = cache_dir.join("abc.tmp.123.456");
+        fs::write(&stale, b"orphan").expect("write");
+        fs::File::options()
+            .write(true)
+            .open(&stale)
+            .expect("open")
+            .set_modified(SystemTime::now() - Duration::from_secs(120))
+            .expect("set mtime");
+
+        let backend = build();
+        assert!(stale.exists(), "build must not scan the directory");
+
+        assert!(backend.get("k").await.expect("get").is_none());
+        assert!(backend.exists("k").await.is_ok());
+        assert!(stale.exists(), "reads must not sweep");
+
+        // Clones share the once-per-instance flag: one sweep, not one per clone.
+        let clone = backend.clone();
+        clone.set("k", b"v".to_vec(), None).await.expect("set");
+        assert!(!stale.exists(), "first set must sweep stale orphans");
+        assert!(
+            backend.swept.load(Ordering::Relaxed),
+            "clones share the flag"
+        );
     }
 
     // ── Hardening ────────────────────────────────────────────────────────────
