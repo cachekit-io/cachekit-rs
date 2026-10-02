@@ -19,9 +19,10 @@
 //! so only the timed loop is counted and setup needs no differencing. It
 //! reports the median instructions per op and the run-to-run spread. With
 //! `--base`, it runs a second build of this example interleaved (ABBA) and
-//! calls a delta only when it beats `max(3 x spread, 0.5%)`; it exits 1 when
-//! any case got slower by that much. Wall time is printed for orientation and
-//! is never a measured saving.
+//! calls a delta only when it beats `max(3 x spread, 0.5%)`. Exit codes: 1 when
+//! any case got slower by that much; 2 when nothing was measured (an unknown
+//! flag, a filter matching no case, or valgrind failing). Wall time is printed
+//! for orientation and is never a measured saving.
 
 #![allow(clippy::print_stdout)]
 
@@ -475,9 +476,10 @@ fn main() -> ExitCode {
     match result {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
+        // 2, not 1: a run that measured nothing must not read as a regression.
         Err(e) => {
             eprintln!("bench_hot_path: {e}");
-            ExitCode::FAILURE
+            ExitCode::from(2)
         }
     }
 }

@@ -34,10 +34,10 @@
 //!   Nothing is retried, so a limiter verdict is never retried into;
 //! - total requests, warm-ups and trace probes included, are capped
 //!   (`--max-ops`, at most 2000) and paced under `--max-per-min`; a burst is at
-//!   most 32 concurrent requests. A `#[cachekit]` cold miss counts as the five
-//!   requests it can send (GET, a re-check GET, lock, PUT, unlock), and every
-//!   one it sent is checked against the stop rules: the macro itself swallows
-//!   backend errors.
+//!   most 32 concurrent requests. A `#[cachekit]` cold miss sends four requests
+//!   (GET, lock, PUT, unlock) and is budgeted at five, one spare; a call that
+//!   sends more stops the run. Every request it sent is checked against the
+//!   stop rules, because the macro itself swallows backend errors.
 //!
 //! ```text
 //! CACHEKIT_API_KEY=… CACHEKIT_API_URL=https://… cargo run --release \
@@ -72,8 +72,9 @@ const MAX_OPS: usize = 2000;
 const MAX_CONCURRENCY: usize = 32;
 /// 5xx responses (503 excepted) a run records before it stops.
 const MAX_SERVER_ERRORS: usize = 5;
-/// Most requests one `#[cachekit]` cold miss sends: GET miss, lock, PUT and
-/// unlock, plus the re-check GET a fill sometimes makes (8 of 40 calls on dev).
+/// Budget for one `#[cachekit]` cold miss: a serial leader sends four requests
+/// (GET miss, lock, PUT, unlock); the fifth is a margin. A call that records
+/// more than this stops the run.
 const MACRO_REQUESTS: usize = 5;
 const ABBA: [usize; 4] = [0, 1, 1, 0];
 
@@ -257,6 +258,13 @@ fn validate(a: &Args) -> Result<(), String> {
     if a.max_ops > MAX_OPS || a.max_per_min == 0 {
         return Err(format!(
             "--max-ops must be at most {MAX_OPS}, --max-per-min positive"
+        ));
+    }
+    if a.env != "dev" {
+        // The host allowlist is dev only, so any other label would mislabel rows.
+        return Err(format!(
+            "--env must be dev (the only writable host); got {:?}",
+            a.env
         ));
     }
     if a.macro_cold_miss && a.concurrency > 1 {
@@ -519,16 +527,20 @@ impl Recorded {
             Ok(v) => ((method, Some(ok(v))), None),
             Err(e) => ((method, http_status(&e.to_string())), Some(e.to_string())),
         };
-        if let Ok(mut parts) = self.parts.lock() {
-            parts.push(entry);
-        }
+        // These records are the macro stop rules' only input: never drop one.
+        self.parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(entry);
     }
 
     fn drain(&self) -> Vec<(Part, Option<String>)> {
-        self.parts
-            .lock()
-            .map(|mut p| std::mem::take(&mut *p))
-            .unwrap_or_default()
+        std::mem::take(
+            &mut *self
+                .parts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 }
 
@@ -577,13 +589,19 @@ impl LockableBackend for Recorded {
         key: &str,
         timeout_ms: u64,
     ) -> Result<Option<String>, BackendError> {
-        let r = self.inner.acquire_lock(key, timeout_ms).await;
+        // A null lock id means held, or a storage error on the server. Passed
+        // through, the fill would poll GET up to 50 times, unpaced; as an
+        // error it fills unlocked, and the recorded error stops the run.
+        let r = match self.inner.acquire_lock(key, timeout_ms).await {
+            Ok(None) => Err(BackendError::permanent("lock not granted")),
+            r => r,
+        };
         self.note("LOCK", &r, |_| 200);
         r
     }
     async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError> {
         let r = self.inner.release_lock(key, lock_id).await;
-        self.note("UNLOCK", &r, |_| 200);
+        self.note("UNLOCK", &r, |released| if *released { 200 } else { 404 });
         r
     }
 }
@@ -761,6 +779,10 @@ async fn timed_op(arm: &Arm, op: Op, key: &str, value: &str, ttl: Duration, seri
 }
 
 async fn timed_cold_miss(arm: &Arm, id: &str) -> Timed {
+    // Start from an empty record: the block's warm-up GET ran on this arm too.
+    if let Some(r) = &arm.recorded {
+        r.drain();
+    }
     let before = tls_sockets();
     let started = iso_now();
     let t0 = Instant::now();
@@ -769,7 +791,7 @@ async fn timed_cold_miss(arm: &Arm, id: &str) -> Timed {
     let ended = iso_now();
     let after = tls_sockets();
     let recorded = arm.recorded.as_ref().map(|r| r.drain()).unwrap_or_default();
-    // The first failed request decides the row, so the stop rules see it.
+    // Report the first failed request; `Sink::row` judges every one of them.
     let outcome = match recorded.iter().find_map(|(_, err)| err.clone()) {
         Some(err) => Err(err),
         None => called.map_err(|e| e.to_string()),
@@ -897,8 +919,35 @@ impl Sink {
             ex.map_or_else(|| "-".to_owned(), |e| format!("{:.1}", ms(e.ttfb))),
             row["ray_id"].as_str().unwrap_or("-"),
         );
+        if t.parts.is_empty() {
+            return self.judge(t.method, status, t.outcome.is_ok(), t);
+        }
+        // A macro call: every request it sent is judged on its own.
+        if t.parts.len() > MACRO_REQUESTS {
+            return Err(Stop::Refused(format!(
+                "{}: sent {} requests, over the budget of {MACRO_REQUESTS}: {:?}",
+                t.op,
+                t.parts.len(),
+                t.parts
+            )));
+        }
+        for (method, part_status) in &t.parts {
+            let ok = part_status.is_some_and(|s| (200..300).contains(&s) || s == 404);
+            self.judge(method, *part_status, ok, t)?;
+        }
+        Ok(())
+    }
+
+    /// The stop rule for one request.
+    fn judge(
+        &mut self,
+        method: &str,
+        status: Option<u16>,
+        ok: bool,
+        t: &Timed,
+    ) -> Result<(), Stop> {
         match status {
-            Some(s) if ((200..300).contains(&s) || s == 404) && t.outcome.is_ok() => Ok(()),
+            Some(s) if ((200..300).contains(&s) || s == 404) && ok => Ok(()),
             // A 503 is this service's limiter or fail-closed verdict: stop.
             // Any other 5xx is counted and the run goes on, so a server's
             // sporadic errors become a measured rate instead of ending it.
@@ -907,8 +956,8 @@ impl Sink {
                 Ok(())
             }
             _ => Err(Stop::Refused(format!(
-                "{} {}: status {status:?}, {:?}",
-                t.method, t.op, t.outcome
+                "{method} in {}: status {status:?}, {:?}",
+                t.op, t.outcome
             ))),
         }
     }

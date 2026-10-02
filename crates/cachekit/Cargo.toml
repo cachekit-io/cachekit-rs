@@ -126,7 +126,7 @@ js-sys = "0.3"
 name = "bench_hot_path"
 required-features = ["l1", "reliability", "encryption"]
 
-# Client wall time against a non-production cachekit.io endpoint, as JSONL.
+# Client wall time against the allowlisted cachekit.io dev host, as JSONL.
 [[example]]
 name = "wall_time_probe"
 required-features = ["cachekitio", "macros"]
