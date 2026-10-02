@@ -211,6 +211,13 @@ pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// fred client options for [`RedisBackendBuilder::build`].
 ///
+/// TCP_NODELAY is on: fred leaves Nagle enabled by default, and on one
+/// multiplexed connection a command written while another is in flight then
+/// waits for the first ACK, so every overlapping op costs 2 RTT instead of 1.
+/// redis-py and ioredis set it too. The trade: same-host (loopback) Redis
+/// loses Nagle's batching, which lowers one connection's throughput ceiling at
+/// high concurrency.
+///
 /// The unresponsive-connection check is enabled only with a reconnect policy:
 /// fred closes a connection it deems unresponsive, and without a policy it is
 /// never re-established, so one stall past the threshold would leave the
@@ -221,6 +228,7 @@ pub(crate) fn fred_options(reconnects: bool) -> (PerformanceConfig, ConnectionCo
         ..Default::default()
     };
     let mut connection = ConnectionConfig::default();
+    connection.tcp.nodelay = Some(true);
     if reconnects {
         connection.unresponsive.max_timeout = Some(COMMAND_TIMEOUT);
     }
@@ -314,6 +322,14 @@ mod tests {
         for reconnects in [false, true] {
             let (perf, _) = fred_options(reconnects);
             assert_eq!(perf.default_command_timeout, COMMAND_TIMEOUT);
+        }
+    }
+
+    #[test]
+    fn tcp_nodelay_on_every_build() {
+        for reconnects in [false, true] {
+            let (_, connection) = fred_options(reconnects);
+            assert_eq!(connection.tcp.nodelay, Some(true));
         }
     }
 

@@ -284,7 +284,7 @@ let backend = CachekitIO::builder()
 
 ### Redis
 
-Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Each command times out after 5 s with `BackendErrorKind::Timeout`. A timed-out command may still run on the server: harmless for `get`/`set`/`delete`, and a timed-out lock acquire leaves the lock to expire on its own TTL. Requires the `redis` feature flag.
+Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Each command times out after 5 s with `BackendErrorKind::Timeout`. The connection sets `TCP_NODELAY` (as redis-py and ioredis do), so a command sent while another is in flight costs one round trip rather than two. The trade is per-connection throughput at high concurrency: with many ops in flight against a same-host or sub-0.25 ms-RTT server, Nagle's batching no longer coalesces them. A timed-out command may still run on the server: harmless for `get`/`set`/`delete`, and a timed-out lock acquire leaves the lock to expire on its own TTL. Requires the `redis` feature flag.
 
 ```toml
 cachekit-rs = { version = "0.8", features = ["redis"] }
