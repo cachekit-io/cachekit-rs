@@ -16,7 +16,7 @@ use wasm_bindgen_test::wasm_bindgen_test;
 
 /// The exact panic site: building session headers on wasm32.
 /// Reaching the asserts at all proves the clock (and uuid's js entropy) did
-/// not trap; the value asserts are AC-2 (non-zero, plausible epoch millis —
+/// not trap; the value asserts check non-zero, plausible epoch millis (the
 /// bounds mirror the native tests in src/session.rs, keep them in lockstep).
 #[wasm_bindgen_test]
 fn session_headers_valid_on_wasm32() {
