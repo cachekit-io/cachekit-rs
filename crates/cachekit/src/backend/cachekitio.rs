@@ -5,7 +5,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use zeroize::Zeroizing;
 
-use crate::backend::{encode_key, Backend, Freshness, HealthStatus, LockableBackend};
+use crate::backend::{
+    delete_succeeded, encode_key, Backend, Freshness, HealthStatus, LockableBackend,
+};
 use crate::error::{BackendError, BackendErrorKind};
 use crate::metrics::{metrics_headers, MetricsProvider};
 use crate::session::session_headers;
@@ -251,6 +253,8 @@ impl Backend for CachekitIO {
         }
     }
 
+    /// `true` on every successful delete, whether or not the key existed: the
+    /// server does not report existence on `DELETE`.
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
         let req = self.with_standard_headers(
             self.client
@@ -263,10 +267,10 @@ impl Backend for CachekitIO {
             .await
             .map_err(|e| reqwest_err_sanitized(e, self.api_key.as_str()))?;
 
-        match resp.status().as_u16() {
-            200 | 204 => Ok(true),
-            404 => Ok(false),
-            _ => Err(self.error_from_response(resp).await),
+        if delete_succeeded(resp.status().as_u16()) {
+            Ok(true)
+        } else {
+            Err(self.error_from_response(resp).await)
         }
     }
 

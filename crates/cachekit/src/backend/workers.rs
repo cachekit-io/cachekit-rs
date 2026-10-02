@@ -14,7 +14,9 @@ use zeroize::Zeroizing;
 use crate::backend::saas_wire::{
     LockAcquireRequest, LockAcquireResponse, RefreshTtlRequest, TtlResponse,
 };
-use crate::backend::{encode_key, Backend, HealthStatus, LockableBackend, TtlInspectable};
+use crate::backend::{
+    delete_succeeded, encode_key, Backend, HealthStatus, LockableBackend, TtlInspectable,
+};
 use crate::error::BackendError;
 use crate::metrics::{metrics_headers, MetricsProvider};
 use crate::session::session_headers;
@@ -224,13 +226,15 @@ impl Backend for WorkersCachekitIO {
         }
     }
 
+    /// `true` on every successful delete, whether or not the key existed: the
+    /// server does not report existence on `DELETE`.
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
         let mut resp = self.fetch("DELETE", &self.url(key)?, None, vec![]).await?;
 
-        match resp.status_code() {
-            200 | 204 => Ok(true),
-            404 => Ok(false),
-            _ => Err(self.error_from_response(resp).await),
+        if delete_succeeded(resp.status_code()) {
+            Ok(true)
+        } else {
+            Err(self.error_from_response(resp).await)
         }
     }
 

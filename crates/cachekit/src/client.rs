@@ -637,6 +637,10 @@ impl CacheKit {
 
     /// Delete `key` and return `true` if it existed.
     ///
+    /// `CachekitIO` and `WorkersCachekitIO` return `true` on every successful
+    /// delete, whether or not the key existed: the server does not report
+    /// existence on `DELETE`.
+    ///
     /// Invalidates the L1 entry regardless of the backend result.
     pub async fn delete(&self, key: &str) -> Result<bool, CachekitError> {
         let full_key = self.resolve_key(key)?;

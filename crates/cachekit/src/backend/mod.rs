@@ -79,6 +79,10 @@ pub trait Backend: Send + Sync {
     ) -> Result<(), BackendError>;
 
     /// Remove `key` and return `true` if it existed.
+    ///
+    /// `CachekitIO` and `WorkersCachekitIO` return `true` on every successful
+    /// delete, whether or not the key existed: the server does not report
+    /// existence on `DELETE`.
     async fn delete(&self, key: &str) -> Result<bool, BackendError>;
 
     /// Return `true` if `key` exists without fetching the value.
@@ -148,6 +152,10 @@ pub trait Backend {
     ) -> Result<(), BackendError>;
 
     /// Remove `key` and return `true` if it existed.
+    ///
+    /// `CachekitIO` and `WorkersCachekitIO` return `true` on every successful
+    /// delete, whether or not the key existed: the server does not report
+    /// existence on `DELETE`.
     async fn delete(&self, key: &str) -> Result<bool, BackendError>;
 
     /// Return `true` if `key` exists without fetching the value.
@@ -330,6 +338,16 @@ pub(crate) fn encode_key(key: &str) -> Result<std::borrow::Cow<'_, str>, Backend
     Ok(encoded)
 }
 
+/// Whether a `DELETE /v1/cache/{key}` status is a success. The server answers
+/// `200` whether or not the key existed and never `404` (`spec/saas-api.md`),
+/// so success carries no existence signal and every other status, `404`
+/// included, takes the caller's error path. Shared by the native and Workers
+/// backends so their mappings cannot drift.
+#[cfg(any(feature = "cachekitio", feature = "workers", test))]
+pub(crate) fn delete_succeeded(status: u16) -> bool {
+    matches!(status, 200 | 204)
+}
+
 // ── Feature-gated backend modules ─────────────────────────────────────────────
 
 /// JSON wire bodies for the SaaS lock/TTL endpoints. Compiled under `test`
@@ -491,6 +509,28 @@ mod encode_key_tests {
     fn near_misses_are_not_rejected() {
         for k in RS_NEAR_MISSES {
             assert!(encode_key(k).is_ok(), "near-miss key {k:?} must encode");
+        }
+    }
+}
+
+// ── delete_succeeded unit tests ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod delete_status_tests {
+    use super::delete_succeeded;
+
+    #[test]
+    fn delete_success_is_200_or_204() {
+        assert!(delete_succeeded(200));
+        assert!(delete_succeeded(204));
+    }
+
+    #[test]
+    fn delete_404_is_not_a_miss() {
+        // The server never answers DELETE with 404, so it is an error, not `Ok(false)`.
+        assert!(!delete_succeeded(404));
+        for status in [201, 400, 401, 403, 429, 500, 503] {
+            assert!(!delete_succeeded(status), "{status}");
         }
     }
 }
