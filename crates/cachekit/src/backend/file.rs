@@ -568,16 +568,25 @@ impl Backend for FileBackend {
             }
         };
 
-        let path = self.entry_path(key);
-        let swept = Arc::clone(&self.swept);
-        self.locked(stripe_of(&path), move || {
-            // Swapped here, not before the lock: a set cancelled while it
-            // waits for its stripe must not use up the sweep.
-            if !swept.swap(true, Ordering::Relaxed) {
-                if let Some(dir) = path.parent() {
-                    cleanup_temp_files(dir);
+        if !self.swept.load(Ordering::Relaxed) {
+            // No stripe: the sweep touches only temp files past the orphan
+            // threshold, never an entry, and one stripe could not fence the
+            // other stripes' writes anyway. Swapped inside the closure, so
+            // only a sweep that actually runs uses up the flag; once running,
+            // it finishes even if this set is cancelled.
+            let swept = Arc::clone(&self.swept);
+            let dir = self.cache_dir.clone();
+            run_blocking(move || {
+                if !swept.swap(true, Ordering::Relaxed) {
+                    cleanup_temp_files(&dir);
                 }
-            }
+                Ok(())
+            })
+            .await?;
+        }
+
+        let path = self.entry_path(key);
+        self.locked(stripe_of(&path), move || {
             write_entry(&path, build_header(expiry), &value)
         })
         .await
@@ -1080,19 +1089,24 @@ mod tests {
         assert!(!rewrite_expiry(&dir.path().join("nope"), new_expiry).expect("no error"));
     }
 
-    #[test]
-    fn temp_file_sweep_removes_stale_keeps_fresh() {
-        let dir = tempfile::tempdir().expect("tempdir");
-
-        let stale = dir.path().join("abc.tmp.123.456");
+    /// A `.tmp.` orphan two minutes old: past the sweep's 60 s threshold.
+    fn plant_stale_temp(dir: &Path) -> PathBuf {
+        let stale = dir.join("abc.tmp.123.456");
         fs::write(&stale, b"orphan").expect("write");
-        let two_minutes_ago = SystemTime::now() - Duration::from_secs(120);
         fs::File::options()
             .write(true)
             .open(&stale)
             .expect("open")
-            .set_modified(two_minutes_ago)
+            .set_modified(SystemTime::now() - Duration::from_secs(120))
             .expect("set mtime");
+        stale
+    }
+
+    #[test]
+    fn temp_file_sweep_removes_stale_keeps_fresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let stale = plant_stale_temp(dir.path());
 
         let fresh = dir.path().join("def.tmp.123.789");
         fs::write(&fresh, b"in flight").expect("write");
@@ -1121,14 +1135,7 @@ mod tests {
         };
         drop(build()); // creates the directory owner-only
 
-        let stale = cache_dir.join("abc.tmp.123.456");
-        fs::write(&stale, b"orphan").expect("write");
-        fs::File::options()
-            .write(true)
-            .open(&stale)
-            .expect("open")
-            .set_modified(SystemTime::now() - Duration::from_secs(120))
-            .expect("set mtime");
+        let stale = plant_stale_temp(&cache_dir);
 
         let backend = build();
         assert!(stale.exists(), "build must not scan the directory");
@@ -1145,6 +1152,37 @@ mod tests {
             backend.swept.load(Ordering::Relaxed),
             "clones share the flag"
         );
+    }
+
+    // A set parked on its stripe needs the blocking pool; `unsync` runs I/O inline.
+    #[cfg(not(feature = "unsync"))]
+    #[tokio::test]
+    async fn first_set_sweeps_without_waiting_for_its_stripe() {
+        // The sweep touches only temp files past the orphan threshold, never
+        // an entry, so it must neither wait for nor hold the key's stripe.
+        let (_dir, backend) = private_backend();
+        let stale = plant_stale_temp(backend.cache_dir());
+        let stripe = stripe_of(&backend.entry_path("k"));
+        let held = Arc::clone(&backend.stripes[stripe]).lock_owned().await;
+
+        let set = {
+            let b = backend.clone();
+            tokio::spawn(async move { b.set("k", b"v".to_vec(), None).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stale.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the sweep must not wait for the set's stripe");
+        assert!(
+            !set.is_finished(),
+            "the write itself still waits for its stripe"
+        );
+
+        drop(held);
+        set.await.expect("join").expect("set");
     }
 
     // ── Hardening ────────────────────────────────────────────────────────────
