@@ -385,7 +385,7 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 │  GET path:                                              │
 │  L1 fresh hit (~50ns) ──► return immediately            │
 │  L1 stale hit ──► return + background refresh (SWR)     │
-│  L1 miss ──► L2 backend ──► backfill L1 (30s cap)      │
+│  L1 miss ──► L2 backend ──► backfill L1 if fresh (≤30s) │
 │                                                         │
 │  SET path:                                              │
 │  write to L2 backend ──► write-through to L1            │
@@ -402,7 +402,7 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 | Behavior | Detail |
 |:---------|:-------|
 | **Write-through** | `set()` writes to L2 first, then L1 |
-| **Backfill on miss** | L2 hits populate L1 with a capped 30s TTL |
+| **Backfill on miss** | L2 hits populate L1 for at most 30 s. On cachekit.io a shorter `X-CacheKit-Fresh-For` bounds it further, and a hit labelled stale or with `Fresh-For: 0` is not backfilled at all, so the next read goes back to the server |
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
 | **Encrypted L1** | `SecureCache` stores ciphertext in L1 (never plaintext) |
 | **Evict on decrypt failure** | A `SecureCache` read that fails decryption drops the key's L1 copy and returns the error; the backend entry is kept, so the next read reaches the backend: a hit once the entry is replaced with ciphertext the client can decrypt, a miss once it expires or is deleted |
@@ -445,6 +445,11 @@ fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
   bounds staleness of L2-derived data, but SWR replaces its expiry cliff with
   a background refresh that restores the full write-path TTL. The configured
   ratio is never silently clamped; the window follows the entry.
+- **The server's freshness bound is a hard limit.** When cachekit.io sends a
+  shorter `X-CacheKit-Fresh-For`, the backfilled entry's TTL is that bound, so
+  SWR goes stale at ~`ratio × Fresh-For` and never serves the copy past it.
+  Stale-labelled reads are never backfilled, so there is nothing local to
+  serve; the server serves its own stale window.
 - **Refresh completion is version-guarded and same-key ordered.** Each L1
   stale read receives a mutation token. A concurrent explicit write or delete
   through that client or a clone invalidates the token, so an older origin

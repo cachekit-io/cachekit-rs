@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use crate::backend::{Backend, HealthStatus, LockableBackend};
+use crate::backend::{Backend, Freshness, HealthStatus, LockableBackend};
 use crate::client::SharedBackend;
 use crate::error::BackendError;
 use crate::random_unit;
@@ -731,6 +731,15 @@ impl ReliableBackend {
 impl Backend for ReliableBackend {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
         self.guarded(|| self.inner.get(key)).await
+    }
+
+    // Forwarded, not defaulted: the default would call `self.get` and drop
+    // the inner backend's freshness, unbounding the L1 backfill.
+    async fn get_with_freshness(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, Freshness)>, BackendError> {
+        self.guarded(|| self.inner.get_with_freshness(key)).await
     }
 
     async fn set(

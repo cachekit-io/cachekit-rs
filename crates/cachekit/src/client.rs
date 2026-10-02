@@ -4,6 +4,8 @@ use std::time::Duration;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::backend::Backend;
+#[cfg(feature = "l1")]
+use crate::backend::Freshness;
 use crate::error::CachekitError;
 use crate::metrics::{CacheCounters, L1Stats, ReadOutcome};
 use crate::serializer;
@@ -63,6 +65,8 @@ const MAX_KEY_BYTES: usize = 1024;
 
 /// Maximum TTL for L1 entries populated from L2 cache hits.
 /// Uses a short ceiling to limit staleness when the original TTL is unknown.
+/// A server `X-CacheKit-Fresh-For` bounds it further, and a stale read or a
+/// zero bound is not backfilled at all — see [`l1_backfill_ttl`].
 ///
 /// Reconciliation with stale-while-revalidate: a backfilled entry's SWR
 /// freshness window derives from this capped TTL (window = ratio × entry
@@ -74,6 +78,20 @@ const MAX_KEY_BYTES: usize = 1024;
 /// the caller's full TTL. Without SWR the entry simply hard-expires at the cap
 /// and the next read blocks on L2, as before.
 const L1_BACKFILL_TTL_SECS: u64 = 30;
+
+/// L1 lifetime for a backfill from an L2 hit, or `None` when the read must not
+/// be backfilled (`spec/saas-api.md` § Remaining Freshness). A stale label or a
+/// zero `Fresh-For` forbids it; a present `Fresh-For` is a hard bound under the
+/// 30 s cap, which SWR cannot outlive because moka drops the entry at its TTL.
+/// With no header the cap applies unchanged.
+#[cfg(feature = "l1")]
+fn l1_backfill_ttl(default_ttl: Duration, freshness: Freshness) -> Option<Duration> {
+    let cap = std::cmp::min(default_ttl, Duration::from_secs(L1_BACKFILL_TTL_SECS));
+    let ttl = freshness
+        .fresh_for
+        .map_or(cap, |fresh_for| cap.min(fresh_for));
+    (!freshness.is_stale && !ttl.is_zero()).then_some(ttl)
+}
 
 fn validate_key(key: &str) -> Result<(), CachekitError> {
     if key.is_empty() {
@@ -273,12 +291,11 @@ impl CacheKit {
         self.l1.as_ref().and_then(|l1| l1.get(full_key))
     }
 
-    /// Populate L1 from an L2 hit with capped TTL to limit staleness.
+    /// Populate L1 from an L2 hit, for no longer than [`l1_backfill_ttl`] allows.
     #[cfg(feature = "l1")]
-    fn l1_backfill(&self, full_key: &str, bytes: &[u8]) {
-        if let Some(ref l1) = self.l1 {
-            let l1_ttl = std::cmp::min(self.default_ttl, Duration::from_secs(L1_BACKFILL_TTL_SECS));
-            l1.set(full_key, bytes, l1_ttl);
+    fn l1_backfill(&self, full_key: &str, bytes: &[u8], freshness: Freshness) {
+        if let (Some(l1), Some(ttl)) = (&self.l1, l1_backfill_ttl(self.default_ttl, freshness)) {
+            l1.set(full_key, bytes, ttl);
         }
     }
 
@@ -534,10 +551,10 @@ impl CacheKit {
         }
 
         // L2 backend
-        let bytes = match self.backend.get(&full_key).await? {
-            Some(b) => {
+        let (bytes, freshness) = match self.backend.get_with_freshness(&full_key).await? {
+            Some(hit) => {
                 self.counters.record(ReadOutcome::L2Hit, &full_key);
-                b
+                hit
             }
             None => {
                 self.counters.record(ReadOutcome::Miss, &full_key);
@@ -547,9 +564,11 @@ impl CacheKit {
 
         self.check_payload_size(bytes.len())?;
 
-        // Populate L1 on L2 hit (capped TTL to limit staleness)
+        // Populate L1 on L2 hit, bounded by the cap and the server's freshness
         #[cfg(feature = "l1")]
-        self.l1_backfill(&full_key, &bytes);
+        self.l1_backfill(&full_key, &bytes, freshness);
+        #[cfg(not(feature = "l1"))]
+        let _ = freshness;
 
         Ok(Some(bytes))
     }
@@ -1309,5 +1328,62 @@ impl CacheKitBuilder {
             #[cfg(feature = "encryption")]
             encryption: self.encryption,
         })
+    }
+}
+
+#[cfg(all(test, feature = "l1"))]
+mod backfill_ttl_tests {
+    use std::time::Duration;
+
+    use super::l1_backfill_ttl;
+    use crate::backend::Freshness;
+
+    const DEFAULT_TTL: Duration = Duration::from_secs(300);
+
+    fn fresh_for(secs: u64) -> Freshness {
+        Freshness {
+            is_stale: false,
+            fresh_for: Some(Duration::from_secs(secs)),
+        }
+    }
+
+    /// (e) No header: today's `min(default_ttl, 30 s)`, unchanged.
+    #[test]
+    fn absent_header_keeps_the_30s_cap() {
+        let absent = Freshness::default();
+        assert_eq!(
+            l1_backfill_ttl(DEFAULT_TTL, absent),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            l1_backfill_ttl(Duration::from_secs(10), absent),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn fresh_for_bounds_but_never_lifts_the_cap() {
+        assert_eq!(
+            l1_backfill_ttl(DEFAULT_TTL, fresh_for(5)),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            l1_backfill_ttl(DEFAULT_TTL, fresh_for(3600)),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn stale_or_zero_forbids_the_backfill() {
+        assert_eq!(l1_backfill_ttl(DEFAULT_TTL, fresh_for(0)), None);
+        let stale = |fresh_for| Freshness {
+            is_stale: true,
+            fresh_for,
+        };
+        assert_eq!(l1_backfill_ttl(DEFAULT_TTL, stale(None)), None);
+        assert_eq!(
+            l1_backfill_ttl(DEFAULT_TTL, stale(Some(Duration::from_secs(60)))),
+            None
+        );
     }
 }
