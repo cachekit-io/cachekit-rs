@@ -15,7 +15,8 @@ use crate::backend::saas_wire::{
     LockAcquireRequest, LockAcquireResponse, RefreshTtlRequest, TtlResponse,
 };
 use crate::backend::{
-    delete_succeeded, encode_key, Backend, HealthStatus, LockableBackend, TtlInspectable,
+    delete_succeeded, encode_key, ttl_header, Backend, HealthStatus, LockableBackend,
+    TtlInspectable,
 };
 use crate::error::BackendError;
 use crate::metrics::{metrics_headers, MetricsProvider};
@@ -211,7 +212,7 @@ impl Backend for WorkersCachekitIO {
     ) -> Result<(), BackendError> {
         let mut headers = vec![("Content-Type", "application/octet-stream".to_owned())];
         if let Some(ttl) = ttl {
-            headers.push(("X-TTL", ttl.as_secs().to_string()));
+            headers.push(ttl_header(ttl));
         }
 
         let mut resp = self
