@@ -42,7 +42,7 @@
 |:--------|:-------:|:------------|
 | `cachekitio` | ✅ | HTTP backend for [api.cachekit.io](https://api.cachekit.io) via [reqwest](https://crates.io/crates/reqwest) + rustls |
 | `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core) |
-| `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka), with stale-while-revalidate (native) |
+| `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka), with stale-while-revalidate (native). Not supported on `wasm32-unknown-unknown` (compile error: no clock there) |
 | `reliability` | ✅ | Retry with backoff + jitter, circuit breaker, backpressure, distributed fill locks (native only) |
 | `redis` | ❌ | Redis backend via [fred](https://crates.io/crates/fred) (native only) |
 | `memcached` | ❌ | Memcached backend via [rust-memcache](https://crates.io/crates/memcache) (native only) |
@@ -72,6 +72,8 @@ cachekit-rs = { version = "0.8", default-features = false, features = ["workers"
 > - `workers` + `reliability` — retry/breaker timers need tokio `time`, unavailable in wasm32
 > - `workers` + `memcached` — Workers runtime has no TCP sockets
 > - `workers` + `file` — Workers runtime has no filesystem
+>
+> `l1` is also a compile error on `wasm32-unknown-unknown` with any feature set: `std::time::Instant` has no clock there, so the first L1 insert would panic. Build for that target with `default-features = false`; `wasm32-wasip1` keeps L1.
 
 ---
 
@@ -481,7 +483,7 @@ fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
 - **Refresh failures are absorbed**: the stale value keeps serving, a later
   stale read retries, and once the entry hard-expires the blocking path
   surfaces errors normally.
-- **Native only**: on wasm32 (`workers` excludes `l1`) and under `unsync`
+- **Native only**: on wasm32 (`l1` is refused on `wasm32-unknown-unknown`) and under `unsync`
   there is no SWR; the builder knobs don't exist there, so misuse is a
   compile error rather than a silent no-op. A sync function under
   `#[cachekit]` is likewise a clear compile-time error.

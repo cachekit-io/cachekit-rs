@@ -41,8 +41,9 @@ workers = ["dep:worker", "dep:js-sys", "dep:getrandom", "dep:serde_json"]
 # and a pinned version in prose is the only part that rots.
 encryption = ["cachekit-core/encryption"]
 # tokio/rt provides Handle::try_current + spawn for the L1 stale-while-
-# revalidate background refresh (native only — `workers`+`l1` is a compile
-# error, so this never reaches wasm32).
+# revalidate background refresh (native only; the spawn is cfg'd off wasm32).
+# L1 itself is a compile error on wasm32-unknown-unknown: std::time::Instant
+# has no clock there, so the first insert would panic. wasm32-wasip1 keeps L1.
 l1 = ["dep:moka", "tokio/rt"]
 macros = ["dep:cachekit-macros"]
 # Retry with backoff + circuit breaker around backend ops, and cross-process
