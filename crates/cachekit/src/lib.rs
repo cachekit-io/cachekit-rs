@@ -154,17 +154,34 @@ pub use reliability::{
 
 // ── Shared jitter source ─────────────────────────────────────────────────────
 
-/// Uniform random in `[0, 1)`. uuid v4 is the crate's existing entropy source
-/// (getrandom-backed); jitter needs decorrelation across clients, not crypto
-/// quality — 53 bits is plenty. Used by retry backoff (`reliability`) and the
-/// L1 SWR freshness threshold at entry insertion (`l1`).
+/// Uniform random in `[0, 1)`. Used by retry backoff (`reliability`) and the
+/// L1 SWR freshness threshold at entry insertion (`l1`). Jitter needs
+/// decorrelation across clients, not crypto quality, so this is a per-thread
+/// SplitMix64 seeded once from std's `RandomState` (OS entropy per process,
+/// a fresh key per thread) instead of a getrandom syscall per call; 53 bits
+/// is plenty. Native only: `workers` excludes both `l1` and `reliability`,
+/// and on wasm32 `RandomState` would carry no entropy.
 #[cfg(any(
     feature = "l1",
     all(feature = "reliability", not(target_arch = "wasm32"))
 ))]
 pub(crate) fn random_unit() -> f64 {
-    let bits = uuid::Uuid::new_v4().as_u128() & ((1u128 << 53) - 1);
-    (bits as f64) / ((1u64 << 53) as f64)
+    use std::cell::Cell;
+    use std::hash::{BuildHasher, Hasher};
+
+    thread_local! {
+        static STATE: Cell<u64> =
+            Cell::new(std::collections::hash_map::RandomState::new().build_hasher().finish());
+    }
+    let mut z = STATE.with(|state| {
+        let next = state.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+        state.set(next);
+        next
+    });
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    ((z >> 11) as f64) / ((1u64 << 53) as f64)
 }
 
 // ── SWR background-refresh spawn (macro plumbing) ───────────────────────────
@@ -211,4 +228,37 @@ pub mod prelude {
 
     #[cfg(feature = "macros")]
     pub use crate::cachekit;
+}
+
+#[cfg(all(
+    test,
+    any(
+        feature = "l1",
+        all(feature = "reliability", not(target_arch = "wasm32"))
+    )
+))]
+mod random_unit_tests {
+    use super::random_unit;
+
+    #[test]
+    fn stays_in_unit_interval_and_spreads() {
+        let draws: Vec<f64> = (0..10_000).map(|_| random_unit()).collect();
+        assert!(draws.iter().all(|x| (0.0..1.0).contains(x)));
+        let mean = draws.iter().sum::<f64>() / draws.len() as f64;
+        assert!((mean - 0.5).abs() < 0.02, "mean {mean}");
+        let low = draws.iter().filter(|x| **x < 0.1).count();
+        let high = draws.iter().filter(|x| **x >= 0.9).count();
+        assert!(low > 800 && high > 800, "tails {low} / {high}");
+    }
+
+    /// Each thread seeds from its own `RandomState` key, so two threads (and
+    /// two processes) do not replay one sequence.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn threads_draw_different_sequences() {
+        let draw = || (0..4).map(|_| random_unit().to_bits()).collect::<Vec<_>>();
+        let a = std::thread::spawn(draw).join().expect("thread a");
+        let b = std::thread::spawn(draw).join().expect("thread b");
+        assert_ne!(a, b);
+    }
 }

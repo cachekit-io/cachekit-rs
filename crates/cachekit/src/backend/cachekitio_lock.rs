@@ -22,12 +22,7 @@ impl CachekitIO {
         lock_id: &str,
     ) -> Result<reqwest::RequestBuilder, BackendError> {
         let url = self.lock_url(key)?;
-        Ok(self.with_standard_headers(
-            self.client()
-                .delete(&url)
-                .bearer_auth(self.api_key_str())
-                .header(LOCK_ID_HEADER, lock_id),
-        ))
+        Ok(self.with_standard_headers(self.client().delete(&url).header(LOCK_ID_HEADER, lock_id)))
     }
 }
 
@@ -62,7 +57,6 @@ impl LockableBackend for CachekitIO {
         let req = self.with_standard_headers(
             self.client()
                 .post(&url)
-                .bearer_auth(self.api_key_str())
                 .header("Content-Type", "application/json")
                 .body(body),
         );

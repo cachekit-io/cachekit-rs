@@ -27,8 +27,7 @@ impl TtlInspectable for CachekitIO {
     async fn ttl(&self, key: &str) -> Result<Option<Duration>, BackendError> {
         let url = self.ttl_url(key)?;
 
-        let req =
-            self.with_standard_headers(self.client().get(&url).bearer_auth(self.api_key_str()));
+        let req = self.with_standard_headers(self.client().get(&url));
 
         let resp = req
             .send()
@@ -64,7 +63,6 @@ impl TtlInspectable for CachekitIO {
         let req = self.with_standard_headers(
             self.client()
                 .patch(&url)
-                .bearer_auth(self.api_key_str())
                 .header("Content-Type", "application/json")
                 .body(body),
         );
