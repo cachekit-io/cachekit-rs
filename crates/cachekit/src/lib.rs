@@ -158,11 +158,12 @@ pub use reliability::{
 /// L1 SWR freshness threshold at entry insertion (`l1`). Jitter needs
 /// decorrelation across clients, not crypto quality, so this is a per-thread
 /// SplitMix64 seeded from std's `RandomState` instead of a getrandom syscall
-/// per call; 53 bits is plenty. Native only: `workers` excludes both `l1` and
-/// `reliability`, and on wasm32 `RandomState` would carry no entropy.
-#[cfg(any(
-    feature = "l1",
-    all(feature = "reliability", not(target_arch = "wasm32"))
+/// per call; 53 bits is plenty. Native only: wasm32 has no process ids
+/// (`std::process::id()` panics there), and `RandomState` carries no entropy
+/// on wasm32-unknown-unknown.
+#[cfg(all(
+    any(feature = "l1", feature = "reliability"),
+    not(target_arch = "wasm32")
 ))]
 pub(crate) fn random_unit() -> f64 {
     thread_local! {
@@ -172,10 +173,18 @@ pub(crate) fn random_unit() -> f64 {
     ((z >> 11) as f64) / ((1u64 << 53) as f64)
 }
 
+/// wasm32 variant (`l1` without `workers`, e.g. on WASI): one host-RNG draw per
+/// call through UUID v4. Nothing forks there, so the per-call draw is safe.
+#[cfg(all(feature = "l1", target_arch = "wasm32"))]
+pub(crate) fn random_unit() -> f64 {
+    let bits = uuid::Uuid::new_v4().as_u128() & ((1u128 << 53) - 1);
+    (bits as f64) / ((1u64 << 53) as f64)
+}
+
 /// The owning process id and SplitMix64 state behind [`random_unit`].
-#[cfg(any(
-    feature = "l1",
-    all(feature = "reliability", not(target_arch = "wasm32"))
+#[cfg(all(
+    any(feature = "l1", feature = "reliability"),
+    not(target_arch = "wasm32")
 ))]
 type JitterState = std::cell::Cell<Option<(u32, u64)>>;
 
@@ -185,9 +194,9 @@ type JitterState = std::cell::Cell<Option<(u32, u64)>>;
 /// parent's sequence and synchronise refreshes and backoffs. The pid is hashed
 /// into the seed because siblings forked from one parent also inherit the same
 /// `RandomState` keys.
-#[cfg(any(
-    feature = "l1",
-    all(feature = "reliability", not(target_arch = "wasm32"))
+#[cfg(all(
+    any(feature = "l1", feature = "reliability"),
+    not(target_arch = "wasm32")
 ))]
 fn next_jitter(state: &JitterState, pid: u32) -> u64 {
     use std::hash::{BuildHasher, Hasher};
@@ -256,10 +265,8 @@ pub mod prelude {
 
 #[cfg(all(
     test,
-    any(
-        feature = "l1",
-        all(feature = "reliability", not(target_arch = "wasm32"))
-    )
+    any(feature = "l1", feature = "reliability"),
+    not(target_arch = "wasm32")
 ))]
 mod random_unit_tests {
     use super::{next_jitter, random_unit, JitterState};
