@@ -27,7 +27,7 @@ build:
 build-wasm:
 	$(CARGO) build --target wasm32-unknown-unknown --no-default-features --features workers,cachekitio,encryption
 
-# wasm32 runtime tests (LAB-1079) — same invocation as the CI `wasm` job.
+# wasm32 runtime tests — same invocation as the CI `wasm` job.
 # Needs a wasm-bindgen-test-runner binary on PATH whose version matches the
 # wasm-bindgen pin in Cargo.lock, plus Node.
 test-wasm:
