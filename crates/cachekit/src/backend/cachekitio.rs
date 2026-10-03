@@ -3,13 +3,15 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use reqwest::header::{HeaderName, HeaderValue, InvalidHeaderValue};
 use zeroize::Zeroizing;
 
 use crate::backend::{
     delete_succeeded, encode_key, ttl_header, Backend, Freshness, HealthStatus, LockableBackend,
 };
 use crate::error::{BackendError, BackendErrorKind};
-use crate::metrics::{metrics_headers, MetricsProvider};
+use crate::metrics::{metrics_headers_named, MetricsProvider, METRICS_HEADER_NAMES};
 use crate::session::session_headers;
 use crate::url_validator::validate_cachekitio_url;
 
@@ -20,6 +22,13 @@ pub struct CachekitIO {
     client: reqwest::Client,
     api_key: Zeroizing<String>,
     api_url: String,
+    /// `Authorization` and the session headers, built once so no request
+    /// re-formats or re-parses them. The bearer value is marked sensitive, so
+    /// a request's `Debug` output redacts it, and its buffer is wiped when the
+    /// last clone drops.
+    static_headers: [(HeaderName, HeaderValue); 3],
+    /// The telemetry header names, parsed once, in [`METRICS_HEADER_NAMES`] order.
+    metrics_header_names: [HeaderName; 5],
     /// Source of the `X-CacheKit-*` telemetry headers. Set once: by the
     /// builder when the user supplies one, otherwise by the client at build
     /// time via [`Backend::attach_metrics`] (first writer wins).
@@ -52,7 +61,7 @@ impl CachekitIO {
         &self.client
     }
 
-    /// Return the API key as a string slice (for bearer auth in sibling modules).
+    /// Return the API key as a string slice (for error sanitizing in sibling modules).
     pub(crate) fn api_key_str(&self) -> &str {
         self.api_key.as_str()
     }
@@ -88,15 +97,17 @@ impl CachekitIO {
         format!("{}/v1/cache/health", self.api_url)
     }
 
-    /// Apply standard session and metrics headers to a request builder.
+    /// Apply the bearer token, session and metrics headers to a request builder.
     pub(crate) fn with_standard_headers(
         &self,
         mut req: reqwest::RequestBuilder,
     ) -> reqwest::RequestBuilder {
-        for (name, value) in session_headers() {
-            req = req.header(name, value);
+        for (name, value) in &self.static_headers {
+            req = req.header(name.clone(), value.clone());
         }
-        for (name, value) in metrics_headers(self.metrics_provider.get()) {
+        for (name, value) in
+            metrics_headers_named(self.metrics_provider.get(), &self.metrics_header_names)
+        {
             req = req.header(name, value);
         }
         req
@@ -113,7 +124,6 @@ impl CachekitIO {
         let mut req = self
             .client
             .put(self.url(key)?)
-            .bearer_auth(self.api_key.as_str())
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(value);
 
@@ -219,11 +229,7 @@ impl Backend for CachekitIO {
         &self,
         key: &str,
     ) -> Result<Option<(Vec<u8>, Freshness)>, BackendError> {
-        let req = self.with_standard_headers(
-            self.client
-                .get(self.url(key)?)
-                .bearer_auth(self.api_key.as_str()),
-        );
+        let req = self.with_standard_headers(self.client.get(self.url(key)?));
 
         let resp = req
             .send()
@@ -237,7 +243,7 @@ impl Backend for CachekitIO {
                     .bytes()
                     .await
                     .map_err(|e| reqwest_err_sanitized(e, self.api_key.as_str()))?;
-                Ok(Some((bytes.to_vec(), freshness)))
+                Ok(Some((Vec::from(bytes), freshness)))
             }
             404 => Ok(None),
             _ => Err(self.error_from_response(resp).await),
@@ -267,11 +273,7 @@ impl Backend for CachekitIO {
     /// `true` on every successful delete, whether or not the key existed: the
     /// server does not report existence on `DELETE`.
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
-        let req = self.with_standard_headers(
-            self.client
-                .delete(self.url(key)?)
-                .bearer_auth(self.api_key.as_str()),
-        );
+        let req = self.with_standard_headers(self.client.delete(self.url(key)?));
 
         let resp = req
             .send()
@@ -286,11 +288,7 @@ impl Backend for CachekitIO {
     }
 
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
-        let req = self.with_standard_headers(
-            self.client
-                .head(self.url(key)?)
-                .bearer_auth(self.api_key.as_str()),
-        );
+        let req = self.with_standard_headers(self.client.head(self.url(key)?));
 
         let resp = req
             .send()
@@ -307,11 +305,7 @@ impl Backend for CachekitIO {
     async fn health(&self) -> Result<HealthStatus, BackendError> {
         let start = std::time::Instant::now();
 
-        let req = self.with_standard_headers(
-            self.client
-                .get(self.health_url())
-                .bearer_auth(self.api_key.as_str()),
-        );
+        let req = self.with_standard_headers(self.client.get(self.health_url()));
 
         let resp = req
             .send()
@@ -338,6 +332,63 @@ impl Backend for CachekitIO {
     fn as_lockable(&self) -> Option<&dyn LockableBackend> {
         Some(self)
     }
+}
+
+// ── Prebuilt headers ──────────────────────────────────────────────────────────
+
+/// Build the per-client constant headers: `Authorization: Bearer <key>`,
+/// marked sensitive as `bearer_auth` would, and the process's session headers.
+/// The bearer outlives every request and each request clones it, so its buffer
+/// is a zeroising owner those clones share: the last drop wipes the key.
+///
+/// # Errors
+///
+/// [`CachekitError::Config`](crate::error::CachekitError::Config) when the key
+/// holds bytes an HTTP header cannot carry. The message never echoes the key.
+fn static_headers(
+    api_key: &str,
+) -> Result<[(HeaderName, HeaderValue); 3], crate::error::CachekitError> {
+    use crate::error::CachekitError;
+
+    let mut bearer = Zeroizing::new(Vec::with_capacity("Bearer ".len() + api_key.len()));
+    bearer.extend_from_slice(b"Bearer ");
+    bearer.extend_from_slice(api_key.as_bytes());
+    let mut auth = header_over(bearer).map_err(|_| {
+        CachekitError::Config("api_key holds characters an HTTP header cannot carry".to_string())
+    })?;
+    auth.set_sensitive(true);
+
+    let [(id_name, id), (start_name, start)] = session_headers();
+    let header = |name: &str, value: &str| {
+        Ok::<_, CachekitError>((
+            HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| CachekitError::Config(format!("header name {name}: {e}")))?,
+            HeaderValue::from_str(value)
+                .map_err(|e| CachekitError::Config(format!("header {name}: {e}")))?,
+        ))
+    };
+    Ok([
+        (reqwest::header::AUTHORIZATION, auth),
+        header(id_name, id)?,
+        header(start_name, start)?,
+    ])
+}
+
+/// A header value over `owner`'s buffer, not a copy of it: clones share the
+/// buffer, and `owner` drops with the last of them.
+fn header_over<T: AsRef<[u8]> + Send + 'static>(
+    owner: T,
+) -> Result<HeaderValue, InvalidHeaderValue> {
+    HeaderValue::from_maybe_shared(Bytes::from_owner(owner))
+}
+
+/// Parse [`METRICS_HEADER_NAMES`] once per client.
+fn metrics_header_names() -> Result<[HeaderName; 5], crate::error::CachekitError> {
+    let [a, b, c, d, e] = METRICS_HEADER_NAMES.map(|name| {
+        HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| crate::error::CachekitError::Config(format!("header name {name}: {e}")))
+    });
+    Ok([a?, b?, c?, d?, e?])
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
@@ -424,7 +475,8 @@ impl CachekitIOBuilder {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - `api_key` was not set.
+    /// - `api_key` was not set, or holds bytes an HTTP header cannot carry
+    ///   (a control character such as a newline).
     /// - the resolved URL scheme is not `https`.
     /// - the URL hostname is not permitted (see [`validate_cachekitio_url`]).
     pub fn build(self) -> Result<CachekitIO, crate::error::CachekitError> {
@@ -448,10 +500,15 @@ impl CachekitIOBuilder {
         let client = http_client()
             .map_err(|e| CachekitError::Config(format!("failed to build HTTP client: {e}")))?;
 
+        let static_headers = static_headers(&api_key)?;
+        let metrics_header_names = metrics_header_names()?;
+
         Ok(CachekitIO {
             client,
             api_key,
             api_url,
+            static_headers,
+            metrics_header_names,
             metrics_provider: self
                 .metrics_provider
                 .map_or_else(OnceLock::new, OnceLock::from),
@@ -775,6 +832,128 @@ mod put_ttl_header_tests {
         let req = put(None);
         assert!(req.headers().get("X-CacheKit-TTL").is_none());
         assert!(req.headers().get("X-TTL").is_none());
+    }
+}
+
+// ── Prebuilt header tests ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::expect_used)] // test-only: a builder failure on a fixture should panic loudly
+mod prebuilt_header_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use super::{header_over, CachekitIO};
+    use crate::metrics::{metrics_headers, L1Stats, MetricsProvider};
+    use crate::session::session_headers;
+
+    const KEY: &str = "ck_live_prebuilt_secret";
+
+    fn put(provider: Option<MetricsProvider>) -> reqwest::Request {
+        let mut builder = CachekitIO::builder().api_key(KEY);
+        if let Some(provider) = provider {
+            builder = builder.metrics_provider(provider);
+        }
+        builder
+            .build()
+            .expect("builder succeeds")
+            .put_request("k", b"v".to_vec(), None)
+            .expect("key encodes")
+            .build()
+            .expect("request builds")
+    }
+
+    #[test]
+    fn bearer_is_sent_and_redacted_from_debug() {
+        let req = put(None);
+        let auth = req
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .expect("authorization header");
+        assert_eq!(auth.as_bytes(), format!("Bearer {KEY}").as_bytes());
+        assert!(auth.is_sensitive(), "prebuilt bearer must be sensitive");
+        let debug = format!("{req:?}");
+        assert!(!debug.contains(KEY), "api key leaked into Debug: {debug}");
+    }
+
+    /// The bearer's zeroising owner is the header's buffer, not a copy of it:
+    /// clones share it, and it drops (wiping the key) only with the last one.
+    #[test]
+    fn header_clones_share_the_owner_until_the_last_drops() {
+        struct Owner(Vec<u8>, Arc<AtomicBool>);
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let header = header_over(Owner(b"Bearer k".to_vec(), Arc::clone(&dropped))).expect("valid");
+        let clone = header.clone();
+        drop(header);
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "owner dropped while a clone lives"
+        );
+        assert_eq!(clone.as_bytes(), b"Bearer k");
+        drop(clone);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "owner outlived its last clone"
+        );
+    }
+
+    #[test]
+    fn a_key_no_header_can_carry_fails_build_without_echoing_it() {
+        let err = CachekitIO::builder()
+            .api_key("ck_bad\nkey")
+            .build()
+            .expect_err("newline in key");
+        assert!(!err.to_string().contains("ck_bad"), "{err}");
+    }
+
+    /// The prebuilt headers carry the same names and values the string
+    /// builders produce (header names compare case-insensitively).
+    #[test]
+    fn session_and_metrics_headers_match_their_string_builders() {
+        let provider: MetricsProvider = Arc::new(|| {
+            Some(L1Stats {
+                l1_hits: 3,
+                l2_hits: 2,
+                misses: 5,
+                l1_enabled: true,
+            })
+        });
+        let req = put(Some(provider.clone()));
+        let expected = session_headers()
+            .into_iter()
+            .map(|(n, v)| (n, v.to_string()))
+            .chain(metrics_headers(Some(&provider)));
+        let mut count = 0;
+        for (name, value) in expected {
+            let got = req.headers().get_all(name).iter().collect::<Vec<_>>();
+            assert_eq!(got.len(), 1, "{name} sent {} times", got.len());
+            assert_eq!(got[0].as_bytes(), value.as_bytes(), "{name}");
+            count += 1;
+        }
+        assert_eq!(count, 7);
+    }
+
+    #[test]
+    fn disabled_metrics_send_only_the_status_header() {
+        let req = put(None);
+        assert_eq!(
+            req.headers()
+                .get("X-CacheKit-L1-Status")
+                .map(|v| v.as_bytes()),
+            Some(&b"disabled"[..])
+        );
+        assert!(req.headers().get("X-CacheKit-L1-Hits").is_none());
     }
 }
 

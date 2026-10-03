@@ -48,9 +48,31 @@ impl L1Stats {
 /// Thread-safe closure that produces an optional [`L1Stats`] snapshot.
 pub type MetricsProvider = Arc<dyn Fn() -> Option<L1Stats> + Send + Sync>;
 
+/// Names of the `X-CacheKit-*` telemetry headers, in the order
+/// [`metrics_headers`] emits them: L1 status, L1 hits, L2 hits, misses, L1 hit
+/// rate.
+pub(crate) const METRICS_HEADER_NAMES: [&str; 5] = [
+    "X-CacheKit-L1-Status",
+    "X-CacheKit-L1-Hits",
+    "X-CacheKit-L2-Hits",
+    "X-CacheKit-Misses",
+    "X-CacheKit-L1-Hit-Rate",
+];
+
 /// Build `X-CacheKit-*` HTTP headers from the current L1 stats provider.
 pub fn metrics_headers(provider: Option<&MetricsProvider>) -> Vec<(&'static str, String)> {
-    let disabled = vec![("X-CacheKit-L1-Status", "disabled".to_string())];
+    metrics_headers_named(provider, &METRICS_HEADER_NAMES)
+}
+
+/// [`metrics_headers`] with the names supplied in [`METRICS_HEADER_NAMES`]
+/// order, so the native CachekitIO backend can pass prebuilt `HeaderName`s
+/// instead of having reqwest parse each name on every request.
+pub(crate) fn metrics_headers_named<N: Clone>(
+    provider: Option<&MetricsProvider>,
+    names: &[N; 5],
+) -> Vec<(N, String)> {
+    let [status, l1_hits, l2_hits, misses, hit_rate] = names.clone();
+    let disabled = vec![(status.clone(), "disabled".to_string())];
 
     let provider = match provider {
         Some(p) => p,
@@ -72,14 +94,11 @@ pub fn metrics_headers(provider: Option<&MetricsProvider>) -> Vec<(&'static str,
         // Metrics Headers"). Like the Python and TypeScript SDKs we report the
         // aggregate `miss` whenever L1 is on — per-request classification is
         // not something an L2 request can know about itself.
-        ("X-CacheKit-L1-Status", "miss".to_string()),
-        ("X-CacheKit-L1-Hits", stats.l1_hits.to_string()),
-        ("X-CacheKit-L2-Hits", stats.l2_hits.to_string()),
-        ("X-CacheKit-Misses", stats.misses.to_string()),
-        (
-            "X-CacheKit-L1-Hit-Rate",
-            format!("{:.3}", stats.l1_hit_rate()),
-        ),
+        (status, "miss".to_string()),
+        (l1_hits, stats.l1_hits.to_string()),
+        (l2_hits, stats.l2_hits.to_string()),
+        (misses, stats.misses.to_string()),
+        (hit_rate, format!("{:.3}", stats.l1_hit_rate())),
     ]
 }
 

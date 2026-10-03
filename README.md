@@ -472,8 +472,9 @@ fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
   layer. The guard is intentionally process-local; cross-instance invalidation
   is outside SWR's serving-policy scope.
 - **Jitter is fixed per entry.** The ±10% threshold jitter is drawn when an
-  entry is inserted, not on every hit; hot L1 reads do not perform entropy
-  work and the entry's freshness boundary stays stable for its lifetime.
+  entry is inserted, not on every hit, from a per-thread generator seeded once
+  from OS entropy, so neither hot L1 reads nor inserts make an entropy syscall,
+  and the entry's freshness boundary stays stable for its lifetime.
 - **The background refresh needs a tokio runtime** (`Handle::try_current`).
   On other executors the stale value is still served and the refresh is
   skipped — behaviourally SWR-off, never a panic.
