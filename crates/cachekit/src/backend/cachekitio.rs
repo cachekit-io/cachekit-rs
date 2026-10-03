@@ -355,9 +355,10 @@ const USER_AGENT: &str = concat!("cachekit-rs/", env!("CARGO_PKG_VERSION"));
 #[cfg(not(target_arch = "wasm32"))]
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(390);
 
-/// The HTTP client every native [`CachekitIO`] uses.
+/// The settings behind every native [`CachekitIO`] client, unbuilt so tests can
+/// add `.no_proxy()` and reach a loopback stub whatever the proxy env says.
 #[cfg(not(target_arch = "wasm32"))]
-fn http_client() -> reqwest::Result<reqwest::Client> {
+fn http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .use_rustls_tls()
         .user_agent(USER_AGENT)
@@ -365,7 +366,12 @@ fn http_client() -> reqwest::Result<reqwest::Client> {
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-        .build()
+}
+
+/// The HTTP client every native [`CachekitIO`] uses.
+#[cfg(not(target_arch = "wasm32"))]
+fn http_client() -> reqwest::Result<reqwest::Client> {
+    http_client_builder().build()
 }
 
 /// wasm32: the platform's `fetch` owns pooling and timeouts; no User-Agent is set.
@@ -782,7 +788,17 @@ mod http_client_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use super::http_client;
+    use super::http_client_builder;
+
+    /// The production client minus the system proxy: an `HTTP_PROXY` or
+    /// `ALL_PROXY` that does not exempt loopback would otherwise take the
+    /// stub's requests.
+    fn client() -> reqwest::Client {
+        http_client_builder()
+            .no_proxy()
+            .build()
+            .expect("client builds")
+    }
 
     /// A keep-alive HTTP/1.1 stub on loopback: answers every request `200`,
     /// records each request's header lines, and counts accepted connections.
@@ -837,7 +853,7 @@ mod http_client_tests {
     /// tokio clock reqwest's pool reads.
     async fn connections_after_idle(idle: Duration) -> usize {
         let stub = stub();
-        let client = http_client().expect("client builds");
+        let client = client();
         client.get(&stub.url).send().await.expect("first GET");
         tokio::time::pause();
         tokio::time::advance(idle).await;
@@ -850,12 +866,7 @@ mod http_client_tests {
     #[tokio::test]
     async fn sends_cachekit_rs_user_agent() {
         let stub = stub();
-        http_client()
-            .expect("client builds")
-            .get(&stub.url)
-            .send()
-            .await
-            .expect("GET");
+        client().get(&stub.url).send().await.expect("GET");
         let want = format!("user-agent: cachekit-rs/{}", env!("CARGO_PKG_VERSION"));
         let requests = stub.requests.lock().expect("lock");
         assert!(
