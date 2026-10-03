@@ -342,6 +342,44 @@ impl Backend for CachekitIO {
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
+/// `User-Agent` on every native CachekitIO request, so the service and its edge
+/// can tell this SDK and version apart from other HTTP clients.
+#[cfg(not(target_arch = "wasm32"))]
+const USER_AGENT: &str = concat!("cachekit-rs/", env!("CARGO_PKG_VERSION"));
+
+/// How long an idle pooled connection is kept for reuse. Cloudflare closes an
+/// idle client HTTP/1.1 connection after 400 s, not configurable; reqwest's
+/// 90 s default dropped connections the edge would still serve, so a request
+/// after a 90-390 s gap paid DNS, TCP and TLS again. 390 s leaves a 10 s
+/// margin, and reqwest's 15 s TCP keepalive keeps NAT mappings alive meanwhile.
+#[cfg(not(target_arch = "wasm32"))]
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(390);
+
+/// The settings behind every native [`CachekitIO`] client, unbuilt so tests can
+/// add `.no_proxy()` and reach a loopback stub whatever the proxy env says.
+#[cfg(not(target_arch = "wasm32"))]
+fn http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+}
+
+/// The HTTP client every native [`CachekitIO`] uses.
+#[cfg(not(target_arch = "wasm32"))]
+fn http_client() -> reqwest::Result<reqwest::Client> {
+    http_client_builder().build()
+}
+
+/// wasm32: the platform's `fetch` owns pooling and timeouts; no User-Agent is set.
+#[cfg(target_arch = "wasm32")]
+fn http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder().build()
+}
+
 /// Builder for [`CachekitIO`].
 #[derive(Default)]
 #[must_use]
@@ -407,17 +445,7 @@ impl CachekitIOBuilder {
         // Trim trailing slash once so url()/health_url() don't repeat it per-request.
         let api_url = api_url.trim_end_matches('/').to_string();
 
-        let client = reqwest::Client::builder();
-
-        #[cfg(not(target_arch = "wasm32"))]
-        let client = client
-            .use_rustls_tls()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10));
-
-        let client = client
-            .build()
+        let client = http_client()
             .map_err(|e| CachekitError::Config(format!("failed to build HTTP client: {e}")))?;
 
         Ok(CachekitIO {
@@ -747,5 +775,114 @@ mod put_ttl_header_tests {
         let req = put(None);
         assert!(req.headers().get("X-CacheKit-TTL").is_none());
         assert!(req.headers().get("X-TTL").is_none());
+    }
+}
+
+// ── HTTP client settings tests ────────────────────────────────────────────────
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::expect_used)] // test-only: a stub-server failure should panic loudly
+mod http_client_tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::http_client_builder;
+
+    /// The production client minus the system proxy: an `HTTP_PROXY` or
+    /// `ALL_PROXY` that does not exempt loopback would otherwise take the
+    /// stub's requests.
+    fn client() -> reqwest::Client {
+        http_client_builder()
+            .no_proxy()
+            .build()
+            .expect("client builds")
+    }
+
+    /// A keep-alive HTTP/1.1 stub on loopback: answers every request `200`,
+    /// records each request's header lines, and counts accepted connections.
+    struct Stub {
+        url: String,
+        connections: Arc<Mutex<usize>>,
+        requests: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    fn stub() -> Stub {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let url = format!("http://{}/", listener.local_addr().expect("addr"));
+        let connections = Arc::new(Mutex::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (conns, reqs) = (connections.clone(), requests.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                *conns.lock().expect("lock") += 1;
+                let reqs = reqs.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                    loop {
+                        let mut head = Vec::new();
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                            head.push(line.trim_end().to_owned());
+                        }
+                        reqs.lock().expect("lock").push(head);
+                        let ok = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+                        if stream.write_all(ok).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Stub {
+            url,
+            connections,
+            requests,
+        }
+    }
+
+    /// Connections the stub accepted for two GETs `idle` apart, on the
+    /// tokio clock reqwest's pool reads.
+    async fn connections_after_idle(idle: Duration) -> usize {
+        let stub = stub();
+        let client = client();
+        client.get(&stub.url).send().await.expect("first GET");
+        tokio::time::pause();
+        tokio::time::advance(idle).await;
+        tokio::time::resume();
+        client.get(&stub.url).send().await.expect("second GET");
+        let n = *stub.connections.lock().expect("lock");
+        n
+    }
+
+    #[tokio::test]
+    async fn sends_cachekit_rs_user_agent() {
+        let stub = stub();
+        client().get(&stub.url).send().await.expect("GET");
+        let want = format!("user-agent: cachekit-rs/{}", env!("CARGO_PKG_VERSION"));
+        let requests = stub.requests.lock().expect("lock");
+        assert!(
+            requests[0].iter().any(|h| h.eq_ignore_ascii_case(&want)),
+            "no `{want}` in {:?}",
+            requests[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn reuses_a_connection_idle_389_s() {
+        assert_eq!(connections_after_idle(Duration::from_secs(389)).await, 1);
+    }
+
+    #[tokio::test]
+    async fn redials_a_connection_idle_past_390_s() {
+        assert_eq!(connections_after_idle(Duration::from_secs(391)).await, 2);
     }
 }
