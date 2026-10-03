@@ -84,7 +84,7 @@ jobs:
       # holds CARGO_REGISTRY_TOKEN and only runs on a release (a handful of
       # times a year), so a third-party action buys negligible build-time
       # savings against a real increase in that secret's trust surface.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # On dispatch, build and publish the tag's content — never main HEAD.
           # inputs.tag is empty on push events, so github.sha keeps the default
