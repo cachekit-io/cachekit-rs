@@ -64,7 +64,9 @@ rmp-serde = "1"
 thiserror = "2.0"
 async-trait = "0.1"
 blake2 = "0.10"
-bytes = "1"
+# 1.9: `Bytes::from_owner`, which backs the CachekitIO bearer header with a
+# zeroising buffer.
+bytes = "1.9"
 zeroize = { version = "1", features = ["derive"] }
 urlencoding = "2"
 hex = "0.4"

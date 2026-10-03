@@ -3,7 +3,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderName, HeaderValue};
+use bytes::Bytes;
+use reqwest::header::{HeaderName, HeaderValue, InvalidHeaderValue};
 use zeroize::Zeroizing;
 
 use crate::backend::{
@@ -23,7 +24,8 @@ pub struct CachekitIO {
     api_url: String,
     /// `Authorization` and the session headers, built once so no request
     /// re-formats or re-parses them. The bearer value is marked sensitive, so
-    /// a request's `Debug` output redacts it.
+    /// a request's `Debug` output redacts it, and its buffer is wiped when the
+    /// last clone drops.
     static_headers: [(HeaderName, HeaderValue); 3],
     /// The telemetry header names, parsed once, in [`METRICS_HEADER_NAMES`] order.
     metrics_header_names: [HeaderName; 5],
@@ -336,6 +338,8 @@ impl Backend for CachekitIO {
 
 /// Build the per-client constant headers: `Authorization: Bearer <key>`,
 /// marked sensitive as `bearer_auth` would, and the process's session headers.
+/// The bearer outlives every request and each request clones it, so its buffer
+/// is a zeroising owner those clones share: the last drop wipes the key.
 ///
 /// # Errors
 ///
@@ -346,8 +350,10 @@ fn static_headers(
 ) -> Result<[(HeaderName, HeaderValue); 3], crate::error::CachekitError> {
     use crate::error::CachekitError;
 
-    let bearer = Zeroizing::new(format!("Bearer {api_key}"));
-    let mut auth = HeaderValue::from_str(&bearer).map_err(|_| {
+    let mut bearer = Zeroizing::new(Vec::with_capacity("Bearer ".len() + api_key.len()));
+    bearer.extend_from_slice(b"Bearer ");
+    bearer.extend_from_slice(api_key.as_bytes());
+    let mut auth = header_over(bearer).map_err(|_| {
         CachekitError::Config("api_key holds characters an HTTP header cannot carry".to_string())
     })?;
     auth.set_sensitive(true);
@@ -366,6 +372,14 @@ fn static_headers(
         header(id_name, id)?,
         header(start_name, start)?,
     ])
+}
+
+/// A header value over `owner`'s buffer, not a copy of it: clones share the
+/// buffer, and `owner` drops with the last of them.
+fn header_over<T: AsRef<[u8]> + Send + 'static>(
+    owner: T,
+) -> Result<HeaderValue, InvalidHeaderValue> {
+    HeaderValue::from_maybe_shared(Bytes::from_owner(owner))
 }
 
 /// Parse [`METRICS_HEADER_NAMES`] once per client.
@@ -826,9 +840,10 @@ mod put_ttl_header_tests {
 #[cfg(test)]
 #[allow(clippy::expect_used)] // test-only: a builder failure on a fixture should panic loudly
 mod prebuilt_header_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    use super::CachekitIO;
+    use super::{header_over, CachekitIO};
     use crate::metrics::{metrics_headers, L1Stats, MetricsProvider};
     use crate::session::session_headers;
 
@@ -859,6 +874,38 @@ mod prebuilt_header_tests {
         assert!(auth.is_sensitive(), "prebuilt bearer must be sensitive");
         let debug = format!("{req:?}");
         assert!(!debug.contains(KEY), "api key leaked into Debug: {debug}");
+    }
+
+    /// The bearer's zeroising owner is the header's buffer, not a copy of it:
+    /// clones share it, and it drops (wiping the key) only with the last one.
+    #[test]
+    fn header_clones_share_the_owner_until_the_last_drops() {
+        struct Owner(Vec<u8>, Arc<AtomicBool>);
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let header = header_over(Owner(b"Bearer k".to_vec(), Arc::clone(&dropped))).expect("valid");
+        let clone = header.clone();
+        drop(header);
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "owner dropped while a clone lives"
+        );
+        assert_eq!(clone.as_bytes(), b"Bearer k");
+        drop(clone);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "owner outlived its last clone"
+        );
     }
 
     #[test]
