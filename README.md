@@ -161,6 +161,16 @@ let cache = CacheKit::builder()
 > [!IMPORTANT]
 > Never hardcode API keys or master keys. Use environment variables or a secrets manager.
 
+On native targets every request carries the User-Agent `cachekit-rs/<version>`,
+and an idle pooled connection is kept for 390 s (reqwest's default is 90 s).
+Cloudflare closes an idle client connection after 400 s, so a request after a
+90-390 s pause reuses the open connection instead of paying for a new DNS
+lookup, TCP connect and TLS handshake. reqwest's 15 s TCP keepalive keeps NAT
+mappings alive while the connection is idle. On Linux and macOS it also drops
+a silently dead connection within about 60 s; Windows keeps its own fixed
+probe count, so detection there takes about 165 s. On wasm32 the platform's
+`fetch` decides pooling and the User-Agent.
+
 ---
 
 ## Zero-Knowledge Encryption

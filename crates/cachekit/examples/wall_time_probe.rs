@@ -11,7 +11,8 @@
 //!   `cf-ray` and its status is inferred from the result.
 //! - `transport`: a [`Backend`] defined here over a `reqwest::Client` built
 //!   with the options `CachekitIO` uses (rustls, no redirects, 30 s timeout,
-//!   10 s connect timeout, HTTP/1.1), the same headers and the same URLs. It
+//!   10 s connect timeout, 390 s pool idle timeout, the `cachekit-rs/<version>`
+//!   User-Agent, HTTP/1.1), the same headers and the same URLs. It
 //!   reads `cf-ray`, status, HTTP version and time to first byte, and counts
 //!   DNS resolutions (one per new connection). Before trusting its legs, run it
 //!   against `sdk`: the two must agree within the `sdk`/`sdk` A/A spread, or
@@ -353,9 +354,11 @@ impl Transport {
         // Mirrors CachekitIOBuilder::build; the only addition is the resolver.
         let client = reqwest::Client::builder()
             .use_rustls_tls()
+            .user_agent(concat!("cachekit-rs/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Duration::from_secs(390))
             .dns_resolver(Arc::new(CountingResolver {
                 count: resolves.clone(),
             }))

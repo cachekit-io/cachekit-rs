@@ -141,7 +141,7 @@ sha2 = "0.10"
 # cannot build for wasm32, and cargo compiles the whole dev-dep graph whenever
 # any integration test compiles — so these must not be in the wasm32 dev graph.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
 serial_test = "3"
 tempfile = "3"
 
