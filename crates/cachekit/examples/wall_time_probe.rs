@@ -470,7 +470,8 @@ impl Backend for Transport {
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(value);
         if let Some(ttl) = ttl {
-            req = req.header("X-TTL", ttl.as_secs().to_string());
+            // Same TTL header as `CachekitIO::set` (`backend::ttl_header`).
+            req = req.header("X-CacheKit-TTL", ttl.as_secs().to_string());
         }
         let resp = self.send("PUT", key, req).await?;
         match resp.status().as_u16() {

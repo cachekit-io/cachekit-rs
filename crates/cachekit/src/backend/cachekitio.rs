@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use zeroize::Zeroizing;
 
 use crate::backend::{
-    delete_succeeded, encode_key, Backend, Freshness, HealthStatus, LockableBackend,
+    delete_succeeded, encode_key, ttl_header, Backend, Freshness, HealthStatus, LockableBackend,
 };
 use crate::error::{BackendError, BackendErrorKind};
 use crate::metrics::{metrics_headers, MetricsProvider};
@@ -100,6 +100,29 @@ impl CachekitIO {
             req = req.header(name, value);
         }
         req
+    }
+
+    /// Build the `PUT` for [`Backend::set`] without sending it, so tests can
+    /// pin its headers.
+    fn put_request(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> Result<reqwest::RequestBuilder, BackendError> {
+        let mut req = self
+            .client
+            .put(self.url(key)?)
+            .bearer_auth(self.api_key.as_str())
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(value);
+
+        if let Some(ttl) = ttl {
+            let (name, value) = ttl_header(ttl);
+            req = req.header(name, value);
+        }
+
+        Ok(self.with_standard_headers(req))
     }
 
     /// Read error body from response and build a sanitized BackendError.
@@ -227,20 +250,8 @@ impl Backend for CachekitIO {
         value: Vec<u8>,
         ttl: Option<Duration>,
     ) -> Result<(), BackendError> {
-        let mut req = self
-            .client
-            .put(self.url(key)?)
-            .bearer_auth(self.api_key.as_str())
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(value);
-
-        if let Some(ttl) = ttl {
-            req = req.header("X-TTL", ttl.as_secs().to_string());
-        }
-
-        let req = self.with_standard_headers(req);
-
-        let resp = req
+        let resp = self
+            .put_request(key, value, ttl)?
             .send()
             .await
             .map_err(|e| reqwest_err_sanitized(e, self.api_key.as_str()))?;
@@ -696,5 +707,45 @@ mod path_encoding_tests {
                 lock.path()
             );
         }
+    }
+}
+
+// ── PUT TTL header tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::expect_used)] // test-only: a builder failure on a fixture should panic loudly
+mod put_ttl_header_tests {
+    use std::time::Duration;
+
+    use super::CachekitIO;
+
+    fn put(ttl: Option<Duration>) -> reqwest::Request {
+        CachekitIO::builder()
+            .api_key("ck_test_key")
+            .build()
+            .expect("builder succeeds")
+            .put_request("k", b"v".to_vec(), ttl)
+            .expect("key encodes")
+            .build()
+            .expect("request builds")
+    }
+
+    #[test]
+    fn put_sends_x_cachekit_ttl_and_no_legacy_x_ttl() {
+        let req = put(Some(Duration::from_secs(300)));
+        assert_eq!(
+            req.headers()
+                .get("X-CacheKit-TTL")
+                .and_then(|v| v.to_str().ok()),
+            Some("300")
+        );
+        assert!(req.headers().get("X-TTL").is_none(), "legacy header sent");
+    }
+
+    #[test]
+    fn put_without_ttl_sends_no_ttl_header() {
+        let req = put(None);
+        assert!(req.headers().get("X-CacheKit-TTL").is_none());
+        assert!(req.headers().get("X-TTL").is_none());
     }
 }

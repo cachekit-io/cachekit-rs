@@ -348,6 +348,16 @@ pub(crate) fn delete_succeeded(status: u16) -> bool {
     matches!(status, 200 | 204)
 }
 
+/// The `PUT /v1/cache/{key}` header that carries a write's TTL in whole
+/// seconds. `spec/saas-api.md` says SDKs MUST send `X-CacheKit-TTL` only: the
+/// legacy `X-TTL` goes away in protocol 2.0, and a write that sends only it
+/// would then be stored with no expiry. Shared by the native and Workers
+/// backends so their wire forms cannot drift.
+#[cfg(any(feature = "cachekitio", feature = "workers", test))]
+pub(crate) fn ttl_header(ttl: Duration) -> (&'static str, String) {
+    ("X-CacheKit-TTL", ttl.as_secs().to_string())
+}
+
 // ── Feature-gated backend modules ─────────────────────────────────────────────
 
 /// JSON wire bodies for the SaaS lock/TTL endpoints. Compiled under `test`
@@ -532,5 +542,22 @@ mod delete_status_tests {
         for status in [201, 400, 401, 403, 429, 500, 503] {
             assert!(!delete_succeeded(status), "{status}");
         }
+    }
+}
+
+// ── ttl_header unit tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod ttl_header_tests {
+    use std::time::Duration;
+
+    use super::ttl_header;
+
+    #[test]
+    fn ttl_header_is_the_canonical_name_in_whole_seconds() {
+        assert_eq!(
+            ttl_header(Duration::from_millis(60_900)),
+            ("X-CacheKit-TTL", "60".to_owned())
+        );
     }
 }
