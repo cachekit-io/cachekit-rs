@@ -656,8 +656,9 @@ adds a dependency.
 **CPU cost of the hot path** — `examples/bench_hot_path.rs` drives the public
 `CacheKit` API over an in-memory backend, so it measures the client's own work
 (key handling, MessagePack, L1, the reliability stack, AES-256-GCM) and no
-network. Cases are `l1_hit`, `l2_hit`, `set` and `delete`, each `plain`, with
-reliability (`rel`) or with encryption (`enc`), at 64 B, 1 KiB and 64 KiB.
+network. Cases are `l1_hit`, `l2_hit`, `set`, `delete` and `exists` (a warm
+key), each `plain`, with reliability (`rel`) or with encryption (`enc`), at
+64 B, 1 KiB and 64 KiB.
 
 ```bash
 make bench                                  # wall ns/op: indicative only

@@ -38,7 +38,7 @@ use cachekit::backend::{Backend, HealthStatus};
 use cachekit::reliability::ReliabilityConfig;
 use cachekit::{BackendError, CacheKit, CachekitError};
 
-const OPS: [&str; 4] = ["l1_hit", "l2_hit", "set", "delete"];
+const OPS: [&str; 5] = ["l1_hit", "l2_hit", "set", "delete", "exists"];
 const MODES: [&str; 3] = ["plain", "rel", "enc"];
 const SIZES: [usize; 3] = [64, 1024, 65536];
 const TTL: Duration = Duration::from_secs(300);
@@ -179,6 +179,17 @@ impl Bench {
             "set" => write(&self.reader, self.enc, key, &self.value).await,
             "delete" if self.enc => self.reader.secure_cache()?.delete(key).await.map(drop),
             "delete" => self.reader.delete(key).await.map(drop),
+            // A warm key: answered from L1, so the backend is never asked.
+            "exists" => {
+                let found = if self.enc {
+                    self.reader.secure_cache()?.exists(key).await?
+                } else {
+                    self.reader.exists(key).await?
+                };
+                found.then_some(()).ok_or_else(|| {
+                    CachekitError::Config(format!("{key}: expected exists, got absent"))
+                })
+            }
             _ => {
                 let got: Option<String> = if self.enc {
                     self.reader.secure_cache()?.get(key).await?
