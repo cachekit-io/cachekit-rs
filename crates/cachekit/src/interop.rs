@@ -397,18 +397,21 @@ pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError
         ));
     }
 
-    let mut de = crate::serializer::bounded_deserializer(bytes)?;
+    let (mut de, doc_len) = crate::serializer::bounded_deserializer(bytes)?;
     let value = T::deserialize(&mut de)
         .map_err(|e| CachekitError::Serialization(format!("interop decode: {e}")))?;
 
-    // `Read for &[u8]` advances the slice, so the reader now holds exactly the
-    // bytes the decoder did not consume.
-    let remaining: &[u8] = de.into_inner();
-    if !remaining.is_empty() {
+    // The structural walk measured the first document; anything after it is
+    // trailing. A successful decode consumes that whole document: rmp-serde
+    // rejects an array or map its target leaves unread. Ext is the exception: a
+    // target that reads only an ext's type byte leaves the body unread and is
+    // accepted. Ext is outside the interop data model, so no interop value
+    // reaches that path.
+    let trailing = bytes.len() - doc_len;
+    if trailing > 0 {
         return Err(CachekitError::Serialization(format!(
-            "interop payload has {} trailing byte(s) after the MessagePack document — \
-             interop readers must consume exactly one document",
-            remaining.len()
+            "interop payload has {trailing} trailing byte(s) after the MessagePack document — \
+             interop readers must consume exactly one document"
         )));
     }
 
@@ -680,6 +683,20 @@ mod tests {
             err.to_string().contains("trailing byte"),
             "expected trailing-bytes error, got: {err}"
         );
+    }
+
+    /// The one decode the trailing-byte check cannot see: a target that reads
+    /// only an ext's type byte leaves the body unread, and the borrowed-slice
+    /// reader cannot report what it left. Pinned so the gap documented on
+    /// [`deserialize`] stays a known one; interop values never contain ext.
+    #[test]
+    fn deserialize_accepts_ext_target_that_reads_only_the_type_byte() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename = "_ExtStruct")]
+        struct TagOnly((i8,));
+        // fixext1: type 5, one data byte the target never reads.
+        let TagOnly((tag,)) = deserialize(&[0xd4, 0x05, 0xaa]).unwrap();
+        assert_eq!(tag, 5);
     }
 
     #[test]
