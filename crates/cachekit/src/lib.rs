@@ -157,31 +157,55 @@ pub use reliability::{
 /// Uniform random in `[0, 1)`. Used by retry backoff (`reliability`) and the
 /// L1 SWR freshness threshold at entry insertion (`l1`). Jitter needs
 /// decorrelation across clients, not crypto quality, so this is a per-thread
-/// SplitMix64 seeded once from std's `RandomState` (OS entropy per process,
-/// a fresh key per thread) instead of a getrandom syscall per call; 53 bits
-/// is plenty. Native only: `workers` excludes both `l1` and `reliability`,
-/// and on wasm32 `RandomState` would carry no entropy.
+/// SplitMix64 seeded from std's `RandomState` instead of a getrandom syscall
+/// per call; 53 bits is plenty. Native only: `workers` excludes both `l1` and
+/// `reliability`, and on wasm32 `RandomState` would carry no entropy.
 #[cfg(any(
     feature = "l1",
     all(feature = "reliability", not(target_arch = "wasm32"))
 ))]
 pub(crate) fn random_unit() -> f64 {
-    use std::cell::Cell;
+    thread_local! {
+        static STATE: JitterState = const { std::cell::Cell::new(None) };
+    }
+    let z = STATE.with(|state| next_jitter(state, std::process::id()));
+    ((z >> 11) as f64) / ((1u64 << 53) as f64)
+}
+
+/// The owning process id and SplitMix64 state behind [`random_unit`].
+#[cfg(any(
+    feature = "l1",
+    all(feature = "reliability", not(target_arch = "wasm32"))
+))]
+type JitterState = std::cell::Cell<Option<(u32, u64)>>;
+
+/// One SplitMix64 step. The state reseeds whenever `pid` differs from the one
+/// it was seeded under: a forked child inherits its parent's thread-local
+/// state, and without the reseed every prefork worker would replay the
+/// parent's sequence and synchronise refreshes and backoffs. The pid is hashed
+/// into the seed because siblings forked from one parent also inherit the same
+/// `RandomState` keys.
+#[cfg(any(
+    feature = "l1",
+    all(feature = "reliability", not(target_arch = "wasm32"))
+))]
+fn next_jitter(state: &JitterState, pid: u32) -> u64 {
     use std::hash::{BuildHasher, Hasher};
 
-    thread_local! {
-        static STATE: Cell<u64> =
-            Cell::new(std::collections::hash_map::RandomState::new().build_hasher().finish());
-    }
-    let mut z = STATE.with(|state| {
-        let next = state.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
-        state.set(next);
-        next
-    });
+    let current = match state.get() {
+        Some((owner, current)) if owner == pid => current,
+        _ => {
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_u32(pid);
+            hasher.finish()
+        }
+    };
+    let next = current.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    state.set(Some((pid, next)));
+    let mut z = next;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    ((z >> 11) as f64) / ((1u64 << 53) as f64)
+    z ^ (z >> 31)
 }
 
 // ── SWR background-refresh spawn (macro plumbing) ───────────────────────────
@@ -238,7 +262,27 @@ pub mod prelude {
     )
 ))]
 mod random_unit_tests {
-    use super::random_unit;
+    use super::{next_jitter, random_unit, JitterState};
+
+    /// A forked child inherits the parent's thread-local state (simulated by
+    /// copying the cell). Under its own pid it must not replay the parent's
+    /// next draw, and two siblings must not match each other either.
+    #[test]
+    fn a_new_pid_reseeds_instead_of_replaying_the_parent() {
+        let parent = JitterState::new(None);
+        next_jitter(&parent, 100);
+        let child_a = JitterState::new(parent.get());
+        let child_b = JitterState::new(parent.get());
+        let from_parent = next_jitter(&parent, 100);
+        let from_a = next_jitter(&child_a, 101);
+        let from_b = next_jitter(&child_b, 102);
+        assert_ne!(from_parent, from_a);
+        assert_ne!(from_parent, from_b);
+        assert_ne!(from_a, from_b);
+        // Same pid: the sequence continues rather than reseeding each draw.
+        let replay = JitterState::new(child_a.get());
+        assert_eq!(next_jitter(&replay, 101), next_jitter(&child_a, 101));
+    }
 
     #[test]
     fn stays_in_unit_interval_and_spreads() {
