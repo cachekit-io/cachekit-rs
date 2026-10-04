@@ -44,7 +44,8 @@
 //! `--hold-lock` tests those stop rules against a live refusal: before the
 //! run's first cold miss, a second client takes that key's fill lock (held
 //! 10 s at most), so the call's LOCK is refused by the server and the run must
-//! stop with exit 3. The second client then releases its lock.
+//! stop with exit 3; a run that does not stop there exits 1. The second client
+//! then releases its lock.
 //!
 //! ```text
 //! CACHEKIT_API_KEY=… CACHEKIT_API_URL=https://… cargo run --release \
@@ -1172,21 +1173,24 @@ async fn schedule(sink: &mut Sink, api_key: &str, api_url: &str) -> Result<(), S
                     let id = format!("{prefix}:{counter}:{}", short_id());
                     let key = macro_key(&id).map_err(|e| e.to_string())?;
                     sink.ledger(&key)?;
-                    let held = if hold && counter == 1 {
-                        pacer.wait(1).await;
+                    // The held lock's LOCK and UNLOCK share the call's pacer
+                    // slots: a pacer wait inside the lock's lifetime would let
+                    // it lapse before the call meets it at a low --max-per-min.
+                    let hold_now = hold && counter == 1;
+                    let requests = MACRO_REQUESTS + 2 * usize::from(hold_now);
+                    pacer
+                        .wait(u32::try_from(requests).unwrap_or(u32::MAX))
+                        .await;
+                    let held = if hold_now {
                         Some(hold_lock(api_key, api_url, &key).await?)
                     } else {
                         None
                     };
-                    pacer
-                        .wait(u32::try_from(MACRO_REQUESTS).unwrap_or(u32::MAX))
-                        .await;
                     let t = timed_cold_miss(&pool[i], &id).await;
                     let judged = sink.row(&pool[i], b, s, &t, None);
                     // Release before acting on the verdict, so a stopped run
                     // leaves no lock behind for its timeout to clear.
                     if let Some((holder, lock_id)) = held {
-                        pacer.wait(1).await;
                         match holder.release_lock(&key, &lock_id).await {
                             Ok(released) => println!(
                                 "  hold-lock  UNLOCK {}",
@@ -1195,6 +1199,13 @@ async fn schedule(sink: &mut Sink, api_key: &str, api_url: &str) -> Result<(), S
                             Err(e) => eprintln!(
                                 "wall_time_probe: hold-lock UNLOCK failed ({e}); the lock lapses within {HOLD_LOCK_MS} ms"
                             ),
+                        }
+                        // Exit 0 here would read as a passed run: the false
+                        // negative this flag exists to catch.
+                        if judged.is_ok() {
+                            return Err(Stop::Fault(format!(
+                                "hold-lock: the cold miss on {key} did not stop the run"
+                            )));
                         }
                     }
                     judged?;
