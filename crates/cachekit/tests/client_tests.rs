@@ -254,6 +254,29 @@ async fn interop_get_fails_closed_on_namespaced_client() {
     );
 }
 
+// ── Write TTL bounds (spec/saas-api.md, TTL Validation Rules) ────────────────
+
+/// A positive sub-second TTL is accepted (the wire ceils it to 1 s); zero is
+/// still a `Config` error.
+#[tokio::test]
+async fn set_with_ttl_accepts_sub_second_and_rejects_zero() {
+    let client = mock_client();
+
+    client
+        .set_with_ttl("k", &1u8, Duration::from_millis(500))
+        .await
+        .expect("a 500 ms TTL must be accepted");
+
+    let err = client
+        .set_with_ttl("k", &1u8, Duration::ZERO)
+        .await
+        .expect_err("a zero TTL must be rejected");
+    assert!(
+        matches!(err, CachekitError::Config(_)),
+        "expected Config error, got: {err:?}"
+    );
+}
+
 // ── L1 backfill honours the server's freshness (spec/saas-api.md) ─────────────
 
 /// A stale label or `Fresh-For: 0` forbids the L1 backfill; a present
@@ -443,6 +466,30 @@ mod freshness {
             "served from L2, not L1"
         );
         assert_eq!(backend.reads(), 2, "the SWR read must reach L2");
+    }
+
+    /// The writer's own L1 copy lives no longer than the TTL the write sent:
+    /// 1.5 s goes on the wire as 1 s, so by 1.2 s the next read reaches L2.
+    /// Real time, as above.
+    #[tokio::test]
+    async fn write_through_is_bounded_by_the_wire_ttl() {
+        let backend = LabelledBackend::labelled(Freshness::default());
+        let shared: SharedBackend = backend.clone();
+        let cache = CacheKit::builder()
+            .backend(shared)
+            .build()
+            .expect("client builds");
+
+        cache
+            .set_with_ttl("k", &"v".to_owned(), Duration::from_millis(1500))
+            .await
+            .expect("write succeeds");
+        assert_eq!(read(&cache).await.as_deref(), Some("v"));
+        assert_eq!(backend.reads(), 0, "a fresh write-through serves from L1");
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(read(&cache).await.as_deref(), Some("v"));
+        assert_eq!(backend.reads(), 1, "L1 kept the copy past the wire TTL");
     }
 
     /// (e) No header leaves today's behaviour: the hit is backfilled (the 30 s

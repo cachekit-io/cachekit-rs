@@ -7,7 +7,7 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::backend::Backend;
 #[cfg(feature = "l1")]
-use crate::backend::Freshness;
+use crate::backend::{ttl_wire_secs, Freshness};
 use crate::error::CachekitError;
 use crate::metrics::{CacheCounters, L1Stats, ReadOutcome};
 use crate::serializer;
@@ -301,11 +301,15 @@ impl CacheKit {
         }
     }
 
-    /// Write-through to L1.
+    /// Write-through to L1 after a write the backend accepted. The copy lives
+    /// no longer than the TTL the write sent on the wire ([`ttl_wire_secs`]):
+    /// `spec/saas-api.md` forbids serving it past `min(local_ttl, effective_ttl)`,
+    /// and the wire truncates a fractional TTL from 1 s up (1.5 s goes as 1).
     #[cfg(feature = "l1")]
     fn l1_set(&self, full_key: &str, bytes: Bytes, ttl: Duration) {
         if let Some(ref l1) = self.l1 {
-            l1.set_shared(full_key, bytes, ttl);
+            let wire = Duration::from_secs(ttl_wire_secs(ttl));
+            l1.set_shared(full_key, bytes, ttl.min(wire));
         }
     }
 
@@ -368,12 +372,13 @@ impl CacheKit {
         Ok(false)
     }
 
-    /// Validate TTL is at least 1 second.
+    /// Validate TTL is non-zero. A positive sub-second TTL is accepted and
+    /// stored for 1 s (`spec/saas-api.md`: ceiled, never truncated to 0).
     fn validate_ttl(ttl: Duration) -> Result<(), CachekitError> {
-        if ttl < Duration::from_secs(1) {
-            return Err(CachekitError::Config(format!(
-                "TTL must be at least 1 second; got {ttl:?}"
-            )));
+        if ttl.is_zero() {
+            return Err(CachekitError::Config(
+                "TTL must be greater than zero".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -584,7 +589,9 @@ impl CacheKit {
 
     /// Serialize and store `value` under `key` with an explicit `ttl`.
     ///
-    /// Returns [`CachekitError::Config`] if `ttl` is less than 1 second.
+    /// A positive sub-second `ttl` is stored for 1 second.
+    ///
+    /// Returns [`CachekitError::Config`] if `ttl` is zero.
     pub async fn set_with_ttl<T: Serialize>(
         &self,
         key: &str,
