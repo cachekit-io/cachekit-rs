@@ -208,8 +208,7 @@ impl CacheKit {
     ///   backoff, 100 ms → 30 s, retrying indefinitely)
     /// * L1 cache: **on** (1 000 entries, stores ciphertext)
     /// * Encryption: **AES-256-GCM** with HKDF-SHA256, on every value read
-    ///   and write — plain `get` / `set` / `set_with_ttl` / `interop_get` /
-    ///   `interop_get_swr` as well as the
+    ///   and write, not only those through the
     ///   [`secure_cache()`](CacheKit::secure_cache) handle (see
     ///   [Encryption](CacheKit#encryption))
     /// * Reliability: **on** — retry with backoff + jitter, circuit

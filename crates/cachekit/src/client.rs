@@ -407,7 +407,9 @@ impl CacheKit {
     /// decryption. The key's L1 copy is dropped first and the backend entry
     /// is left in place, so the next read reaches the backend: a hit once the
     /// entry is replaced with ciphertext this client can decrypt, a miss once
-    /// it expires or is deleted.
+    /// it expires or is deleted. A decrypted entry that does not decode as `T`
+    /// is [`CachekitError::Serialization`] naming only `T`, never quoting the
+    /// value.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, CachekitError> {
         #[cfg(feature = "encryption")]
         if let Some(secure) = self.encrypting() {
@@ -996,10 +998,12 @@ impl SecureCache<'_> {
     /// decryption. The key's L1 copy is dropped first and the backend entry
     /// is left in place, so the next read reaches the backend: a hit once the
     /// entry is replaced with ciphertext this client can decrypt, a miss once
-    /// it expires or is deleted.
+    /// it expires or is deleted. A decrypted entry that does not decode as `T`
+    /// is [`CachekitError::Serialization`] naming only `T`: the decoder's own
+    /// message would quote the plaintext.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, CachekitError> {
         match self.get_plaintext(key).await? {
-            Some(plaintext) => Ok(Some(serializer::deserialize(&plaintext)?)),
+            Some(plaintext) => Ok(Some(redact_decode(serializer::deserialize(&plaintext))?)),
             None => Ok(None),
         }
     }
@@ -1025,7 +1029,9 @@ impl SecureCache<'_> {
     ) -> Result<Option<T>, CachekitError> {
         self.client.reject_namespaced_interop()?;
         match self.get_plaintext(key).await? {
-            Some(plaintext) => Ok(Some(crate::interop::deserialize(&plaintext)?)),
+            Some(plaintext) => Ok(Some(redact_decode(crate::interop::deserialize(
+                &plaintext,
+            ))?)),
             None => Ok(None),
         }
     }
@@ -1046,11 +1052,13 @@ impl SecureCache<'_> {
     ) -> Result<SwrRead<T>, CachekitError> {
         self.client.reject_namespaced_interop()?;
         match self.client.get_bytes_swr(key).await? {
-            SwrRead::Fresh(ct) => Ok(SwrRead::Fresh(crate::interop::deserialize(
+            SwrRead::Fresh(ct) => Ok(SwrRead::Fresh(redact_decode(crate::interop::deserialize(
                 &self.decrypt_or_evict(&ct, key)?,
-            )?)),
+            ))?)),
             SwrRead::Stale(ct, token) => Ok(SwrRead::Stale(
-                crate::interop::deserialize(&self.decrypt_or_evict(&ct, key)?)?,
+                redact_decode(crate::interop::deserialize(
+                    &self.decrypt_or_evict(&ct, key)?,
+                ))?,
                 token,
             )),
             SwrRead::Miss => Ok(SwrRead::Miss),
@@ -1096,6 +1104,22 @@ impl SecureCache<'_> {
     pub async fn exists(&self, key: &str) -> Result<bool, CachekitError> {
         self.client.exists(key).await
     }
+}
+
+/// Decoding decrypted plaintext keeps the `Serialization` class, which
+/// `#[cachekit]` reads as a miss, but replaces the decoder's message: serde
+/// quotes the offending value (`invalid type: string "…", expected struct
+/// …`), and that value is the plaintext encryption exists to protect
+/// (CWE-532).
+#[cfg(feature = "encryption")]
+fn redact_decode<T>(decoded: Result<T, CachekitError>) -> Result<T, CachekitError> {
+    decoded.map_err(|e| match e {
+        CachekitError::Serialization(_) => CachekitError::Serialization(format!(
+            "decrypted entry does not decode as {}",
+            std::any::type_name::<T>()
+        )),
+        other => other,
+    })
 }
 
 // ── CacheKitBuilder ───────────────────────────────────────────────────────────
@@ -1243,10 +1267,8 @@ impl CacheKitBuilder {
     /// — their ASCII bytes are 64 bytes long and rejected here.
     /// Keys are derived per-tenant via HKDF-SHA256.
     ///
-    /// The built client encrypts every value read and write — plain
-    /// `get` / `set` / `set_with_ttl` / `interop_get` / `interop_get_swr`
-    /// included, L1 holds ciphertext — not only the
-    /// [`secure_cache()`](CacheKit::secure_cache) handle; see
+    /// The built client encrypts every value read and write, not only those
+    /// through the [`secure_cache()`](CacheKit::secure_cache) handle; see
     /// [Encryption](CacheKit#encryption). Calling any encryption method
     /// again replaces the earlier configuration.
     ///

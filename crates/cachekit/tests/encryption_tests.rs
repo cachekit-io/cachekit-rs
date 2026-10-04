@@ -723,6 +723,40 @@ async fn plain_reads_reject_a_plaintext_entry() {
     );
 }
 
+/// A decode failure after a successful decrypt names only the target type:
+/// serde's own message quotes the decrypted value (CWE-532) — here
+/// `invalid type: string "sk-live-…", expected struct Secret`. The error stays
+/// `Serialization`, which `#[cachekit]` reads as a miss.
+#[tokio::test]
+async fn decode_error_after_decrypt_does_not_quote_the_value() {
+    let client = make_encrypted_client(MockBackend::shared());
+    client.set("typed", &"sk-live-REDACTME").await.unwrap(); // pragma: allowlist secret
+    let secure = client.secure_cache().unwrap();
+    for (how, result) in [
+        ("get", client.get::<Secret>("typed").await.map(drop)),
+        (
+            "interop_get",
+            client.interop_get::<Secret>("typed").await.map(drop),
+        ),
+        (
+            "interop_get_swr",
+            client.interop_get_swr::<Secret>("typed").await.map(drop),
+        ),
+        ("handle get", secure.get::<Secret>("typed").await.map(drop)),
+    ] {
+        match result {
+            Err(CachekitError::Serialization(msg)) => {
+                assert!(!msg.contains("REDACTME"), "{how} quotes the value: {msg}");
+                assert!(
+                    msg.contains("Secret"),
+                    "{how} must name the target type: {msg}"
+                );
+            }
+            other => panic!("{how}: expected a Serialization error, got {other:?}"),
+        }
+    }
+}
+
 // ── Master-key length (spec/intent-presets.md § Master Key Input) ─────────────
 
 fn assert_builder_config_err(result: Result<cachekit::CacheKitBuilder, CachekitError>, what: &str) {
