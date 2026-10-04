@@ -95,7 +95,7 @@ impl CachekitConfig {
     /// |---|---|
     /// | `CACHEKIT_API_KEY` | API key for cachekit.io |
     /// | `CACHEKIT_API_URL` | Override API base URL (must be HTTPS) |
-    /// | `CACHEKIT_MASTER_KEY` | Hex-encoded master key (min 32 bytes) |
+    /// | `CACHEKIT_MASTER_KEY` | Hex-encoded master key (min 32 bytes); set but empty, not hex or not UTF-8 is an error, never unset |
     /// | `CACHEKIT_PREVIOUS_MASTER_KEYS` | Comma-separated hex-encoded decrypt-only previous master keys (max 3; blank value = unset) |
     /// | `CACHEKIT_DEFAULT_TTL` | Default TTL in seconds (min 1) |
     pub fn from_env() -> Result<Self, CachekitError> {
@@ -115,17 +115,29 @@ impl CachekitConfig {
         // Master key — hex-decode and validate length >= 32 bytes.
         // Deliberately NO blank-value tolerance here (unlike the previous-keys
         // var below): a blank CACHEKIT_MASTER_KEY treated as unset would
-        // silently turn encryption off.
-        if let Ok(val) = std::env::var("CACHEKIT_MASTER_KEY") {
-            // `env::var` hands back an owned copy of the hex secret. Wrap it so
-            // that copy is wiped on drop too — the decoded bytes below are
-            // already `Zeroizing`, but the hex form is the same key material.
-            // Defence in depth over the heap copy only: the process `environ`
-            // block still holds the identical hex for the process lifetime and
-            // is not wiped here, so this narrows post-lifetime recovery (core
-            // dumps, swap, heap reuse), it does not eliminate the exposure.
-            let val = Zeroizing::new(val);
-            config.master_key = Some(decode_master_key_hex(&val, "CACHEKIT_MASTER_KEY")?);
+        // silently turn encryption off. Set but not UTF-8 (a raw key put in
+        // the environment without hex-encoding it) is an error for the same
+        // reason, never unset.
+        match std::env::var("CACHEKIT_MASTER_KEY") {
+            Ok(val) => {
+                // `env::var` hands back an owned copy of the hex secret. Wrap it
+                // so that copy is wiped on drop too — the decoded bytes below are
+                // already `Zeroizing`, but the hex form is the same key material.
+                // Defence in depth over the heap copy only: the process `environ`
+                // block still holds the identical hex for the process lifetime
+                // and is not wiped here, so this narrows post-lifetime recovery
+                // (core dumps, swap, heap reuse), it does not eliminate the
+                // exposure.
+                let val = Zeroizing::new(val);
+                config.master_key = Some(decode_master_key_hex(&val, "CACHEKIT_MASTER_KEY")?);
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(CachekitError::Config(
+                    "CACHEKIT_MASTER_KEY is not valid UTF-8: set it to the key's 64 hex chars"
+                        .to_owned(),
+                ))
+            }
         }
 
         config.previous_master_keys =

@@ -76,6 +76,36 @@ fn config_from_env_rejects_short_master_key() {
     );
 }
 
+/// Set but not UTF-8 is not unset: a raw key exported without hex-encoding
+/// it must fail, never yield a config with no key (and so a plaintext
+/// client from `CacheKit::from_env`).
+#[cfg(unix)]
+#[test]
+#[serial]
+fn config_from_env_rejects_non_utf8_master_key() {
+    use std::os::unix::ffi::OsStrExt;
+
+    // Records the prior values (CACHEKIT_MASTER_KEY included) and restores
+    // them on drop; the raw bytes are set directly because EnvGuard takes str.
+    let _env = EnvGuard::set(&[
+        ("CACHEKIT_API_KEY", None),
+        ("CACHEKIT_API_URL", None),
+        ("CACHEKIT_MASTER_KEY", None),
+        ("CACHEKIT_PREVIOUS_MASTER_KEYS", None),
+        ("CACHEKIT_DEFAULT_TTL", None),
+    ]);
+    std::env::set_var(
+        "CACHEKIT_MASTER_KEY",
+        std::ffi::OsStr::from_bytes(&[0xff; 32]),
+    );
+
+    let err = CachekitConfig::from_env().expect_err("non-UTF-8 master key must be rejected");
+    assert!(
+        matches!(&err, cachekit::CachekitError::Config(msg) if msg.contains("CACHEKIT_MASTER_KEY")),
+        "expected a Config error naming the variable, got {err:?}"
+    );
+}
+
 #[test]
 #[serial]
 fn config_from_env_accepts_32_byte_master_key() {
