@@ -43,6 +43,19 @@
 //! A missing, non-hex or short key fails at construction, before any Redis
 //! I/O; `secure` never falls back to plaintext.
 //!
+//! **Which calls encrypt.** On a `secure` client — and on any client built
+//! with a builder encryption method, such as `io` plus
+//! [`.encryption()`](CacheKitBuilder::encryption) — every value read and
+//! write encrypts: plain [`get`](CacheKit::get), [`set`](CacheKit::set),
+//! [`set_with_ttl`](CacheKit::set_with_ttl),
+//! [`interop_get`](CacheKit::interop_get) and
+//! [`interop_get_swr`](CacheKit::interop_get_swr) behave exactly as the
+//! `SecureCache` handle from `cache.secure_cache()` does, and L1 holds
+//! ciphertext. The handle is optional: it fails on a client without
+//! encryption, for code that must never run unencrypted. A build without the
+//! `encryption` feature rejects every builder encryption call with
+//! [`CachekitError::Config`].
+//!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let cache = cachekit::CacheKit::io_from_env()?
