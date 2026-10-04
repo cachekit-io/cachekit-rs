@@ -428,6 +428,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Header on a `429` that denies a spent quota or balance rather than a rate
 /// limit; such an error is never retried within the call (see
 /// [`crate::error::QuotaDenied`]).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // wasm32 uses the Workers backend
 const DENY_REASON_HEADER: &str = "x-cachekit-deny-reason";
 
 #[cfg(not(target_arch = "wasm32"))]
