@@ -719,7 +719,9 @@ CACHEKIT_API_KEY=… CACHEKIT_API_URL=https://api.dev.cachekit.io \
 samples, `--concurrency N` sends bursts (after one failed request, the burst
 sends nothing more), and `--macro-cold-miss` times a
 `#[cachekit]` cold miss (GET, lock, origin, PUT, unlock; each request it sends
-is checked, and a call sending more than five stops the run); `--help` lists every
+is checked, and a call sending more than five stops the run). `--hold-lock`
+tests those rules against a live refusal: a second client holds the first cold
+miss's fill lock, so the run must stop with exit 3. `--help` lists every
 flag. Delete the ledger's keys when the run ends;
 the TTL is the backstop.
 
