@@ -72,50 +72,31 @@ repos:
         entry: '\b(?i:LAB)-[0-9]+|op://|\.ts\.net|(?i:\bk3s[\s_-]+(?:cluster|node|host)s?\b)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])'
         files: ^((packages|crates)/[^/]+/)?README[^/]*$|^docs/
         types: [text]
-        # Whole-file search, so a phrase wrapped across two lines still matches.
-        args: [--multiline]
         stages: [pre-commit]
       - id: no-internal-references-commit-msg
         name: No internal references in commit message
-        # Same patterns, over the text git will commit. git hands this hook the raw message file
-        # and cleans it afterwards, so the hook skips only what git itself wrote and will drop.
+        # Same patterns. git hands this hook the raw message file: "# " comment lines, the diff
+        # below the `git commit -v` scissors line, and its own merge and revert subjects, which
+        # quote branch names and earlier subjects. Only the text the author wrote is checked.
         language: python
         entry: python -c
         args:
           - |
-            import os, re, subprocess, sys
+            import re, sys
             P = re.compile(r"\b(?i:LAB)-[0-9]+|op://|\.ts\.net|(?i:\bk3s[\s_-]+(?:cluster|node|host)s?\b)|dev\.cachekit\.io|\bStage [0-9]|\bAC-[0-9]|github\.com/cachekit(?![\w-])")
             KIND = r"(?:branch|branches|remote-tracking branch|remote-tracking branches|tag|tags|commit|commits)"
             GIT_SUBJECT = re.compile(rf"Merge {KIND} '[^']*'(?:(?:, |; | and ){KIND}? ?'[^']*')*(?: of \S+)?(?: into \S+)?|(?:Revert|Reapply) \".*\"")
-            CUT = "# ------------------------ >8 ------------------------"
-            COMMENT = re.compile(r"#(?:[ \t]|$)")
             try:
                 with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
-                    lines = f.read().splitlines()
+                    text = f.read()
             except OSError as e:
                 sys.exit(f"{sys.argv[1]}: cannot read the commit message: {e}")
-            # git sets GIT_EDITOR=: for this hook when no editor ran (-m, -F, --no-edit). Then git keeps
-            # "#" lines and writes no scissors line, so everything is checked.
-            if os.environ.get("GIT_EDITOR") != ":":
-                # git cuts at a scissors line it wrote itself, which only "#" lines and the
-                # `commit -v` diff follow. Text typed below a pasted one is kept, so it is checked.
-                if CUT in lines:
-                    cut = lines.index(CUT)
-                    below = lines[cut + 1:]
-                    end = next((i for i, line in enumerate(below) if line.startswith("diff --git ")), len(below))
-                    if all(not line.strip() or COMMENT.match(line) for line in below[:end]):
-                        lines = lines[:cut]
-                lines = [line for line in lines if not COMMENT.match(line)]
-            lines = [line for line in lines if line.strip()]
-            # A merge or revert in progress writes a subject quoting branch names or an earlier subject.
-            state = subprocess.run(["git", "rev-parse", "--git-path", "MERGE_HEAD", "--git-path", "REVERT_HEAD"],
-                                   capture_output=True, text=True).stdout.splitlines()
-            if lines and GIT_SUBJECT.fullmatch(lines[0]) and any(os.path.exists(p) for p in state):
+            text = text.split("# ------------------------ >8 ------------------------")[0]
+            lines = [line for line in text.splitlines() if line.strip() and not re.match(r"#(?:[ \t]|$)", line)]
+            if lines and GIT_SUBJECT.fullmatch(lines[0]):
                 lines = lines[1:]
-            # Joined, so a phrase wrapped across two lines still matches.
-            body = "\n".join(lines)
-            bad = sorted({body.count("\n", 0, m.start()) for m in P.finditer(body)})
-            for i in bad:
-                print(f"{sys.argv[1]}: {lines[i]}")
+            bad = [line for line in lines if P.search(line)]
+            for line in bad:
+                print(f"{sys.argv[1]}: {line}")
             sys.exit(1 if bad else 0)
         stages: [commit-msg]
