@@ -48,6 +48,14 @@ use crate::random_unit;
 // ── Configuration ────────────────────────────────────────────────────────────
 
 /// Retry policy configuration (truncated exponential backoff with jitter).
+///
+/// All attempts of one operation share one deadline: 5 s for a read (`get`,
+/// `exists`) and 10 s for a write (`set`, `delete`), matching the cachekit.io
+/// backend's per-attempt timeouts. An attempt still running at the deadline is
+/// cancelled and the operation fails with a `Timeout` error, and no backoff
+/// sleep starts that would end past it. A backend that stops answering
+/// therefore costs one attempt, not `max_attempts` of them, while fast
+/// failures (a `503`, a dropped connection) still get every attempt that fits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetryConfig {
     /// Total attempts, including the first (default: 3). `0` behaves as `1`.
@@ -214,9 +222,16 @@ impl ReliabilityConfig {
 
 // ── RetryPolicy ──────────────────────────────────────────────────────────────
 
+/// The deadline shared by every attempt of a read (see [`RetryConfig`]).
+pub(crate) const READ_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The deadline shared by every attempt of a write (see [`RetryConfig`]).
+pub(crate) const WRITE_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Retries an operation on errors where [`crate::error::BackendErrorKind::is_retryable`] is
 /// true, sleeping a truncated exponential backoff (with jitter) between
-/// attempts. `Permanent` and `Authentication` errors propagate immediately.
+/// attempts, all inside one deadline. `Permanent` and `Authentication` errors,
+/// and a quota or balance deny, propagate immediately.
 #[derive(Debug)]
 pub(crate) struct RetryPolicy {
     config: RetryConfig,
@@ -240,17 +255,37 @@ impl RetryPolicy {
         }
     }
 
-    pub(crate) async fn execute<T, F, Fut>(&self, f: F) -> Result<T, BackendError>
+    /// Run `f` until it succeeds, fails for good, or `budget` runs out.
+    ///
+    /// The tokio clock measures the budget, so a paused test runtime controls it.
+    pub(crate) async fn execute<T, F, Fut>(&self, budget: Duration, f: F) -> Result<T, BackendError>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T, BackendError>>,
     {
+        let deadline = tokio::time::Instant::now() + budget;
         let mut attempt: u32 = 0;
         loop {
-            match f().await {
+            let Ok(result) = tokio::time::timeout_at(deadline, f()).await else {
+                return Err(BackendError::timeout(format!(
+                    "operation did not complete within its {budget:?} deadline ({} attempt(s))",
+                    attempt + 1
+                )));
+            };
+            match result {
                 Ok(v) => return Ok(v),
-                Err(e) if e.kind.is_retryable() && attempt + 1 < self.config.max_attempts => {
-                    tokio::time::sleep(self.delay(attempt)).await;
+                Err(e)
+                    if e.kind.is_retryable()
+                        && !e.is_quota_denied()
+                        && attempt + 1 < self.config.max_attempts =>
+                {
+                    let delay = self.delay(attempt);
+                    // A retry that cannot start before the deadline would only
+                    // turn this error into a deadline timeout: return it now.
+                    if tokio::time::Instant::now() + delay >= deadline {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
                 Err(e) => return Err(e),
@@ -694,7 +729,8 @@ impl ReliableBackend {
         }
     }
 
-    async fn guarded<T, F, Fut>(&self, f: F) -> Result<T, BackendError>
+    /// Run `f` through the stack; `budget` is the retry deadline for this op.
+    async fn guarded<T, F, Fut>(&self, budget: Duration, f: F) -> Result<T, BackendError>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T, BackendError>>,
@@ -711,7 +747,7 @@ impl ReliableBackend {
             None => None,
         };
         let result = match &self.retry {
-            Some(retry) => retry.execute(f).await,
+            Some(retry) => retry.execute(budget, f).await,
             None => f().await,
         };
         if let Some(permit) = permit {
@@ -730,7 +766,7 @@ impl ReliableBackend {
 #[cfg_attr(feature = "unsync", async_trait(?Send))]
 impl Backend for ReliableBackend {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
-        self.guarded(|| self.inner.get(key)).await
+        self.guarded(READ_DEADLINE, || self.inner.get(key)).await
     }
 
     // Forwarded, not defaulted: the default would call `self.get` and drop
@@ -739,7 +775,8 @@ impl Backend for ReliableBackend {
         &self,
         key: &str,
     ) -> Result<Option<(Vec<u8>, Freshness)>, BackendError> {
-        self.guarded(|| self.inner.get_with_freshness(key)).await
+        self.guarded(READ_DEADLINE, || self.inner.get_with_freshness(key))
+            .await
     }
 
     async fn set(
@@ -749,16 +786,17 @@ impl Backend for ReliableBackend {
         ttl: Option<Duration>,
     ) -> Result<(), BackendError> {
         // Clone per attempt: the inner call consumes the buffer.
-        self.guarded(|| self.inner.set(key, value.clone(), ttl))
+        self.guarded(WRITE_DEADLINE, || self.inner.set(key, value.clone(), ttl))
             .await
     }
 
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
-        self.guarded(|| self.inner.delete(key)).await
+        self.guarded(WRITE_DEADLINE, || self.inner.delete(key))
+            .await
     }
 
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
-        self.guarded(|| self.inner.exists(key)).await
+        self.guarded(READ_DEADLINE, || self.inner.exists(key)).await
     }
 
     async fn health(&self) -> Result<HealthStatus, BackendError> {
@@ -1083,5 +1121,22 @@ mod tests {
         assert_eq!(no_jitter.delay(0), Duration::from_millis(100));
         assert_eq!(no_jitter.delay(1), Duration::from_millis(200));
         assert_eq!(no_jitter.delay(20), Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_quota_deny_is_not_retried() {
+        let calls = AtomicU64::new(0);
+        let policy = RetryPolicy::new(RetryConfig::default());
+
+        let err = policy
+            .execute(READ_DEADLINE, || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(BackendError::from_http_status(429, b"").with_quota_denied())
+            })
+            .await
+            .expect_err("denied");
+
+        assert!(err.is_quota_denied());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

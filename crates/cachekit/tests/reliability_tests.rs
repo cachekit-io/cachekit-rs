@@ -1061,3 +1061,192 @@ async fn circuit_state_is_none_without_a_breaker() {
     let disabled = client_with(shared, ReliabilityConfig::disabled());
     assert_eq!(disabled.circuit_state(), None);
 }
+
+// ── Retry deadline ───────────────────────────────────────────────────────────
+
+/// Every data op sleeps `latency` on the tokio clock, then fails with `kind`;
+/// `None` never completes. Counts calls.
+#[derive(Debug, Clone)]
+struct SlowBackend {
+    latency: Option<Duration>,
+    kind: BackendErrorKind,
+    calls: Arc<AtomicU32>,
+}
+
+impl SlowBackend {
+    fn new_with_handle(latency: Option<Duration>, kind: BackendErrorKind) -> (SharedBackend, Self) {
+        let backend = Self {
+            latency,
+            kind,
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let handle = backend.clone();
+        #[cfg(not(feature = "unsync"))]
+        let shared: SharedBackend = Arc::new(backend);
+        #[cfg(feature = "unsync")]
+        let shared: SharedBackend = std::rc::Rc::new(backend);
+        (shared, handle)
+    }
+
+    fn calls(&self) -> u32 {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    async fn op<T>(&self) -> Result<T, BackendError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.latency {
+            Some(latency) => tokio::time::sleep(latency).await,
+            None => std::future::pending().await,
+        }
+        Err(BackendError {
+            kind: self.kind.clone(),
+            message: "scripted failure".to_owned(),
+            source: None,
+        })
+    }
+}
+
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
+impl Backend for SlowBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        self.op().await
+    }
+
+    async fn set(
+        &self,
+        _key: &str,
+        _value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        self.op().await
+    }
+
+    async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+        self.op().await
+    }
+
+    async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+        self.op().await
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Ok(HealthStatus {
+            is_healthy: true,
+            latency_ms: 0.0,
+            backend_type: "slow".to_owned(),
+            details: HashMap::new(),
+        })
+    }
+}
+
+/// The preset stack with jitter off, so virtual time is exact.
+fn default_stack(backend: SharedBackend) -> CacheKit {
+    client_with(
+        backend,
+        ReliabilityConfig {
+            retry: Some(RetryConfig {
+                jitter: false,
+                ..RetryConfig::default()
+            }),
+            ..ReliabilityConfig::default()
+        },
+    )
+}
+
+/// Run `op` and return its result with the virtual time it took.
+async fn timed<T>(op: impl std::future::Future<Output = T>) -> (T, Duration) {
+    let start = tokio::time::Instant::now();
+    let out = op.await;
+    (out, start.elapsed())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_get_fails_at_the_5_s_read_deadline() {
+    let (backend, handle) = SlowBackend::new_with_handle(None, BackendErrorKind::Timeout);
+    let client = default_stack(backend);
+
+    let (result, elapsed) = timed(client.get::<u32>("k")).await;
+
+    let err = result.expect_err("stalled");
+    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Timeout));
+    assert_eq!(elapsed, Duration::from_secs(5));
+    assert_eq!(handle.calls(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_set_fails_at_the_10_s_write_deadline() {
+    let (backend, handle) = SlowBackend::new_with_handle(None, BackendErrorKind::Timeout);
+    let client = default_stack(backend);
+
+    let (result, elapsed) = timed(client.set("k", &7u32)).await;
+
+    let err = result.expect_err("stalled");
+    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Timeout));
+    assert_eq!(elapsed, Duration::from_secs(10));
+    assert_eq!(handle.calls(), 1);
+}
+
+/// The old cachekit.io shape: each attempt times out after 30 s. Without the
+/// deadline this took 3 x 30 s + 0.3 s backoff = 90.3 s.
+#[tokio::test(start_paused = true)]
+async fn a_30_s_attempt_timeout_is_cut_to_the_deadline() {
+    let (backend, handle) =
+        SlowBackend::new_with_handle(Some(Duration::from_secs(30)), BackendErrorKind::Timeout);
+    let client = default_stack(backend);
+
+    let (result, elapsed) = timed(client.get::<u32>("k")).await;
+
+    result.expect_err("timed out");
+    assert_eq!(elapsed, Duration::from_secs(5));
+    assert_eq!(handle.calls(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fast_failures_still_get_every_attempt() {
+    let (backend, handle) =
+        SlowBackend::new_with_handle(Some(Duration::ZERO), BackendErrorKind::Transient);
+    let client = default_stack(backend);
+
+    let (result, elapsed) = timed(client.get::<u32>("k")).await;
+
+    let err = result.expect_err("always fails");
+    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Transient));
+    assert_eq!(handle.calls(), 3);
+    assert_eq!(elapsed, Duration::from_millis(300), "100 + 200 ms backoff");
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_backoff_starts_past_the_deadline() {
+    // 4.95 s attempt + 100 ms backoff would start attempt 2 past 5 s: return
+    // the attempt's own error rather than a deadline timeout.
+    let (backend, handle) = SlowBackend::new_with_handle(
+        Some(Duration::from_millis(4950)),
+        BackendErrorKind::Transient,
+    );
+    let client = default_stack(backend);
+
+    let (result, elapsed) = timed(client.get::<u32>("k")).await;
+
+    let err = result.expect_err("fails");
+    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Transient));
+    assert_eq!(handle.calls(), 1);
+    assert_eq!(elapsed, Duration::from_millis(4950));
+}
+
+#[tokio::test(start_paused = true)]
+async fn serial_stalled_gets_open_the_breaker_inside_its_window() {
+    let (backend, handle) = SlowBackend::new_with_handle(None, BackendErrorKind::Timeout);
+    let client = default_stack(backend);
+
+    // Five 5 s failures fit the 60 s rolling window; at 90 s each they never did.
+    for _ in 0..5 {
+        client.get::<u32>("k").await.expect_err("stalled");
+    }
+    assert_eq!(client.circuit_state(), Some(CircuitState::Open));
+
+    let calls = handle.calls();
+    let err = client.get::<u32>("k").await.expect_err("open");
+    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::CircuitOpen));
+    assert_eq!(handle.calls(), calls, "an open breaker sends nothing");
+}
