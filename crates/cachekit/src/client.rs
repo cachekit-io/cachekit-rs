@@ -372,8 +372,7 @@ impl CacheKit {
         Ok(false)
     }
 
-    /// Validate TTL is non-zero. A positive sub-second TTL is accepted and
-    /// stored for 1 s (`spec/saas-api.md`: ceiled, never truncated to 0).
+    /// Rejects a zero TTL.
     fn validate_ttl(ttl: Duration) -> Result<(), CachekitError> {
         if ttl.is_zero() {
             return Err(CachekitError::Config(
@@ -589,7 +588,7 @@ impl CacheKit {
 
     /// Serialize and store `value` under `key` with an explicit `ttl`.
     ///
-    /// A positive sub-second `ttl` is stored for 1 second.
+    /// A positive sub-second `ttl` is sent to the backend as 1 second.
     ///
     /// Returns [`CachekitError::Config`] if `ttl` is zero.
     pub async fn set_with_ttl<T: Serialize>(

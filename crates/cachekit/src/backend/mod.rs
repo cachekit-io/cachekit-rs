@@ -353,7 +353,13 @@ pub(crate) fn delete_succeeded(status: u16) -> bool {
 /// From 1 s up it truncates, so the wire TTL stays an upper bound on the
 /// requested one and the writer's L1 copy can be bounded by it. Zero stays
 /// zero: TTL 0 is an error, and the server rejects it with `400`.
-#[cfg(any(feature = "cachekitio", feature = "workers", feature = "l1", test))]
+#[cfg(any(
+    feature = "cachekitio",
+    feature = "workers",
+    feature = "l1",
+    feature = "tracing",
+    test
+))]
 pub(crate) fn ttl_wire_secs(ttl: Duration) -> u64 {
     if ttl.is_zero() {
         return 0;

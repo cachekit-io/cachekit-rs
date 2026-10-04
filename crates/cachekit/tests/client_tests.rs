@@ -492,6 +492,30 @@ mod freshness {
         assert_eq!(backend.reads(), 1, "L1 kept the copy past the wire TTL");
     }
 
+    /// The other half of `min(local_ttl, wire)`: a 500 ms write goes on the
+    /// wire as 1 s, but its L1 copy keeps 500 ms, so by 700 ms the next read
+    /// reaches L2. Real time, as above.
+    #[tokio::test]
+    async fn sub_second_write_through_keeps_the_local_ttl() {
+        let backend = LabelledBackend::labelled(Freshness::default());
+        let shared: SharedBackend = backend.clone();
+        let cache = CacheKit::builder()
+            .backend(shared)
+            .build()
+            .expect("client builds");
+
+        cache
+            .set_with_ttl("k", &"v".to_owned(), Duration::from_millis(500))
+            .await
+            .expect("write succeeds");
+        assert_eq!(read(&cache).await.as_deref(), Some("v"));
+        assert_eq!(backend.reads(), 0, "a fresh write-through serves from L1");
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(read(&cache).await.as_deref(), Some("v"));
+        assert_eq!(backend.reads(), 1, "L1 kept the copy past the local TTL");
+    }
+
     /// (e) No header leaves today's behaviour: the hit is backfilled (the 30 s
     /// cap itself is pinned by `client::backfill_ttl_tests`).
     #[tokio::test]

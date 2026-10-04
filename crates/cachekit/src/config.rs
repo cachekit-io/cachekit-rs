@@ -256,7 +256,7 @@ impl CachekitConfigBuilder {
     }
 
     /// Set the default TTL. Must be non-zero; a positive sub-second TTL is
-    /// stored for 1 second.
+    /// sent to the backend as 1 second.
     pub fn default_ttl(mut self, ttl: Duration) -> Result<Self, CachekitError> {
         if ttl.is_zero() {
             return Err(CachekitError::Config(
