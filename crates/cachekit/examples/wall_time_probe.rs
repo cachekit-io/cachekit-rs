@@ -44,8 +44,9 @@
 //! `--hold-lock` tests those stop rules against a live refusal: before the
 //! run's first cold miss, a second client takes that key's fill lock (held
 //! 10 s at most), so the call's LOCK is refused by the server and the run must
-//! stop with exit 3; a run that does not stop there exits 1. The second client
-//! then releases its lock.
+//! stop; a run that does not stop there exits 1. Exit 3 is any stop, so read
+//! the `STOPPED` line for the cause: only `LOCK in macro-cold-miss` with
+//! `lock not granted` is the held lock. The second client then releases its lock.
 //!
 //! ```text
 //! CACHEKIT_API_KEY=… CACHEKIT_API_URL=https://… cargo run --release \
@@ -833,7 +834,7 @@ async fn timed_cold_miss(arm: &Arm, id: &str) -> Timed {
 
 /// `--hold-lock`: a second client takes `key`'s fill lock before the cold miss
 /// that will need it. Its own failure is a fault (exit 1), never a stop (exit
-/// 3), so exit 3 can only mean the cold miss met the held lock.
+/// 3), so it cannot pass for the refusal under test.
 async fn hold_lock(api_key: &str, api_url: &str, key: &str) -> Result<(CachekitIO, String), Stop> {
     let holder = CachekitIO::builder()
         .api_key(api_key)
