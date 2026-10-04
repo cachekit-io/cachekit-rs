@@ -390,8 +390,9 @@ async fn secure_with_namespace() {
     assert_eq!(val, "value");
 }
 
-/// The AAD binds the key as stored, namespace included: same master key and
-/// tenant, but ciphertext copied from `app1:k1` to `app2:k1` must not decrypt.
+/// The AAD binds the key the client passes to its backend, namespace
+/// included: same master key and tenant, but ciphertext copied from `app1:k1`
+/// to `app2:k1` must not decrypt.
 #[tokio::test]
 async fn secure_namespace_is_bound_in_aad() {
     let (shared, backend) = MockBackend::new_with_handle();
@@ -414,7 +415,7 @@ async fn secure_namespace_is_bound_in_aad() {
         .unwrap();
     let stored = backend.store.lock().await["app1:k1"].clone();
 
-    // The ciphertext authenticates under the stored key, not the bare one.
+    // The ciphertext authenticates under the namespaced key, not the bare one.
     let layer = cachekit::EncryptionLayer::new(TEST_MASTER_KEY, "one-tenant").unwrap();
     assert!(layer.decrypt(&stored, "app1:k1").is_ok());
     assert!(layer.decrypt(&stored, "k1").is_err());

@@ -997,10 +997,10 @@ impl SecureCache<'_> {
             .await
     }
 
-    /// Serialize and encrypt `value` for `key`, returning the key as stored
-    /// with the ciphertext. Every write encrypts here, so the AAD binds the
-    /// stored key, namespace included, and an entry copied to another
-    /// namespace fails to decrypt.
+    /// Serialize and encrypt `value` for `key`, returning the key this client
+    /// passes to its backend (`.namespace()` prefix included) with the
+    /// ciphertext. Every write encrypts here, so the AAD binds that key and an
+    /// entry copied to another namespace fails to decrypt.
     fn seal<T: Serialize>(&self, key: &str, value: &T) -> Result<(String, Vec<u8>), CachekitError> {
         let full_key = self.client.resolve_key(key)?;
         let plaintext = serializer::serialize(value)?;
@@ -1097,8 +1097,8 @@ impl SecureCache<'_> {
         }
     }
 
-    /// Decrypt ciphertext read for `key` against the key as stored (namespace
-    /// included); on failure, drop the key's L1 copy before propagating the
+    /// Decrypt ciphertext read for `key` against the key this client passes to
+    /// its backend (`.namespace()` prefix included); on failure, drop the key's L1 copy before propagating the
     /// error.
     ///
     /// An L2 hit is backfilled into L1 before it is decrypted, so an entry
