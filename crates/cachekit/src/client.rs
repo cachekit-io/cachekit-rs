@@ -237,13 +237,22 @@ impl CacheKit {
     /// config. Requires the `cachekitio` feature. With the `encryption`
     /// feature on and `CACHEKIT_MASTER_KEY` set, the client encrypts every
     /// value read and write (see [Encryption](CacheKit#encryption)); without
-    /// the feature the variable is validated but configures nothing.
+    /// the feature, a set `CACHEKIT_MASTER_KEY` is a [`CachekitError::Config`].
     #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
     pub fn from_env() -> Result<CacheKitBuilder, CachekitError> {
         use crate::backend::cachekitio::CachekitIO;
         use crate::config::CachekitConfig;
 
         let config = CachekitConfig::from_env()?;
+
+        // The same environment encrypts on a build with the feature, so
+        // ignoring the key here would be a silent plaintext downgrade.
+        #[cfg(not(feature = "encryption"))]
+        if config.master_key.is_some() {
+            return Err(encryption_feature_missing(
+                "CacheKit::from_env() with CACHEKIT_MASTER_KEY set",
+            ));
+        }
 
         let api_key_z = config
             .api_key
@@ -1154,9 +1163,9 @@ pub struct CacheKitBuilder {
 }
 
 #[cfg(not(feature = "encryption"))]
-fn encryption_feature_missing(method: &str) -> CachekitError {
+fn encryption_feature_missing(what: &str) -> CachekitError {
     CachekitError::Config(format!(
-        ".{method}() needs the `encryption` cargo feature, which this build of \
+        "{what} needs the `encryption` cargo feature, which this build of \
          cachekit-rs was compiled without; enable it to encrypt"
     ))
 }
@@ -1360,7 +1369,7 @@ impl CacheKitBuilder {
         _master_key: &[u8],
         _tenant_id: &str,
     ) -> Result<Self, CachekitError> {
-        Err(encryption_feature_missing("encryption_from_bytes"))
+        Err(encryption_feature_missing(".encryption_from_bytes()"))
     }
 
     /// Always [`CachekitError::Config`]: this build has no `encryption`
@@ -1373,7 +1382,7 @@ impl CacheKitBuilder {
         _tenant_id: &str,
     ) -> Result<Self, CachekitError> {
         Err(encryption_feature_missing(
-            "encryption_from_bytes_with_previous",
+            ".encryption_from_bytes_with_previous()",
         ))
     }
 
@@ -1381,7 +1390,7 @@ impl CacheKitBuilder {
     /// feature.
     #[cfg(not(feature = "encryption"))]
     pub fn encryption(self, _hex_key: &str, _tenant_id: &str) -> Result<Self, CachekitError> {
-        Err(encryption_feature_missing("encryption"))
+        Err(encryption_feature_missing(".encryption()"))
     }
 
     /// Finalise and build the [`CacheKit`] client.
