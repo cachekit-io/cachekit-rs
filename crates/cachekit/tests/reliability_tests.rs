@@ -1062,7 +1062,7 @@ async fn circuit_state_is_none_without_a_breaker() {
     assert_eq!(disabled.circuit_state(), None);
 }
 
-// ── Retry deadline ───────────────────────────────────────────────────────────
+// ── No retry deadline outside CacheKit::io ───────────────────────────────────
 
 /// Every data op sleeps `latency` on the tokio clock, then fails with `kind`;
 /// `None` never completes. Counts calls.
@@ -1140,8 +1140,8 @@ impl Backend for SlowBackend {
     }
 }
 
-/// The preset stack with jitter off, so virtual time is exact.
-fn default_stack(backend: SharedBackend) -> CacheKit {
+/// The default layers with jitter off, so virtual time is exact.
+fn jitter_off_stack(backend: SharedBackend) -> CacheKit {
     client_with(
         backend,
         ReliabilityConfig {
@@ -1154,99 +1154,22 @@ fn default_stack(backend: SharedBackend) -> CacheKit {
     )
 }
 
-/// Run `op` and return its result with the virtual time it took.
-async fn timed<T>(op: impl std::future::Future<Output = T>) -> (T, Duration) {
-    let start = tokio::time::Instant::now();
-    let out = op.await;
-    (out, start.elapsed())
-}
-
+/// A custom backend keeps every attempt: the 5 s / 10 s retry deadline is
+/// scoped to `CacheKit::io`, so a slow but working backend is never cut short
+/// (or counted as an outage) by budgets sized for cachekit.io.
 #[tokio::test(start_paused = true)]
-async fn a_stalled_get_fails_at_the_5_s_read_deadline() {
-    let (backend, handle) = SlowBackend::new_with_handle(None, BackendErrorKind::Timeout);
-    let client = default_stack(backend);
-
-    let (result, elapsed) = timed(client.get::<u32>("k")).await;
-
-    let err = result.expect_err("stalled");
-    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Timeout));
-    assert_eq!(elapsed, Duration::from_secs(5));
-    assert_eq!(handle.calls(), 1);
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_stalled_set_fails_at_the_10_s_write_deadline() {
-    let (backend, handle) = SlowBackend::new_with_handle(None, BackendErrorKind::Timeout);
-    let client = default_stack(backend);
-
-    let (result, elapsed) = timed(client.set("k", &7u32)).await;
-
-    let err = result.expect_err("stalled");
-    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Timeout));
-    assert_eq!(elapsed, Duration::from_secs(10));
-    assert_eq!(handle.calls(), 1);
-}
-
-/// The old cachekit.io shape: each attempt times out after 30 s. Without the
-/// deadline this took 3 x 30 s + 0.3 s backoff = 90.3 s.
-#[tokio::test(start_paused = true)]
-async fn a_30_s_attempt_timeout_is_cut_to_the_deadline() {
+async fn a_custom_backend_gets_no_retry_deadline() {
     let (backend, handle) =
         SlowBackend::new_with_handle(Some(Duration::from_secs(30)), BackendErrorKind::Timeout);
-    let client = default_stack(backend);
+    let client = jitter_off_stack(backend);
 
-    let (result, elapsed) = timed(client.get::<u32>("k")).await;
+    let start = tokio::time::Instant::now();
+    client.get::<u32>("k").await.expect_err("times out");
 
-    result.expect_err("timed out");
-    assert_eq!(elapsed, Duration::from_secs(5));
-    assert_eq!(handle.calls(), 1);
-}
-
-#[tokio::test(start_paused = true)]
-async fn fast_failures_still_get_every_attempt() {
-    let (backend, handle) =
-        SlowBackend::new_with_handle(Some(Duration::ZERO), BackendErrorKind::Transient);
-    let client = default_stack(backend);
-
-    let (result, elapsed) = timed(client.get::<u32>("k")).await;
-
-    let err = result.expect_err("always fails");
-    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Transient));
-    assert_eq!(handle.calls(), 3);
-    assert_eq!(elapsed, Duration::from_millis(300), "100 + 200 ms backoff");
-}
-
-#[tokio::test(start_paused = true)]
-async fn no_backoff_starts_past_the_deadline() {
-    // 4.95 s attempt + 100 ms backoff would start attempt 2 past 5 s: return
-    // the attempt's own error rather than a deadline timeout.
-    let (backend, handle) = SlowBackend::new_with_handle(
-        Some(Duration::from_millis(4950)),
-        BackendErrorKind::Transient,
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_millis(90_300),
+        "3 x 30 s + 100 + 200 ms"
     );
-    let client = default_stack(backend);
-
-    let (result, elapsed) = timed(client.get::<u32>("k")).await;
-
-    let err = result.expect_err("fails");
-    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Transient));
-    assert_eq!(handle.calls(), 1);
-    assert_eq!(elapsed, Duration::from_millis(4950));
-}
-
-#[tokio::test(start_paused = true)]
-async fn serial_stalled_gets_open_the_breaker_inside_its_window() {
-    let (backend, handle) = SlowBackend::new_with_handle(None, BackendErrorKind::Timeout);
-    let client = default_stack(backend);
-
-    // Five 5 s failures fit the 60 s rolling window; at 90 s each they never did.
-    for _ in 0..5 {
-        client.get::<u32>("k").await.expect_err("stalled");
-    }
-    assert_eq!(client.circuit_state(), Some(CircuitState::Open));
-
-    let calls = handle.calls();
-    let err = client.get::<u32>("k").await.expect_err("open");
-    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::CircuitOpen));
-    assert_eq!(handle.calls(), calls, "an open breaker sends nothing");
+    assert_eq!(handle.calls(), 3);
 }

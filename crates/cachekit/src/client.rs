@@ -1166,6 +1166,11 @@ pub struct CacheKitBuilder {
 
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
     reliability: Option<crate::reliability::ReliabilityConfig>,
+
+    /// Retry deadlines for the backend `CacheKit::io` built; cleared by
+    /// [`Self::backend`] so a replaced backend never inherits them.
+    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+    pub(crate) retry_deadlines: Option<crate::reliability::RetryDeadlines>,
 }
 
 #[cfg(not(feature = "encryption"))]
@@ -1180,6 +1185,10 @@ impl CacheKitBuilder {
     /// Set the storage backend.
     pub fn backend(mut self, backend: SharedBackend) -> Self {
         self.backend = Some(backend);
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        {
+            self.retry_deadlines = None;
+        }
         self
     }
 
@@ -1463,7 +1472,7 @@ impl CacheKitBuilder {
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         let (backend, breaker) = match self.reliability {
             Some(config) if !config.is_disabled() => {
-                crate::reliability::wrap_reliable(backend, config)
+                crate::reliability::wrap_reliable(backend, config, self.retry_deadlines)
             }
             _ => (backend, None),
         };

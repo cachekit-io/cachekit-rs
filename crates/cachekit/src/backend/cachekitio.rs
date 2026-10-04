@@ -306,7 +306,8 @@ impl Backend for CachekitIO {
         match resp.status().as_u16() {
             200 => Ok(true),
             404 => Ok(false),
-            status => Err(BackendError::from_http_status(status, &[])),
+            // Through the header-aware path, so a quota-deny `429` is marked.
+            _ => Err(self.error_from_response(resp).await),
         }
     }
 
@@ -1144,6 +1145,22 @@ mod http_client_tests {
         );
     }
 
+    /// The stub's request count once it reaches `at_least`, or after 2 s.
+    ///
+    /// The stub records a request on its own thread; a stalled request may
+    /// time out on the paused clock before that thread has read it.
+    #[cfg(feature = "reliability")]
+    fn recorded(stub: &Stub, at_least: usize) -> usize {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let n = stub.requests.lock().expect("lock").len();
+            if n >= at_least || std::time::Instant::now() >= deadline {
+                return n;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Answers the first request (to pool a connection), stalls every later one.
     fn first_only(n: usize) -> Option<&'static [u8]> {
         (n == 0).then_some(OK)
@@ -1185,7 +1202,9 @@ mod http_client_tests {
     mod through_the_reliability_stack {
         use super::*;
         use crate::client::SharedBackend;
-        use crate::reliability::{wrap_reliable, ReliabilityConfig, RetryConfig};
+        use crate::reliability::{
+            wrap_reliable, ReliabilityConfig, RetryConfig, CACHEKITIO_DEADLINES,
+        };
 
         /// The default stack with jitter off, so virtual time is exact.
         fn reliable(backend: CachekitIO) -> SharedBackend {
@@ -1209,7 +1228,7 @@ mod http_client_tests {
                 }),
                 ..ReliabilityConfig::default()
             };
-            wrap_reliable(shared, config)
+            wrap_reliable(shared, config, Some(CACHEKITIO_DEADLINES))
         }
 
         const QUOTA_DENY: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\n\
@@ -1231,11 +1250,19 @@ mod http_client_tests {
 
             assert_eq!(result.expect_err("stalled").kind, BackendErrorKind::Timeout);
             assert_budget(elapsed, Duration::from_secs(5));
-            assert_eq!(
-                stub.requests.lock().expect("lock").len(),
-                2,
-                "warm-up + one GET"
-            );
+            assert_eq!(recorded(&stub, 2), 2, "warm-up + one GET");
+        }
+
+        #[tokio::test]
+        async fn a_quota_denied_exists_is_sent_once() {
+            let stub = stub_with(|_| Some(QUOTA_DENY));
+            let backend = reliable(backend_at(&stub));
+
+            let err = backend.exists("k").await.expect_err("denied");
+
+            assert_eq!(err.kind, BackendErrorKind::Transient);
+            assert!(err.is_quota_denied());
+            assert_eq!(recorded(&stub, 1), 1, "no in-call retry");
         }
 
         #[tokio::test]
