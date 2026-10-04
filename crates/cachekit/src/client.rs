@@ -181,6 +181,18 @@ impl Eq for SwrToken {}
 /// state, and encryption layer. Clones exist so `'static` background work
 /// (e.g. the SWR refresh spawned by `#[cachekit]`) can hold the client
 /// without borrowing it.
+///
+/// # Encryption
+///
+/// A client built with encryption configured (by any of the builder's
+/// encryption methods, the `secure` / `secure_from_env` preset, or
+/// [`CacheKit::from_env`] with `CACHEKIT_MASTER_KEY` set) encrypts every
+/// value it writes and decrypts every value it reads — [`Self::get`],
+/// [`Self::interop_get`], [`Self::interop_get_swr`], [`Self::set`] and
+/// [`Self::set_with_ttl`] — and L1 holds ciphertext. Such a client has no
+/// plaintext value path, and the `SecureCache` handle from `secure_cache()`
+/// reads and writes the same entries. [`Self::delete`] and [`Self::exists`]
+/// carry no value and are the same either way.
 #[derive(Clone)]
 pub struct CacheKit {
     backend: SharedBackend,
@@ -222,7 +234,10 @@ impl CacheKit {
     /// Build from environment variables via [`crate::config::CachekitConfig::from_env`].
     ///
     /// Creates a [`crate::backend::cachekitio::CachekitIO`] backend from the
-    /// config. Requires the `cachekitio` feature.
+    /// config. Requires the `cachekitio` feature. With the `encryption`
+    /// feature on and `CACHEKIT_MASTER_KEY` set, the client encrypts every
+    /// value read and write (see [Encryption](CacheKit#encryption)); without
+    /// the feature the variable is validated but configures nothing.
     #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
     pub fn from_env() -> Result<CacheKitBuilder, CachekitError> {
         use crate::backend::cachekitio::CachekitIO;
@@ -384,7 +399,20 @@ impl CacheKit {
     ///
     /// Returns `None` if the key does not exist.
     /// Checks L1 cache before hitting the backend.
+    ///
+    /// # Errors
+    ///
+    /// On a client with encryption configured, returns
+    /// [`CachekitError::Encryption`] — not a miss — if the stored entry fails
+    /// decryption. The key's L1 copy is dropped first and the backend entry
+    /// is left in place, so the next read reaches the backend: a hit once the
+    /// entry is replaced with ciphertext this client can decrypt, a miss once
+    /// it expires or is deleted.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, CachekitError> {
+        #[cfg(feature = "encryption")]
+        if let Some(secure) = self.encrypting() {
+            return secure.get(key).await;
+        }
         match self.get_bytes(key).await? {
             Some(bytes) => Ok(Some(serializer::deserialize(&bytes)?)),
             None => Ok(None),
@@ -402,7 +430,12 @@ impl CacheKit {
     /// Use with keys from [`crate::interop::interop_key`] on a client
     /// **without** a namespace prefix. There is no interop-specific write
     /// method: [`Self::set`] already writes plain MessagePack (no ByteStorage
-    /// envelope), which is the interop value format.
+    /// envelope), which is the interop value format. On a client with
+    /// encryption configured the stored bytes are AES-GCM ciphertext of that
+    /// MessagePack, decrypted here before decoding: in interop mode the
+    /// AES-GCM plaintext is the plain MessagePack value bytes, so the AAD
+    /// (v0x03, `format="msgpack"`, `compressed="False"`) verifies cross-SDK
+    /// unchanged.
     ///
     /// # Errors
     ///
@@ -411,11 +444,18 @@ impl CacheKit {
     /// would rewrite the storage key to `{prefix}:{interop_key}`, which no
     /// other SDK computes — every cross-SDK entry would silently miss. Interop
     /// keys carry their own namespace segment; failing loudly here beats a
-    /// 100% miss rate that looks like a cold cache.
+    /// 100% miss rate that looks like a cold cache. With encryption
+    /// configured, an entry that fails decryption is
+    /// [`CachekitError::Encryption`], with the key's L1 copy dropped as for
+    /// [`Self::get`].
     pub async fn interop_get<T: DeserializeOwned>(
         &self,
         key: &str,
     ) -> Result<Option<T>, CachekitError> {
+        #[cfg(feature = "encryption")]
+        if let Some(secure) = self.encrypting() {
+            return secure.interop_get(key).await;
+        }
         self.reject_namespaced_interop()?;
         match self.get_bytes(key).await? {
             Some(bytes) => Ok(Some(crate::interop::deserialize(&bytes)?)),
@@ -461,6 +501,10 @@ impl CacheKit {
     /// like [`Self::interop_get`]: hits are `Fresh`, `Stale` is never
     /// produced.
     ///
+    /// On a client with encryption configured, staleness is judged on the L1
+    /// **ciphertext** entry (freshness metadata never exposes plaintext),
+    /// then the value is decrypted as for [`Self::interop_get`].
+    ///
     /// # Errors
     ///
     /// Same as [`Self::interop_get`] (including the namespaced-client
@@ -469,6 +513,10 @@ impl CacheKit {
         &self,
         key: &str,
     ) -> Result<SwrRead<T>, CachekitError> {
+        #[cfg(feature = "encryption")]
+        if let Some(secure) = self.encrypting() {
+            return secure.interop_get_swr(key).await;
+        }
         self.reject_namespaced_interop()?;
         match self.get_bytes_swr(key).await? {
             SwrRead::Fresh(b) => Ok(SwrRead::Fresh(crate::interop::deserialize(&b)?)),
@@ -578,11 +626,18 @@ impl CacheKit {
     }
 
     /// Serialize and store `value` under `key` using the client's default TTL.
+    ///
+    /// Encrypts first on a client with encryption configured — see
+    /// [`Self::set_with_ttl`].
     pub async fn set<T: Serialize>(&self, key: &str, value: &T) -> Result<(), CachekitError> {
         self.set_with_ttl(key, value, self.default_ttl).await
     }
 
     /// Serialize and store `value` under `key` with an explicit `ttl`.
+    ///
+    /// On a client with encryption configured the value is encrypted first:
+    /// the backend and L1 receive only the AES-256-GCM ciphertext, and the
+    /// payload limit applies to the ciphertext.
     ///
     /// Returns [`CachekitError::Config`] if `ttl` is less than 1 second.
     pub async fn set_with_ttl<T: Serialize>(
@@ -591,6 +646,10 @@ impl CacheKit {
         value: &T,
         ttl: Duration,
     ) -> Result<(), CachekitError> {
+        #[cfg(feature = "encryption")]
+        if let Some(secure) = self.encrypting() {
+            return secure.set_with_ttl(key, value, ttl).await;
+        }
         Self::validate_ttl(ttl)?;
 
         let bytes = serializer::serialize(value)?;
@@ -625,8 +684,9 @@ impl CacheKit {
         Ok(())
     }
 
-    /// Commit an unencrypted SWR refresh only if its stale-read token is
-    /// still current. Macro plumbing; ordinary writes use [`Self::set_with_ttl`].
+    /// Commit an SWR refresh only if its stale-read token is still current,
+    /// encrypted when the client has encryption configured. Macro plumbing;
+    /// ordinary writes use [`Self::set_with_ttl`].
     #[doc(hidden)]
     pub async fn __complete_swr_refresh<T: Serialize>(
         &self,
@@ -635,6 +695,10 @@ impl CacheKit {
         ttl: Duration,
         token: SwrToken,
     ) -> Result<bool, CachekitError> {
+        #[cfg(feature = "encryption")]
+        if let Some(secure) = self.encrypting() {
+            return secure.__complete_swr_refresh(key, value, ttl, token).await;
+        }
         let bytes = serializer::serialize(value)?;
         self.complete_swr_bytes(key, bytes, ttl, token).await
     }
@@ -761,6 +825,13 @@ impl CacheKit {
     /// L1 stores **ciphertext** (not plaintext) to preserve the zero-knowledge
     /// property across all cache layers.
     ///
+    /// The handle encrypts exactly what this client's own value methods
+    /// already encrypt (see [Encryption](CacheKit#encryption)), and the two
+    /// read each other's entries. What it adds is the guarantee: code that
+    /// must never run unencrypted asks for the handle, which fails on a
+    /// client without encryption, and it carries the
+    /// [`previous_key_hits`](SecureCache::previous_key_hits) rotation signal.
+    ///
     /// # Errors
     /// Returns `CachekitError::Config` if no encryption layer is configured.
     /// Configure encryption via [`CacheKitBuilder::encryption`] /
@@ -769,17 +840,25 @@ impl CacheKit {
     /// `CacheKit::secure_from_env(url)` preset (`redis` feature).
     #[cfg(feature = "encryption")]
     pub fn secure_cache(&self) -> Result<SecureCache<'_>, CachekitError> {
-        let enc = self.encryption.as_ref().ok_or_else(|| {
+        self.encrypting().ok_or_else(|| {
             CachekitError::Config(
                 "encryption not configured: use the CacheKit::secure(url, master_key_hex) \
                  preset, CacheKit::secure_from_env(url) to read the hex key from \
                  CACHEKIT_MASTER_KEY, or call .encryption() on the builder"
                     .to_owned(),
             )
-        })?;
-        Ok(SecureCache {
+        })
+    }
+
+    /// The encrypting handle when encryption is configured. Every value
+    /// method routes through it first, so a configured key leaves no
+    /// plaintext path (protocol `spec/intent-presets.md` § Encryption
+    /// Activation, rule 1).
+    #[cfg(feature = "encryption")]
+    fn encrypting(&self) -> Option<SecureCache<'_>> {
+        self.encryption.as_deref().map(|encryption| SecureCache {
             client: self,
-            encryption: enc,
+            encryption,
         })
     }
 
@@ -801,7 +880,9 @@ impl CacheKit {
 /// Encrypted cache handle returned by [`CacheKit::secure_cache()`].
 ///
 /// All values are serialized, then encrypted with AES-256-GCM before storage.
-/// L1 stores ciphertext to maintain zero-knowledge guarantees.
+/// L1 stores ciphertext to maintain zero-knowledge guarantees. The client's
+/// own value methods route through these same methods once encryption is
+/// configured, so the handle and the client read each other's entries.
 #[cfg(feature = "encryption")]
 pub struct SecureCache<'a> {
     client: &'a CacheKit,
@@ -1048,6 +1129,14 @@ pub struct CacheKitBuilder {
     reliability: Option<crate::reliability::ReliabilityConfig>,
 }
 
+#[cfg(not(feature = "encryption"))]
+fn encryption_feature_missing(method: &str) -> CachekitError {
+    CachekitError::Config(format!(
+        ".{method}() needs the `encryption` cargo feature, which this build of \
+         cachekit-rs was compiled without; enable it to encrypt"
+    ))
+}
+
 impl CacheKitBuilder {
     /// Set the storage backend.
     pub fn backend(mut self, backend: SharedBackend) -> Self {
@@ -1153,6 +1242,17 @@ impl CacheKitBuilder {
     /// [`CachekitError::Config`]. Hex-encoded keys go to [`Self::encryption`]
     /// — their ASCII bytes are 64 bytes long and rejected here.
     /// Keys are derived per-tenant via HKDF-SHA256.
+    ///
+    /// The built client encrypts every value read and write — plain
+    /// `get` / `set` / `set_with_ttl` / `interop_get` / `interop_get_swr`
+    /// included, L1 holds ciphertext — not only the
+    /// [`secure_cache()`](CacheKit::secure_cache) handle; see
+    /// [Encryption](CacheKit#encryption). Calling any encryption method
+    /// again replaces the earlier configuration.
+    ///
+    /// Without the `encryption` cargo feature this method, and every other
+    /// builder encryption method, returns [`CachekitError::Config`]: a build
+    /// that cannot encrypt never accepts a key.
     #[cfg(feature = "encryption")]
     pub fn encryption_from_bytes(
         mut self,
@@ -1173,6 +1273,9 @@ impl CacheKitBuilder {
     /// truncated. See [`crate::encryption::EncryptionLayer::with_previous_keys`].
     ///
     /// Every key, current and previous, must be exactly 32 raw bytes.
+    ///
+    /// Encrypts every value read and write, as for
+    /// [`Self::encryption_from_bytes`].
     #[cfg(feature = "encryption")]
     pub fn encryption_from_bytes_with_previous(
         mut self,
@@ -1194,6 +1297,9 @@ impl CacheKitBuilder {
     /// Hex-decodes with the same decoder as [`CacheKit::from_env`] and the
     /// `secure` preset. The key must decode to at least 32 bytes; use exactly
     /// 32 (64 hex chars), the only length every SDK accepts.
+    ///
+    /// Encrypts every value read and write, as for
+    /// [`Self::encryption_from_bytes`].
     #[cfg(feature = "encryption")]
     pub fn encryption(self, hex_key: &str, tenant_id: &str) -> Result<Self, CachekitError> {
         let bytes = crate::config::decode_master_key_hex(hex_key, "master key")?;
@@ -1219,16 +1325,24 @@ impl CacheKitBuilder {
         Ok(self)
     }
 
-    // Stub for when encryption feature is disabled.
+    // Without the `encryption` feature the builder methods still exist, so
+    // feature-agnostic code compiles, but each one is an error: accepting a
+    // key and building a plaintext client is the silent downgrade protocol
+    // `spec/intent-presets.md` § Encryption Activation rule 1 forbids.
+
+    /// Always [`CachekitError::Config`]: this build has no `encryption`
+    /// feature.
     #[cfg(not(feature = "encryption"))]
     pub fn encryption_from_bytes(
         self,
         _master_key: &[u8],
         _tenant_id: &str,
     ) -> Result<Self, CachekitError> {
-        Ok(self)
+        Err(encryption_feature_missing("encryption_from_bytes"))
     }
 
+    /// Always [`CachekitError::Config`]: this build has no `encryption`
+    /// feature.
     #[cfg(not(feature = "encryption"))]
     pub fn encryption_from_bytes_with_previous(
         self,
@@ -1236,12 +1350,16 @@ impl CacheKitBuilder {
         _previous_keys: &[&[u8]],
         _tenant_id: &str,
     ) -> Result<Self, CachekitError> {
-        Ok(self)
+        Err(encryption_feature_missing(
+            "encryption_from_bytes_with_previous",
+        ))
     }
 
+    /// Always [`CachekitError::Config`]: this build has no `encryption`
+    /// feature.
     #[cfg(not(feature = "encryption"))]
     pub fn encryption(self, _hex_key: &str, _tenant_id: &str) -> Result<Self, CachekitError> {
-        Ok(self)
+        Err(encryption_feature_missing("encryption"))
     }
 
     /// Finalise and build the [`CacheKit`] client.
@@ -1396,5 +1514,65 @@ mod backfill_ttl_tests {
             l1_backfill_ttl(DEFAULT_TTL, stale(Some(Duration::from_secs(60)))),
             None
         );
+    }
+}
+
+// SWR staleness exists only on native builds with L1 (see tests/swr_tests.rs).
+#[cfg(all(
+    test,
+    feature = "encryption",
+    feature = "l1",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
+#[allow(clippy::unwrap_used)] // test-only: a failed setup step should panic loudly
+mod secure_l1_tests {
+    use std::time::Duration;
+
+    use super::{CacheKit, SharedBackend, SwrRead};
+    use crate::backend::MemoryBackend;
+    use crate::error::CachekitError;
+
+    /// The Stale arm reads straight from L1, and every public write on an
+    /// encrypted client stores decryptable ciphertext there, so the
+    /// undecryptable bytes are planted in L1 directly.
+    #[tokio::test]
+    async fn secure_interop_get_swr_evicts_stale_l1_after_decrypt_failure() {
+        let backend = MemoryBackend::default();
+        let shared: SharedBackend = std::sync::Arc::new(backend.clone());
+        let client = CacheKit::builder()
+            .backend(shared)
+            .l1_capacity(100)
+            .swr_threshold_ratio(0.001)
+            .encryption_from_bytes(&[7u8; 32], "test-tenant")
+            .unwrap()
+            .build()
+            .unwrap();
+        client.l1_set(
+            "poisoned-stale",
+            bytes::Bytes::from_static(b"not ciphertext"),
+            Duration::from_secs(60),
+        );
+        // Real time, not tokio's paused clock: L1 ages entries by std
+        // Instant. threshold = 0.001 × 60 s = 60 ms (±10%); hard expiry 60 s.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let secure = client.secure_cache().unwrap();
+        let err = secure
+            .interop_get_swr::<String>("poisoned-stale")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+        // Served from L1, so the entry had not hard-expired into the L2 path.
+        let stats = client.stats();
+        assert_eq!((stats.l1_hits, stats.l2_hits), (1, 0), "{stats:?}");
+
+        // Nothing in the backend: a surviving L1 copy would keep failing; an
+        // evicted one yields a miss.
+        assert!(backend.store.lock().await.is_empty());
+        assert!(matches!(
+            secure.interop_get_swr::<String>("poisoned-stale").await,
+            Ok(SwrRead::Miss)
+        ));
     }
 }

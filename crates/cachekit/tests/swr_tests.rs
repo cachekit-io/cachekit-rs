@@ -227,6 +227,58 @@ async fn concurrent_delete_wins_over_an_older_secure_refresh() {
     assert_eq!(SECURE_DELETE_RACE_CALLS.load(Ordering::SeqCst), 2);
 }
 
+#[cfg(feature = "encryption")]
+static PLAIN_ENCRYPTED_CALLS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "encryption")]
+#[cachekit(
+    client = cache,
+    ttl = 4,
+    interop = "swr_plain_encrypted",
+    namespace = "swrtest"
+)]
+async fn swr_plain_encrypted(cache: &CacheKit, id: u64) -> Result<String, CachekitError> {
+    let n = PLAIN_ENCRYPTED_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    Ok(format!("pe{id}-c{n}"))
+}
+
+/// A plain (non-`secure`) function's background refresh on a client with
+/// encryption configured commits ciphertext, like every other write on it.
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn plain_refresh_on_encrypted_client_commits_ciphertext() {
+    const TENANT: &str = "swr-plain-tenant";
+    let (shared, backend) = MockBackend::new_with_handle();
+    let cache = CacheKit::builder()
+        .backend(shared)
+        .swr_threshold_ratio(0.25)
+        .encryption_from_bytes(&[7_u8; 32], TENANT)
+        .expect("encryption configures")
+        .build()
+        .expect("client builds");
+    let storage_key = key("swr_plain_encrypted", 17);
+
+    assert_eq!(swr_plain_encrypted(&cache, 17).await.unwrap(), "pe17-c1");
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    // Stale: served at once while one refresh runs in the background.
+    assert_eq!(swr_plain_encrypted(&cache, 17).await.unwrap(), "pe17-c1");
+
+    let layer = cachekit::EncryptionLayer::new(&[7_u8; 32], TENANT).unwrap();
+    let refreshed = cachekit::serializer::serialize(&"pe17-c2").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let stored = backend.store.lock().await.get(&storage_key).cloned();
+        if stored.is_some_and(|s| layer.decrypt(&s, &storage_key).ok() == Some(refreshed.clone())) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the refresh never committed ciphertext of the new value"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 static SET_RACE_CALLS: AtomicU32 = AtomicU32::new(0);
 static SET_REFRESH_STARTED: Notify = Notify::const_new();
 static SET_REFRESH_RELEASE: Notify = Notify::const_new();

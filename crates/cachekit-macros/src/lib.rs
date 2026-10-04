@@ -210,7 +210,12 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   error — the CachekitIO server parses those key prefixes); operations are
 ///   unaffected. Neither segment may contain `..` (a compile error — the
 ///   server rejects `..` anywhere in a key); a lone `.` is fine.
-/// - `secure` (optional flag): Use encrypted cache via `cache.secure_cache()`.
+/// - `secure` (optional flag): require encryption — every call fails with
+///   `CachekitError::Config` on a client without it — and fail closed on
+///   every backend error (see *Reliability behaviour*). The flag is not what
+///   encrypts: on a client with encryption configured, a function without it
+///   stores and reads ciphertext too, because the client's value methods
+///   encrypt.
 ///
 /// # Requirements
 ///
@@ -229,13 +234,14 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   namespaced client.
 /// - A stored entry that cannot be decoded as the return type
 ///   (`CachekitError::Serialization`) is treated as a miss and overwritten
-///   (self-healing). On `secure` functions this covers only post-decrypt
-///   decode failures: an entry that fails AES-GCM authentication raises
-///   `CachekitError::Encryption`, which propagates (fail-closed). The failed
-///   read drops the key's L1 copy and leaves the backend entry in place, so
-///   the next call reads the backend again: it fails while that entry
-///   remains, succeeds once any process replaces it with ciphertext this
-///   client can decrypt, and is a miss once it expires or is deleted.
+///   (self-healing). On a client with encryption configured, `secure` or
+///   not, this covers only post-decrypt decode failures: an entry that fails
+///   AES-GCM authentication raises `CachekitError::Encryption`, which
+///   propagates (fail-closed). The failed read drops the key's L1 copy and
+///   leaves the backend entry in place, so the next call reads the backend
+///   again: it fails while that entry remains, succeeds once any process
+///   replaces it with ciphertext this client can decrypt, and is a miss once
+///   it expires or is deleted.
 ///
 /// # Requirements (continued)
 ///
@@ -269,7 +275,9 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   (a wrong API key must fail loudly, not silently disable caching
 ///   forever). With `secure`, *every* backend and decryption error fails
 ///   *closed* and propagates: an encrypted workload never silently
-///   degrades.
+///   degrades. Without the flag, a client with encryption configured still
+///   propagates decryption errors and still encrypts what it writes; only
+///   the outage-class backend errors above fail open.
 /// - **Cold-miss single-flight**: concurrent calls that miss on the same
 ///   key are collapsed to one execution per process (and per fleet, when
 ///   the backend supports distributed fill locks — CachekitIO and Redis do,

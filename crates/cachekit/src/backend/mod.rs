@@ -561,3 +561,50 @@ mod ttl_header_tests {
         );
     }
 }
+
+// ── In-memory backend for crate-internal tests ───────────────────────────────
+
+/// In-memory [`Backend`] for crate-internal tests that must see the bytes
+/// that actually reached the backend. Clones share one store.
+#[cfg(test)]
+#[allow(dead_code)] // its tests are feature-gated; builds without them still compile it
+#[derive(Clone, Default)]
+pub(crate) struct MemoryBackend {
+    pub(crate) store: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+#[cfg(test)]
+#[cfg_attr(not(any(target_arch = "wasm32", feature = "unsync")), async_trait)]
+#[cfg_attr(any(target_arch = "wasm32", feature = "unsync"), async_trait(?Send))]
+impl Backend for MemoryBackend {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        Ok(self.store.lock().await.get(key).cloned())
+    }
+
+    async fn set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        self.store.lock().await.insert(key.to_owned(), value);
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> Result<bool, BackendError> {
+        Ok(self.store.lock().await.remove(key).is_some())
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, BackendError> {
+        Ok(self.store.lock().await.contains_key(key))
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Ok(HealthStatus {
+            is_healthy: true,
+            latency_ms: 0.0,
+            backend_type: "memory".to_owned(),
+            details: HashMap::new(),
+        })
+    }
+}

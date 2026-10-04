@@ -207,7 +207,11 @@ impl CacheKit {
     ///   **auto-reconnects** after a dropped connection with exponential
     ///   backoff, 100 ms → 30 s, retrying indefinitely)
     /// * L1 cache: **on** (1 000 entries, stores ciphertext)
-    /// * Encryption: **AES-256-GCM** with HKDF-SHA256
+    /// * Encryption: **AES-256-GCM** with HKDF-SHA256, on every value read
+    ///   and write — plain `get` / `set` / `set_with_ttl` / `interop_get` /
+    ///   `interop_get_swr` as well as the
+    ///   [`secure_cache()`](CacheKit::secure_cache) handle (see
+    ///   [Encryption](CacheKit#encryption))
     /// * Reliability: **on** — retry with backoff + jitter, circuit
     ///   breaker, backpressure (max 100 concurrent backend ops)
     /// * Default TTL: **600 s**
@@ -248,7 +252,8 @@ impl CacheKit {
     /// let cache = cachekit::CacheKit::secure("redis://localhost:6379", &master_key_hex)
     ///     .await?
     ///     .build()?;
-    /// let secure = cache.secure_cache()?;
+    /// // Encrypted before it leaves the process; L1 holds the ciphertext.
+    /// cache.set("user:42:ssn", &"123-45-6789").await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -297,7 +302,9 @@ impl CacheKit {
     /// let cache = cachekit::CacheKit::secure_from_env("redis://localhost:6379")
     ///     .await?
     ///     .build()?;
-    /// let secure = cache.secure_cache()?;
+    /// cache.set("user:42:ssn", &"123-45-6789").await?; // encrypted
+    /// // Reads served by each CACHEKIT_PREVIOUS_MASTER_KEYS entry, for rotation.
+    /// let drain = cache.secure_cache()?.previous_key_hits();
     /// # Ok(())
     /// # }
     /// ```
@@ -311,7 +318,8 @@ impl CacheKit {
     /// * Backend: [cachekit.io](https://cachekit.io) HTTP API
     /// * L1 cache: **on** (1 000 entries)
     /// * Encryption: **no** (add via
-    ///   [`.encryption()`](CacheKitBuilder::encryption))
+    ///   [`.encryption()`](CacheKitBuilder::encryption), which then encrypts
+    ///   every value read and write)
     /// * Reliability: **on** — retry with backoff + jitter, circuit
     ///   breaker, backpressure (max 100 concurrent backend ops)
     /// * Default TTL: **3 600 s**
@@ -439,6 +447,57 @@ mod secure_tests {
             .decrypt(&ciphertext, CACHE_KEY)
             .expect("default-tenant vector must decrypt");
         assert_eq!(hex::encode(plaintext), PLAINTEXT_HEX);
+    }
+
+    /// § Encryption Activation rule 1 on the preset: plain `set` on a
+    /// `secure` client puts only ciphertext in the backend and in L1, and
+    /// plain `get` decrypts it. Driven through `secure_defaults` so it runs
+    /// without Redis.
+    #[tokio::test]
+    async fn plain_set_on_secure_preset_stores_ciphertext() {
+        const VALUE: &str = "ssn 123-45-6789";
+        let backend = crate::backend::MemoryBackend::default();
+        let master_key = hex::decode(MASTER_KEY_HEX).expect("vector hex");
+        let cache = super::secure_defaults(&master_key, &[])
+            .expect("valid key")
+            .backend(super::wrap(backend.clone()))
+            .build()
+            .expect("secure defaults must build");
+
+        cache.set(CACHE_KEY, &VALUE).await.expect("plain set");
+
+        let stored = backend
+            .store
+            .lock()
+            .await
+            .get(CACHE_KEY)
+            .cloned()
+            .expect("plain set reached the backend");
+        let plaintext = crate::serializer::serialize(&VALUE).expect("serializes");
+        assert_ne!(stored, plaintext, "backend holds plaintext");
+        let independent = crate::EncryptionLayer::new(&master_key, "default").expect("valid key");
+        assert_eq!(
+            independent
+                .decrypt(&stored, CACHE_KEY)
+                .expect("backend bytes are ciphertext under the preset's key and tenant"),
+            plaintext
+        );
+        #[cfg(feature = "l1")]
+        assert_eq!(
+            cache
+                .l1
+                .as_ref()
+                .expect("secure preset enables L1")
+                .get_shared(CACHE_KEY)
+                .as_deref(),
+            Some(stored.as_slice()),
+            "L1 holds the same ciphertext as the backend"
+        );
+
+        assert_eq!(
+            cache.get::<String>(CACHE_KEY).await.expect("plain get"),
+            Some(VALUE.to_owned())
+        );
     }
 
     #[test]
