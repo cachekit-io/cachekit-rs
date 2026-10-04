@@ -82,12 +82,6 @@ compile_error!(
 #[cfg(all(feature = "workers", feature = "l1"))]
 compile_error!("features `workers` and `l1` are mutually exclusive — moka requires std threads unavailable in wasm32");
 
-// std's `Instant::now()` is an unsupported stub on wasm32-unknown-unknown (no
-// clock), and L1 stamps every insert with it (moka reads it too), so the first
-// insert would panic at runtime. WASI has a real clock and keeps L1.
-#[cfg(all(feature = "l1", target_arch = "wasm32", target_os = "unknown"))]
-compile_error!("feature `l1` is not supported on wasm32-unknown-unknown — std::time::Instant has no clock there and the first L1 insert would panic; set `default-features = false` and leave out `l1` (or target wasm32-wasip1)");
-
 #[cfg(all(feature = "workers", feature = "reliability"))]
 compile_error!("features `workers` and `reliability` are mutually exclusive — retry/breaker timers need tokio `time`, unavailable in wasm32");
 
@@ -98,6 +92,10 @@ compile_error!("features `workers` and `memcached` are mutually exclusive — Wo
 compile_error!(
     "features `workers` and `file` are mutually exclusive — Workers runtime has no filesystem"
 );
+
+// Target guard: moka reads `Instant::now()` for its clock origin when the cache is constructed.
+#[cfg(all(feature = "l1", target_arch = "wasm32", target_os = "unknown"))]
+compile_error!("feature `l1` is not supported on wasm32-unknown-unknown — std::time::Instant has no clock there, so building the client (and its L1 cache) would panic; set `default-features = false, features = [\"encryption\"]` plus your backend feature, leaving out `l1`");
 
 /// Pluggable cache backend trait and implementations (CachekitIO, Redis,
 /// Memcached, File, Workers).
