@@ -215,7 +215,7 @@ let secure = cache.secure_cache()?;
 |:---------|:---------------|
 | **Encryption** | AES-256-GCM (AEAD) via [cachekit-core](https://crates.io/crates/cachekit-core) (`ring` on native, `aes-gcm` on wasm32) |
 | **Key Derivation** | HKDF-SHA256 — per-tenant cryptographic isolation |
-| **AAD Binding** | Cache key bound to ciphertext (prevents substitution attacks) |
+| **AAD Binding** | Cache key as stored, `.namespace()` prefix included, bound to ciphertext (prevents substitution between keys and namespaces) |
 | **Memory Safety** | [zeroize](https://crates.io/crates/zeroize) on drop for all key material |
 | **L1 Guarantee** | L1 stores ciphertext, never plaintext |
 | **Cache-key path encoding (CWE-22)** | Keys are percent-encoded into the CachekitIO request path; the empty key, and a key encoding to a reserved segment (`.`, `..`, `health`, `ttl`, `lock`), are **rejected** rather than sent |
