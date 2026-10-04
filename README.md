@@ -73,7 +73,7 @@ cachekit-rs = { version = "0.8", default-features = false, features = ["workers"
 > - `workers` + `memcached` — Workers runtime has no TCP sockets
 > - `workers` + `file` — Workers runtime has no filesystem
 >
-> `l1` is also a compile error on `wasm32-unknown-unknown` with any feature set: `std::time::Instant` has no clock there, so the first L1 insert would panic. Build for that target with `default-features = false`; `wasm32-wasip1` keeps L1.
+> `l1` is also a compile error on `wasm32-unknown-unknown` with any feature set: `std::time::Instant` has no clock there, so building the client would panic. Build for that target with `default-features = false, features = ["encryption"]` plus your backend feature; `wasm32-wasip1` keeps L1.
 
 ---
 
