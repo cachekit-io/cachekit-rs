@@ -353,7 +353,11 @@ impl CacheKit {
             .default_ttl(Duration::from_secs(3600))
             .l1_capacity(1000);
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-        let builder = builder.reliability(crate::reliability::ReliabilityConfig::default());
+        let builder = {
+            let mut builder = builder.reliability(crate::reliability::ReliabilityConfig::default());
+            builder.retry_deadlines = Some(crate::reliability::CACHEKITIO_DEADLINES);
+            builder
+        };
         Ok(builder)
     }
 
@@ -639,5 +643,37 @@ mod secure_tests {
                 "{why} must be a Config error"
             );
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "cachekitio",
+    feature = "reliability",
+    not(target_arch = "wasm32")
+))]
+#[allow(clippy::expect_used)] // test-only
+mod io_deadline_tests {
+    use crate::reliability::CACHEKITIO_DEADLINES;
+    use crate::CacheKit;
+
+    #[test]
+    fn io_sets_the_cachekitio_retry_deadlines() {
+        let builder = CacheKit::io("ck_test_key").expect("io builds");
+        assert_eq!(builder.retry_deadlines, Some(CACHEKITIO_DEADLINES));
+    }
+
+    /// A backend swapped in after `io` must not inherit budgets sized for
+    /// cachekit.io.
+    #[test]
+    fn replacing_the_backend_drops_the_deadlines() {
+        let other = crate::backend::cachekitio::CachekitIO::builder()
+            .api_key("ck_test_key")
+            .build()
+            .expect("builds");
+        let builder = CacheKit::io("ck_test_key")
+            .expect("io builds")
+            .backend(super::wrap(other));
+        assert_eq!(builder.retry_deadlines, None);
     }
 }

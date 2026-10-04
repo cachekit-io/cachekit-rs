@@ -163,6 +163,11 @@ let cache = CacheKit::builder()
 > [!IMPORTANT]
 > Never hardcode API keys or master keys. Use environment variables or a secrets manager.
 
+On native targets each cachekit.io request attempt times out after 5 s, the
+protocol's `CACHEKIT_TIMEOUT` default and the same as cachekit-py and
+cachekit-ts; a write (`set`, `delete`) gets 10 s. The timeout covers connect,
+TLS and the response, and surfaces as `BackendErrorKind::Timeout`.
+
 On native targets every request carries the User-Agent `cachekit-rs/<version>`,
 and an idle pooled connection is kept for 390 s (reqwest's default is 90 s).
 Cloudflare closes an idle client connection after 400 s, so a request after a
@@ -502,7 +507,7 @@ With the `reliability` feature (default, native only), the `production`, `secure
 
 | Layer | What it does | Defaults |
 |:------|:-------------|:---------|
-| **Retry** | Truncated exponential backoff + jitter on transient/timeout errors (`BackendErrorKind::is_retryable`); permanent and auth errors propagate immediately | 3 attempts, 100 ms base, 5 s cap, jitter ×[0.5, 1.5) |
+| **Retry** | Truncated exponential backoff + jitter on transient/timeout errors (`BackendErrorKind::is_retryable`); permanent and auth errors propagate immediately. Under `io`, all attempts of one op share a deadline: an attempt still running at it is cancelled with `BackendErrorKind::Timeout`, and no retry starts past it, so a cachekit.io request that stops answering costs one attempt, not three. Other presets and custom backends get no deadline. A cachekit.io `429` for a spent quota or balance (`X-CacheKit-Deny-Reason`) is not retried; it stays `Transient`, so it still fails open and counts toward the breaker | 3 attempts, 100 ms base, 5 s cap, jitter ×[0.5, 1.5); `io` deadline 5 s per read, 10 s per write |
 | **Circuit breaker** | closed → open after N retryable failures in a rolling window; fails fast (`BackendErrorKind::CircuitOpen`) while open; half-open probes recovery | threshold 5, window 60 s, open 5 s, 3 probes, close after 3 successes |
 | **Backpressure** | Bounds concurrent backend data ops with a semaphore + bounded waiting queue; over-limit calls are shed with `BackendErrorKind::Backpressure` before reaching the backend — a slow backend can't exhaust the caller's connection pool or memory | 100 concurrent, 1 000 queued, 100 ms wait (Python SDK parity) |
 | **Graceful degradation** | On outage-class backend failure (transient, timeout, open breaker, backpressure shed), `#[cachekit]`-wrapped functions run uncached (fail-open); permanent/auth errors propagate — a wrong API key fails loudly. `#[cachekit(secure)]` paths fail **closed** on everything — encrypted workloads never silently degrade | built into the macro |

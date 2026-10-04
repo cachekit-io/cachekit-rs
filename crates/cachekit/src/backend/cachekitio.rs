@@ -138,8 +138,14 @@ impl CachekitIO {
     /// Read error body from response and build a sanitized BackendError.
     pub(crate) async fn error_from_response(&self, resp: reqwest::Response) -> BackendError {
         let status = resp.status().as_u16();
+        let quota_denied = status == 429 && resp.headers().contains_key(DENY_REASON_HEADER);
         let body = resp.bytes().await.unwrap_or_default();
-        from_http_status_sanitized(status, &body, self.api_key.as_str())
+        let err = from_http_status_sanitized(status, &body, self.api_key.as_str());
+        if quota_denied {
+            err.with_quota_denied()
+        } else {
+            err
+        }
     }
 }
 
@@ -258,6 +264,7 @@ impl Backend for CachekitIO {
     ) -> Result<(), BackendError> {
         let resp = self
             .put_request(key, value, ttl)?
+            .timeout(WRITE_TIMEOUT)
             .send()
             .await
             .map_err(|e| reqwest_err_sanitized(e, self.api_key.as_str()))?;
@@ -276,6 +283,7 @@ impl Backend for CachekitIO {
         let req = self.with_standard_headers(self.client.delete(self.url(key)?));
 
         let resp = req
+            .timeout(WRITE_TIMEOUT)
             .send()
             .await
             .map_err(|e| reqwest_err_sanitized(e, self.api_key.as_str()))?;
@@ -298,7 +306,8 @@ impl Backend for CachekitIO {
         match resp.status().as_u16() {
             200 => Ok(true),
             404 => Ok(false),
-            status => Err(BackendError::from_http_status(status, &[])),
+            // Through the header-aware path, so a quota-deny `429` is marked.
+            _ => Err(self.error_from_response(resp).await),
         }
     }
 
@@ -403,6 +412,26 @@ const USER_AGENT: &str = concat!("cachekit-rs/", env!("CARGO_PKG_VERSION"));
 /// 90 s default dropped connections the edge would still serve, so a request
 /// after a 90-390 s gap paid DNS, TCP and TLS again. 390 s leaves a 10 s
 /// margin, and reqwest's 15 s TCP keepalive keeps NAT mappings alive meanwhile.
+/// Per-attempt budget for every request but a write, connect and TLS
+/// included: the protocol's `CACHEKIT_TIMEOUT` default (`spec/saas-api.md`),
+/// as in cachekit-py and cachekit-ts. It was 30 s, so under the retrying
+/// presets a request the service accepted and never answered held a call for
+/// ~90 s before it failed open.
+#[cfg(not(target_arch = "wasm32"))]
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-attempt budget for a write (`PUT`, `DELETE`): twice the read budget,
+/// because a write carries the payload and the service commits it before it
+/// answers, so a slow but healthy write must not time out and be re-sent.
+#[cfg(not(target_arch = "wasm32"))]
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Header on a `429` that denies a spent quota or balance rather than a rate
+/// limit; such an error is never retried within the call (see
+/// [`crate::error::QuotaDenied`]).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // wasm32 uses the Workers backend
+const DENY_REASON_HEADER: &str = "x-cachekit-deny-reason";
+
 #[cfg(not(target_arch = "wasm32"))]
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(390);
 
@@ -414,8 +443,8 @@ fn http_client_builder() -> reqwest::ClientBuilder {
         .use_rustls_tls()
         .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(10))
+        .timeout(READ_TIMEOUT)
+        .connect_timeout(READ_TIMEOUT)
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
 }
 
@@ -967,7 +996,9 @@ mod http_client_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use super::http_client_builder;
+    use super::{http_client_builder, CachekitIO, READ_TIMEOUT, WRITE_TIMEOUT};
+    use crate::backend::Backend;
+    use crate::error::BackendErrorKind;
 
     /// The production client minus the system proxy: an `HTTP_PROXY` or
     /// `ALL_PROXY` that does not exempt loopback would otherwise take the
@@ -987,7 +1018,15 @@ mod http_client_tests {
         requests: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
+    const OK: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+
     fn stub() -> Stub {
+        stub_with(|_| Some(OK))
+    }
+
+    /// [`stub`], but `answer(n)` gives the reply to the stub's `n`th request
+    /// (from 0); `None` reads the request and never answers it.
+    fn stub_with(answer: fn(usize) -> Option<&'static [u8]>) -> Stub {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let url = format!("http://{}/", listener.local_addr().expect("addr"));
         let connections = Arc::new(Mutex::new(0));
@@ -1012,9 +1051,18 @@ mod http_client_tests {
                             }
                             head.push(line.trim_end().to_owned());
                         }
-                        reqs.lock().expect("lock").push(head);
-                        let ok = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
-                        if stream.write_all(ok).is_err() {
+                        let n = {
+                            let mut reqs = reqs.lock().expect("lock");
+                            reqs.push(head);
+                            reqs.len() - 1
+                        };
+                        let Some(reply) = answer(n) else {
+                            // Hold the connection open, unanswered, for good.
+                            loop {
+                                std::thread::park();
+                            }
+                        };
+                        if stream.write_all(reply).is_err() {
                             return;
                         }
                     }
@@ -1063,5 +1111,212 @@ mod http_client_tests {
     #[tokio::test]
     async fn redials_a_connection_idle_past_390_s() {
         assert_eq!(connections_after_idle(Duration::from_secs(391)).await, 2);
+    }
+
+    /// A production [`CachekitIO`] aimed at `stub` over plain HTTP: the
+    /// builder only accepts `https`, so the test swaps the client and URL.
+    fn backend_at(stub: &Stub) -> CachekitIO {
+        let mut backend = CachekitIO::builder()
+            .api_key("ck_test_key")
+            .build()
+            .expect("builder succeeds for the default host");
+        backend.client = client();
+        backend.api_url = stub.url.trim_end_matches('/').to_owned();
+        backend
+    }
+
+    /// How long `op` takes on the tokio clock, paused once the stub's first
+    /// request has opened the pooled connection: an unanswered request then
+    /// advances virtual time straight to whichever timer fires first.
+    async fn paused_elapsed<T>(op: impl std::future::Future<Output = T>) -> (T, Duration) {
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        let out = op.await;
+        let elapsed = start.elapsed();
+        tokio::time::resume();
+        (out, elapsed)
+    }
+
+    /// `elapsed` is `budget`, give or take the tokio timer's 1 ms resolution.
+    fn assert_budget(elapsed: Duration, budget: Duration) {
+        assert!(
+            elapsed >= budget && elapsed <= budget + Duration::from_millis(2),
+            "took {elapsed:?}, budget {budget:?}"
+        );
+    }
+
+    /// The stub's request count once it reaches `at_least`, or after 2 s.
+    ///
+    /// The stub records a request on its own thread; a stalled request may
+    /// time out on the paused clock before that thread has read it.
+    #[cfg(feature = "reliability")]
+    fn recorded(stub: &Stub, at_least: usize) -> usize {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let n = stub.requests.lock().expect("lock").len();
+            if n >= at_least || std::time::Instant::now() >= deadline {
+                return n;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Answers the first request (to pool a connection), stalls every later one.
+    fn first_only(n: usize) -> Option<&'static [u8]> {
+        (n == 0).then_some(OK)
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_read_times_out_after_5_s() {
+        let stub = stub_with(first_only);
+        let backend = backend_at(&stub);
+        backend
+            .exists("warm")
+            .await
+            .expect("first request pools a connection");
+
+        let (result, elapsed) = paused_elapsed(backend.get("k")).await;
+
+        let err = result.expect_err("an unanswered GET times out");
+        assert_eq!(err.kind, BackendErrorKind::Timeout);
+        assert_budget(elapsed, READ_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_write_times_out_after_10_s() {
+        let stub = stub_with(first_only);
+        let backend = backend_at(&stub);
+        backend
+            .exists("warm")
+            .await
+            .expect("first request pools a connection");
+
+        let (result, elapsed) = paused_elapsed(backend.set("k", b"v".to_vec(), None)).await;
+
+        let err = result.expect_err("an unanswered PUT times out");
+        assert_eq!(err.kind, BackendErrorKind::Timeout);
+        assert_budget(elapsed, WRITE_TIMEOUT);
+    }
+
+    #[cfg(feature = "reliability")]
+    mod through_the_reliability_stack {
+        use super::*;
+        use crate::client::SharedBackend;
+        use crate::reliability::{
+            wrap_reliable, ReliabilityConfig, RetryConfig, CACHEKITIO_DEADLINES,
+        };
+
+        /// The default stack with jitter off, so virtual time is exact.
+        fn reliable(backend: CachekitIO) -> SharedBackend {
+            reliable_with_breaker(backend).0
+        }
+
+        fn reliable_with_breaker(
+            backend: CachekitIO,
+        ) -> (
+            SharedBackend,
+            Option<Arc<crate::reliability::CircuitBreaker>>,
+        ) {
+            #[cfg(not(feature = "unsync"))]
+            let shared: SharedBackend = Arc::new(backend);
+            #[cfg(feature = "unsync")]
+            let shared: SharedBackend = std::rc::Rc::new(backend);
+            let config = ReliabilityConfig {
+                retry: Some(RetryConfig {
+                    jitter: false,
+                    ..RetryConfig::default()
+                }),
+                ..ReliabilityConfig::default()
+            };
+            wrap_reliable(shared, config, Some(CACHEKITIO_DEADLINES))
+        }
+
+        const QUOTA_DENY: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\n\
+            x-cachekit-deny-reason: quota\r\ncontent-length: 0\r\n\r\n";
+        const RATE_LIMITED: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\n\
+            retry-after: 1\r\ncontent-length: 0\r\n\r\n";
+
+        /// Was 3 x 30 s + backoff = 90.3 s and 3 requests.
+        #[tokio::test]
+        async fn an_unanswered_get_costs_one_attempt_and_5_s() {
+            let stub = stub_with(first_only);
+            let backend = reliable(backend_at(&stub));
+            backend
+                .exists("warm")
+                .await
+                .expect("first request pools a connection");
+
+            let (result, elapsed) = paused_elapsed(backend.get("k")).await;
+
+            assert_eq!(result.expect_err("stalled").kind, BackendErrorKind::Timeout);
+            assert_budget(elapsed, Duration::from_secs(5));
+            assert_eq!(recorded(&stub, 2), 2, "warm-up + one GET");
+        }
+
+        #[tokio::test]
+        async fn a_quota_denied_exists_is_sent_once() {
+            let stub = stub_with(|_| Some(QUOTA_DENY));
+            let backend = reliable(backend_at(&stub));
+
+            let err = backend.exists("k").await.expect_err("denied");
+
+            assert_eq!(err.kind, BackendErrorKind::Transient);
+            assert!(err.is_quota_denied());
+            assert_eq!(recorded(&stub, 1), 1, "no in-call retry");
+        }
+
+        #[tokio::test]
+        async fn a_quota_deny_is_sent_once_and_stays_transient() {
+            let stub = stub_with(|_| Some(QUOTA_DENY));
+            let backend = reliable(backend_at(&stub));
+
+            let err = backend.get("k").await.expect_err("denied");
+
+            assert_eq!(
+                err.kind,
+                BackendErrorKind::Transient,
+                "fails open, counts toward the breaker"
+            );
+            assert!(err.is_quota_denied());
+            assert_eq!(
+                stub.requests.lock().expect("lock").len(),
+                1,
+                "no in-call retry"
+            );
+        }
+
+        #[tokio::test]
+        async fn quota_denies_still_open_the_breaker() {
+            let stub = stub_with(|_| Some(QUOTA_DENY));
+            let (backend, breaker) = reliable_with_breaker(backend_at(&stub));
+
+            for _ in 0..5 {
+                backend.get("k").await.expect_err("denied");
+            }
+
+            let breaker = breaker.expect("default stack has a breaker");
+            assert_eq!(breaker.state(), crate::reliability::CircuitState::Open);
+            assert_eq!(
+                stub.requests.lock().expect("lock").len(),
+                5,
+                "one request per op"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_rate_limit_429_still_retries() {
+            let stub = stub_with(|_| Some(RATE_LIMITED));
+            let backend = reliable(backend_at(&stub));
+
+            let err = backend.get("k").await.expect_err("rate limited");
+
+            assert_eq!(err.kind, BackendErrorKind::Transient);
+            assert!(!err.is_quota_denied());
+            assert_eq!(
+                stub.requests.lock().expect("lock").len(),
+                3,
+                "every attempt is sent"
+            );
+        }
     }
 }

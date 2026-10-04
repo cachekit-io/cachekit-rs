@@ -185,4 +185,40 @@ impl BackendError {
             source: None,
         }
     }
+
+    /// Mark this error as a quota or balance deny (see [`QuotaDenied`]).
+    #[cfg_attr(
+        not(all(feature = "reliability", feature = "cachekitio", not(target_arch = "wasm32"))),
+        allow(dead_code) // only the native reliability stack reads the marker
+    )]
+    pub(crate) fn with_quota_denied(mut self) -> Self {
+        self.source = Some(Box::new(QuotaDenied));
+        self
+    }
+
+    /// `true` for a quota or balance deny: still `Transient`, so the macro
+    /// fails open and the breaker counts it, but never retried within a call.
+    #[cfg_attr(
+        not(all(feature = "reliability", feature = "cachekitio", not(target_arch = "wasm32"))),
+        allow(dead_code) // only the native reliability stack reads the marker
+    )]
+    pub(crate) fn is_quota_denied(&self) -> bool {
+        self.source
+            .as_deref()
+            .is_some_and(|s| s.is::<QuotaDenied>())
+    }
 }
+
+/// The source of a `429` the service sent with `X-CacheKit-Deny-Reason`: the
+/// tenant's monthly quota or account balance is spent. Unlike a rate-limit
+/// `429`, no retry can succeed until the tenant upgrades or tops up.
+///
+/// A private source rather than a [`BackendErrorKind`] variant, so the
+/// classification adds no public API.
+#[cfg_attr(
+    not(all(feature = "reliability", feature = "cachekitio", not(target_arch = "wasm32"))),
+    allow(dead_code) // only the native reliability stack reads the marker
+)]
+#[derive(Debug, Error)]
+#[error("quota or balance denied")]
+pub(crate) struct QuotaDenied;
