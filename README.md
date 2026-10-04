@@ -701,8 +701,8 @@ any later comparison has to clear. Then run `sdk,transport`, which must agree
 within that floor before the transport arm's extra fields are trusted. Both
 arms speak HTTP/1.1 (`reqwest` is built without HTTP/2).
 
-It writes and deletes keys, so it runs only against the dev endpoint
-(`api.dev.cachekit.io`, an allowlist in the example), appends every key
+It writes and deletes keys, so it runs only against a non-production
+endpoint (an allowlist in the example), appends every key
 to `--ledger` before the PUT that writes it, caps every TTL at 900 s, and never
 retries. A 429, a 503, any other 4xx but 404, or a transport error stops the run;
 other 5xx responses are recorded and the run goes on, up to five, so an
@@ -710,7 +710,7 @@ endpoint's sporadic errors become a counted rate rather than ending the run.
 
 ```bash
 cargo build --release --example wall_time_probe --features macros
-CACHEKIT_API_KEY=… CACHEKIT_API_URL=https://api.dev.cachekit.io \
+CACHEKIT_API_KEY=… CACHEKIT_API_URL=<allowlisted endpoint> \
   target/release/examples/wall_time_probe --run r1 --phase warm \
   --out rows.jsonl --ledger keys.txt --arms sdk,sdk --samples 40 --block 10
 ```
@@ -743,6 +743,13 @@ keeping the job name green. Two properties make that visible:
 ## Minimum Supported Rust Version
 
 **Rust 1.85** or later (Edition 2021).
+
+## Contributing
+
+User-facing docs in this repository follow CacheKit's shared rule on what belongs in them:
+[What belongs in these docs](https://docs.cachekit.io/contributing/#what-belongs-in-these-docs).
+`prek install` (or `pre-commit install`) sets up hooks that reject internal references in README
+files, `docs/` and commit messages.
 
 ## License
 
