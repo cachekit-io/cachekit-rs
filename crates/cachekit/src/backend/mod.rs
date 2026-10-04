@@ -348,14 +348,33 @@ pub(crate) fn delete_succeeded(status: u16) -> bool {
     matches!(status, 200 | 204)
 }
 
+/// The whole seconds a write's TTL goes on the wire as. `spec/saas-api.md`
+/// says a positive sub-second TTL MUST be ceiled to 1, never truncated to 0.
+/// From 1 s up it truncates, so the wire TTL stays an upper bound on the
+/// requested one and the writer's L1 copy can be bounded by it. Zero stays
+/// zero: TTL 0 is an error, and the server rejects it with `400`.
+#[cfg(any(
+    feature = "cachekitio",
+    feature = "workers",
+    feature = "l1",
+    feature = "tracing",
+    test
+))]
+pub(crate) fn ttl_wire_secs(ttl: Duration) -> u64 {
+    if ttl.is_zero() {
+        return 0;
+    }
+    ttl.as_secs().max(1)
+}
+
 /// The `PUT /v1/cache/{key}` header that carries a write's TTL in whole
-/// seconds. `spec/saas-api.md` says SDKs MUST send `X-CacheKit-TTL` only: the
-/// legacy `X-TTL` goes away in protocol 2.0, and a write that sends only it
-/// would then be stored with no expiry. Shared by the native and Workers
-/// backends so their wire forms cannot drift.
+/// seconds ([`ttl_wire_secs`]). `spec/saas-api.md` says SDKs MUST send
+/// `X-CacheKit-TTL` only: the legacy `X-TTL` goes away in protocol 2.0, and a
+/// write that sends only it would then be stored with no expiry. Shared by the
+/// native and Workers backends so their wire forms cannot drift.
 #[cfg(any(feature = "cachekitio", feature = "workers", test))]
 pub(crate) fn ttl_header(ttl: Duration) -> (&'static str, String) {
-    ("X-CacheKit-TTL", ttl.as_secs().to_string())
+    ("X-CacheKit-TTL", ttl_wire_secs(ttl).to_string())
 }
 
 // ── Feature-gated backend modules ─────────────────────────────────────────────
@@ -551,7 +570,7 @@ mod delete_status_tests {
 mod ttl_header_tests {
     use std::time::Duration;
 
-    use super::ttl_header;
+    use super::{ttl_header, ttl_wire_secs};
 
     #[test]
     fn ttl_header_is_the_canonical_name_in_whole_seconds() {
@@ -559,6 +578,27 @@ mod ttl_header_tests {
             ttl_header(Duration::from_millis(60_900)),
             ("X-CacheKit-TTL", "60".to_owned())
         );
+    }
+
+    #[test]
+    fn ttl_header_sends_a_sub_second_ttl_as_one() {
+        assert_eq!(
+            ttl_header(Duration::from_millis(500)),
+            ("X-CacheKit-TTL", "1".to_owned())
+        );
+    }
+
+    #[test]
+    fn wire_secs_ceil_sub_second_and_truncate_the_rest() {
+        assert_eq!(ttl_wire_secs(Duration::from_millis(500)), 1);
+        assert_eq!(ttl_wire_secs(Duration::from_nanos(1)), 1);
+        assert_eq!(ttl_wire_secs(Duration::from_secs(60)), 60);
+        assert_eq!(ttl_wire_secs(Duration::from_millis(60_900)), 60);
+    }
+
+    #[test]
+    fn wire_secs_keep_zero_as_zero() {
+        assert_eq!(ttl_wire_secs(Duration::ZERO), 0);
     }
 }
 

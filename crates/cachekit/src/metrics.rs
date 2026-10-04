@@ -250,7 +250,7 @@ pub(crate) fn trace_write(full_key: &str, ttl: Duration) {
         target: TARGET,
         op = "set",
         key_hash = %key_hash(full_key),
-        ttl_secs = ttl.as_secs(),
+        ttl_secs = crate::backend::ttl_wire_secs(ttl),
     );
     #[cfg(not(feature = "tracing"))]
     let _ = (full_key, ttl);

@@ -418,3 +418,19 @@ fn config_from_env_rejects_previous_keys_without_master_key() {
         "previous keys without a current master key must fail at load, not be silently dropped"
     );
 }
+
+/// A positive sub-second default TTL is accepted (the wire ceils it to 1 s);
+/// zero is still a `Config` error.
+#[test]
+fn builder_default_ttl_accepts_sub_second_and_rejects_zero() {
+    let config = CachekitConfigBuilder::new()
+        .default_ttl(Duration::from_millis(500))
+        .expect("a 500 ms default TTL must be accepted")
+        .build();
+    assert_eq!(config.default_ttl, Duration::from_millis(500));
+
+    assert_config_err(
+        CachekitConfigBuilder::new().default_ttl(Duration::ZERO),
+        "zero default_ttl",
+    );
+}
