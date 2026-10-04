@@ -942,12 +942,7 @@ impl SecureCache<'_> {
         ttl: Duration,
     ) -> Result<(), CachekitError> {
         CacheKit::validate_ttl(ttl)?;
-        let full_key = self.client.resolve_key(key)?;
-
-        // Serialize then encrypt. The AAD binds the key as stored, namespace
-        // included, so an entry copied to another namespace fails to decrypt.
-        let plaintext = serializer::serialize(value)?;
-        let ciphertext = self.encryption.encrypt(&plaintext, &full_key)?;
+        let (full_key, ciphertext) = self.seal(key, value)?;
         // Size-check what is actually persisted (nonce + ciphertext + tag).
         // The get paths check the stored ciphertext length, so checking the
         // plaintext here would let a value within 28 bytes of the limit write
@@ -996,13 +991,21 @@ impl SecureCache<'_> {
         ttl: Duration,
         token: SwrToken,
     ) -> Result<bool, CachekitError> {
-        let plaintext = serializer::serialize(value)?;
-        let ciphertext = self
-            .encryption
-            .encrypt(&plaintext, &self.client.resolve_key(key)?)?;
+        let (_, ciphertext) = self.seal(key, value)?;
         self.client
             .complete_swr_bytes(key, ciphertext, ttl, token)
             .await
+    }
+
+    /// Serialize and encrypt `value` for `key`, returning the key as stored
+    /// with the ciphertext. Every write encrypts here, so the AAD binds the
+    /// stored key, namespace included, and an entry copied to another
+    /// namespace fails to decrypt.
+    fn seal<T: Serialize>(&self, key: &str, value: &T) -> Result<(String, Vec<u8>), CachekitError> {
+        let full_key = self.client.resolve_key(key)?;
+        let plaintext = serializer::serialize(value)?;
+        let ciphertext = self.encryption.encrypt(&plaintext, &full_key)?;
+        Ok((full_key, ciphertext))
     }
 
     /// Retrieve, decrypt, and deserialize a value stored under `key`.
