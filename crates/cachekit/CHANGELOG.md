@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.10.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.9.0...cachekit-rs-v0.10.0) (2026-10-04)
+
+
+### ⚠ BREAKING CHANGES
+
+* **l1:** refuse l1 on wasm32-unknown-unknown at compile time (LAB-7884) ([#127](https://github.com/cachekit-io/cachekit-rs/issues/127))
+
+### Bug Fixes
+
+* **backend:** send X-CacheKit-TTL, not the deprecated X-TTL, on writes (LAB-7676) ([#124](https://github.com/cachekit-io/cachekit-rs/issues/124)) ([a43963e](https://github.com/cachekit-io/cachekit-rs/commit/a43963e94eef88f18895f5c04ff3662f404e1d42))
+* **cachekitio:** DELETE never reports existence, so a 404 is an error (LAB-5580) ([#116](https://github.com/cachekit-io/cachekit-rs/issues/116)) ([4b11ab7](https://github.com/cachekit-io/cachekit-rs/commit/4b11ab771f6a8ffbcf76b4726fb903ec01b0d0e9))
+* **l1:** correct the wasm32-unknown-unknown guard text (LAB-7919) ([#128](https://github.com/cachekit-io/cachekit-rs/issues/128)) ([706db14](https://github.com/cachekit-io/cachekit-rs/commit/706db1436bc9160d2d15489e37c5a0ab5dc49de2))
+* **l1:** refuse l1 on wasm32-unknown-unknown at compile time (LAB-7884) ([#127](https://github.com/cachekit-io/cachekit-rs/issues/127)) ([0684e55](https://github.com/cachekit-io/cachekit-rs/commit/0684e557c64dd862952ff12084da1ceb2ca9ed7f))
+
+
+### Performance Improvements
+
+* **cachekitio:** keep pooled connections 390 s and send a cachekit-rs User-Agent (LAB-7085) ([#125](https://github.com/cachekit-io/cachekit-rs/issues/125)) ([64a0b77](https://github.com/cachekit-io/cachekit-rs/commit/64a0b77970cd6640a7c58942c99be9acfcd36d03))
+* **cachekitio:** prebuild static request headers and drop per-request formatting, copies and UUID jitter (LAB-7088) ([#126](https://github.com/cachekit-io/cachekit-rs/issues/126)) ([7ae6765](https://github.com/cachekit-io/cachekit-rs/commit/7ae67655bcaeb1a3456c8fd80ce86b68ec91e83c))
+* **l1:** store L1 payloads as shared Bytes instead of copying on every hit (LAB-7089) ([#123](https://github.com/cachekit-io/cachekit-rs/issues/123)) ([d14def6](https://github.com/cachekit-io/cachekit-rs/commit/d14def6af6dd236292c8e964a491bdd64ca229ec))
+* **serializer:** decode with rmp-serde's borrowed slice reader (LAB-7090) ([#122](https://github.com/cachekit-io/cachekit-rs/issues/122)) ([282d864](https://github.com/cachekit-io/cachekit-rs/commit/282d864959ecad6c4a31abafbb8d26c04d17ec21))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.9.0 to 0.10.0
+
 ## [0.9.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.8.0...cachekit-rs-v0.9.0) (2026-10-02)
 
 
