@@ -208,6 +208,9 @@ let secure = cache.secure_cache()?;
 > [!WARNING]
 > Earlier releases encrypted only through `secure_cache()`: plain `get` / `set` on a client with a key configured read and wrote plaintext. Reading such an entry now returns an `Encryption` error until it is overwritten, deleted or expires, so delete (or let expire) whatever those calls wrote before you upgrade.
 
+> [!WARNING]
+> Earlier releases left the `.namespace()` prefix out of the AAD. On a client with both encryption and `.namespace()` configured, reading an entry an earlier release wrote returns an `Encryption` error, never a miss, on every read until it is overwritten, deleted or expires. Before you upgrade, delete those entries or move to a fresh namespace; waiting out the TTL is not a migration. There is no fallback to the old AAD, because one would keep accepting ciphertext moved between namespaces. Clients without a namespace are unaffected.
+
 <details>
 <summary><strong>Security Properties</strong></summary>
 
