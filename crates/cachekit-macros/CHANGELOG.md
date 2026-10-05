@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.10.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.9.0...cachekit-macros-v0.10.0) (2026-10-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* **encryption:** a client with encryption configured (`.encryption()`, `.encryption_from_bytes()`, `.encryption_from_bytes_with_previous()`, the `secure` / `secure_from_env` presets, or `CacheKit::from_env()` with `CACHEKIT_MASTER_KEY` set) now encrypts every value read and write, not only those made through `secure_cache()`: plain `get`, `set`, `set_with_ttl`, `interop_get`, `interop_get_swr` and non-`secure` `#[cachekit]` functions store and read AES-256-GCM ciphertext, and L1 holds ciphertext. Entries those calls wrote in plaintext before this release are not migrated: reading one now returns `CachekitError::Encryption`, never a silent miss, until it is overwritten, deleted or expires, so delete or let expire what they wrote before upgrading. Builds without the `encryption` feature now get `CachekitError::Config` from all three builder encryption methods, and from `CacheKit::from_env()` when `CACHEKIT_MASTER_KEY` is set, instead of a plaintext client. On every build, a `CACHEKIT_MASTER_KEY` that is set but not valid UTF-8 is now a `Config` error from `CachekitConfig::from_env()` and `CacheKit::from_env()`, where it was read as unset and gave a plaintext client.
+
+### Bug Fixes
+
+* **encryption:** encrypt every value read and write once a key is configured (LAB-4676) ([#133](https://github.com/cachekit-io/cachekit-rs/issues/133)) ([5a963d9](https://github.com/cachekit-io/cachekit-rs/commit/5a963d9dcbc3b7de103b02610b8203e2bf2c56ee))
+
 ## [0.9.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.8.0...cachekit-macros-v0.9.0) (2026-10-02)
 
 
