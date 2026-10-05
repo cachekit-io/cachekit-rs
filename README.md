@@ -733,9 +733,12 @@ CACHEKIT_API_KEY=… CACHEKIT_API_URL=<allowlisted endpoint> \
 samples, `--concurrency N` sends bursts (after one failed request, the burst
 sends nothing more), and `--macro-cold-miss` times a
 `#[cachekit]` cold miss (GET, lock, origin, PUT, unlock; each request it sends
-is checked, and a call sending more than five stops the run); `--help` lists every
-flag. Delete the ledger's keys when the run ends;
-the TTL is the backstop.
+is checked, and a call sending more than five stops the run). `--hold-lock`
+tests those rules against a live refusal: a second client holds the first cold
+miss's fill lock, so the run must stop (exit 1 if it does not). Exit 3 is any
+stop: only a `STOPPED` line naming `LOCK in macro-cold-miss` and `lock not
+granted` is the held lock. `--help` lists every flag. Delete the ledger's keys when the run ends; the TTL
+is the backstop.
 
 ### Gate tamper-evidence
 

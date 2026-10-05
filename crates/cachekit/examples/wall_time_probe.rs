@@ -41,6 +41,13 @@
 //!   sends more stops the run. Every request it sent is checked against the
 //!   stop rules, because the macro itself swallows backend errors.
 //!
+//! `--hold-lock` tests those stop rules against a live refusal: before the
+//! run's first cold miss, a second client takes that key's fill lock (held
+//! 10 s at most), so the call's LOCK is refused by the server and the run must
+//! stop; a run that does not stop there exits 1. Exit 3 is any stop, so read
+//! the `STOPPED` line for the cause: only `LOCK in macro-cold-miss` with
+//! `lock not granted` is the held lock. The second client then releases its lock.
+//!
 //! ```text
 //! CACHEKIT_API_KEY=… CACHEKIT_API_URL=https://… cargo run --release \
 //!   --example wall_time_probe --features macros -- --run R1 --phase aa-warm --out rows.jsonl \
@@ -78,6 +85,9 @@ const MAX_SERVER_ERRORS: usize = 5;
 /// (GET miss, lock, PUT, unlock); the fifth is a margin. A call that records
 /// more than this stops the run.
 const MACRO_REQUESTS: usize = 5;
+/// How long `--hold-lock`'s second client holds its lock: past the one call it
+/// blocks, and short enough to lapse on its own if the release fails.
+const HOLD_LOCK_MS: u64 = 10_000;
 const ABBA: [usize; 4] = [0, 1, 1, 0];
 
 // ── Arguments ────────────────────────────────────────────────────────────────
@@ -123,6 +133,7 @@ struct Args {
     concurrency: usize,
     ops: Vec<Op>,
     macro_cold_miss: bool,
+    hold_lock: bool,
     size: usize,
     ttl: Duration,
     max_per_min: u32,
@@ -132,7 +143,7 @@ struct Args {
 const USAGE: &str = "usage: wall_time_probe --run ID --phase NAME --out FILE --ledger FILE \
 [--env dev] [--key-prefix P] [--arms sdk,sdk|sdk,transport|transport,transport] \
 [--samples N per arm] [--block N] [--gap-ms MS] [--fresh-conn] [--concurrency C] \
-[--ops put,get,head,delete | --macro-cold-miss] [--size BYTES] [--ttl-s S] \
+[--ops put,get,head,delete | --macro-cold-miss [--hold-lock]] [--size BYTES] [--ttl-s S] \
 [--max-per-min N] [--max-ops N]
 env: CACHEKIT_API_KEY, CACHEKIT_API_URL";
 
@@ -166,7 +177,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         if name == "help" {
             return Err("flags:".into());
         }
-        if matches!(name, "fresh-conn" | "macro-cold-miss") {
+        if matches!(name, "fresh-conn" | "macro-cold-miss" | "hold-lock") {
             flags.insert(name);
         } else if !VALUE_FLAGS.contains(&name) {
             return Err(format!("unknown flag --{name}"));
@@ -234,6 +245,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         concurrency: num("concurrency", 1)?,
         ops,
         macro_cold_miss: flags.contains("macro-cold-miss"),
+        hold_lock: flags.contains("hold-lock"),
         size: num("size", 1024)?,
         ttl: Duration::from_secs(num("ttl-s", 900)? as u64),
         max_per_min: u32::try_from(num("max-per-min", 60)?)
@@ -277,6 +289,9 @@ fn validate(a: &Args) -> Result<(), String> {
         // backend implements; a transport arm would time a different call shape.
         return Err("--macro-cold-miss runs on sdk arms only".into());
     }
+    if a.hold_lock && !a.macro_cold_miss {
+        return Err("--hold-lock contends a cold miss's fill lock; add --macro-cold-miss".into());
+    }
     let per_sample = if a.macro_cold_miss {
         MACRO_REQUESTS
     } else {
@@ -286,10 +301,12 @@ fn validate(a: &Args) -> Result<(), String> {
     let steps = if a.concurrency > 1 { 2 } else { 1 };
     let blocks_per_arm = a.samples / a.block;
     let transport_arms = a.arms.iter().filter(|k| **k == Kind::Transport).count();
-    // Plus one warm-up GET per block, and two trace probes per transport block.
+    // Plus one warm-up GET per block, two trace probes per transport block, and
+    // the held lock's LOCK and UNLOCK.
     let total = 2 * a.samples * per_sample * steps
         + 2 * blocks_per_arm
-        + 2 * transport_arms * blocks_per_arm;
+        + 2 * transport_arms * blocks_per_arm
+        + 2 * usize::from(a.hold_lock);
     if total > a.max_ops {
         return Err(format!(
             "this run sends {total} requests, over --max-ops {}",
@@ -816,6 +833,30 @@ async fn timed_cold_miss(arm: &Arm, id: &str) -> Timed {
     }
 }
 
+/// `--hold-lock`: a second client takes `key`'s fill lock before the cold miss
+/// that will need it. Its own failure is a fault (exit 1), never a stop (exit
+/// 3), so it cannot pass for the refusal under test.
+async fn hold_lock(api_key: &str, api_url: &str, key: &str) -> Result<(CachekitIO, String), Stop> {
+    let holder = CachekitIO::builder()
+        .api_key(api_key)
+        .api_url(api_url)
+        .allow_custom_host(true)
+        .build()
+        .map_err(|e| Stop::Fault(format!("hold-lock: {e}")))?;
+    match holder.acquire_lock(key, HOLD_LOCK_MS).await {
+        Ok(Some(lock_id)) => {
+            println!(
+                "  hold-lock  LOCK 200: a second client holds {key} for at most {HOLD_LOCK_MS} ms"
+            );
+            Ok((holder, lock_id))
+        }
+        Ok(None) => Err(Stop::Fault(format!(
+            "hold-lock: the lock on fresh key {key} was not granted"
+        ))),
+        Err(e) => Err(Stop::Fault(format!("hold-lock LOCK: {e}"))),
+    }
+}
+
 fn macro_key(id: &str) -> Result<String, CachekitError> {
     interop_key(MACRO_NS, MACRO_OP, &[InteropValue::from(id)])
 }
@@ -1046,6 +1087,7 @@ async fn schedule(sink: &mut Sink, api_key: &str, api_url: &str) -> Result<(), S
     let a = &sink.args;
     let (arms, block, samples, concurrency) = (a.arms, a.block, a.samples, a.concurrency);
     let (gap, fresh, ttl, macro_mode) = (a.gap, a.fresh_conn, a.ttl, a.macro_cold_miss);
+    let hold = a.hold_lock;
     let ops = a.ops.clone();
     let prefix = a.key_prefix.clone();
     let value: String = "x".repeat(a.size);
@@ -1131,12 +1173,44 @@ async fn schedule(sink: &mut Sink, api_key: &str, api_url: &str) -> Result<(), S
                 counter += 1;
                 if macro_mode {
                     let id = format!("{prefix}:{counter}:{}", short_id());
-                    sink.ledger(&macro_key(&id).map_err(|e| e.to_string())?)?;
+                    let key = macro_key(&id).map_err(|e| e.to_string())?;
+                    sink.ledger(&key)?;
+                    // The held lock's LOCK and UNLOCK share the call's pacer
+                    // slots: a pacer wait inside the lock's lifetime would let
+                    // it lapse before the call meets it at a low --max-per-min.
+                    let hold_now = hold && counter == 1;
+                    let requests = MACRO_REQUESTS + 2 * usize::from(hold_now);
                     pacer
-                        .wait(u32::try_from(MACRO_REQUESTS).unwrap_or(u32::MAX))
+                        .wait(u32::try_from(requests).unwrap_or(u32::MAX))
                         .await;
+                    let held = if hold_now {
+                        Some(hold_lock(api_key, api_url, &key).await?)
+                    } else {
+                        None
+                    };
                     let t = timed_cold_miss(&pool[i], &id).await;
-                    sink.row(&pool[i], b, s, &t, None)?;
+                    let judged = sink.row(&pool[i], b, s, &t, None);
+                    // Release before acting on the verdict, so a stopped run
+                    // leaves no lock behind for its timeout to clear.
+                    if let Some((holder, lock_id)) = held {
+                        match holder.release_lock(&key, &lock_id).await {
+                            Ok(released) => println!(
+                                "  hold-lock  UNLOCK {}",
+                                if released { 200 } else { 404 }
+                            ),
+                            Err(e) => eprintln!(
+                                "wall_time_probe: hold-lock UNLOCK failed ({e}); the lock lapses within {HOLD_LOCK_MS} ms"
+                            ),
+                        }
+                        // Exit 0 here would read as a passed run: the false
+                        // negative this flag exists to catch.
+                        if judged.is_ok() {
+                            return Err(Stop::Fault(format!(
+                                "hold-lock: the cold miss on {key} did not stop the run"
+                            )));
+                        }
+                    }
+                    judged?;
                 } else {
                     let key = format!("{prefix}:rs{}{counter}:{}", slots[i], short_id());
                     for op in &ops {
