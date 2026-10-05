@@ -16,12 +16,14 @@
 //!   its own lock attempt, has passed: by then the other side's lock has
 //!   expired (fail-open — a stampede beats unavailability).
 //!
-//! The `#[cachekit]` macro releases a leader's distributed lock without
-//! waiting for the unlock round trip once its fill is stored (with `l1` on a
-//! tokio runtime; otherwise, and whenever the fill was not stored, it awaits
-//! the unlock as before). The next lock attempt on that key in this process
-//! waits for the pending unlock first, so a re-miss never contests its own
-//! lock.
+//! Once a leader's fill is stored, the `#[cachekit]` macro sends its unlock
+//! from a task spawned on the ambient tokio runtime and returns without
+//! waiting for it. That needs `l1` and a tokio runtime, and never happens
+//! under `unsync`; there, and whenever the fill was not stored, the caller
+//! awaits the unlock. If the spawned unlock has not been confirmed by the
+//! next lock attempt on that key in this process (still in flight, or its
+//! runtime idle or dropped), that attempt sends the unlock itself first, so
+//! a re-miss never contests its own lock.
 //!
 //! The `#[cachekit]` macro wires this in automatically around its miss path.
 //! Its stale-while-revalidate refresh takes the same locks but never waits
@@ -96,6 +98,18 @@ const FILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 #[derive(Default)]
 pub(crate) struct FlightMap {
     entries: Mutex<HashMap<String, Weak<tokio::sync::Mutex<KeyState>>>>,
+    /// Strong references that keep an entry with a pending unlock alive
+    /// until its lease has expired server-side (oldest first), so a re-miss
+    /// finds the unlock even when its task was cancelled with its runtime.
+    #[cfg(all(
+        feature = "reliability",
+        feature = "l1",
+        not(feature = "unsync"),
+        not(target_arch = "wasm32")
+    ))]
+    pins: Mutex<
+        std::collections::VecDeque<(tokio::time::Instant, Arc<tokio::sync::Mutex<KeyState>>)>,
+    >,
 }
 
 /// What the per-key mutex in [`FlightMap`] guards.
@@ -103,19 +117,73 @@ pub(crate) struct FlightMap {
 struct KeyState {
     /// The stand-down note (see [`FlightMap`]).
     stand_down: bool,
-    /// An unlock still in flight from a leader that stored its fill and
-    /// returned without waiting for it ([`SingleFlight::__release_detached`]).
-    /// The next lock attempt on this key awaits it first: a re-miss inside
-    /// the unlock window would otherwise find its own lease still held and
-    /// poll an empty cache until the lock timeout. The release task holds the
-    /// key's map entry alive until it finishes, so the next attempt finds it.
+    /// An unlock spawned by a leader that stored its fill and returned
+    /// without waiting for it ([`SingleFlight::__release_detached`]).
+    // `l1` stands in for tokio's `rt` feature (spawn), which `reliability`
+    // alone does not enable.
     #[cfg(all(
         feature = "reliability",
         feature = "l1",
         not(feature = "unsync"),
         not(target_arch = "wasm32")
     ))]
-    pending_release: Option<tokio::task::JoinHandle<()>>,
+    pending_release: Option<PendingRelease>,
+}
+
+#[cfg(all(
+    feature = "reliability",
+    feature = "l1",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
+struct PendingRelease {
+    task: tokio::task::JoinHandle<()>,
+    lock_id: String,
+    /// Set once the backend confirmed the unlock.
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(all(
+    feature = "reliability",
+    feature = "l1",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
+impl PendingRelease {
+    /// Make sure the unlock has reached the backend before this process
+    /// contests the key again: a re-miss would otherwise find its own lease
+    /// held and poll an empty cache until the lock timeout. Never waits on
+    /// the spawned task, whose runtime may be idle or gone: an unconfirmed
+    /// unlock is aborted and sent again from here. Release is owner-checked,
+    /// so a duplicate is harmless.
+    async fn settle(&self, backend: &SharedBackend, full_key: &str) {
+        if self.done.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        self.task.abort();
+        release_lock(backend, full_key, &self.lock_id).await;
+    }
+}
+
+impl FlightMap {
+    /// Keep `entry` alive for one lease timeout.
+    #[cfg(all(
+        feature = "reliability",
+        feature = "l1",
+        not(feature = "unsync"),
+        not(target_arch = "wasm32")
+    ))]
+    fn pin(&self, entry: Arc<tokio::sync::Mutex<KeyState>>) {
+        let now = tokio::time::Instant::now();
+        let mut pins = self.pins.lock().unwrap_or_else(PoisonError::into_inner);
+        while pins.front().is_some_and(|(until, _)| *until <= now) {
+            pins.pop_front();
+        }
+        pins.push_back((
+            now + std::time::Duration::from_millis(FILL_LOCK_TIMEOUT_MS),
+            entry,
+        ));
+    }
 }
 
 impl FlightMap {
@@ -247,8 +315,9 @@ enum LockAttempt {
     Granted(String),
     /// The backend has no distributed lock.
     Unlockable,
-    /// Another process holds the lease; carries when the attempt started.
-    Contested { since: tokio::time::Instant },
+    /// Another process holds the lease, which has expired by `deadline`:
+    /// one lock timeout after this attempt started.
+    Contested { deadline: tokio::time::Instant },
     /// The lock call itself failed.
     Failed,
 }
@@ -260,22 +329,20 @@ impl LockAttempt {
         let Some(lockable) = backend.as_lockable() else {
             return Self::Unlockable;
         };
-        // This process's own unlock may still be in flight: wait for it, or
-        // this attempt contests our own lease. Cleared only once it resolves,
-        // so a cancelled wait leaves it for the next attempt.
+        // Cleared only once settled, so a cancelled settle is redone by the
+        // next attempt.
         #[cfg(all(feature = "l1", not(feature = "unsync")))]
-        if let Some(pending) = state.pending_release.as_mut() {
-            // An Err means the task panicked or was cancelled at runtime
-            // shutdown: either way it is no longer in flight.
-            let _ = pending.await;
+        if let Some(pending) = &state.pending_release {
+            pending.settle(backend, full_key).await;
             state.pending_release = None;
         }
         #[cfg(not(all(feature = "l1", not(feature = "unsync"))))]
         let _ = state;
-        let since = tokio::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(FILL_LOCK_TIMEOUT_MS);
+        let deadline = tokio::time::Instant::now() + timeout;
         match lockable.acquire_lock(full_key, FILL_LOCK_TIMEOUT_MS).await {
             Ok(Some(lock_id)) => Self::Granted(lock_id),
-            Ok(None) => Self::Contested { since },
+            Ok(None) => Self::Contested { deadline },
             Err(err) => {
                 crate::metrics::trace_lock_error(full_key, "lock", &err);
                 Self::Failed
@@ -290,12 +357,7 @@ impl LockAttempt {
         match self {
             Self::Granted(lock_id) => (Role::Leader, Some(lock_id)),
             Self::Unlockable | Self::Failed => (Role::Leader, None),
-            Self::Contested { since } => (
-                Role::RemoteContested {
-                    deadline: since + std::time::Duration::from_millis(FILL_LOCK_TIMEOUT_MS),
-                },
-                None,
-            ),
+            Self::Contested { deadline } => (Role::RemoteContested { deadline }, None),
         }
     }
 }
@@ -308,9 +370,16 @@ impl LockAttempt {
 /// Dropping without `release` is safe: the in-process lock frees immediately
 /// and a distributed lock expires server-side after its timeout.
 pub struct SingleFlight {
-    /// The per-key lock. Its value is the stand-down note (see
-    /// [`FlightMap`]).
+    /// The per-key lock, guarding the key's [`KeyState`].
     local: tokio::sync::OwnedMutexGuard<KeyState>,
+    /// The map `local` came from, to pin it while an unlock is pending.
+    #[cfg(all(
+        feature = "reliability",
+        feature = "l1",
+        not(feature = "unsync"),
+        not(target_arch = "wasm32")
+    ))]
+    map: crate::client::SharedFlight,
     role: Role,
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
     backend: SharedBackend,
@@ -332,8 +401,8 @@ impl SingleFlight {
     ///   then behaves as a leader or a contested flight.
     /// - Contested cross-process: sleeps one poll interval per call, `true`
     ///   until the lock timeout (5 s), measured from this flight's lock
-    ///   attempt, has passed. Bound your re-check by that deadline too: a
-    ///   re-check that hangs is not cut short here.
+    ///   attempt, has passed. A hung re-check is not cut short here;
+    ///   `#[cachekit]` bounds its own.
     pub async fn wait_for_fill(&mut self) -> bool {
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         if let Role::LocalFollower {
@@ -391,7 +460,8 @@ impl SingleFlight {
     /// fill: after an error or a failed store, a quick re-call would miss
     /// again, so [`Self::release`] keeps the unlock on the caller's path.
     /// Without `l1`, under `unsync` or off a tokio runtime this is
-    /// [`Self::release`].
+    /// [`Self::release`]. A later lock attempt on the key re-sends an unlock
+    /// that was not confirmed (see [`PendingRelease::settle`]).
     #[doc(hidden)]
     #[cfg_attr(
         not(all(
@@ -411,15 +481,30 @@ impl SingleFlight {
         ))]
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             if let Some(lock_id) = self.lock_id.take() {
-                // The task keeps the key's map entry alive, and with it the
-                // pending release the next lock attempt waits for.
-                let entry = Arc::clone(tokio::sync::OwnedMutexGuard::mutex(&self.local));
-                let backend = self.backend.clone();
-                let full_key = std::mem::take(&mut self.full_key);
-                self.local.pending_release = Some(runtime.spawn(async move {
-                    release_lock(&backend, &full_key, &lock_id).await;
-                    drop(entry);
-                }));
+                self.map
+                    .pin(Arc::clone(tokio::sync::OwnedMutexGuard::mutex(&self.local)));
+                let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let unlock = {
+                    let (backend, full_key, lock_id, done) = (
+                        self.backend.clone(),
+                        std::mem::take(&mut self.full_key),
+                        lock_id.clone(),
+                        Arc::clone(&done),
+                    );
+                    async move {
+                        if release_lock(&backend, &full_key, &lock_id).await {
+                            done.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                };
+                // Keep the caller's span, so a failed unlock traces under it.
+                #[cfg(feature = "tracing")]
+                let unlock = tracing::Instrument::instrument(unlock, tracing::Span::current());
+                self.local.pending_release = Some(PendingRelease {
+                    task: runtime.spawn(unlock),
+                    lock_id,
+                    done,
+                });
             }
             return;
         }
@@ -453,6 +538,7 @@ impl SingleFlight {
     /// A flight over a freshly acquired per-key lock, its role recorded in
     /// the stand-down note.
     fn new(
+        map: &crate::client::SharedFlight,
         local: tokio::sync::OwnedMutexGuard<KeyState>,
         role: Role,
         backend: &SharedBackend,
@@ -460,8 +546,22 @@ impl SingleFlight {
     ) -> Self {
         #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
         let _ = (backend, full_key);
+        #[cfg(not(all(
+            feature = "reliability",
+            feature = "l1",
+            not(feature = "unsync"),
+            not(target_arch = "wasm32")
+        )))]
+        let _ = map;
         let mut flight = Self {
             local,
+            #[cfg(all(
+                feature = "reliability",
+                feature = "l1",
+                not(feature = "unsync"),
+                not(target_arch = "wasm32")
+            ))]
+            map: map.clone(),
             role,
             #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
             backend: backend.clone(),
@@ -477,7 +577,11 @@ impl SingleFlight {
     /// Cold-miss entry: lead (attempting cross-process suppression via the
     /// backend's distributed lock, when available), or queue behind a local
     /// holder.
-    pub(crate) async fn acquire(map: &FlightMap, backend: &SharedBackend, full_key: &str) -> Self {
+    pub(crate) async fn acquire(
+        map: &crate::client::SharedFlight,
+        backend: &SharedBackend,
+        full_key: &str,
+    ) -> Self {
         let handle = map.handle(full_key);
         #[cfg_attr(
             not(all(feature = "reliability", not(target_arch = "wasm32"))),
@@ -490,19 +594,19 @@ impl SingleFlight {
                 rechecked: false,
                 contest_lease: local.stand_down,
             };
-            return Self::new(local, role, backend, full_key);
+            return Self::new(map, local, role, backend, full_key);
         };
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         {
             let (role, lock_id) = LockAttempt::run(&mut local, backend, full_key)
                 .await
                 .cold_role();
-            let mut flight = Self::new(local, role, backend, full_key);
+            let mut flight = Self::new(map, local, role, backend, full_key);
             flight.lock_id = lock_id;
             flight
         }
         #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
-        Self::new(local, Role::Leader, backend, full_key)
+        Self::new(map, local, Role::Leader, backend, full_key)
     }
 
     /// Refresh-ahead entry: lead the fill, or `None` to stand down at once.
@@ -514,7 +618,7 @@ impl SingleFlight {
     /// failed lock call all mean stand down: the stale copy keeps being
     /// served, and once it hard-expires the cold-miss path takes over.
     pub(crate) async fn try_lead(
-        map: &FlightMap,
+        map: &crate::client::SharedFlight,
         backend: &SharedBackend,
         full_key: &str,
     ) -> Option<Self> {
@@ -523,7 +627,7 @@ impl SingleFlight {
             not(all(feature = "reliability", not(target_arch = "wasm32"))),
             allow(unused_mut)
         )]
-        let mut flight = Self::new(local, Role::Leader, backend, full_key);
+        let mut flight = Self::new(map, local, Role::Leader, backend, full_key);
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         match LockAttempt::run(&mut flight.local, backend, full_key).await {
             LockAttempt::Granted(lock_id) => flight.lock_id = Some(lock_id),
@@ -540,14 +644,19 @@ impl SingleFlight {
     }
 }
 
-/// Free a distributed fill lock. Best-effort: a failed unlock is traced
-/// (feature `tracing`) and otherwise ignored, since the lock expires
-/// server-side regardless.
+/// Free a distributed fill lock; `true` once the backend answered. Best-effort:
+/// a failed unlock is traced (feature `tracing`) and otherwise ignored, since
+/// the lock expires server-side regardless.
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-async fn release_lock(backend: &SharedBackend, full_key: &str, lock_id: &str) {
-    if let Some(lockable) = backend.as_lockable() {
-        if let Err(err) = lockable.release_lock(full_key, lock_id).await {
+async fn release_lock(backend: &SharedBackend, full_key: &str, lock_id: &str) -> bool {
+    let Some(lockable) = backend.as_lockable() else {
+        return false;
+    };
+    match lockable.release_lock(full_key, lock_id).await {
+        Ok(_) => true,
+        Err(err) => {
             crate::metrics::trace_lock_error(full_key, "unlock", &err);
+            false
         }
     }
 }

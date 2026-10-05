@@ -102,10 +102,15 @@ impl Timed {
 
     /// Backend calls that completed by `t`, in order.
     fn ops_by(&self, t: Instant) -> Vec<&'static str> {
+        self.ops_between(Instant::now() - Duration::from_secs(86_400), t)
+    }
+
+    /// Backend calls that completed after `from` and by `to`, in order.
+    fn ops_between(&self, from: Instant, to: Instant) -> Vec<&'static str> {
         self.st()
             .ops
             .iter()
-            .filter(|(_, at)| *at <= t)
+            .filter(|(_, at)| from < *at && *at <= to)
             .map(|(op, _)| *op)
             .collect()
     }
@@ -338,24 +343,29 @@ async fn re_miss_inside_the_unlock_window_leads_instead_of_polling() {
     let t1 = Instant::now();
     assert_eq!(fill(&cache, 5).await.unwrap(), 50);
     let took = since(t1);
+    let ops = backend.ops_between(t1, Instant::now());
 
     // One GET (the miss), no poll GETs, and the lease was granted, not contested.
     assert_eq!(backend.gets() - gets_before, 1, "no poll GETs");
-    assert!(
-        !backend.st().lock_held || DETACHED,
-        "inline build left no lease held"
-    );
-    let want = if DETACHED {
-        // The leader returned at its SET; its unlock lands 1,000 ms later.
-        // The re-call's GET overlaps it, then it waits out the rest.
-        (1_000 - GET) + GET + LOCK + ORIGIN + SET
+    // Detached: the leader's unlock is still in flight, so the re-call sends
+    // it itself before its own lock call, which is granted. Inline: the
+    // leader returned only after its unlock.
+    let (want_ms, want_ops) = if DETACHED {
+        (
+            GET + 1_000 + LOCK + ORIGIN + SET,
+            vec!["get", "unlock", "lock", "set"],
+        )
     } else {
-        GET + LOCK + ORIGIN + SET + 1_000
+        (
+            GET + LOCK + ORIGIN + SET + 1_000,
+            vec!["get", "lock", "set", "unlock"],
+        )
     };
     println!(
         "re-miss inside the unlock window: {took} ms (5,000+ if it had contested its own lease)"
     );
-    assert_eq!(took, want);
+    assert_eq!(ops, want_ops);
+    assert_eq!(took, want_ms);
 }
 
 // ── Contested follower: bounded by the lock timeout ──────────────────────────
@@ -384,7 +394,6 @@ async fn contested_follower_whose_leader_never_fills_computes_at_the_deadline() 
         computed.as_millis(),
         GET + LOCK + head_poll_wait(GET)
     );
-    assert!(computed <= ms(deadline + POLL_INTERVAL));
     assert_eq!(computed, ms(deadline));
     // 1 miss + 16 polls: the 16th is cut off at the deadline.
     assert_eq!(gets, 17);
@@ -456,7 +465,69 @@ async fn a_remote_fill_is_still_picked_up_within_one_poll() {
     assert_eq!(value.unwrap(), 90);
     let picked_up = since(t0);
     println!("remote fill landing at {lands} ms picked up at {picked_up} ms");
-    assert!(picked_up <= lands + POLL_INTERVAL + GET);
     // The first poll's GET (+100 to +302) reads after the fill lands at +300.
     assert_eq!(picked_up, polling_from + POLL_INTERVAL + GET);
+}
+
+// ── The leader's runtime idles or goes away before the unlock is sent ───────
+
+fn current_thread() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime builds")
+}
+
+/// One client shared by two current_thread runtimes. The leader's runtime
+/// sits idle after its call, so its spawned unlock never runs. A re-miss on
+/// the other runtime must not wait for that task: it sends the unlock itself
+/// and leads. Real clock, so the bound is loose.
+#[test]
+fn re_miss_does_not_wait_on_an_unlock_whose_runtime_idles() {
+    let backend = Timed::new();
+    let cache = backend.client();
+    let idle = current_thread();
+    idle.block_on(async { assert_eq!(fill(&cache, 10).await.unwrap(), 100) });
+    current_thread().block_on(async {
+        cache.delete(&fill_key(10)).await.unwrap();
+        let gets = backend.gets();
+        let t = Instant::now();
+        let value = tokio::time::timeout(Duration::from_secs(4), fill(&cache, 10))
+            .await
+            .expect("the re-miss must not wait on an idle runtime's task");
+        assert_eq!(value.unwrap(), 100);
+        println!(
+            "re-miss beside an idle runtime: {} ms, {} GETs",
+            t.elapsed().as_millis(),
+            backend.gets() - gets
+        );
+        assert_eq!(backend.gets() - gets, 1, "led without polling");
+    });
+    drop(idle);
+}
+
+/// The leader's runtime is dropped right after its call (a runtime per
+/// call), cancelling the spawned unlock before it is sent. A re-miss must
+/// still find the unsent unlock, send it, and lead.
+#[test]
+fn re_miss_after_the_leaders_runtime_is_dropped_sends_the_unlock_and_leads() {
+    let backend = Timed::new();
+    let cache = backend.client();
+    {
+        let per_call = tokio::runtime::Runtime::new().expect("runtime builds");
+        per_call.block_on(async { assert_eq!(fill(&cache, 11).await.unwrap(), 110) });
+    }
+    current_thread().block_on(async {
+        cache.delete(&fill_key(11)).await.unwrap();
+        let gets = backend.gets();
+        let t = Instant::now();
+        assert_eq!(fill(&cache, 11).await.unwrap(), 110);
+        println!(
+            "re-miss after the runtime drop: {} ms, {} GETs, {} unlocks",
+            t.elapsed().as_millis(),
+            backend.gets() - gets,
+            backend.unlocks()
+        );
+        assert_eq!(backend.gets() - gets, 1, "led without polling");
+    });
 }
