@@ -784,7 +784,8 @@ keeping the job name green. Two properties make that visible:
 User-facing docs in this repository follow CacheKit's shared rule on what belongs in them:
 [What belongs in these docs](https://docs.cachekit.io/contributing/#what-belongs-in-these-docs).
 `prek install` (or `pre-commit install`) sets up hooks that reject internal references in README
-files, `docs/` and commit messages.
+files, `docs/` and commit messages, plus a pre-push hook that runs `make test` when a push
+touches `.rs` files.
 
 ## License
 
