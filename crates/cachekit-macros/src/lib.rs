@@ -389,7 +389,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             },
             quote! {
                 let __ck_sec = #client_ident.secure_cache()?;
-                let _ = __ck_sec.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await;
+                __ck_sec.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await.is_ok()
             },
             quote! {
                 let __ck_sec = #client_ident.secure_cache()?;
@@ -406,7 +406,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             quote! { #client_ident.interop_get::<#ok_type>(&__ck_key).await },
             quote! { #client_ident.interop_get_swr::<#ok_type>(&__ck_key).await },
             quote! {
-                let _ = #client_ident.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await;
+                #client_ident.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await.is_ok()
             },
             quote! {
                 let _ = #client_ident.__complete_swr_refresh(
@@ -581,10 +581,14 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
 
             // Cold-miss single-flight: collapse concurrent fills of this key
             // to one execution (misses are billable). While another worker is
-            // filling, re-check the cache instead of recomputing.
+            // filling, re-check the cache instead of recomputing. A re-check
+            // still running at a contested flight's deadline counts as a miss.
             let mut __ck_flight = #client_ident.single_flight(&__ck_key).await;
             while __ck_flight.wait_for_fill().await {
-                match #get_expr {
+                let Some(__ck_read) = __ck_flight.__bounded_poll(async { #get_expr }).await else {
+                    continue;
+                };
+                match __ck_read {
                     Ok(Some(__ck_cached)) => {
                         __ck_flight.release().await;
                         return Ok(__ck_cached);
@@ -602,12 +606,20 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             // Execute original function body
             let __ck_result: #ret_ty = (async #original_body).await;
 
-            // Cache on success
-            if let Ok(ref __ck_val) = __ck_result {
+            // Cache on success. A stored fill releases the distributed lock
+            // without waiting for the unlock; after an error or a failed
+            // store a re-call would miss again, so the unlock stays inline
+            // and that re-call never contests this call's own lock.
+            let __ck_stored = if let Ok(ref __ck_val) = __ck_result {
                 #set_expr
+            } else {
+                false
+            };
+            if __ck_stored {
+                __ck_flight.__release_detached().await;
+            } else {
+                __ck_flight.release().await;
             }
-
-            __ck_flight.release().await;
             __ck_result
         }
     };

@@ -39,7 +39,9 @@
 //!   most 32 concurrent requests. A `#[cachekit]` cold miss sends four requests
 //!   (GET, lock, PUT, unlock) and is budgeted at five, one spare; a call that
 //!   sends more stops the run. Every request it sent is checked against the
-//!   stop rules, because the macro itself swallows backend errors.
+//!   stop rules, because the macro itself swallows backend errors. A stored
+//!   fill's unlock is sent after the call returns, so the probe waits for it
+//!   off the clock and judges it with that call.
 //!
 //! `--hold-lock` tests those stop rules against a live refusal: before the
 //! run's first cold miss, a second client takes that key's fill lock (held
@@ -556,6 +558,39 @@ impl Recorded {
             .push(entry);
     }
 
+    /// `#[cachekit]` unlocks a stored fill after the call returns. Wait for
+    /// a granted LOCK's UNLOCK, so it is judged with its own call; one not
+    /// seen within `limit` is recorded as a failed request, never skipped.
+    async fn settle_unlock(&self, limit: Duration) {
+        let deadline = Instant::now() + limit;
+        while self.awaiting_unlock() {
+            if Instant::now() >= deadline {
+                self.note::<bool>(
+                    "UNLOCK",
+                    &Err(BackendError::timeout(format!(
+                        "unlock not seen within {} ms",
+                        limit.as_millis()
+                    ))),
+                    |_| 200,
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn awaiting_unlock(&self) -> bool {
+        let parts = self
+            .parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sent = |m: &str| parts.iter().any(|((method, _), _)| *method == m);
+        let granted = parts
+            .iter()
+            .any(|((method, status), _)| *method == "LOCK" && *status == Some(200));
+        granted && !sent("UNLOCK")
+    }
+
     fn drain(&self) -> Vec<(Part, Option<String>)> {
         std::mem::take(
             &mut *self
@@ -612,7 +647,7 @@ impl LockableBackend for Recorded {
         timeout_ms: u64,
     ) -> Result<Option<String>, BackendError> {
         // A null lock id means held, or a storage error on the server. Passed
-        // through, the fill would poll GET up to 50 times, unpaced; as an
+        // through, the fill would poll GET for up to 5 s, unpaced; as an
         // error it fills unlocked, and the recorded error stops the run.
         let r = match self.inner.acquire_lock(key, timeout_ms).await {
             Ok(None) => Err(BackendError::permanent("lock not granted")),
@@ -812,6 +847,9 @@ async fn timed_cold_miss(arm: &Arm, id: &str) -> Timed {
     let total = t0.elapsed();
     let ended = iso_now();
     let after = tls_sockets();
+    if let Some(r) = &arm.recorded {
+        r.settle_unlock(Duration::from_secs(10)).await;
+    }
     let recorded = arm.recorded.as_ref().map(|r| r.drain()).unwrap_or_default();
     // Report the first failed request; `Sink::row` judges every one of them.
     let outcome = match recorded.iter().find_map(|(_, err)| err.clone()) {
