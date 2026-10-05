@@ -15,8 +15,8 @@ use crate::backend::saas_wire::{
     LockAcquireRequest, LockAcquireResponse, RefreshTtlRequest, TtlResponse,
 };
 use crate::backend::{
-    delete_succeeded, encode_key, ttl_header, Backend, HealthStatus, LockableBackend,
-    TtlInspectable,
+    delete_succeeded, encode_key, ttl_header, ttl_wire_secs, Backend, HealthStatus,
+    LockableBackend, TtlInspectable,
 };
 use crate::error::BackendError;
 use crate::metrics::{metrics_headers, MetricsProvider};
@@ -360,10 +360,13 @@ impl TtlInspectable for WorkersCachekitIO {
     }
 
     async fn refresh_ttl(&self, key: &str, ttl: Duration) -> Result<bool, BackendError> {
-        let secs = ttl.as_secs();
+        // The same whole seconds a PUT sends: a sub-second TTL goes out as 1
+        // (`spec/saas-api.md` gives PATCH the `X-CacheKit-TTL` rules). Zero
+        // stays an error.
+        let secs = ttl_wire_secs(ttl);
         if secs == 0 {
             return Err(BackendError::permanent(
-                "refresh_ttl requires at least 1 second".to_string(),
+                "refresh_ttl requires a non-zero TTL".to_string(),
             ));
         }
 

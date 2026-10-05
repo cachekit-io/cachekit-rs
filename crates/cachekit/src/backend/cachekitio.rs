@@ -1091,6 +1091,44 @@ mod http_client_tests {
     }
 
     #[tokio::test]
+    async fn refresh_ttl_sends_a_sub_second_ttl_as_one() {
+        use crate::backend::TtlInspectable;
+        let stub = stub();
+        let backend = backend_at(&stub);
+
+        let refreshed = backend
+            .refresh_ttl("k", Duration::from_millis(500))
+            .await
+            .expect("a sub-second TTL is sent, not rejected");
+
+        assert!(refreshed);
+        let requests = stub.requests.lock().expect("lock");
+        let head = &requests[0];
+        assert!(head[0].starts_with("PATCH /v1/cache/k/ttl "), "{head:?}");
+        // `{"ttl":1}` is 9 bytes.
+        assert!(
+            head.iter()
+                .any(|line| line.eq_ignore_ascii_case("content-length: 9")),
+            "{head:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_ttl_rejects_zero_before_sending() {
+        use crate::backend::TtlInspectable;
+        let stub = stub();
+        let backend = backend_at(&stub);
+
+        let err = backend
+            .refresh_ttl("k", Duration::ZERO)
+            .await
+            .expect_err("TTL 0 is an error");
+
+        assert_eq!(err.kind, BackendErrorKind::Permanent);
+        assert!(stub.requests.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
     async fn sends_cachekit_rs_user_agent() {
         let stub = stub();
         client().get(&stub.url).send().await.expect("GET");
