@@ -1,6 +1,7 @@
-//! `tracing` feature: every completed cache operation emits one
-//! debug event on the `cachekit` target carrying `key_hash` — never the key —
-//! and circuit-breaker transitions emit on `cachekit::reliability`.
+//! `tracing` feature: every completed cache operation and every failed
+//! fill-lock call emits one debug event on the `cachekit` target carrying
+//! `key_hash` — never the key — and circuit-breaker transitions emit on
+//! `cachekit::reliability`.
 //!
 //! Run with:
 //!   cargo test --test tracing_tests --features tracing
@@ -367,5 +368,114 @@ mod breaker {
             lines[1].contains("to=Open") && lines[1].contains("seq=1"),
             "the earlier transition arrives second: {lines:?}"
         );
+    }
+}
+
+// ── Fill-lock failures ───────────────────────────────────────────────────────
+
+#[cfg(all(feature = "reliability", not(feature = "unsync")))]
+mod fill_lock {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use cachekit::backend::{Backend, HealthStatus, LockableBackend};
+    use cachekit::metrics::key_hash;
+    use cachekit::{BackendError, CacheKit};
+
+    use super::{has, Capture};
+    use crate::common::MockBackend;
+
+    /// Grants the fill lock only while `grant` is set; every other lock call
+    /// fails with the key in its message, as a transport error's URL carries it.
+    #[derive(Default)]
+    struct FailingLock {
+        mock: MockBackend,
+        grant: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for FailingLock {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+            self.mock.get(key).await
+        }
+
+        async fn set(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Option<Duration>,
+        ) -> Result<(), BackendError> {
+            self.mock.set(key, value, ttl).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<bool, BackendError> {
+            self.mock.delete(key).await
+        }
+
+        async fn exists(&self, key: &str) -> Result<bool, BackendError> {
+            self.mock.exists(key).await
+        }
+
+        async fn health(&self) -> Result<HealthStatus, BackendError> {
+            self.mock.health().await
+        }
+
+        fn as_lockable(&self) -> Option<&dyn LockableBackend> {
+            Some(self)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LockableBackend for FailingLock {
+        async fn acquire_lock(&self, key: &str, _: u64) -> Result<Option<String>, BackendError> {
+            if self.grant.load(Ordering::SeqCst) {
+                return Ok(Some("lock-1".to_owned()));
+            }
+            Err(BackendError::transient(format!(
+                "POST /v1/cache/{key}/lock failed"
+            )))
+        }
+
+        async fn release_lock(&self, key: &str, _: &str) -> Result<bool, BackendError> {
+            Err(BackendError::timeout(format!(
+                "DELETE /v1/cache/{key}/lock failed"
+            )))
+        }
+    }
+
+    /// A failed lock or unlock call is not silent: it emits the error's kind
+    /// on the `cachekit` target, and never its message, which names the key.
+    #[tokio::test]
+    async fn failed_lock_calls_emit_the_error_kind_and_never_the_key() {
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+
+        let backend = Arc::new(FailingLock::default());
+        let client = CacheKit::builder()
+            .backend(backend.clone())
+            .namespace("ns")
+            .build()
+            .expect("client builds");
+
+        drop(client.single_flight("user:42").await);
+        backend.grant.store(true, Ordering::SeqCst);
+        client.single_flight("user:42").await.release().await;
+
+        let lines = capture.lines();
+        assert!(
+            !lines.iter().any(|l| l.contains("user:42")),
+            "raw key leaked into an event: {lines:?}"
+        );
+        let hash = format!("key_hash={}", key_hash("ns:user:42"));
+        for needles in [
+            ["op=lock", "error_kind=transient"],
+            ["op=unlock", "error_kind=timeout"],
+        ] {
+            assert!(
+                has(&lines, "cachekit DEBUG", &[needles[0], needles[1], &hash]),
+                "no event with {needles:?} and the namespaced key hash: {lines:?}"
+            );
+        }
     }
 }

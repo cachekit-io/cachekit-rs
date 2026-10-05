@@ -20,8 +20,9 @@
 //! for another worker's fill: if another worker holds either one, or the lock
 //! call fails, the refresh stands down without polling or re-reading the
 //! cache, and the stale copy keeps being served. A cold miss queued behind a
-//! refresh that stood down on a contested distributed lock contests that lock
-//! itself before computing, since another process may be filling.
+//! holder that found the distributed lock contested and let go without a
+//! fill (a refresh that stood down, a cancelled or failed poll) contests that
+//! lock itself before computing, since another process may be filling.
 //! Manual usage follows the same shape:
 //!
 //! ```no_run
@@ -79,13 +80,15 @@ const FILL_POLL_BUDGET: u32 = 50;
 /// Per-key async mutexes for in-process fill dedup. Weak entries let finished
 /// flights drop their state without an explicit removal protocol.
 ///
-/// Each mutex guards a stand-down note: `true` when a background refresh
-/// stood down on a contested distributed lock, filling nothing, so a queued
-/// cold miss must contest that lock before computing. The note stays set
-/// until a holder resolves it: by acquiring as a leader, by its own lease
-/// contest making it a leader, or by [`SingleFlight::release`] after a fill
-/// was found or made. A follower dropped before then (a cancelled request)
-/// leaves it for the next follower.
+/// Each mutex guards a stand-down note: `true` when the last holder to try
+/// the distributed lock found it contested, so it may have filled nothing (a
+/// refresh stands down; a cold miss polls and may be cancelled or fail), and
+/// a queued cold miss whose re-check misses must contest that lock before
+/// computing. A holder that leads clears the note: on acquire, or when its
+/// own lease contest makes it a leader. A follower leaves it as it found it,
+/// whether it finds a fill, errors out or is dropped, so the next follower
+/// still sees it. A stale `true` costs at most one lock call, by a follower
+/// that was about to compute anyway.
 #[derive(Default)]
 pub(crate) struct FlightMap {
     entries: Mutex<HashMap<String, Weak<tokio::sync::Mutex<bool>>>>,
@@ -193,9 +196,9 @@ enum Role {
     Leader,
     /// Queued behind a local holder that has since finished: re-check the
     /// cache once — a leader's fill is in L1 — then compute if it missed.
-    /// `contest_lease` is set when the holder was a refresh that stood down
-    /// on a contested lease: it filled nothing and another process may be
-    /// filling, so a missed re-check contests the lease before computing.
+    /// `contest_lease` is the stand-down note this follower found (see
+    /// [`FlightMap`]): another process may be filling, so a missed re-check
+    /// contests the lease before computing.
     LocalFollower {
         rechecked: bool,
         #[cfg_attr(
@@ -233,7 +236,10 @@ impl LockAttempt {
         match lockable.acquire_lock(full_key, FILL_LOCK_TIMEOUT_MS).await {
             Ok(Some(lock_id)) => Self::Granted(lock_id),
             Ok(None) => Self::Contested,
-            Err(_) => Self::Failed,
+            Err(err) => {
+                crate::metrics::trace_lock_error(full_key, "lock", &err);
+                Self::Failed
+            }
         }
     }
 
@@ -281,9 +287,9 @@ impl SingleFlight {
     ///
     /// - Leader: immediately `false` (compute, don't re-read your own miss).
     /// - Queued behind a local holder: `true` once, for the re-check, then
-    ///   `false`. If the holder was a background refresh that stood down on
-    ///   a contested distributed lock, a missed re-check first contests that
-    ///   lock and then behaves as a leader or a contested flight.
+    ///   `false`. If the holder found the distributed lock contested and let
+    ///   go without a fill, a missed re-check first contests that lock and
+    ///   then behaves as a leader or a contested flight.
     /// - Contested cross-process: sleeps one poll interval per call, `true`
     ///   until the poll budget is spent.
     pub async fn wait_for_fill(&mut self) -> bool {
@@ -296,11 +302,7 @@ impl SingleFlight {
             (self.role, self.lock_id) = LockAttempt::run(&self.backend, &self.full_key)
                 .await
                 .cold_role();
-            // Leading resolves the note. A contested follower keeps it set
-            // while it polls, in case it is dropped before the fill lands.
-            if matches!(self.role, Role::Leader) {
-                *self.local = false;
-            }
+            self.note_role();
         }
         match &mut self.role {
             Role::Leader => false,
@@ -322,32 +324,42 @@ impl SingleFlight {
     }
 
     /// Release the flight. Best-effort: frees the distributed fill lock (if
-    /// held) so other processes stop waiting early; errors are ignored — the
-    /// lock expires server-side regardless. Also clears the stand-down note
-    /// (see [`FlightMap`]): the caller found or made the fill.
-    pub async fn release(mut self) {
-        *self.local = false;
+    /// held) so other processes stop waiting early. A failed release is
+    /// traced (feature `tracing`) and otherwise ignored: the lock expires
+    /// server-side regardless. Leaves the stand-down note as it is (see
+    /// [`FlightMap`]), since a caller may release after an error, with no fill.
+    pub async fn release(self) {
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         if let (Some(lock_id), Some(lockable)) = (&self.lock_id, self.backend.as_lockable()) {
-            let _ = lockable.release_lock(&self.full_key, lock_id).await;
+            if let Err(err) = lockable.release_lock(&self.full_key, lock_id).await {
+                crate::metrics::trace_lock_error(&self.full_key, "unlock", &err);
+            }
         }
     }
 
-    /// A flight over a freshly acquired per-key lock. A leader clears the
-    /// stand-down note, since it contests the lease itself; a follower leaves
-    /// it set until it resolves it (see [`FlightMap`]).
+    /// Record this flight's role in the stand-down note (see [`FlightMap`]):
+    /// a leader clears it, a contested flight sets it, since it fills nothing
+    /// unless its poll runs out, and a follower leaves it as found.
+    fn note_role(&mut self) {
+        match self.role {
+            Role::Leader => *self.local = false,
+            Role::LocalFollower { .. } => {}
+            #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+            Role::RemoteContested { .. } => *self.local = true,
+        }
+    }
+
+    /// A flight over a freshly acquired per-key lock, its role recorded in
+    /// the stand-down note.
     fn new(
-        mut local: tokio::sync::OwnedMutexGuard<bool>,
+        local: tokio::sync::OwnedMutexGuard<bool>,
         role: Role,
         backend: &SharedBackend,
         full_key: &str,
     ) -> Self {
-        if !matches!(role, Role::LocalFollower { .. }) {
-            *local = false;
-        }
         #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
         let _ = (backend, full_key);
-        Self {
+        let mut flight = Self {
             local,
             role,
             #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
@@ -356,7 +368,9 @@ impl SingleFlight {
             full_key: full_key.to_owned(),
             #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
             lock_id: None,
-        }
+        };
+        flight.note_role();
+        flight
     }
 
     /// Cold-miss entry: lead (attempting cross-process suppression via the

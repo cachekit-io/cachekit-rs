@@ -1145,6 +1145,133 @@ async fn cold_miss_behind_a_dropped_leader_computes_without_a_lock_call() {
     assert_eq!(mock.acquires(), 1, "the queued cold miss made no lock call");
 }
 
+/// How a contested cold miss lets go of its flight without a fill.
+#[cfg(feature = "reliability")]
+enum LetGo {
+    /// Dropped mid-poll: a cancelled request or a timeout.
+    Cancelled,
+    /// `release` on a no-fill path, as the macro does when a re-check read
+    /// fails or the origin errs.
+    ReleasedWithoutFill,
+}
+
+/// A cold miss finds the lease held by another process, polls, and lets go
+/// of the flight without a fill. A cold miss queued behind it must contest
+/// the lease itself and pick up the holder's fill, instead of running the
+/// origin and PUTting without the lease.
+#[cfg(feature = "reliability")]
+async fn assert_cold_miss_contests_behind_a_contested_holder<F, Fut>(
+    let_go: LetGo,
+    operation: &str,
+    calls: &AtomicU32,
+    cold_miss: F,
+) where
+    F: FnOnce(CacheKit) -> Fut,
+    Fut: std::future::Future<Output = Result<String, CachekitError>> + Send + 'static,
+{
+    let (backend, mock) = ContestedBackend::new_with_handle();
+    mock.set_mode(LOCK_CONTESTED);
+    let cache = client(backend);
+    let flight_key = key(operation, 1);
+
+    let (polling, let_go_now) = (
+        std::sync::Arc::new(Notify::new()),
+        std::sync::Arc::new(Notify::new()),
+    );
+    let first = tokio::spawn({
+        let (cache, flight_key) = (cache.clone(), flight_key.clone());
+        let (polling, let_go_now) = (polling.clone(), let_go_now.clone());
+        async move {
+            let mut flight = cache.single_flight(&flight_key).await;
+            assert!(flight.wait_for_fill().await, "a contested flight polls");
+            polling.notify_one();
+            let_go_now.notified().await;
+            flight.release().await;
+        }
+    });
+    eventually("the first cold miss's lock call", || mock.acquires() == 1).await;
+    let cold = tokio::spawn(cold_miss(cache.clone()));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    mock.gate.add_permits(1); // the first cold miss's lock call: contested
+    polling.notified().await;
+    match let_go {
+        LetGo::Cancelled => first.abort(),
+        LetGo::ReleasedWithoutFill => let_go_now.notify_one(),
+    }
+    eventually("the queued cold miss's lock call", || mock.acquires() == 2).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no origin run while another process holds the lease"
+    );
+
+    // The holder fills, and the queued cold miss's poll picks that fill up.
+    let holder = CacheKit::builder()
+        .backend(std::sync::Arc::new(mock.clone()))
+        .no_l1()
+        .build()
+        .expect("holder client builds");
+    holder
+        .set(&flight_key, &"u1-holder".to_owned())
+        .await
+        .unwrap();
+    let sets = mock.sets();
+    mock.gate.add_permits(1);
+    let value = tokio::time::timeout(Duration::from_secs(2), cold)
+        .await
+        .expect("the queued cold miss finds the holder's fill")
+        .expect("cold-miss task panicked")
+        .unwrap();
+    assert_eq!(value, "u1-holder");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "origin not run");
+    assert_eq!(mock.sets(), sets, "no PUT without the lease");
+}
+
+#[cfg(feature = "reliability")]
+static BEHIND_CANCELLED_POLL_CALLS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "reliability")]
+#[cachekit(client = cache, ttl = 2, interop = "swr_behind_cancelled_poll", namespace = "swrtest")]
+async fn swr_behind_cancelled_poll(cache: &CacheKit, id: u64) -> Result<String, CachekitError> {
+    let n = BEHIND_CANCELLED_POLL_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    Ok(format!("u{id}-c{n}"))
+}
+
+#[cfg(feature = "reliability")]
+#[tokio::test]
+async fn cold_miss_behind_a_cancelled_contested_poll_contests_the_lease() {
+    assert_cold_miss_contests_behind_a_contested_holder(
+        LetGo::Cancelled,
+        "swr_behind_cancelled_poll",
+        &BEHIND_CANCELLED_POLL_CALLS,
+        |cache| async move { swr_behind_cancelled_poll(&cache, 1).await },
+    )
+    .await;
+}
+
+#[cfg(feature = "reliability")]
+static BEHIND_UNFILLED_CALLS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "reliability")]
+#[cachekit(client = cache, ttl = 2, interop = "swr_behind_unfilled", namespace = "swrtest")]
+async fn swr_behind_unfilled(cache: &CacheKit, id: u64) -> Result<String, CachekitError> {
+    let n = BEHIND_UNFILLED_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    Ok(format!("u{id}-c{n}"))
+}
+
+#[cfg(feature = "reliability")]
+#[tokio::test]
+async fn cold_miss_behind_a_release_without_fill_contests_the_lease() {
+    assert_cold_miss_contests_behind_a_contested_holder(
+        LetGo::ReleasedWithoutFill,
+        "swr_behind_unfilled",
+        &BEHIND_UNFILLED_CALLS,
+        |cache| async move { swr_behind_unfilled(&cache, 1).await },
+    )
+    .await;
+}
+
 static QUEUED_CALLS: AtomicU32 = AtomicU32::new(0);
 
 #[cachekit(client = cache, ttl = 2, interop = "swr_queued", namespace = "swrtest")]

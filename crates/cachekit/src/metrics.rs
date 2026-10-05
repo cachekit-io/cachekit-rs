@@ -221,8 +221,9 @@ impl CacheCounters {
 // ── tracing events ───────────────────────────────────────────────────────────
 //
 // One `debug` event per completed cache operation on the `cachekit` target
-// (`RUST_LOG=cachekit=debug`). Fields: `op` (`get` | `set` | `delete`),
-// `key_hash` (see `key_hash`), and per op `outcome` / `ttl_secs` / `existed`.
+// (`RUST_LOG=cachekit=debug`), and one per failed fill-lock call. Fields: `op`
+// (`get` | `set` | `delete` | `lock` | `unlock`), `key_hash` (see `key_hash`),
+// and per op `outcome` / `ttl_secs` / `existed` / `error_kind`.
 // Field expressions only run when a subscriber is enabled for the callsite,
 // so the hash is never computed for an uninterested process. Without the
 // feature these are empty functions the optimizer removes.
@@ -267,6 +268,25 @@ pub(crate) fn trace_delete(full_key: &str, existed: bool) {
     );
     #[cfg(not(feature = "tracing"))]
     let _ = (full_key, existed);
+}
+
+/// Emit the event for a failed fill-lock call (`op` is `lock` or `unlock`).
+/// The call bypasses the circuit breaker, so this is the only signal of a
+/// failing lock endpoint: refreshes stand down, cold misses fill without the
+/// lease, and an unreleased lease is left to expire. It carries the error's
+/// kind, never its message: a transport error names the request URL, and the
+/// URL holds the key (CWE-532).
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+pub(crate) fn trace_lock_error(full_key: &str, op: &'static str, err: &crate::BackendError) {
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: TARGET,
+        op,
+        key_hash = %key_hash(full_key),
+        error_kind = %err.kind,
+    );
+    #[cfg(not(feature = "tracing"))]
+    let _ = (full_key, op, err);
 }
 
 #[cfg(test)]
