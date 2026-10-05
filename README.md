@@ -460,18 +460,22 @@ With SWR (default when `l1` is on, native targets), an L1 entry has two phases
 before it disappears: *fresh* until `swr_threshold_ratio` of its TTL has
 elapsed, then *stale* until hard expiry. A `#[cachekit]`-wrapped call that
 hits a stale entry returns it **immediately** — no caller ever blocks on a
-merely-stale value — while exactly one background task re-executes the
+merely-stale value — while at most one background task re-executes the
 function. If the same-key mutation token is still current, the task rewrites
 both cache layers and renews L1 hard expiry with the full write-path TTL; if a
 newer `set()` or `delete()` landed through the same client (or one of its
 clones) while the origin ran, that explicit mutation wins and the older
 refresh result is discarded before it can touch L2. Entry expiry and capacity
 eviction do not invalidate the token, so a valid slow refresh can still
-repopulate both layers. Refresh dedup rides the same single-flight as the cold-miss path
+repopulate both layers. Refresh dedup takes the same locks as the cold-miss single-flight
 (in-process, plus distributed fill locks on lock-capable backends), so N
 concurrent stale readers cost one origin execution — misses are billable;
-stampedes are not acceptable. A hard-expired entry always takes the normal
-blocking miss path: SWR never serves past hard expiry.
+stampedes are not acceptable. Unlike a cold miss, a refresh never waits for
+another worker's fill: if another worker or process already holds the key's
+lock, or the lock call fails, the refresh stands down at once without polling or
+re-reading the cache, records no miss, and the stale value keeps being served
+until hard expiry. A hard-expired entry always takes the normal blocking miss
+path: SWR never serves past hard expiry.
 
 ```rust,ignore
 let cache = CacheKit::builder()
@@ -574,7 +578,7 @@ let breaker = cache.circuit_state();       // Option<CircuitState>: Closed / Ope
 | `CacheKit::l1_entry_count()` | Exact L1 occupancy (runs moka's pending housekeeping first — poll it, don't put it on a hot path). |
 | `CacheKit::circuit_state()` | Live breaker state (`reliability` feature); `None` when the client has no breaker. |
 | SaaS telemetry headers | The cachekit.io backends send `X-CacheKit-L1-Hits` / `L2-Hits` / `Misses` / `L1-Hit-Rate` from the **same counters**, wired automatically by `CacheKitBuilder::build()`. A `.metrics_provider(..)` set on the backend builder still takes precedence. One backend instance reports one client — the first built over it; once that client is gone the headers fall back to `disabled`. |
-| `tracing` feature | One `debug` event per completed operation on the `cachekit` target, and breaker transitions on `cachekit::reliability` (`warn` on open, `info` for half-open / closed). |
+| `tracing` feature | One `debug` event per completed operation and per failed fill-lock call on the `cachekit` target, and breaker transitions on `cachekit::reliability` (`warn` on open, `info` for half-open / closed). |
 
 With the `tracing` feature, point your subscriber at the crate:
 
@@ -589,7 +593,7 @@ DEBUG cachekit: op=get key_hash=bcb35ae6f64fa65b2770ab3af631b1ce outcome=l1_hit
  WARN cachekit::reliability: circuit breaker opened breaker=1 seq=1 from=Closed to=Open
 ```
 
-Fields: `op` (`get` | `set` | `delete`), `outcome` (`l1_hit` | `l1_stale` | `l2_hit` | `miss`), `ttl_secs`, `existed`. Breaker events carry `breaker`, `seq`, `from`, `to`, and **`(breaker, seq)` is the ordering key**: `breaker` is a process-unique id assigned when the breaker is built (stable for its lifetime, not a key or secret), `seq` counts that breaker's transitions and is assigned under the breaker lock. Events are emitted after the lock is released (so a subscriber may call `circuit_state()` safely), which means two transitions can arrive out of order under contention, and several clients in one process each restart `seq` at 1 — group by `breaker`, order by `seq`, never by arrival. For fleet-wide correlation combine the pair with the host/process fields your subscriber adds. Events carry `key_hash` — Blake2b-128 of the namespaced storage key (`cachekit::metrics::key_hash`) — **never the key itself**: keys routinely embed user identifiers (CWE-532). The digest is a correlator, not a redaction: it is unkeyed and deterministic, so it matches the [File backend](#file-local-filesystem)'s on-disk filename (a log line names the cache file it touched), and for the same reason a low-entropy key like `user:42` can be recovered from it by enumeration. Treat `cachekit=debug` output with the care you give the keys themselves.
+Fields: `op` (`get` | `set` | `delete` | `lock` | `unlock`), `outcome` (`l1_hit` | `l1_stale` | `l2_hit` | `miss`), `ttl_secs`, `existed`, and `error_kind` (`transient` | `timeout` | …) on a failed `lock` or `unlock`: a fill-lock call skips the circuit breaker, so this event is the only signal of a failing lock endpoint. Breaker events carry `breaker`, `seq`, `from`, `to`, and **`(breaker, seq)` is the ordering key**: `breaker` is a process-unique id assigned when the breaker is built (stable for its lifetime, not a key or secret), `seq` counts that breaker's transitions and is assigned under the breaker lock. Events are emitted after the lock is released (so a subscriber may call `circuit_state()` safely), which means two transitions can arrive out of order under contention, and several clients in one process each restart `seq` at 1 — group by `breaker`, order by `seq`, never by arrival. For fleet-wide correlation combine the pair with the host/process fields your subscriber adds. Events carry `key_hash` — Blake2b-128 of the namespaced storage key (`cachekit::metrics::key_hash`) — **never the key itself**: keys routinely embed user identifiers (CWE-532). The digest is a correlator, not a redaction: it is unkeyed and deterministic, so it matches the [File backend](#file-local-filesystem)'s on-disk filename (a log line names the cache file it touched), and for the same reason a low-entropy key like `user:42` can be recovered from it by enumeration. Treat `cachekit=debug` output with the care you give the keys themselves.
 
 Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rust services bring their own registry and bridge `tracing` themselves.
 
