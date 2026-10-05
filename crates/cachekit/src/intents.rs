@@ -429,7 +429,8 @@ mod tests {
 #[cfg(all(test, feature = "redis", feature = "encryption"))]
 #[allow(clippy::expect_used)] // test-only: a failing build here should panic loudly
 mod secure_tests {
-    // protocol test-vectors/encryption.json v1.2.0, `default_tenant.vectors[0]`
+    // protocol test-vectors/encryption.json `default_tenant.vectors[0]`
+    // (unchanged since v1.2.0; the vendored copy is tests/vectors/encryption.json)
     // (`default_tenant_interop`): spec/intent-presets.md § Master Key Input
     // rule 5 — with no tenant configured, the preset must derive and bind AAD
     // under the literal "default", byte-for-byte with every other SDK.
@@ -579,6 +580,77 @@ mod secure_tests {
             .expect("secure preset must configure encryption");
         let ciphertext = hex::decode(CIPHERTEXT_HEX).expect("vector hex");
         assert!(layer.decrypt(&ciphertext, CACHE_KEY).is_err());
+    }
+
+    /// protocol `encryption.json` 1.3.0 `master_key_input.accept_vectors[0]`
+    /// (`master_key_every_hex_digit`): a key holding a leading 00 byte, bytes
+    /// above 7f and every hex digit in both places, sealed under tenant
+    /// "default". Read from the copy `tests/master_key_input_tests.rs` pins.
+    struct AcceptRow {
+        master_key_hex: String,
+        cache_key: String,
+        ciphertext: Vec<u8>,
+        plaintext_hex: String,
+    }
+
+    fn accept_row() -> AcceptRow {
+        let all: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/vectors/encryption.json"))
+                .expect("vendored vector file must be valid JSON");
+        let row = &all["master_key_input"]["accept_vectors"][0];
+        assert_eq!(row["name"], "master_key_every_hex_digit");
+        let get = |k: &str| row[k].as_str().expect("accept row field").to_owned();
+        AcceptRow {
+            master_key_hex: get("master_key_hex"),
+            cache_key: get("cache_key"),
+            ciphertext: hex::decode(get("ciphertext_hex")).expect("vector hex"),
+            plaintext_hex: get("plaintext_hex"),
+        }
+    }
+
+    fn assert_decrypts_accept_row(builder: &crate::CacheKitBuilder, row: &AcceptRow) {
+        let layer = builder
+            .encryption
+            .as_ref()
+            .expect("secure preset must configure encryption");
+        assert_eq!(layer.tenant_id(), "default");
+        let plaintext = layer
+            .decrypt(&row.ciphertext, &row.cache_key)
+            .expect("master_key_every_hex_digit must decrypt");
+        assert_eq!(hex::encode(plaintext), row.plaintext_hex);
+    }
+
+    /// The route `CacheKit::secure` takes before it connects: the SDK's own
+    /// hex decoder, then the preset with no tenant.
+    #[test]
+    fn hex_path_decrypts_master_key_input_accept_row() {
+        let row = accept_row();
+        let master_key =
+            crate::config::decode_master_key_hex(&row.master_key_hex, "master_key_hex")
+                .expect("accept row is a valid key");
+        let builder = super::secure_defaults(&master_key, &[]).expect("valid key");
+        assert_decrypts_accept_row(&builder, &row);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_path_decrypts_master_key_input_accept_row() {
+        let row = accept_row();
+        let builder = secure_env_defaults_with(Some(&row.master_key_hex), None).expect("valid key");
+        assert_decrypts_accept_row(&builder, &row);
+    }
+
+    /// PRE-51: both default-tenant entries, sealed under different keys, read
+    /// through one client with one key current and the other previous. A
+    /// client that ignores `CACHEKIT_PREVIOUS_MASTER_KEYS` reads only the first.
+    #[test]
+    #[serial_test::serial]
+    fn env_path_reads_accept_row_and_default_tenant_vector_across_rotation() {
+        let row = accept_row();
+        let builder = secure_env_defaults_with(Some(&row.master_key_hex), Some(MASTER_KEY_HEX))
+            .expect("valid rotation config");
+        assert_decrypts_accept_row(&builder, &row);
+        assert_decrypts_default_tenant_vector(builder);
     }
 
     #[test]

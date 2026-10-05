@@ -96,7 +96,7 @@ One call that names your use case. Each preset returns a pre-configured builder 
 ² See the resilience contract below.
 ³ Requires the `redis` feature flag; `secure` also needs the default-on `encryption` feature.
 ⁴ Or `CacheKit::io_from_env()` to read `CACHEKIT_API_KEY`.
-⁵ Or `CacheKit::secure_from_env(url)` to read `CACHEKIT_MASTER_KEY`, plus the decrypt-only rotation keys in `CACHEKIT_PREVIOUS_MASTER_KEYS` (see [Key Rotation](#key-rotation)). Both take the key as a hex string and decode it the same way every CacheKit SDK does. Use exactly 32 bytes (64 hex chars, `openssl rand -hex 32`) — the only length every SDK accepts. Every value read and write on the client is encrypted — plain `get` / `set` included — and L1 holds ciphertext.
+⁵ Or `CacheKit::secure_from_env(url)` to read `CACHEKIT_MASTER_KEY`, plus the decrypt-only rotation keys in `CACHEKIT_PREVIOUS_MASTER_KEYS` (see [Key Rotation](#key-rotation)). Both take the key as a hex string and decode it the same way every CacheKit SDK does, verified against the protocol's shared [`encryption.json`](crates/cachekit/tests/vectors/encryption.json) master key input vectors (vendored). Use exactly 32 bytes (64 hex chars, `openssl rand -hex 32`) — the only length every SDK accepts. Every value read and write on the client is encrypted — plain `get` / `set` included — and L1 holds ciphertext.
 
 ```rust
 use cachekit::prelude::*;
