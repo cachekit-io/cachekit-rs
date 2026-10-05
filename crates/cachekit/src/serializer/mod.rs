@@ -137,9 +137,9 @@ pub(crate) type SliceDeserializer<'a> = rmp_serde::Deserializer<ReadRefReader<'a
 ///
 /// Every decode of backend-supplied bytes (auto-mode [`deserialize`] and
 /// [`crate::interop::deserialize`]) MUST go through here so the bounds cannot
-/// drift between paths. Runs `check_structure` first, which enforces both the
-/// depth and the allocation bound, and rejects any byte after the document it
-/// measured: no writer emits one, a lenient read would decode a foreign
+/// drift between paths. Runs `check_structure` first (depth and allocation
+/// bound), then rejects any byte after the document it measured: no writer
+/// emits one, a lenient read would decode a foreign
 /// container by its first byte (a cachekit-py CK frame begins with `0x43`, the
 /// complete document 67), and after a decrypt the spec requires a parse
 /// mismatch to fail. It then sets `rmp-serde`'s own depth limit as a
