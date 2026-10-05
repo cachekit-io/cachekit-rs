@@ -1,8 +1,9 @@
 # Pre-commit hooks for cachekit-rs
-# Install: pre-commit install
+# Install: prek install (or pre-commit install) installs every hook type listed
+# in default_install_hook_types below.
 # Run manually: pre-commit run --all-files
 
-default_install_hook_types: [pre-commit, commit-msg]
+default_install_hook_types: [pre-commit, commit-msg, pre-push]
 # Hooks with no `stages` run at commit and push, never on the commit message.
 default_stages: [pre-commit, pre-push]
 
