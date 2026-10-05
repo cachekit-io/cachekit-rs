@@ -87,6 +87,15 @@ fn master_key_hex_from_env() -> Result<zeroize::Zeroizing<String>, CachekitError
         })
 }
 
+/// The key handling of [`CacheKit::secure`] — decode the hex key, then the
+/// `secure` defaults — before any Redis I/O; the hex counterpart of
+/// [`secure_env_defaults`].
+#[cfg(all(feature = "redis", feature = "encryption"))]
+fn secure_hex_defaults(master_key_hex: &str) -> Result<CacheKitBuilder, CachekitError> {
+    let master_key = crate::config::decode_master_key_hex(master_key_hex, "master_key_hex")?;
+    secure_defaults(&master_key, &[])
+}
+
 /// The whole environment read of [`CacheKit::secure_from_env`] — the current
 /// key and `CACHEKIT_PREVIOUS_MASTER_KEYS` — resolved into `secure` defaults
 /// before any Redis I/O. Previous keys go through the same reader as
@@ -261,8 +270,7 @@ impl CacheKit {
         redis_url: &str,
         master_key_hex: &str,
     ) -> Result<CacheKitBuilder, CachekitError> {
-        let master_key = crate::config::decode_master_key_hex(master_key_hex, "master_key_hex")?;
-        connect_secure(redis_url, secure_defaults(&master_key, &[])?).await
+        connect_secure(redis_url, secure_hex_defaults(master_key_hex)?).await
     }
 
     /// **Secure**, keys from the environment — [`CacheKit::secure`] with the
@@ -620,15 +628,11 @@ mod secure_tests {
         assert_eq!(hex::encode(plaintext), row.plaintext_hex);
     }
 
-    /// The route `CacheKit::secure` takes before it connects: the SDK's own
-    /// hex decoder, then the preset with no tenant.
+    /// Everything `CacheKit::secure` does before it connects, with no tenant.
     #[test]
     fn hex_path_decrypts_master_key_input_accept_row() {
         let row = accept_row();
-        let master_key =
-            crate::config::decode_master_key_hex(&row.master_key_hex, "master_key_hex")
-                .expect("accept row is a valid key");
-        let builder = super::secure_defaults(&master_key, &[]).expect("valid key");
+        let builder = super::secure_hex_defaults(&row.master_key_hex).expect("valid key");
         assert_decrypts_accept_row(&builder, &row);
     }
 
@@ -640,9 +644,10 @@ mod secure_tests {
         assert_decrypts_accept_row(&builder, &row);
     }
 
-    /// PRE-51: both default-tenant entries, sealed under different keys, read
-    /// through one client with one key current and the other previous. A
-    /// client that ignores `CACHEKIT_PREVIOUS_MASTER_KEYS` reads only the first.
+    /// PRE-51: `master_key_input.accept_vectors[0]` (current key) and
+    /// `default_tenant.vectors[0]` (previous key), both sealed under tenant
+    /// "default", read through one client. A client that ignores
+    /// `CACHEKIT_PREVIOUS_MASTER_KEYS` reads only the first.
     #[test]
     #[serial_test::serial]
     fn env_path_reads_accept_row_and_default_tenant_vector_across_rotation() {

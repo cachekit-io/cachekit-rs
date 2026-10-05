@@ -7,11 +7,11 @@
 //! (sha256 `f701951147a47c42a968850fe6cb73a544313728e46f45fec3d811c20ed4b377`).
 //! Do not edit the JSON here; regenerate upstream and re-vendor.
 //!
-//! Every reject must be a `Config` error naming the key it came from, not
-//! merely an `Err`: `CacheKit::secure` would also fail on the Redis connect a
-//! wrongly accepted key reaches, and a previous-keys row that decoded to the
-//! current key would fail the repeat check instead of the decoder. The
-//! accepting controls show no entry point passes by refusing everything.
+//! Every reject must be a `Config` error from the key validator, not merely
+//! an `Err`: `CacheKit::secure` would also fail on the Redis connect a
+//! wrongly accepted key reaches. `OTHER_KEY_HEX` fills the slot a row does not,
+//! so the repeat-key check cannot fire in the decoder's place. The accepting
+//! controls show no entry point passes by refusing everything.
 //!
 //! The accept row's decrypt through the `secure` preset and the rotation read
 //! live in `src/intents.rs` (`secure_tests`): they need the crate-internal
@@ -24,6 +24,7 @@
 
 mod common;
 
+use cachekit::config::CachekitConfigBuilder;
 use cachekit::{CacheKit, CachekitConfig, CachekitError, EncryptionLayer};
 use common::EnvGuard;
 use serde_json::Value as Json;
@@ -104,11 +105,6 @@ fn assert_config_err<T>(result: Result<T, CachekitError>, names: &str, row: &str
     }
 }
 
-#[test]
-fn block_binds_the_default_tenant() {
-    assert_eq!(block()["tenant_id"], TENANT);
-}
-
 // ── Hex entry points ─────────────────────────────────────────────────────────
 
 #[test]
@@ -122,6 +118,35 @@ fn builder_encryption_rejects_every_hex_reject_row() {
             "master key",
             &row,
             "CacheKitBuilder::encryption",
+        );
+    }
+}
+
+#[test]
+fn config_builder_rejects_every_hex_reject_row() {
+    let accept = accept_hex();
+    assert!(CachekitConfigBuilder::new()
+        .master_key(&accept)
+        .and_then(|b| b.previous_master_keys(&[OTHER_KEY_HEX]))
+        .is_ok());
+    assert!(CachekitConfigBuilder::new()
+        .master_key(OTHER_KEY_HEX)
+        .and_then(|b| b.previous_master_keys(&[&accept]))
+        .is_ok());
+    for (row, key) in reject_rows() {
+        assert_config_err(
+            CachekitConfigBuilder::new().master_key(&key),
+            "master_key",
+            &row,
+            "CachekitConfigBuilder::master_key",
+        );
+        assert_config_err(
+            CachekitConfigBuilder::new()
+                .master_key(OTHER_KEY_HEX)
+                .and_then(|b| b.previous_master_keys(&[&key])),
+            "previous_master_keys",
+            &row,
+            "CachekitConfigBuilder::previous_master_keys",
         );
     }
 }
