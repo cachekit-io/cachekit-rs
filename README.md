@@ -51,19 +51,21 @@
 | `macros` | ❌ | `#[cachekit]` proc-macro decorator (mints [interop/v1](#cross-sdk-interop-mode) keys) |
 | `tracing` | ❌ | [`tracing`](https://crates.io/crates/tracing) events per cache operation and breaker transition — see [Observability](#observability) |
 
+<!-- x-release-please-start-version -->
 ```toml
 # Defaults: SaaS + encryption + L1
 [dependencies]
-cachekit-rs = "0.8"
+cachekit-rs = "0.10.0"
 
 # With Redis backend
 [dependencies]
-cachekit-rs = { version = "0.8", features = ["redis"] }
+cachekit-rs = { version = "0.10.0", features = ["redis"] }
 
 # For Cloudflare Workers (no L1, no Redis)
 [dependencies]
-cachekit-rs = { version = "0.8", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.10.0", default-features = false, features = ["workers", "encryption"] }
 ```
+<!-- x-release-please-end -->
 
 > [!WARNING]
 > **Mutually exclusive features:**
@@ -96,12 +98,13 @@ One call that names your use case. Each preset returns a pre-configured builder 
 ⁴ Or `CacheKit::io_from_env()` to read `CACHEKIT_API_KEY`.
 ⁵ Or `CacheKit::secure_from_env(url)` to read `CACHEKIT_MASTER_KEY`, plus the decrypt-only rotation keys in `CACHEKIT_PREVIOUS_MASTER_KEYS` (see [Key Rotation](#key-rotation)). Both take the key as a hex string and decode it the same way every CacheKit SDK does. Use exactly 32 bytes (64 hex chars, `openssl rand -hex 32`) — the only length every SDK accepts. Every value read and write on the client is encrypted — plain `get` / `set` included — and L1 holds ciphertext.
 
+<!-- x-release-please-start-version -->
 ```rust
 use cachekit::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), CachekitError> {
-    // Needs: cachekit-rs = { version = "0.8", features = ["redis"] }
+    // Needs: cachekit-rs = { version = "0.10.0", features = ["redis"] }
     let cache = CacheKit::production("redis://localhost:6379").await?
         .namespace("api")
         .build()?;
@@ -113,6 +116,7 @@ async fn main() -> Result<(), CachekitError> {
     Ok(())
 }
 ```
+<!-- x-release-please-end -->
 
 **Resilience contract** — connection failures, at construction and mid-run:
 
@@ -317,9 +321,11 @@ let backend = CachekitIO::builder()
 
 Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Each command times out after 5 s with `BackendErrorKind::Timeout`. A timed-out command may still run on the server: harmless for `get`/`set`/`delete`, and a timed-out lock acquire leaves the lock to expire on its own TTL. Requires the `redis` feature flag.
 
+<!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.8", features = ["redis"] }
+cachekit-rs = { version = "0.10.0", features = ["redis"] }
 ```
+<!-- x-release-please-end -->
 
 ```rust
 use cachekit::backend::redis::RedisBackend;
@@ -338,9 +344,11 @@ Memcached via [rust-memcache](https://crates.io/crates/memcache) (single server,
 
 TTLs above memcached's 30-day ceiling are clamped (larger values would be misread as absolute timestamps); values above the item-size limit (default 1 MiB) fail loudly client-side, and a server-side "object too large" classifies as permanent (never retried). Requires the `memcached` feature flag.
 
+<!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.8", features = ["memcached"] }
+cachekit-rs = { version = "0.10.0", features = ["memcached"] }
 ```
+<!-- x-release-please-end -->
 
 ```rust
 use cachekit::backend::memcached::MemcachedBackend;
@@ -355,9 +363,11 @@ let backend = MemcachedBackend::builder()
 
 Local disk cache, **byte-compatible with cachekit-py's File backend** — a py and an rs process pointed at the same directory read each other's entries (Blake2b-128 hashed filenames, shared 14-byte header, atomic write-then-rename, lazy expiry). An entry whose header carries a nonzero reserved byte or nonzero flags (a transform this reader does not implement) reads as a miss on every path and is never deleted or rewritten, as the protocol requires; an entry with an expiry is expired from that second on. Implements `TtlInspectable` (TTL read off the on-disk header, in-place refresh). Same-process operations on one key serialize on a striped per-key lock (64 stripes), so a read waits on a write to an unrelated key only when the two share a stripe (about 1 in 64); py serializes all operations on one `RLock`. Cross-process behaviour matches py: on unix, reads and in-place TTL rewrites take advisory `flock` while writes stay lock-free via atomic rename; and expired-entry unlinks are inode-validated so a stale read decision doesn't delete a concurrent writer's fresh entry. On unix the cache directory must be owned by you and not group/other-writable. Not yet ported from py: LRU eviction and size caps — the directory grows until entries expire or you clear it. Requires the `file` feature flag and a tokio runtime (I/O runs via `spawn_blocking`).
 
+<!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.8", features = ["file"] }
+cachekit-rs = { version = "0.10.0", features = ["file"] }
 ```
+<!-- x-release-please-end -->
 
 ```rust
 use cachekit::backend::file::FileBackend;
@@ -371,9 +381,11 @@ let backend = FileBackend::builder()
 
 `wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. Requires the `workers` feature with default features disabled.
 
+<!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.8", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.10.0", default-features = false, features = ["workers", "encryption"] }
 ```
+<!-- x-release-please-end -->
 
 <details>
 <summary><strong>Custom Backend</strong></summary>

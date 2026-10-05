@@ -10,6 +10,9 @@ readme = "../../README.md"
 homepage = "https://cachekit.io"
 keywords = ["cache", "redis", "encryption", "moka", "cloudflare-workers"]
 categories = ["caching", "web-programming", "cryptography"]
+# Reads the workspace READMEs from outside this directory, so it cannot build
+# from the published package.
+exclude = ["tests/readme_pin_tests.rs"]
 
 # docs.rs builds with default features only unless told otherwise; without this
 # the Redis intent presets (minimal/production/secure) and the optional
