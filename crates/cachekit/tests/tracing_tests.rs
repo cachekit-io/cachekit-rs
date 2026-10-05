@@ -1,7 +1,7 @@
-//! `tracing` feature: every completed cache operation and every failed
-//! fill-lock call emits one debug event on the `cachekit` target carrying
-//! `key_hash` — never the key — and circuit-breaker transitions emit on
-//! `cachekit::reliability`.
+//! `tracing` feature: every completed cache operation, every failed
+//! fill-lock call and every failed `#[cachekit]` store emits one debug event
+//! on the `cachekit` target carrying `key_hash` — never the key — and
+//! circuit-breaker transitions emit on `cachekit::reliability`.
 //!
 //! Run with:
 //!   cargo test --test tracing_tests --features tracing
@@ -477,5 +477,95 @@ mod fill_lock {
                 "no event with {needles:?} and the namespaced key hash: {lines:?}"
             );
         }
+    }
+}
+
+// ── Macro store failures ─────────────────────────────────────────────────────
+
+#[cfg(all(feature = "macros", not(feature = "unsync")))]
+mod macro_store {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use cachekit::backend::{Backend, HealthStatus};
+    use cachekit::interop::{interop_key, InteropValue};
+    use cachekit::metrics::key_hash;
+    use cachekit::{cachekit, BackendError, CacheKit, CachekitError};
+
+    use super::{has, Capture};
+    use crate::common::MockBackend;
+
+    /// Misses every read and refuses every write with the key in its message,
+    /// as a transport error's URL carries it. Permanent, so no retry backoff.
+    #[derive(Default)]
+    struct FailingSet {
+        mock: MockBackend,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for FailingSet {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+            self.mock.get(key).await
+        }
+
+        async fn set(
+            &self,
+            key: &str,
+            _: Vec<u8>,
+            _: Option<Duration>,
+        ) -> Result<(), BackendError> {
+            Err(BackendError::permanent(format!(
+                "PUT /v1/cache/{key} failed"
+            )))
+        }
+
+        async fn delete(&self, key: &str) -> Result<bool, BackendError> {
+            self.mock.delete(key).await
+        }
+
+        async fn exists(&self, key: &str) -> Result<bool, BackendError> {
+            self.mock.exists(key).await
+        }
+
+        async fn health(&self) -> Result<HealthStatus, BackendError> {
+            self.mock.health().await
+        }
+    }
+
+    #[cachekit(client = cache, ttl = 60, interop = "fill", namespace = "store")]
+    async fn fill(cache: &CacheKit, id: u64) -> Result<u64, CachekitError> {
+        Ok(id * 10)
+    }
+
+    /// A `#[cachekit]` fill the backend refuses to store still returns its
+    /// result, and is not silent: it emits the error's kind on the `cachekit`
+    /// target, and never its message, which names the key.
+    #[tokio::test]
+    async fn a_failed_fill_store_emits_the_error_kind_and_never_the_key() {
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+
+        let client = CacheKit::builder()
+            .backend(Arc::new(FailingSet::default()))
+            .build()
+            .expect("client builds");
+
+        assert_eq!(fill(&client, 42).await.expect("result returned"), 420);
+
+        let key = interop_key("store", "fill", &[InteropValue::from(42u64)]).expect("key");
+        let lines = capture.lines();
+        assert!(
+            !lines.iter().any(|l| l.contains(&key)),
+            "raw key leaked into an event: {lines:?}"
+        );
+        let hash = format!("key_hash={}", key_hash(&key));
+        assert!(
+            has(
+                &lines,
+                "cachekit DEBUG",
+                &["op=set", "error_kind=permanent", &hash]
+            ),
+            "no store-error event with the key hash: {lines:?}"
+        );
     }
 }

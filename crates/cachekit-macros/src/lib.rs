@@ -389,7 +389,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             },
             quote! {
                 let __ck_sec = #client_ident.secure_cache()?;
-                __ck_sec.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await.is_ok()
+                __ck_sec.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await
             },
             quote! {
                 let __ck_sec = #client_ident.secure_cache()?;
@@ -406,7 +406,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             quote! { #client_ident.interop_get::<#ok_type>(&__ck_key).await },
             quote! { #client_ident.interop_get_swr::<#ok_type>(&__ck_key).await },
             quote! {
-                #client_ident.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await.is_ok()
+                #client_ident.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await
             },
             quote! {
                 let _ = #client_ident.__complete_swr_refresh(
@@ -606,12 +606,18 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             // Execute original function body
             let __ck_result: #ret_ty = (async #original_body).await;
 
-            // Cache on success. A stored fill releases the distributed lock
-            // without waiting for the unlock; after an error or a failed
-            // store a re-call would miss again, so the unlock stays inline
-            // and that re-call never contests this call's own lock.
+            // Cache on success. A failed store still returns the result, so
+            // it is traced (kind and key hash only). A stored fill releases
+            // the distributed lock without waiting for the unlock; after an
+            // error or a failed store a re-call would miss again, so the
+            // unlock stays inline and that re-call never contests this
+            // call's own lock.
             let __ck_stored = if let Ok(ref __ck_val) = __ck_result {
-                #set_expr
+                let __ck_store = { #set_expr };
+                if let Err(ref __ck_err) = __ck_store {
+                    cachekit::metrics::__trace_store_error(&__ck_key, __ck_err);
+                }
+                __ck_store.is_ok()
             } else {
                 false
             };

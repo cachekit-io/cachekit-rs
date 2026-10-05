@@ -54,9 +54,9 @@ reliability = ["tokio/time"]
 # Opt into ?Send / Rc on native targets (for tokio::task::LocalSet, single-threaded
 # runtimes, etc.). Same code paths that wasm32 already uses.
 unsync = []
-# Structured `tracing` events: one debug event per get/set/delete and per
-# failed fill-lock call on the `cachekit` target, and circuit-breaker
-# transitions on `cachekit::reliability`.
+# Structured `tracing` events: one debug event per get/set/delete, per failed
+# fill-lock call and per failed `#[cachekit]` store on the `cachekit` target,
+# and circuit-breaker transitions on `cachekit::reliability`.
 # Events carry `key_hash` (Blake2b-128), never the key (CWE-532). Off by
 # default — with no subscriber the callsites are a disabled-check each.
 tracing = ["dep:tracing"]

@@ -108,15 +108,21 @@ impl Timed {
 
     /// Backend calls that completed by `t`, in order.
     fn ops_by(&self, t: Instant) -> Vec<&'static str> {
-        self.ops_between(Instant::now() - Duration::from_secs(86_400), t)
+        self.ops_in(None, t)
     }
 
     /// Backend calls that completed after `from` and by `to`, in order.
     fn ops_between(&self, from: Instant, to: Instant) -> Vec<&'static str> {
+        self.ops_in(Some(from), to)
+    }
+
+    /// No lower bound is `None`, not `now - <span>`: subtracting past the
+    /// clock's origin panics where `Instant` is unsigned (Windows).
+    fn ops_in(&self, from: Option<Instant>, to: Instant) -> Vec<&'static str> {
         self.st()
             .ops
             .iter()
-            .filter(|(_, at)| from < *at && *at <= to)
+            .filter(|(_, at)| from.is_none_or(|f| f < *at) && *at <= to)
             .map(|(op, _)| *op)
             .collect()
     }
