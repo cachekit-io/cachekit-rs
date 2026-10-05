@@ -804,6 +804,34 @@ async fn decode_error_after_decrypt_does_not_quote_the_value() {
     }
 }
 
+/// After a decrypt the reader's container is exactly one MessagePack document
+/// (spec/encryption.md): a plaintext sealed under the reader's own AAD with one
+/// trailing byte is a parse mismatch, never the value before it. Only the
+/// variant is asserted, because `redact_decode` rewrites the message.
+#[tokio::test]
+async fn secure_get_rejects_a_decrypted_plaintext_with_trailing_bytes() {
+    let (backend, handle) = MockBackend::new_with_handle();
+    let client = make_encrypted_client(backend);
+    let mut plaintext = cachekit::serializer::serialize(&7u8).unwrap();
+    plaintext.push(0x00);
+    let sealed = cachekit::EncryptionLayer::new(TEST_MASTER_KEY, "test-tenant")
+        .unwrap()
+        .encrypt(&plaintext, "trailing")
+        .unwrap();
+    handle
+        .store
+        .lock()
+        .await
+        .insert("trailing".to_owned(), sealed);
+
+    let secure = client.secure_cache().unwrap();
+    let err = secure.get::<u8>("trailing").await.unwrap_err();
+    assert!(
+        matches!(err, CachekitError::Serialization(_)),
+        "got: {err:?}"
+    );
+}
+
 // ── Master-key length (spec/intent-presets.md § Master Key Input) ─────────────
 
 fn assert_builder_config_err(result: Result<cachekit::CacheKitBuilder, CachekitError>, what: &str) {

@@ -200,7 +200,7 @@ async fn interop_get_round_trips_plain_msgpack() {
 }
 
 #[tokio::test]
-async fn interop_get_rejects_trailing_bytes_that_get_accepts() {
+async fn get_and_interop_get_both_reject_trailing_bytes() {
     let (backend, handle) = MockBackend::new_with_handle();
     let client = CacheKit::builder()
         .backend(backend)
@@ -208,7 +208,8 @@ async fn interop_get_rejects_trailing_bytes_that_get_accepts() {
         .build()
         .expect("client builds");
 
-    // Simulate a corrupt/foreign entry: a valid document plus trailing bytes.
+    // A valid document plus one trailing byte. No writer produces it; a
+    // lenient read would return 7, as it would return 67 for a CK frame.
     let mut bytes = rmp_serde::to_vec(&7u8).expect("encode");
     bytes.push(0x00);
     handle
@@ -217,19 +218,23 @@ async fn interop_get_rejects_trailing_bytes_that_get_accepts() {
         .await
         .insert("ns:op:deadbeef".to_owned(), bytes);
 
-    // The lenient auto-mode reader accepts it...
-    let lenient: Option<u8> = client.get("ns:op:deadbeef").await.expect("lenient get");
-    assert_eq!(lenient, Some(7));
-
-    // ...the interop reader must reject it (spec MUST: exactly one document).
-    let err = client
-        .interop_get::<u8>("ns:op:deadbeef")
-        .await
-        .expect_err("interop read must reject trailing bytes");
-    assert!(
-        err.to_string().contains("trailing"),
-        "expected trailing-bytes rejection: {err}"
-    );
+    for (how, result) in [
+        ("get", client.get::<u8>("ns:op:deadbeef").await),
+        (
+            "interop_get",
+            client.interop_get::<u8>("ns:op:deadbeef").await,
+        ),
+    ] {
+        match result {
+            Err(CachekitError::Serialization(msg)) => {
+                assert!(
+                    msg.contains("trailing"),
+                    "{how}: expected trailing-bytes rejection: {msg}"
+                );
+            }
+            other => panic!("{how}: expected a Serialization error, got {other:?}"),
+        }
+    }
 }
 
 #[tokio::test]
