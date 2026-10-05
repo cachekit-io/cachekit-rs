@@ -13,7 +13,7 @@ use crate::backend::{
 use crate::error::{BackendError, BackendErrorKind};
 use crate::metrics::{metrics_headers_named, MetricsProvider, METRICS_HEADER_NAMES};
 use crate::session::session_headers;
-use crate::url_validator::validate_cachekitio_url;
+use crate::url_validator::cachekitio_base_url;
 
 // ── CachekitIO ────────────────────────────────────────────────────────────────
 
@@ -455,6 +455,9 @@ fn http_client() -> reqwest::Result<reqwest::Client> {
 }
 
 /// wasm32: the platform's `fetch` owns pooling and timeouts; no User-Agent is set.
+/// It also cannot refuse redirects (reqwest's wasm32 client sets no redirect
+/// mode), so `CachekitIO` must not gain a wasm32 `Backend` impl; `WorkersCachekitIO`
+/// is the wasm32 backend.
 #[cfg(target_arch = "wasm32")]
 fn http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder().build()
@@ -506,8 +509,10 @@ impl CachekitIOBuilder {
     /// Returns an error if:
     /// - `api_key` was not set, or holds bytes an HTTP header cannot carry
     ///   (a control character such as a newline).
-    /// - the resolved URL scheme is not `https`.
-    /// - the URL hostname is not permitted (see [`validate_cachekitio_url`]).
+    /// - the resolved URL scheme is not `https`, or the URL carries a query or
+    ///   a fragment.
+    /// - the URL carries credentials, or its hostname is not permitted (see
+    ///   [`validate_cachekitio_url`](crate::url_validator::validate_cachekitio_url)).
     pub fn build(self) -> Result<CachekitIO, crate::error::CachekitError> {
         use crate::error::CachekitError;
 
@@ -520,11 +525,7 @@ impl CachekitIOBuilder {
             .api_url
             .unwrap_or_else(|| "https://api.cachekit.io".to_string());
 
-        // Validate URL: HTTPS, allowed host, no private IPs.
-        validate_cachekitio_url(&api_url, self.allow_custom_host)?;
-
-        // Trim trailing slash once so url()/health_url() don't repeat it per-request.
-        let api_url = api_url.trim_end_matches('/').to_string();
+        let api_url = cachekitio_base_url(&api_url, self.allow_custom_host)?;
 
         let client = http_client()
             .map_err(|e| CachekitError::Config(format!("failed to build HTTP client: {e}")))?;
@@ -944,6 +945,16 @@ mod prebuilt_header_tests {
             .build()
             .expect_err("newline in key");
         assert!(!err.to_string().contains("ck_bad"), "{err}");
+    }
+
+    #[test]
+    fn requests_go_to_the_validated_url_as_serialized() {
+        let backend = CachekitIO::builder()
+            .api_key("ck_test_key")
+            .api_url("https://api.cachekit.io\\@evil.example")
+            .build()
+            .expect("allowlisted host");
+        assert_eq!(backend.api_url(), "https://api.cachekit.io/@evil.example");
     }
 
     /// The prebuilt headers carry the same names and values the string

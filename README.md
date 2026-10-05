@@ -75,7 +75,7 @@ cachekit-rs = { version = "0.10.0", default-features = false, features = ["worke
 > - `workers` + `memcached` — Workers runtime has no TCP sockets
 > - `workers` + `file` — Workers runtime has no filesystem
 >
-> `l1` is also a compile error on `wasm32-unknown-unknown` with any feature set: `std::time::Instant` has no clock there, so building the client would panic. Build for that target with `default-features = false, features = ["encryption"]` plus your backend feature; `wasm32-wasip1` keeps L1.
+> `l1` is also a compile error on `wasm32-unknown-unknown` with any feature set: `std::time::Instant` has no clock there, so building the client would panic. Build for that target with `default-features = false, features = ["encryption"]` plus your backend feature (`workers` for cachekit.io); `wasm32-wasip1` keeps L1.
 
 ---
 
@@ -179,6 +179,9 @@ mappings alive while the connection is idle. On Linux and macOS it also drops
 a silently dead connection within about 60 s; Windows keeps its own fixed
 probe count, so detection there takes about 165 s. On wasm32 the platform's
 `fetch` decides pooling and the User-Agent.
+
+Neither CachekitIO client follows a redirect: a 3xx from the API is a
+permanent error. On wasm32, use the [Workers backend](#cloudflare-workers).
 
 ---
 
@@ -377,7 +380,7 @@ let backend = FileBackend::builder()
 
 ### Cloudflare Workers
 
-`wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. Requires the `workers` feature with default features disabled.
+`wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. It is the CachekitIO backend on wasm32. Requires the `workers` feature with default features disabled.
 
 <!-- x-release-please-start-version -->
 ```toml
@@ -603,8 +606,9 @@ Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rus
 | `CACHEKIT_DEFAULT_TTL` | ❌ | Default TTL in seconds (min 1, default: 300) |
 
 > [!CAUTION]
-> `CACHEKIT_API_URL` must use HTTPS and must not point to a private IP address.
-> Both constraints are enforced at configuration time.
+> `CACHEKIT_API_URL` must use HTTPS, must not carry credentials, a query or a
+> fragment, and must not point to a private IP address. All of these are
+> enforced at configuration time.
 
 ---
 
