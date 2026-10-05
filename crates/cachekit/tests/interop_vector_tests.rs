@@ -24,8 +24,23 @@ use serde_json::Value as Json;
 
 const VECTORS_JSON: &str = include_str!("vectors/interop-mode.json");
 
+/// sha256 of the vendored file, pinned so a local edit cannot drift from the
+/// protocol copy unnoticed.
+const VECTORS_SHA256: &str = "702613766d1b92bc3a337627a96b9aedc89abfeb4d9208c2bb00c9539a0a1f40"; // pragma: allowlist secret
+
 fn vectors() -> Json {
     serde_json::from_str(VECTORS_JSON).expect("vendored vector file must be valid JSON")
+}
+
+#[test]
+fn vendored_fixture_matches_the_pinned_sha256() {
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        hex::encode(Sha256::digest(VECTORS_JSON.as_bytes())),
+        VECTORS_SHA256,
+        "tests/vectors/interop-mode.json differs from the pinned protocol copy: \
+         re-vendor it from protocol and update VECTORS_SHA256"
+    );
 }
 
 // ── Tagged-JSON input parsing ────────────────────────────────────────────────

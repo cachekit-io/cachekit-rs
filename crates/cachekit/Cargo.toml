@@ -135,8 +135,8 @@ required-features = ["cachekitio", "macros"]
 
 [dev-dependencies]
 serde_json = "1"
-# Pins the sha256 of the vendored protocol vectors (tests/vectors/). Already in
-# the lockfile via cachekit-core, so this adds no new crate to the graph.
+# Pins the sha256 of every vendored protocol vector file (tests/vectors/).
+# Already in the lockfile via cachekit-core, so this adds no new crate to the graph.
 sha2 = "0.10"
 
 # Native-only test machinery: tokio's rt-multi-thread (and tempfile's fs use)

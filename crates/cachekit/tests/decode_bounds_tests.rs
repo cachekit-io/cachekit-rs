@@ -33,6 +33,10 @@ use crate::common::MockBackend;
 
 const VECTORS_JSON: &str = include_str!("vectors/decode-bounds.json");
 
+/// sha256 of the vendored file, pinned so a local edit cannot drift from the
+/// protocol copy unnoticed.
+const VECTORS_SHA256: &str = "907b025d2b270a0f60abd9296a8a1c864e69057c553ac7a70206b44256558916"; // pragma: allowlist secret
+
 fn vectors() -> Json {
     serde_json::from_str(VECTORS_JSON).expect("vendored vector file must be valid JSON")
 }
@@ -165,6 +169,17 @@ fn vector_file_shape_is_the_vendored_one() {
     assert_eq!(v["reject_vectors"].as_array().map(Vec::len), Some(17));
     assert_eq!(v["accept_vectors"].as_array().map(Vec::len), Some(3));
     assert_eq!(v["spec"], "spec/interop-mode.md#decode-bounds");
+}
+
+#[test]
+fn vendored_fixture_matches_the_pinned_sha256() {
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        hex::encode(Sha256::digest(VECTORS_JSON.as_bytes())),
+        VECTORS_SHA256,
+        "tests/vectors/decode-bounds.json differs from the pinned protocol copy: \
+         re-vendor it from protocol and update VECTORS_SHA256"
+    );
 }
 
 #[test]
