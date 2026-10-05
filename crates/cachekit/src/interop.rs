@@ -397,25 +397,12 @@ pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError
         ));
     }
 
-    let (mut de, doc_len) = crate::serializer::bounded_deserializer(bytes)?;
-    let value = T::deserialize(&mut de)
-        .map_err(|e| CachekitError::Serialization(format!("interop decode: {e}")))?;
-
-    // The structural walk measured the first document; anything after it is
-    // trailing. A successful decode consumes that whole document: rmp-serde
-    // rejects an array or map its target leaves unread. Ext is the exception: a
-    // target that reads only an ext's type byte leaves the body unread and is
-    // accepted. Ext is outside the interop data model, so no interop value
-    // reaches that path.
-    let trailing = bytes.len() - doc_len;
-    if trailing > 0 {
-        return Err(CachekitError::Serialization(format!(
-            "interop payload has {trailing} trailing byte(s) after the MessagePack document — \
-             interop readers must consume exactly one document"
-        )));
-    }
-
-    Ok(value)
+    // Trailing bytes are refused before the decode (see bounded_deserializer).
+    // Ext is outside the interop data model, so no interop value reaches the
+    // one target that can leave part of a document unread.
+    let mut de = crate::serializer::bounded_deserializer(bytes)?;
+    T::deserialize(&mut de)
+        .map_err(|e| CachekitError::Serialization(format!("interop decode: {e}")))
 }
 
 // ── Canonical encoder ────────────────────────────────────────────────────────

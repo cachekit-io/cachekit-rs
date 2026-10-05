@@ -437,10 +437,10 @@ impl CacheKit {
     /// Retrieve and deserialize an interop-mode value stored under `key`.
     ///
     /// Identical to [`Self::get`] except the payload is decoded with
-    /// [`crate::interop::deserialize`], which consumes exactly one MessagePack
-    /// document and rejects trailing bytes (interop/v1 spec MUST). A
-    /// Python-SDK-internal CK frame is rejected with a specific diagnostic
-    /// instead of silently decoding as the integer 67.
+    /// [`crate::interop::deserialize`]. Both consume exactly one MessagePack
+    /// document and reject trailing bytes (interop/v1 spec MUST); this one
+    /// also names a Python-SDK-internal CK frame with a specific diagnostic
+    /// instead of a generic trailing-bytes error.
     ///
     /// Use with keys from [`crate::interop::interop_key`] on a client
     /// **without** a namespace prefix. There is no interop-specific write
@@ -1032,7 +1032,7 @@ impl SecureCache<'_> {
     ///
     /// Identical to [`Self::get`] except the decrypted plaintext is decoded
     /// with [`crate::interop::deserialize`] — exactly one MessagePack document,
-    /// trailing bytes rejected (interop/v1 spec MUST). In interop mode the
+    /// trailing bytes rejected (interop/v1 spec MUST), as in [`Self::get`]. In interop mode the
     /// AES-GCM plaintext is the plain MessagePack value bytes, so the AAD
     /// (v0x03, `format="msgpack"`, `compressed="False"`) verifies cross-SDK
     /// unchanged.
