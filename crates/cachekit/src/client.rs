@@ -31,10 +31,10 @@ pub type SharedBackend = std::rc::Rc<dyn Backend>;
 /// Reference-counted pointer to the single-flight map, so client clones share
 /// fill-dedup state (two clones racing a cold miss must collapse to one fill).
 #[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
-type SharedFlight = std::sync::Arc<crate::flight::FlightMap>;
+pub(crate) type SharedFlight = std::sync::Arc<crate::flight::FlightMap>;
 
 #[cfg(any(target_arch = "wasm32", feature = "unsync"))]
-type SharedFlight = std::rc::Rc<crate::flight::FlightMap>;
+pub(crate) type SharedFlight = std::rc::Rc<crate::flight::FlightMap>;
 
 /// Separate same-key ordering from single-flight: a refresh holds the flight
 /// lock while computing, then takes this lock only for its version-checked

@@ -221,7 +221,8 @@ impl CacheCounters {
 // ── tracing events ───────────────────────────────────────────────────────────
 //
 // One `debug` event per completed cache operation on the `cachekit` target
-// (`RUST_LOG=cachekit=debug`), and one per failed fill-lock call. Fields: `op`
+// (`RUST_LOG=cachekit=debug`), one per failed fill-lock call, and one per
+// `#[cachekit]` result the macro could not store. Fields: `op`
 // (`get` | `set` | `delete` | `lock` | `unlock`), `key_hash` (see `key_hash`),
 // and per op `outcome` / `ttl_secs` / `existed` / `error_kind`.
 // Field expressions only run when a subscriber is enabled for the callsite,
@@ -287,6 +288,38 @@ pub(crate) fn trace_lock_error(full_key: &str, op: &'static str, err: &crate::Ba
     );
     #[cfg(not(feature = "tracing"))]
     let _ = (full_key, op, err);
+}
+
+/// Emit the event for a `#[cachekit]` result the macro computed but could not
+/// store: a cold-miss fill, or an SWR refresh whose commit failed. Macro
+/// plumbing: the call still returns its result, so this is the only signal of
+/// a failing store — otherwise it shows only as repeat misses or refreshes.
+/// The macro stores only on an un-namespaced client, so `key` is the storage
+/// key. Like the lock-error event, it carries the error's kind, never
+/// its message: a transport error names the request URL, and an invalid-key
+/// error the key (CWE-532).
+#[doc(hidden)]
+pub fn __trace_store_error(key: &str, err: &crate::CachekitError) {
+    #[cfg(feature = "tracing")]
+    {
+        use crate::CachekitError as E;
+        let error_kind: &dyn std::fmt::Display = match err {
+            E::Backend(be) => &be.kind,
+            E::Serialization(_) => &"serialization",
+            E::Encryption(_) => &"encryption",
+            E::Config(_) => &"config",
+            E::PayloadTooLarge { .. } => &"payload-too-large",
+            E::InvalidKey(_) => &"invalid-key",
+        };
+        tracing::debug!(
+            target: TARGET,
+            op = "set",
+            key_hash = %key_hash(key),
+            error_kind = %error_kind,
+        );
+    }
+    #[cfg(not(feature = "tracing"))]
+    let _ = (key, err);
 }
 
 #[cfg(test)]

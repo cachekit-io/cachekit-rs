@@ -235,7 +235,9 @@ pub trait LockableBackend: Backend {
         key: &str,
         timeout_ms: u64,
     ) -> Result<Option<String>, BackendError>;
-    /// Release a distributed lock. Returns true if released.
+    /// Release a distributed lock. Returns true if released. Must release
+    /// only if `lock_id` still owns the lock: a late or duplicate release
+    /// must never free a lock acquired since.
     async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError>;
 }
 
@@ -249,7 +251,9 @@ pub trait LockableBackend: Backend {
         key: &str,
         timeout_ms: u64,
     ) -> Result<Option<String>, BackendError>;
-    /// Release a distributed lock. Returns true if released.
+    /// Release a distributed lock. Returns true if released. Must release
+    /// only if `lock_id` still owns the lock: a late or duplicate release
+    /// must never free a lock acquired since.
     async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError>;
 }
 
