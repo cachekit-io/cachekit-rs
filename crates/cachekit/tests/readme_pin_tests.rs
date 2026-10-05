@@ -12,8 +12,8 @@
 //! release PR if release-please stopped rewriting them.
 //!
 //! It fails closed without knowing any TOML spelling. In a `toml` or shell
-//! fence (judged by the first word of the info string, so ` ```toml title=... `
-//! counts), where install snippets live, every line that names `cachekit-rs`
+//! fence (backtick or tilde, judged by the first word of the info string, so
+//! ` ```toml title=... ` counts), where install snippets live, every line that names `cachekit-rs`
 //! must carry its version on the same line, which forces the inline form (`cachekit-rs = ...`, a renamed
 //! `{ package = "cachekit-rs", version = ... }`, `cargo add cachekit-rs@...`)
 //! and rejects a table whose version sits on another line. In a block,
@@ -32,29 +32,45 @@ const READMES: [(&str, &str); 2] = [
 /// `0.8` in `cachekit-rs@0.8`, with the semver suffix release-please writes
 /// after `-` or `+`, so `0.11.0-rc.1` reads whole.
 fn versions(line: &str) -> Vec<&str> {
-    line.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')))
-        .filter_map(|token| {
-            // A prefix such as `v` in `v0.10.0` is not part of the version.
-            let token = token.trim_start_matches(|c: char| !c.is_ascii_digit());
-            let digits = token
-                .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-                .unwrap_or(token.len());
-            let core = token[..digits].trim_end_matches('.');
-            // `1.x` is no version, and `.html` in `1.85.0.html` is no suffix.
-            let version = if token[core.len()..].starts_with(['-', '+']) {
-                token.trim_end_matches(['.', '-', '+'])
+    let mut found = Vec::new();
+    let mut rest = line;
+    // Each run of digits and dots; `v` in `v0.10.0` and `h2-` in `h2-0.4.0` fall between runs.
+    while let Some(start) = rest.find(|c: char| c.is_ascii_digit()) {
+        rest = &rest[start..];
+        let mut end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        let core = rest[..end].trim_end_matches('.');
+        // `1.x` is no version, and `.html` in `1.85.0.html` is no suffix.
+        if core.contains('.') {
+            if rest[core.len()..].starts_with(['-', '+']) {
+                end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')))
+                    .unwrap_or(rest.len());
+                found.push(rest[..end].trim_end_matches(['.', '-', '+']));
             } else {
-                core
-            };
-            core.contains('.').then_some(version)
-        })
-        .collect()
+                found.push(core);
+            }
+        }
+        rest = &rest[end..];
+    }
+    found
+}
+
+/// The marker (` ``` `, `~~~~`, ...) and the rest of a code fence line.
+fn fence_line(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim_start();
+    let mark = line.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let rest = line.trim_start_matches(mark);
+    let marker = &line[..line.len() - rest.len()];
+    (marker.len() >= 3).then_some((marker, rest))
 }
 
 fn check(path: &str, text: &str, version: &str) {
     let mut in_block = false;
-    // First word of the open code fence's info string, such as `toml` or `rust`.
-    let mut fence: Option<&str> = None;
+    // The open code fence's marker, and the first word of its info string,
+    // such as `toml` or `rust`.
+    let mut fence: Option<(&str, &str)> = None;
     let mut pins = 0;
     for (n, line) in text.lines().enumerate() {
         let at = format!("{path}:{}", n + 1);
@@ -66,17 +82,29 @@ fn check(path: &str, text: &str, version: &str) {
             in_block = false;
             continue;
         }
-        if let Some(info) = line.trim_start().strip_prefix("```") {
-            fence = match fence {
-                Some(_) => None,
-                None => info
-                    .trim_start()
-                    .split(|c: char| c.is_whitespace() || matches!(c, ',' | '{'))
-                    .next(),
-            };
-            continue;
+        if let Some((marker, info)) = fence_line(line) {
+            match fence {
+                None => {
+                    let word = info
+                        .trim_start()
+                        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '{'))
+                        .next();
+                    fence = Some((marker, word.unwrap_or_default()));
+                    continue;
+                }
+                // Only the opener's character, at least as long, with nothing after it, closes.
+                Some((open, _)) if marker.starts_with(open) && info.trim().is_empty() => {
+                    fence = None;
+                    continue;
+                }
+                // Anything else, such as ` ```text ` in a ` ```` ` fence, is content.
+                Some(_) => {}
+            }
         }
-        let install_fence = matches!(fence, Some("toml" | "sh" | "bash" | "shell" | "console"));
+        let install_fence = matches!(
+            fence,
+            Some((_, "toml" | "sh" | "bash" | "shell" | "console"))
+        );
         let pin = line.contains("cachekit-rs");
         let found = versions(line);
         assert!(
@@ -119,24 +147,27 @@ fn readme_pins_name_this_version_inside_release_please_blocks() {
     }
 }
 
-/// A renamed dependency table split across lines, then the fence's close.
-const SPLIT_TABLE: &str =
-    "[dependencies.cache]\npackage = \"cachekit-rs\"\nversion = \"0.8\"\n```\n";
+/// A renamed dependency table split across lines.
+const SPLIT_TABLE: &str = "[dependencies.cache]\npackage = \"cachekit-rs\"\nversion = \"0.8\"\n";
 
 #[test]
-#[should_panic(expected = "names cachekit-rs with no version on the line")]
-fn split_table_in_titled_toml_fence_fails() {
-    check(
-        "t",
-        &format!("```toml title=\"Cargo.toml\"\n{SPLIT_TABLE}"),
-        "0.10.0",
-    );
-}
-
-#[test]
-#[should_panic(expected = "names cachekit-rs with no version on the line")]
-fn split_table_in_toml_fence_with_attributes_fails() {
-    check("t", &format!("```toml,ignore\n{SPLIT_TABLE}"), "0.10.0");
+fn split_table_fails_in_every_toml_fence_spelling() {
+    for (open, close) in [
+        ("```toml title=\"Cargo.toml\"", "```"),
+        ("```toml,ignore", "```"),
+        ("~~~toml", "~~~"),
+        ("````toml", "````"),
+        // A marker with text after it is content, so it does not close the fence.
+        ("```toml\n```text", "```"),
+    ] {
+        let text = format!("{open}\n{SPLIT_TABLE}{close}\n");
+        let panic = std::panic::catch_unwind(|| check("t", &text, "0.10.0")).expect_err(&text);
+        let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(
+            message.contains("names cachekit-rs with no version on the line"),
+            "{text}: {message}"
+        );
+    }
 }
 
 const PRERELEASE_BLOCK: &str = "<!-- x-release-please-start-version -->\n```toml\ncachekit-rs = \"0.11.0-rc.1\"\n```\n<!-- x-release-please-end -->\n";
@@ -167,5 +198,6 @@ fn versions_keep_semver_suffixes_and_skip_non_versions() {
     assert_eq!(versions("redis://127.0.0.1:6379"), ["127.0.0.1"]);
     assert_eq!(versions("redis://localhost:6379"), none);
     assert_eq!(versions("rustc-1.85.0.html"), ["1.85.0"]);
+    assert_eq!(versions("h2-0.4.0, python3-3.12.1"), ["0.4.0", "3.12.1"]);
     assert_eq!(versions("tokio 1.x, AES-256-GCM, sha256.hex"), none);
 }
