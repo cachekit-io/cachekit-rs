@@ -25,8 +25,8 @@
 
 | Component | What it does |
 |:----------|:-------------|
-| **CacheKit** | `get` / `set` / `delete` / `exists` with automatic L1 → L2 layering |
-| **SecureCache** | Transparent AES-256-GCM encryption before storage (zero-knowledge) |
+| **CacheKit** | `get` / `set` / `delete` / `exists` with automatic L1 → L2 layering; with a master key configured, every value is AES-256-GCM encrypted before storage (zero-knowledge) |
+| **SecureCache** | The same encryption as a handle (`cache.secure_cache()`) that refuses a client without a key |
 | **Backend** | Pluggable trait — cachekit.io SaaS, Redis, Memcached, local File, Cloudflare Workers |
 | **L1 Cache** | In-process [moka](https://crates.io/crates/moka) cache with write-through + backfill |
 
@@ -41,7 +41,7 @@
 | Feature | Default | Description |
 |:--------|:-------:|:------------|
 | `cachekitio` | ✅ | HTTP backend for [api.cachekit.io](https://api.cachekit.io) via [reqwest](https://crates.io/crates/reqwest) + rustls |
-| `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core) |
+| `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core). Without it, every builder encryption call (`.encryption()`, `.encryption_from_bytes()`, `.encryption_from_bytes_with_previous()`) returns a config error, and so does `from_env()` with `CACHEKIT_MASTER_KEY` set |
 | `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka), with stale-while-revalidate (native). Not supported on `wasm32-unknown-unknown` (compile error: no clock there) |
 | `reliability` | ✅ | Retry with backoff + jitter, circuit breaker, backpressure, distributed fill locks (native only) |
 | `redis` | ❌ | Redis backend via [fred](https://crates.io/crates/fred) (native only) |
@@ -94,7 +94,7 @@ One call that names your use case. Each preset returns a pre-configured builder 
 ² See the resilience contract below.
 ³ Requires the `redis` feature flag; `secure` also needs the default-on `encryption` feature.
 ⁴ Or `CacheKit::io_from_env()` to read `CACHEKIT_API_KEY`.
-⁵ Or `CacheKit::secure_from_env(url)` to read `CACHEKIT_MASTER_KEY`, plus the decrypt-only rotation keys in `CACHEKIT_PREVIOUS_MASTER_KEYS` (see [Key Rotation](#key-rotation)). Both take the key as a hex string and decode it the same way every CacheKit SDK does. Use exactly 32 bytes (64 hex chars, `openssl rand -hex 32`) — the only length every SDK accepts.
+⁵ Or `CacheKit::secure_from_env(url)` to read `CACHEKIT_MASTER_KEY`, plus the decrypt-only rotation keys in `CACHEKIT_PREVIOUS_MASTER_KEYS` (see [Key Rotation](#key-rotation)). Both take the key as a hex string and decode it the same way every CacheKit SDK does. Use exactly 32 bytes (64 hex chars, `openssl rand -hex 32`) — the only length every SDK accepts. Every value read and write on the client is encrypted — plain `get` / `set` included — and L1 holds ciphertext.
 
 ```rust
 use cachekit::prelude::*;
@@ -163,6 +163,11 @@ let cache = CacheKit::builder()
 > [!IMPORTANT]
 > Never hardcode API keys or master keys. Use environment variables or a secrets manager.
 
+On native targets each cachekit.io request attempt times out after 5 s, the
+protocol's `CACHEKIT_TIMEOUT` default and the same as cachekit-py and
+cachekit-ts; a write (`set`, `delete`) gets 10 s. The timeout covers connect,
+TLS and the response, and surfaces as `BackendErrorKind::Timeout`.
+
 On native targets every request carries the User-Agent `cachekit-rs/<version>`,
 and an idle pooled connection is kept for 390 s (reqwest's default is 90 s).
 Cloudflare closes an idle client connection after 400 s, so a request after a
@@ -177,30 +182,36 @@ probe count, so detection there takes about 165 s. On wasm32 the platform's
 
 ## Zero-Knowledge Encryption
 
-Call `.secure_cache()` to get an encrypted cache handle. All values are encrypted client-side with AES-256-GCM before hitting any backend. The backend only ever sees ciphertext.
+Configure a master key — the `secure` preset, or `.encryption()` / `.encryption_from_bytes()` / `.encryption_from_bytes_with_previous()` on any builder — and every value the client reads or writes is encrypted client-side with AES-256-GCM before it reaches any cache layer. `get`, `set`, `set_with_ttl`, `interop_get`, `interop_get_swr` and `#[cachekit]` functions all encrypt; the backend and L1 only ever see ciphertext. `delete` and `exists` carry no value.
 
 ```rust
 // Env: CACHEKIT_MASTER_KEY=<64 hex chars>
 let cache = CacheKit::secure_from_env("redis://localhost:6379").await?.build()?;
-let secure = cache.secure_cache()?;
 
-// Encrypt → store (backend sees only ciphertext)
-secure.set("user:42:ssn", &"123-45-6789").await?;
+// Encrypt → store (backend and L1 see only ciphertext)
+cache.set("user:42:ssn", &"123-45-6789").await?;
 
 // Retrieve → decrypt (transparent to caller)
-let ssn: String = secure.get("user:42:ssn").await?.unwrap();
+let ssn: String = cache.get("user:42:ssn").await?.unwrap();
+
+// Same encryption as a handle that errors on a client without a key — for
+// code that must never run unencrypted.
+let secure = cache.secure_cache()?;
 ```
 
 ```
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  Your Code   │────>│  SecureCache  │────>│   Backend    │
-│              │     │  AES-256-GCM  │     │  (cachekit.io│
-│  plaintext   │     │  encrypt /    │     │   or Redis)  │
-│              │<────│  decrypt      │<────│              │
+│  Your Code   │────>│   CacheKit   │────>│   Backend    │
+│              │     │  AES-256-GCM │     │  (cachekit.io│
+│  plaintext   │     │  encrypt /   │     │   or Redis)  │
+│              │<────│  decrypt     │<────│              │
 └──────────────┘     └──────────────┘     └──────────────┘
                       L1 stores ciphertext
                       (zero-knowledge preserved)
 ```
+
+> [!WARNING]
+> Earlier releases encrypted only through `secure_cache()`: plain `get` / `set` on a client with a key configured read and wrote plaintext. Reading such an entry now returns an `Encryption` error until it is overwritten, deleted or expires, so delete (or let expire) whatever those calls wrote before you upgrade.
 
 <details>
 <summary><strong>Security Properties</strong></summary>
@@ -272,10 +283,10 @@ let user: Option<User> = cache.interop_get(&key).await?; // strict read: exactly
 
 `ns` and `nsapi` are reserved as namespaces — the CachekitIO server parses a key starting `ns:` or `nsapi:` as namespace-prefixed — so `interop_key` rejects them with `InvalidKey` and `#[cachekit(namespace = ...)]` with a compile error; operations are unaffected. Neither segment may contain `..` (`a..b` is rejected the same two ways; a lone `.`, as in `app.v1`, is fine), because the server rejects `..` anywhere in a key.
 
-Argument hashing is byte-identical across SDKs (canonical MessagePack + Blake2b-256), verified against the shared [protocol](https://github.com/cachekit-io/protocol) test vectors ([`interop-mode.json`](crates/cachekit/tests/vectors/interop-mode.json), vendored) in this repo's test suite. `interop_get` (also on `SecureCache`) rejects trailing bytes and Python-internal CK frames instead of silently misreading them. Every decode of backend-supplied bytes (`get` and `interop_get` alike) first passes a header-only structural walk that rejects, before anything is decoded, a document nested deeper than `serializer::MAX_DECODE_DEPTH` (100 levels, matching the TypeScript SDK; every collection header counts, empty ones included) or declaring more elements or bytes than the input can back, verified against the protocol's shared [`decode-bounds.json`](crates/cachekit/tests/vectors/decode-bounds.json) vectors (vendored) — a forged nested-header entry is a bounded `Serialization` error, not a memory blow-up or a stack overflow. Encryption works unchanged — interop keys are identical across SDKs, so the AAD verifies cross-SDK.
+Argument hashing is byte-identical across SDKs (canonical MessagePack + Blake2b-256), verified against the shared [protocol](https://github.com/cachekit-io/protocol) test vectors ([`interop-mode.json`](crates/cachekit/tests/vectors/interop-mode.json), vendored) in this repo's test suite. `interop_get` (also on `SecureCache`) rejects trailing bytes and Python-internal CK frames instead of silently misreading them. Every decode of backend-supplied bytes (`get` and `interop_get` alike) first passes a header-only structural walk that rejects, before anything is decoded, a document nested deeper than `serializer::MAX_DECODE_DEPTH` (100 levels, matching the TypeScript SDK; every collection header counts, empty ones included) or declaring more elements or bytes than the input can back, verified against the protocol's shared [`decode-bounds.json`](crates/cachekit/tests/vectors/decode-bounds.json) vectors (vendored) — a forged nested-header entry is a bounded `Serialization` error, not a memory blow-up or a stack overflow. Encryption works unchanged — interop keys are identical across SDKs, so the AAD verifies cross-SDK. On a client with encryption configured, `set_with_ttl` stores the AES-GCM ciphertext of that MessagePack and `interop_get` decrypts it.
 
 > [!WARNING]
-> Every service that binds one `(namespace, operation)` must agree on encryption: on in all of them or off in all of them, with the same master key and `tenant_id` (decrypt-only previous master keys may differ). If an unencrypted service shares the operation with an encrypted one, values end up **stored unencrypted** at the shared key: the unencrypted service writes in the clear whenever it fills the entry, and a plain (non-`secure`) `#[cachekit]` function also replaces ciphertext it cannot decode. See [Shared entries are a contract](https://docs.cachekit.io/concepts/using-interop-mode/#shared-entries-are-a-contract).
+> Every service that binds one `(namespace, operation)` must agree on encryption: on in all of them or off in all of them, with the same master key and `tenant_id` (decrypt-only previous master keys may differ). If an unencrypted service shares the operation with an encrypted one, values end up **stored unencrypted** at the shared key: the unencrypted service writes in the clear whenever it fills the entry, and a `#[cachekit]` function on a client without encryption also replaces ciphertext it cannot decode. See [Shared entries are a contract](https://docs.cachekit.io/concepts/using-interop-mode/#shared-entries-are-a-contract).
 
 > [!IMPORTANT]
 > Use interop keys on a client **without** `.namespace()` — a client prefix would rewrite the storage key to `{prefix}:{interop_key}`, which no other SDK computes. `interop_get` fails closed with a config error rather than silently missing; interop keys already carry their own namespace segment.
@@ -421,8 +432,8 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 | **Write-through** | `set()` writes to L2 first, then L1 |
 | **Backfill on miss** | L2 hits populate L1 for at most 30 s. On cachekit.io a shorter `X-CacheKit-Fresh-For` bounds it further, and a hit labelled stale or with `Fresh-For: 0` is not backfilled at all, so the next read goes back to the server |
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
-| **Encrypted L1** | `SecureCache` stores ciphertext in L1 (never plaintext) |
-| **Evict on decrypt failure** | A `SecureCache` read that fails decryption drops the key's L1 copy and returns the error; the backend entry is kept, so the next read reaches the backend: a hit once the entry is replaced with ciphertext the client can decrypt, a miss once it expires or is deleted |
+| **Encrypted L1** | A client with encryption configured stores ciphertext in L1 (never plaintext) |
+| **Evict on decrypt failure** | A read on an encrypted client that fails decryption drops the key's L1 copy and returns the error; the backend entry is kept, so the next read reaches the backend: a hit once the entry is replaced with ciphertext the client can decrypt, a miss once it expires or is deleted |
 | **Default capacity** | 1,000 entries (configurable via `.l1_capacity()`) |
 | **Live counters** | `cache.stats()` reports L1 hits / L2 hits / misses; `cache.l1_entry_count()` the current occupancy — see [Observability](#observability) |
 | **Stale-while-revalidate** | On by default (native; `minimal` turns it off): `#[cachekit]` serves an L1 hit past `swr_threshold_ratio` × entry TTL (default 0.5, ±10% jitter) immediately and refreshes it in the background — see below |
@@ -496,7 +507,7 @@ With the `reliability` feature (default, native only), the `production`, `secure
 
 | Layer | What it does | Defaults |
 |:------|:-------------|:---------|
-| **Retry** | Truncated exponential backoff + jitter on transient/timeout errors (`BackendErrorKind::is_retryable`); permanent and auth errors propagate immediately | 3 attempts, 100 ms base, 5 s cap, jitter ×[0.5, 1.5) |
+| **Retry** | Truncated exponential backoff + jitter on transient/timeout errors (`BackendErrorKind::is_retryable`); permanent and auth errors propagate immediately. Under `io`, all attempts of one op share a deadline: an attempt still running at it is cancelled with `BackendErrorKind::Timeout`, and no retry starts past it, so a cachekit.io request that stops answering costs one attempt, not three. Other presets and custom backends get no deadline. A cachekit.io `429` for a spent quota or balance (`X-CacheKit-Deny-Reason`) is not retried; it stays `Transient`, so it still fails open and counts toward the breaker | 3 attempts, 100 ms base, 5 s cap, jitter ×[0.5, 1.5); `io` deadline 5 s per read, 10 s per write |
 | **Circuit breaker** | closed → open after N retryable failures in a rolling window; fails fast (`BackendErrorKind::CircuitOpen`) while open; half-open probes recovery | threshold 5, window 60 s, open 5 s, 3 probes, close after 3 successes |
 | **Backpressure** | Bounds concurrent backend data ops with a semaphore + bounded waiting queue; over-limit calls are shed with `BackendErrorKind::Backpressure` before reaching the backend — a slow backend can't exhaust the caller's connection pool or memory | 100 concurrent, 1 000 queued, 100 ms wait (Python SDK parity) |
 | **Graceful degradation** | On outage-class backend failure (transient, timeout, open breaker, backpressure shed), `#[cachekit]`-wrapped functions run uncached (fail-open); permanent/auth errors propagate — a wrong API key fails loudly. `#[cachekit(secure)]` paths fail **closed** on everything — encrypted workloads never silently degrade | built into the macro |
@@ -574,7 +585,7 @@ Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rus
 |:---------|:--------:|:------------|
 | `CACHEKIT_API_KEY` | ✅ | API key for cachekit.io (`from_env()` and `CacheKit::io_from_env()`) |
 | `CACHEKIT_API_URL` | ❌ | Override API endpoint (default: `https://api.cachekit.io`) |
-| `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and `from_env()`); use exactly 32 bytes (64 hex chars) — shorter is rejected |
+| `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and `from_env()`); use exactly 32 bytes (64 hex chars) — shorter, non-hex or non-UTF-8 values are rejected, never treated as unset |
 | `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (`CacheKit::secure_from_env()` and `from_env()`; max 3; a blank value is treated as unset) |
 | `CACHEKIT_DEFAULT_TTL` | ❌ | Default TTL in seconds (min 1, default: 300) |
 
@@ -701,8 +712,8 @@ any later comparison has to clear. Then run `sdk,transport`, which must agree
 within that floor before the transport arm's extra fields are trusted. Both
 arms speak HTTP/1.1 (`reqwest` is built without HTTP/2).
 
-It writes and deletes keys, so it runs only against the dev endpoint
-(`api.dev.cachekit.io`, an allowlist in the example), appends every key
+It writes and deletes keys, so it runs only against a non-production
+endpoint (an allowlist in the example), appends every key
 to `--ledger` before the PUT that writes it, caps every TTL at 900 s, and never
 retries. A 429, a 503, any other 4xx but 404, or a transport error stops the run;
 other 5xx responses are recorded and the run goes on, up to five, so an
@@ -710,7 +721,7 @@ endpoint's sporadic errors become a counted rate rather than ending the run.
 
 ```bash
 cargo build --release --example wall_time_probe --features macros
-CACHEKIT_API_KEY=… CACHEKIT_API_URL=https://api.dev.cachekit.io \
+CACHEKIT_API_KEY=… CACHEKIT_API_URL=<allowlisted endpoint> \
   target/release/examples/wall_time_probe --run r1 --phase warm \
   --out rows.jsonl --ledger keys.txt --arms sdk,sdk --samples 40 --block 10
 ```
@@ -746,6 +757,13 @@ keeping the job name green. Two properties make that visible:
 ## Minimum Supported Rust Version
 
 **Rust 1.85** or later (Edition 2021).
+
+## Contributing
+
+User-facing docs in this repository follow CacheKit's shared rule on what belongs in them:
+[What belongs in these docs](https://docs.cachekit.io/contributing/#what-belongs-in-these-docs).
+`prek install` (or `pre-commit install`) sets up hooks that reject internal references in README
+files, `docs/` and commit messages.
 
 ## License
 

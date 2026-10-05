@@ -48,6 +48,17 @@ use crate::random_unit;
 // ── Configuration ────────────────────────────────────────────────────────────
 
 /// Retry policy configuration (truncated exponential backoff with jitter).
+///
+/// Under [`CacheKit::io`](crate::CacheKit::io), all attempts of one operation
+/// also share one deadline: 5 s for a read (`get`, `exists`) and 10 s for a
+/// write (`set`, `delete`), matching the cachekit.io backend's per-attempt
+/// timeouts. An attempt still running at the deadline is cancelled and the
+/// operation fails with a `Timeout` error, and no backoff sleep starts that
+/// would end past it. A cachekit.io request that stops answering therefore
+/// costs one attempt, not `max_attempts` of them, while fast failures (a
+/// `503`, a dropped connection) still get every attempt that fits. Other
+/// backends, and a backend set on the builder after `io`, get no deadline:
+/// their operations run to their own timeouts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetryConfig {
     /// Total attempts, including the first (default: 3). `0` behaves as `1`.
@@ -214,9 +225,29 @@ impl ReliabilityConfig {
 
 // ── RetryPolicy ──────────────────────────────────────────────────────────────
 
+/// One deadline shared by every attempt of an operation (see [`RetryConfig`]).
+/// Crate-private and set only by [`CacheKit::io`](crate::CacheKit::io): the
+/// budgets match the cachekit.io client's per-attempt timeouts, and a
+/// backend with slower healthy operations must not be cut short by them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetryDeadlines {
+    /// For `get`, `get_with_freshness` and `exists`.
+    pub(crate) read: Duration,
+    /// For `set` and `delete`.
+    pub(crate) write: Duration,
+}
+
+/// The cachekit.io deadlines: one per-attempt timeout each.
+#[cfg(feature = "cachekitio")]
+pub(crate) const CACHEKITIO_DEADLINES: RetryDeadlines = RetryDeadlines {
+    read: Duration::from_secs(5),
+    write: Duration::from_secs(10),
+};
+
 /// Retries an operation on errors where [`crate::error::BackendErrorKind::is_retryable`] is
 /// true, sleeping a truncated exponential backoff (with jitter) between
-/// attempts. `Permanent` and `Authentication` errors propagate immediately.
+/// attempts, all inside one deadline. `Permanent` and `Authentication` errors,
+/// and a quota or balance deny, propagate immediately.
 #[derive(Debug)]
 pub(crate) struct RetryPolicy {
     config: RetryConfig,
@@ -240,17 +271,48 @@ impl RetryPolicy {
         }
     }
 
-    pub(crate) async fn execute<T, F, Fut>(&self, f: F) -> Result<T, BackendError>
+    /// Run `f` until it succeeds, fails for good, or `budget` (if any) runs out.
+    ///
+    /// The tokio clock measures the budget, so a paused test runtime controls it.
+    pub(crate) async fn execute<T, F, Fut>(
+        &self,
+        budget: Option<Duration>,
+        f: F,
+    ) -> Result<T, BackendError>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T, BackendError>>,
     {
+        let deadline = budget.map(|budget| tokio::time::Instant::now() + budget);
         let mut attempt: u32 = 0;
         loop {
-            match f().await {
+            let result = match deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, f()).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        return Err(BackendError::timeout(format!(
+                            "operation did not complete within its {:?} deadline ({} attempt(s))",
+                            budget.unwrap_or_default(),
+                            attempt + 1
+                        )))
+                    }
+                },
+                None => f().await,
+            };
+            match result {
                 Ok(v) => return Ok(v),
-                Err(e) if e.kind.is_retryable() && attempt + 1 < self.config.max_attempts => {
-                    tokio::time::sleep(self.delay(attempt)).await;
+                Err(e)
+                    if e.kind.is_retryable()
+                        && !e.is_quota_denied()
+                        && attempt + 1 < self.config.max_attempts =>
+                {
+                    let delay = self.delay(attempt);
+                    // A retry that cannot start before the deadline would only
+                    // turn this error into a deadline timeout: return it now.
+                    if deadline.is_some_and(|d| tokio::time::Instant::now() + delay >= d) {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
                 Err(e) => return Err(e),
@@ -680,12 +742,18 @@ pub(crate) struct ReliableBackend {
     /// it through the type-erased backend.
     breaker: Option<Arc<CircuitBreaker>>,
     limiter: Option<ConcurrencyLimiter>,
+    deadlines: Option<RetryDeadlines>,
 }
 
 impl ReliableBackend {
-    pub(crate) fn new(inner: SharedBackend, config: ReliabilityConfig) -> Self {
+    pub(crate) fn new(
+        inner: SharedBackend,
+        config: ReliabilityConfig,
+        deadlines: Option<RetryDeadlines>,
+    ) -> Self {
         Self {
             inner,
+            deadlines,
             retry: config.retry.map(RetryPolicy::new),
             breaker: config
                 .circuit_breaker
@@ -694,7 +762,8 @@ impl ReliableBackend {
         }
     }
 
-    async fn guarded<T, F, Fut>(&self, f: F) -> Result<T, BackendError>
+    /// Run `f` through the stack; `budget` is the retry deadline for this op, if any.
+    async fn guarded<T, F, Fut>(&self, budget: Option<Duration>, f: F) -> Result<T, BackendError>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T, BackendError>>,
@@ -711,7 +780,7 @@ impl ReliableBackend {
             None => None,
         };
         let result = match &self.retry {
-            Some(retry) => retry.execute(f).await,
+            Some(retry) => retry.execute(budget, f).await,
             None => f().await,
         };
         if let Some(permit) = permit {
@@ -730,7 +799,8 @@ impl ReliableBackend {
 #[cfg_attr(feature = "unsync", async_trait(?Send))]
 impl Backend for ReliableBackend {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
-        self.guarded(|| self.inner.get(key)).await
+        self.guarded(self.deadlines.map(|d| d.read), || self.inner.get(key))
+            .await
     }
 
     // Forwarded, not defaulted: the default would call `self.get` and drop
@@ -739,7 +809,10 @@ impl Backend for ReliableBackend {
         &self,
         key: &str,
     ) -> Result<Option<(Vec<u8>, Freshness)>, BackendError> {
-        self.guarded(|| self.inner.get_with_freshness(key)).await
+        self.guarded(self.deadlines.map(|d| d.read), || {
+            self.inner.get_with_freshness(key)
+        })
+        .await
     }
 
     async fn set(
@@ -749,16 +822,20 @@ impl Backend for ReliableBackend {
         ttl: Option<Duration>,
     ) -> Result<(), BackendError> {
         // Clone per attempt: the inner call consumes the buffer.
-        self.guarded(|| self.inner.set(key, value.clone(), ttl))
-            .await
+        self.guarded(self.deadlines.map(|d| d.write), || {
+            self.inner.set(key, value.clone(), ttl)
+        })
+        .await
     }
 
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
-        self.guarded(|| self.inner.delete(key)).await
+        self.guarded(self.deadlines.map(|d| d.write), || self.inner.delete(key))
+            .await
     }
 
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
-        self.guarded(|| self.inner.exists(key)).await
+        self.guarded(self.deadlines.map(|d| d.read), || self.inner.exists(key))
+            .await
     }
 
     async fn health(&self) -> Result<HealthStatus, BackendError> {
@@ -775,8 +852,9 @@ impl Backend for ReliableBackend {
 pub(crate) fn wrap_reliable(
     inner: SharedBackend,
     config: ReliabilityConfig,
+    deadlines: Option<RetryDeadlines>,
 ) -> (SharedBackend, Option<Arc<CircuitBreaker>>) {
-    let reliable = ReliableBackend::new(inner, config);
+    let reliable = ReliableBackend::new(inner, config, deadlines);
     let breaker = reliable.breaker.clone();
     #[cfg(not(feature = "unsync"))]
     let shared: SharedBackend = std::sync::Arc::new(reliable);
@@ -1083,5 +1161,243 @@ mod tests {
         assert_eq!(no_jitter.delay(0), Duration::from_millis(100));
         assert_eq!(no_jitter.delay(1), Duration::from_millis(200));
         assert_eq!(no_jitter.delay(20), Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_quota_deny_is_not_retried() {
+        let calls = AtomicU64::new(0);
+        let policy = RetryPolicy::new(RetryConfig::default());
+
+        let err = policy
+            .execute(None, || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(BackendError::from_http_status(429, b"").with_quota_denied())
+            })
+            .await
+            .expect_err("denied");
+
+        assert!(err.is_quota_denied());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+// ── Retry deadline (CacheKit::io) ────────────────────────────────────────────
+
+/// The deadline is crate-private, so these run in-crate rather than in
+/// `tests/reliability_tests.rs`.
+#[cfg(all(test, feature = "cachekitio"))]
+#[allow(clippy::expect_used)] // test-only
+mod deadline_tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+
+    use super::{CircuitState, ReliabilityConfig, RetryConfig, CACHEKITIO_DEADLINES};
+    use crate::backend::{Backend, HealthStatus};
+    use crate::client::SharedBackend;
+    use crate::error::{BackendError, BackendErrorKind};
+    use crate::{CacheKit, CachekitError};
+
+    /// Every data op sleeps `latency` on the tokio clock, then fails with `kind`;
+    /// `None` never completes. Counts calls.
+    #[derive(Debug, Clone)]
+    struct SlowBackend {
+        latency: Option<Duration>,
+        kind: BackendErrorKind,
+        calls: Arc<AtomicU32>,
+    }
+
+    impl SlowBackend {
+        fn new_with_handle(
+            latency: Option<Duration>,
+            kind: BackendErrorKind,
+        ) -> (SharedBackend, Self) {
+            let backend = Self {
+                latency,
+                kind,
+                calls: Arc::new(AtomicU32::new(0)),
+            };
+            let handle = backend.clone();
+            #[cfg(not(feature = "unsync"))]
+            let shared: SharedBackend = Arc::new(backend);
+            #[cfg(feature = "unsync")]
+            let shared: SharedBackend = std::rc::Rc::new(backend);
+            (shared, handle)
+        }
+
+        fn calls(&self) -> u32 {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        async fn op<T>(&self) -> Result<T, BackendError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.latency {
+                Some(latency) => tokio::time::sleep(latency).await,
+                None => std::future::pending().await,
+            }
+            Err(BackendError {
+                kind: self.kind.clone(),
+                message: "scripted failure".to_owned(),
+                source: None,
+            })
+        }
+    }
+
+    #[cfg_attr(not(feature = "unsync"), async_trait)]
+    #[cfg_attr(feature = "unsync", async_trait(?Send))]
+    impl Backend for SlowBackend {
+        async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+            self.op().await
+        }
+
+        async fn set(
+            &self,
+            _key: &str,
+            _value: Vec<u8>,
+            _ttl: Option<Duration>,
+        ) -> Result<(), BackendError> {
+            self.op().await
+        }
+
+        async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+            self.op().await
+        }
+
+        async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+            self.op().await
+        }
+
+        async fn health(&self) -> Result<HealthStatus, BackendError> {
+            Ok(HealthStatus {
+                is_healthy: true,
+                latency_ms: 0.0,
+                backend_type: "slow".to_owned(),
+                details: HashMap::new(),
+            })
+        }
+    }
+
+    /// The `CacheKit::io` stack (default layers plus the cachekit.io deadlines)
+    /// around `backend`, with jitter off so virtual time is exact.
+    fn default_stack(backend: SharedBackend) -> CacheKit {
+        let mut builder = CacheKit::builder()
+            .backend(backend)
+            .reliability(ReliabilityConfig {
+                retry: Some(RetryConfig {
+                    jitter: false,
+                    ..RetryConfig::default()
+                }),
+                ..ReliabilityConfig::default()
+            })
+            .no_l1();
+        builder.retry_deadlines = Some(CACHEKITIO_DEADLINES);
+        builder.build().expect("client builds")
+    }
+
+    fn backend_kind(err: &CachekitError) -> Option<&BackendErrorKind> {
+        match err {
+            CachekitError::Backend(b) => Some(&b.kind),
+            _ => None,
+        }
+    }
+
+    /// Run `op` and return its result with the virtual time it took.
+    async fn timed<T>(op: impl std::future::Future<Output = T>) -> (T, Duration) {
+        let start = tokio::time::Instant::now();
+        let out = op.await;
+        (out, start.elapsed())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_get_fails_at_the_5_s_read_deadline() {
+        let (backend, handle) = SlowBackend::new_with_handle(None, BackendErrorKind::Timeout);
+        let client = default_stack(backend);
+
+        let (result, elapsed) = timed(client.get::<u32>("k")).await;
+
+        let err = result.expect_err("stalled");
+        assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Timeout));
+        assert_eq!(elapsed, Duration::from_secs(5));
+        assert_eq!(handle.calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_set_fails_at_the_10_s_write_deadline() {
+        let (backend, handle) = SlowBackend::new_with_handle(None, BackendErrorKind::Timeout);
+        let client = default_stack(backend);
+
+        let (result, elapsed) = timed(client.set("k", &7u32)).await;
+
+        let err = result.expect_err("stalled");
+        assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Timeout));
+        assert_eq!(elapsed, Duration::from_secs(10));
+        assert_eq!(handle.calls(), 1);
+    }
+
+    /// The old cachekit.io shape: each attempt times out after 30 s. Without the
+    /// deadline this took 3 x 30 s + 0.3 s backoff = 90.3 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_30_s_attempt_timeout_is_cut_to_the_deadline() {
+        let (backend, handle) =
+            SlowBackend::new_with_handle(Some(Duration::from_secs(30)), BackendErrorKind::Timeout);
+        let client = default_stack(backend);
+
+        let (result, elapsed) = timed(client.get::<u32>("k")).await;
+
+        result.expect_err("timed out");
+        assert_eq!(elapsed, Duration::from_secs(5));
+        assert_eq!(handle.calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fast_failures_still_get_every_attempt() {
+        let (backend, handle) =
+            SlowBackend::new_with_handle(Some(Duration::ZERO), BackendErrorKind::Transient);
+        let client = default_stack(backend);
+
+        let (result, elapsed) = timed(client.get::<u32>("k")).await;
+
+        let err = result.expect_err("always fails");
+        assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Transient));
+        assert_eq!(handle.calls(), 3);
+        assert_eq!(elapsed, Duration::from_millis(300), "100 + 200 ms backoff");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_backoff_starts_past_the_deadline() {
+        // 4.95 s attempt + 100 ms backoff would start attempt 2 past 5 s: return
+        // the attempt's own error rather than a deadline timeout.
+        let (backend, handle) = SlowBackend::new_with_handle(
+            Some(Duration::from_millis(4950)),
+            BackendErrorKind::Transient,
+        );
+        let client = default_stack(backend);
+
+        let (result, elapsed) = timed(client.get::<u32>("k")).await;
+
+        let err = result.expect_err("fails");
+        assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Transient));
+        assert_eq!(handle.calls(), 1);
+        assert_eq!(elapsed, Duration::from_millis(4950));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serial_stalled_gets_open_the_breaker_inside_its_window() {
+        let (backend, handle) = SlowBackend::new_with_handle(None, BackendErrorKind::Timeout);
+        let client = default_stack(backend);
+
+        // Five 5 s failures fit the 60 s rolling window; at 90 s each they never did.
+        for _ in 0..5 {
+            client.get::<u32>("k").await.expect_err("stalled");
+        }
+        assert_eq!(client.circuit_state(), Some(CircuitState::Open));
+
+        let calls = handle.calls();
+        let err = client.get::<u32>("k").await.expect_err("open");
+        assert_eq!(backend_kind(&err), Some(&BackendErrorKind::CircuitOpen));
+        assert_eq!(handle.calls(), calls, "an open breaker sends nothing");
     }
 }

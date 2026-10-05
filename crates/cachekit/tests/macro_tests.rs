@@ -475,6 +475,54 @@ async fn macro_secure_evicts_l1_after_decrypt_failure() {
     assert_eq!(POISONED_RUNS.load(SeqCst), 1);
 }
 
+#[cfg(feature = "encryption")]
+static PLAIN_ENCRYPTED_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(feature = "encryption")]
+#[cachekit(client = cache, ttl = 60, interop = "plain_on_encrypted", namespace = "reliab")]
+async fn plain_on_encrypted(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
+    PLAIN_ENCRYPTED_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(User {
+        name: format!("user {id}"),
+    })
+}
+
+/// A plain (non-`secure`) function on a client with encryption configured
+/// fills with ciphertext and reads it back: the macro calls the client's value
+/// methods, and on such a client those encrypt.
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn macro_plain_fill_on_encrypted_client_stores_ciphertext() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let (shared, backend) = common::MockBackend::new_with_handle();
+    let cache = CacheKit::builder()
+        .backend(shared)
+        .no_l1()
+        .encryption_from_bytes(&[7u8; 32], "default")
+        .expect("encryption configures")
+        .build()
+        .expect("client builds");
+    let key = interop_key("reliab", "plain_on_encrypted", &[InteropValue::from(3u64)]).unwrap();
+
+    let user = plain_on_encrypted(&cache, 3).await.unwrap();
+    let stored = backend
+        .store
+        .lock()
+        .await
+        .get(&key)
+        .cloned()
+        .expect("the fill reached the backend");
+    let decrypted = cachekit::EncryptionLayer::new(&[7u8; 32], "default")
+        .unwrap()
+        .decrypt(&stored, &key)
+        .expect("the fill is ciphertext under the client's key");
+    assert_eq!(decrypted, cachekit::serializer::serialize(&user).unwrap());
+
+    assert_eq!(plain_on_encrypted(&cache, 3).await.unwrap(), user);
+    assert_eq!(PLAIN_ENCRYPTED_RUNS.load(SeqCst), 1, "second call is a hit");
+}
+
 static SLOW_OP_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[cachekit(client = cache, ttl = 60, interop = "slow_op", namespace = "flight")]

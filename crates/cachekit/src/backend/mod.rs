@@ -348,14 +348,33 @@ pub(crate) fn delete_succeeded(status: u16) -> bool {
     matches!(status, 200 | 204)
 }
 
+/// The whole seconds a write's TTL goes on the wire as. `spec/saas-api.md`
+/// says a positive sub-second TTL MUST be ceiled to 1, never truncated to 0.
+/// From 1 s up it truncates, so the wire TTL stays an upper bound on the
+/// requested one and the writer's L1 copy can be bounded by it. Zero stays
+/// zero: TTL 0 is an error, and the server rejects it with `400`.
+#[cfg(any(
+    feature = "cachekitio",
+    feature = "workers",
+    feature = "l1",
+    feature = "tracing",
+    test
+))]
+pub(crate) fn ttl_wire_secs(ttl: Duration) -> u64 {
+    if ttl.is_zero() {
+        return 0;
+    }
+    ttl.as_secs().max(1)
+}
+
 /// The `PUT /v1/cache/{key}` header that carries a write's TTL in whole
-/// seconds. `spec/saas-api.md` says SDKs MUST send `X-CacheKit-TTL` only: the
-/// legacy `X-TTL` goes away in protocol 2.0, and a write that sends only it
-/// would then be stored with no expiry. Shared by the native and Workers
-/// backends so their wire forms cannot drift.
+/// seconds ([`ttl_wire_secs`]). `spec/saas-api.md` says SDKs MUST send
+/// `X-CacheKit-TTL` only: the legacy `X-TTL` goes away in protocol 2.0, and a
+/// write that sends only it would then be stored with no expiry. Shared by the
+/// native and Workers backends so their wire forms cannot drift.
 #[cfg(any(feature = "cachekitio", feature = "workers", test))]
 pub(crate) fn ttl_header(ttl: Duration) -> (&'static str, String) {
-    ("X-CacheKit-TTL", ttl.as_secs().to_string())
+    ("X-CacheKit-TTL", ttl_wire_secs(ttl).to_string())
 }
 
 // ── Feature-gated backend modules ─────────────────────────────────────────────
@@ -551,7 +570,7 @@ mod delete_status_tests {
 mod ttl_header_tests {
     use std::time::Duration;
 
-    use super::ttl_header;
+    use super::{ttl_header, ttl_wire_secs};
 
     #[test]
     fn ttl_header_is_the_canonical_name_in_whole_seconds() {
@@ -559,5 +578,73 @@ mod ttl_header_tests {
             ttl_header(Duration::from_millis(60_900)),
             ("X-CacheKit-TTL", "60".to_owned())
         );
+    }
+
+    #[test]
+    fn ttl_header_sends_a_sub_second_ttl_as_one() {
+        assert_eq!(
+            ttl_header(Duration::from_millis(500)),
+            ("X-CacheKit-TTL", "1".to_owned())
+        );
+    }
+
+    #[test]
+    fn wire_secs_ceil_sub_second_and_truncate_the_rest() {
+        assert_eq!(ttl_wire_secs(Duration::from_millis(500)), 1);
+        assert_eq!(ttl_wire_secs(Duration::from_nanos(1)), 1);
+        assert_eq!(ttl_wire_secs(Duration::from_secs(60)), 60);
+        assert_eq!(ttl_wire_secs(Duration::from_millis(60_900)), 60);
+    }
+
+    #[test]
+    fn wire_secs_keep_zero_as_zero() {
+        assert_eq!(ttl_wire_secs(Duration::ZERO), 0);
+    }
+}
+
+// ── In-memory backend for crate-internal tests ───────────────────────────────
+
+/// In-memory [`Backend`] for crate-internal tests that must see the bytes
+/// that actually reached the backend. Clones share one store.
+#[cfg(test)]
+#[allow(dead_code)] // its tests are feature-gated; builds without them still compile it
+#[derive(Clone, Default)]
+pub(crate) struct MemoryBackend {
+    pub(crate) store: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+#[cfg(test)]
+#[cfg_attr(not(any(target_arch = "wasm32", feature = "unsync")), async_trait)]
+#[cfg_attr(any(target_arch = "wasm32", feature = "unsync"), async_trait(?Send))]
+impl Backend for MemoryBackend {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        Ok(self.store.lock().await.get(key).cloned())
+    }
+
+    async fn set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        self.store.lock().await.insert(key.to_owned(), value);
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> Result<bool, BackendError> {
+        Ok(self.store.lock().await.remove(key).is_some())
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, BackendError> {
+        Ok(self.store.lock().await.contains_key(key))
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Ok(HealthStatus {
+            is_healthy: true,
+            latency_ms: 0.0,
+            backend_type: "memory".to_owned(),
+            details: HashMap::new(),
+        })
     }
 }
