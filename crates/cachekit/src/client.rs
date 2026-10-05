@@ -452,6 +452,12 @@ impl CacheKit {
     /// (v0x03, `format="msgpack"`, `compressed="False"`) verifies cross-SDK
     /// unchanged.
     ///
+    /// Unlike this read, [`Self::set`] / [`Self::set_with_ttl`] do not check
+    /// the client namespace: on a client with [`CacheKitBuilder::namespace`]
+    /// set they return `Ok` and store the entry under
+    /// `{namespace}:{interop_key}`, which no interop reader addresses. Interop
+    /// writes need a client without a namespace.
+    ///
     /// # Errors
     ///
     /// Returns [`CachekitError::Config`] if the client was built with
@@ -657,6 +663,10 @@ impl CacheKit {
     /// A positive sub-second `ttl` is sent to the backend as 1 second.
     ///
     /// Returns [`CachekitError::Config`] if `ttl` is zero.
+    ///
+    /// The client namespace is not checked here: an interop key written on a
+    /// namespaced client lands under `{namespace}:{interop_key}`, which no
+    /// interop reader addresses — see [`Self::interop_get`].
     pub async fn set_with_ttl<T: Serialize>(
         &self,
         key: &str,
@@ -935,6 +945,10 @@ impl SecureCache<'_> {
     }
 
     /// Encrypt and store `value` under `key` with an explicit `ttl`.
+    ///
+    /// The client namespace is not checked here: an interop key written on a
+    /// namespaced client lands under `{namespace}:{interop_key}`, which no
+    /// interop reader addresses — see [`CacheKit::interop_get`].
     pub async fn set_with_ttl<T: Serialize>(
         &self,
         key: &str,
