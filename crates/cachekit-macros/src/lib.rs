@@ -533,10 +533,12 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                 Ok(cachekit::SwrRead::Fresh(__ck_cached)) => return Ok(__ck_cached),
                 // Stale (past the freshness threshold, before hard expiry):
                 // serve the cached value immediately and schedule ONE
-                // background refresh. Dedup rides the same single-flight as
-                // the cold-miss path: the first refresh task leads and
-                // re-executes the function; concurrent tasks queue, see the
-                // (still-present) entry, and exit without computing. Refresh
+                // background refresh. Dedup takes the same locks as the
+                // cold-miss single-flight but never waits on them: the first
+                // refresh task leads and re-executes the function; a task
+                // that finds the in-process flight held, or the distributed
+                // fill lock contested, exits at once without polling or
+                // re-reading (no wait, no billed miss). Refresh
                 // failures are deliberately absorbed — the stale value keeps
                 // being served, a later stale read retries, and hard expiry
                 // falls through to the blocking path where errors surface.
@@ -551,16 +553,10 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                         let __ck_key = __ck_swr_key;
                         #swr_rebinds
                         let _: ::std::result::Result<(), cachekit::error::CachekitError> = async {
-                            let mut __ck_flight = #client_ident.single_flight(&__ck_key).await;
-                            while __ck_flight.wait_for_fill().await {
-                                if matches!(#get_expr, Ok(Some(_))) {
-                                    // Another worker is already on it (the
-                                    // stale entry is still present, or the
-                                    // leader has refreshed) — stand down.
-                                    __ck_flight.release().await;
-                                    return Ok(());
-                                }
-                            }
+                            let Some(__ck_flight) = #client_ident.__refresh_flight(&__ck_key).await else {
+                                // Another worker is already filling this key.
+                                return Ok(());
+                            };
                             let __ck_result: #ret_ty = (async #original_body).await;
                             if let Ok(ref __ck_val) = __ck_result {
                                 // Commit only if no newer set/delete replaced

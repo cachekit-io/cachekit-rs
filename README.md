@@ -467,10 +467,13 @@ newer `set()` or `delete()` landed through the same client (or one of its
 clones) while the origin ran, that explicit mutation wins and the older
 refresh result is discarded before it can touch L2. Entry expiry and capacity
 eviction do not invalidate the token, so a valid slow refresh can still
-repopulate both layers. Refresh dedup rides the same single-flight as the cold-miss path
+repopulate both layers. Refresh dedup takes the same locks as the cold-miss single-flight
 (in-process, plus distributed fill locks on lock-capable backends), so N
 concurrent stale readers cost one origin execution — misses are billable;
-stampedes are not acceptable. A hard-expired entry always takes the normal
+stampedes are not acceptable. Unlike a cold miss, a refresh never waits: if
+another worker or process already holds the key's lock, the refresh stands down
+at once without polling or re-reading the cache, records no miss, and the stale
+value keeps being served until hard expiry. A hard-expired entry always takes the normal
 blocking miss path: SWR never serves past hard expiry.
 
 ```rust,ignore

@@ -131,7 +131,8 @@ pub enum SwrRead<T> {
     Fresh(T),
     /// L1 hit past the freshness threshold but before hard expiry: use the
     /// value now, and schedule a background refresh (the `#[cachekit]` macro
-    /// does this via [`CacheKit::single_flight`] + re-execution). The token
+    /// re-executes the function, deduplicated on the [`CacheKit::single_flight`]
+    /// locks without waiting on them). The token
     /// makes refresh completion conditional: a newer set or delete wins.
     Stale(T, SwrToken),
     /// No usable entry: fall through to a normal blocking miss + fill.
@@ -509,9 +510,11 @@ impl CacheKit {
     /// - [`SwrRead::Stale`] — L1 hit past the threshold but **before hard
     ///   expiry**: the value is returned without touching the backend or
     ///   origin, and the caller should schedule exactly one background
-    ///   refresh (dedup via [`Self::single_flight`] — this is what the
-    ///   `#[cachekit]` macro generates). The accompanying [`SwrToken`] makes
-    ///   completion conditional, so a newer set/delete always wins.
+    ///   refresh. The `#[cachekit]` macro dedups it on the cold-miss
+    ///   [`Self::single_flight`] locks without waiting: a refresh that finds
+    ///   either lock held stands down and the stale value keeps being
+    ///   served. The accompanying [`SwrToken`] makes completion conditional,
+    ///   so a newer set/delete always wins.
     /// - [`SwrRead::Miss`] — nothing usable anywhere: normal blocking miss.
     ///
     /// A hard-expired L1 entry is a [`SwrRead::Miss`], never `Stale` — moka
@@ -843,6 +846,16 @@ impl CacheKit {
     pub async fn single_flight(&self, key: &str) -> crate::flight::SingleFlight {
         let full_key = self.namespaced_key(key);
         crate::flight::SingleFlight::acquire(&self.flight, &self.backend, &full_key).await
+    }
+
+    /// Begin the single-flight for an SWR background refresh, or `None` when
+    /// another worker already holds this key's in-process flight or
+    /// distributed fill lock. Unlike [`Self::single_flight`] it never waits.
+    /// Macro plumbing for `#[cachekit]` — not public API.
+    #[doc(hidden)]
+    pub async fn __refresh_flight(&self, key: &str) -> Option<crate::flight::SingleFlight> {
+        let full_key = self.namespaced_key(key);
+        crate::flight::SingleFlight::try_lead(&self.flight, &self.backend, &full_key).await
     }
 
     // ── Secure cache ─────────────────────────────────────────────────────────
@@ -1248,9 +1261,10 @@ impl CacheKitBuilder {
     ///
     /// With SWR on, an L1 hit older than `swr_threshold_ratio` of its TTL is
     /// still served immediately, and the `#[cachekit]` macro schedules
-    /// exactly one background refresh (deduplicated through
-    /// [`CacheKit::single_flight`], in-process and — on lock-capable
-    /// backends — across processes). A hard-expired entry is never served:
+    /// exactly one background refresh (deduplicated on the
+    /// [`CacheKit::single_flight`] locks, in-process and — on lock-capable
+    /// backends — across processes; a refresh that finds either lock held
+    /// stands down instead of waiting). A hard-expired entry is never served:
     /// it falls through to a normal blocking miss.
     ///
     /// Native targets only: this knob does not exist on wasm32, under the

@@ -16,6 +16,9 @@
 //!   (fail-open — a stampede beats unavailability).
 //!
 //! The `#[cachekit]` macro wires this in automatically around its miss path.
+//! Its stale-while-revalidate refresh takes the same locks but never waits:
+//! if another worker holds either one, the refresh stands down without
+//! polling or re-reading the cache, and the stale copy keeps being served.
 //! Manual usage follows the same shape:
 //!
 //! ```no_run
@@ -299,6 +302,24 @@ impl SingleFlight {
             role,
             dist,
         }
+    }
+
+    /// Refresh-ahead entry: lead the fill, or `None` to stand down at once.
+    ///
+    /// A refresh runs only while a stale copy is still being served, so it
+    /// never waits for another worker's fill and never re-reads the cache
+    /// (`spec/saas-api.md` API-62/63): a held in-process flight or a contested
+    /// distributed lock means someone else is already filling this key. A
+    /// lock-infrastructure error still fails open to a plain leader, as in
+    /// [`Self::lead`].
+    pub(crate) async fn try_lead(
+        map: &FlightMap,
+        backend: &SharedBackend,
+        full_key: &str,
+    ) -> Option<Self> {
+        let local = map.handle(full_key).try_lock_owned().ok()?;
+        let flight = Self::lead(local, backend, full_key).await;
+        matches!(flight.role, Role::Leader).then_some(flight)
     }
 
     #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
