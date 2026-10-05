@@ -942,17 +942,12 @@ impl SecureCache<'_> {
         ttl: Duration,
     ) -> Result<(), CachekitError> {
         CacheKit::validate_ttl(ttl)?;
-
-        // Serialize then encrypt
-        let plaintext = serializer::serialize(value)?;
-        let ciphertext = self.encryption.encrypt(&plaintext, key)?;
+        let (full_key, ciphertext) = self.seal(key, value)?;
         // Size-check what is actually persisted (nonce + ciphertext + tag).
         // The get paths check the stored ciphertext length, so checking the
         // plaintext here would let a value within 28 bytes of the limit write
         // successfully and then fail EVERY subsequent read with PayloadTooLarge.
         self.client.check_payload_size(ciphertext.len())?;
-
-        let full_key = self.client.resolve_key(key)?;
 
         #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
         let mutation = self.client.lock_l1_mutation(&full_key).await;
@@ -996,11 +991,21 @@ impl SecureCache<'_> {
         ttl: Duration,
         token: SwrToken,
     ) -> Result<bool, CachekitError> {
-        let plaintext = serializer::serialize(value)?;
-        let ciphertext = self.encryption.encrypt(&plaintext, key)?;
+        let (_, ciphertext) = self.seal(key, value)?;
         self.client
             .complete_swr_bytes(key, ciphertext, ttl, token)
             .await
+    }
+
+    /// Serialize and encrypt `value` for `key`, returning the key this client
+    /// passes to its backend (`.namespace()` prefix included) with the
+    /// ciphertext. Every write encrypts here, so the AAD binds that key and an
+    /// entry copied to another namespace fails to decrypt.
+    fn seal<T: Serialize>(&self, key: &str, value: &T) -> Result<(String, Vec<u8>), CachekitError> {
+        let full_key = self.client.resolve_key(key)?;
+        let plaintext = serializer::serialize(value)?;
+        let ciphertext = self.encryption.encrypt(&plaintext, &full_key)?;
+        Ok((full_key, ciphertext))
     }
 
     /// Retrieve, decrypt, and deserialize a value stored under `key`.
@@ -1092,22 +1097,22 @@ impl SecureCache<'_> {
         }
     }
 
-    /// Decrypt ciphertext read for `key`; on failure, drop the key's L1 copy
-    /// before propagating the error.
+    /// Decrypt ciphertext read for `key` against the key this client passes to
+    /// its backend (`.namespace()` prefix included); on failure, drop the key's L1 copy before propagating the
+    /// error.
     ///
     /// An L2 hit is backfilled into L1 before it is decrypted, so an entry
     /// that fails authentication would otherwise keep failing from L1 after
     /// the backend entry is fixed or deleted. The backend entry itself is
     /// left untouched as evidence.
     fn decrypt_or_evict(&self, ciphertext: &[u8], key: &str) -> Result<Vec<u8>, CachekitError> {
-        self.encryption.decrypt(ciphertext, key).inspect_err(|_| {
-            // The read that produced `ciphertext` already resolved this key,
-            // so `resolve_key` cannot fail here.
-            #[cfg(feature = "l1")]
-            if let Ok(full_key) = self.client.resolve_key(key) {
+        let full_key = self.client.resolve_key(key)?;
+        self.encryption
+            .decrypt(ciphertext, &full_key)
+            .inspect_err(|_| {
+                #[cfg(feature = "l1")]
                 self.client.l1_delete(&full_key);
-            }
-        })
+            })
     }
 
     /// Delete an encrypted key. Behaves identically to [`CacheKit::delete`].

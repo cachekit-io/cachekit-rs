@@ -390,6 +390,53 @@ async fn secure_with_namespace() {
     assert_eq!(val, "value");
 }
 
+/// The AAD binds the key the client passes to its backend, namespace
+/// included: same master key and tenant, but ciphertext copied from `app1:k1`
+/// to `app2:k1` must not decrypt.
+#[tokio::test]
+async fn secure_namespace_is_bound_in_aad() {
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client_in = |ns: &str| {
+        CacheKit::builder()
+            .backend(shared.clone())
+            .namespace(ns)
+            .no_l1()
+            .encryption_from_bytes(TEST_MASTER_KEY, "one-tenant")
+            .unwrap()
+            .build()
+            .unwrap()
+    };
+    let (app1, app2) = (client_in("app1"), client_in("app2"));
+
+    app1.secure_cache()
+        .unwrap()
+        .set("k1", &"v-from-app1")
+        .await
+        .unwrap();
+    let stored = backend.store.lock().await["app1:k1"].clone();
+
+    // The ciphertext authenticates under the namespaced key, not the bare one.
+    let layer = cachekit::EncryptionLayer::new(TEST_MASTER_KEY, "one-tenant").unwrap();
+    assert!(layer.decrypt(&stored, "app1:k1").is_ok());
+    assert!(layer.decrypt(&stored, "k1").is_err());
+
+    backend
+        .store
+        .lock()
+        .await
+        .insert("app2:k1".to_owned(), stored);
+    let err = app2
+        .secure_cache()
+        .unwrap()
+        .get::<String>("k1")
+        .await
+        .expect_err("ciphertext moved across namespaces must fail authentication");
+    assert!(
+        matches!(err, CachekitError::Encryption(_)),
+        "expected Encryption, got: {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn secure_set_rejects_payload_whose_ciphertext_exceeds_limit() {
     // The get paths size-check the STORED ciphertext (plaintext + 28 bytes of

@@ -213,6 +213,9 @@ let secure = cache.secure_cache()?;
 > [!WARNING]
 > Earlier releases encrypted only through `secure_cache()`: plain `get` / `set` on a client with a key configured read and wrote plaintext. Reading such an entry now returns an `Encryption` error until it is overwritten, deleted or expires, so delete (or let expire) whatever those calls wrote before you upgrade.
 
+> [!WARNING]
+> Earlier releases left the `.namespace()` prefix out of the AAD. On a client with both encryption and `.namespace()` configured, reading an entry an earlier release wrote returns an `Encryption` error, never a miss, on every read until it is overwritten, deleted or expires. Before you upgrade, delete those entries or move to a fresh namespace; waiting out the TTL is not a migration. There is no fallback to the old AAD, because one would keep accepting ciphertext moved between namespaces. Clients without a namespace are unaffected.
+
 <details>
 <summary><strong>Security Properties</strong></summary>
 
@@ -220,7 +223,7 @@ let secure = cache.secure_cache()?;
 |:---------|:---------------|
 | **Encryption** | AES-256-GCM (AEAD) via [cachekit-core](https://crates.io/crates/cachekit-core) (`ring` on native, `aes-gcm` on wasm32) |
 | **Key Derivation** | HKDF-SHA256 — per-tenant cryptographic isolation |
-| **AAD Binding** | Cache key bound to ciphertext (prevents substitution attacks) |
+| **AAD Binding** | The key the client passes to its backend, `.namespace()` prefix included, bound to ciphertext (prevents substitution between keys and namespaces) |
 | **Memory Safety** | [zeroize](https://crates.io/crates/zeroize) on drop for all key material |
 | **L1 Guarantee** | L1 stores ciphertext, never plaintext |
 | **Cache-key path encoding (CWE-22)** | Keys are percent-encoded into the CachekitIO request path; the empty key, and a key encoding to a reserved segment (`.`, `..`, `health`, `ttl`, `lock`), are **rejected** rather than sent |
