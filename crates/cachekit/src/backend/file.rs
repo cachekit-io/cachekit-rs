@@ -901,6 +901,22 @@ mod tests {
 
     const FILE_BACKEND_VECTORS: &str = include_str!("../../tests/vectors/file-backend.json");
 
+    /// sha256 of the vendored file, pinned so a local edit cannot drift from the
+    /// protocol copy unnoticed.
+    const FILE_BACKEND_SHA256: &str =
+        "8d9d8c4709baf9ef3a8f2d71d21fb5a56207bc7a05c9bc7a967ac567f2604615"; // pragma: allowlist secret
+
+    #[test]
+    fn vendored_fixture_matches_the_pinned_sha256() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            hex::encode(Sha256::digest(FILE_BACKEND_VECTORS.as_bytes())),
+            FILE_BACKEND_SHA256,
+            "tests/vectors/file-backend.json differs from the pinned protocol copy: \
+             re-vendor it from protocol and update FILE_BACKEND_SHA256"
+        );
+    }
+
     fn file_backend_vectors() -> Vec<serde_json::Value> {
         let doc: serde_json::Value =
             serde_json::from_str(FILE_BACKEND_VECTORS).expect("vector file parses");
