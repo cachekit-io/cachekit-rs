@@ -484,6 +484,7 @@ mod fill_lock {
 
 #[cfg(all(feature = "macros", not(feature = "unsync")))]
 mod macro_store {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -495,11 +496,13 @@ mod macro_store {
     use super::{has, Capture};
     use crate::common::MockBackend;
 
-    /// Misses every read and refuses every write with the key in its message,
-    /// as a transport error's URL carries it. Permanent, so no retry backoff.
+    /// Refuses every write with the key in its message, as a transport
+    /// error's URL carries it, unless `accepting` is set. Permanent, so no
+    /// retry backoff. Reads pass through, so they miss until a write lands.
     #[derive(Default)]
     struct FailingSet {
         mock: MockBackend,
+        accepting: AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -511,9 +514,12 @@ mod macro_store {
         async fn set(
             &self,
             key: &str,
-            _: Vec<u8>,
-            _: Option<Duration>,
+            value: Vec<u8>,
+            ttl: Option<Duration>,
         ) -> Result<(), BackendError> {
+            if self.accepting.load(Ordering::SeqCst) {
+                return self.mock.set(key, value, ttl).await;
+            }
             Err(BackendError::permanent(format!(
                 "PUT /v1/cache/{key} failed"
             )))
@@ -566,6 +572,53 @@ mod macro_store {
                 &["op=set", "error_kind=permanent", &hash]
             ),
             "no store-error event with the key hash: {lines:?}"
+        );
+    }
+
+    #[cachekit(client = cache, ttl = 4, interop = "refresh", namespace = "store")]
+    async fn refresh(cache: &CacheKit, id: u64) -> Result<u64, CachekitError> {
+        Ok(id * 10)
+    }
+
+    /// An SWR refresh whose commit the backend refuses keeps serving the stale
+    /// value, and is not silent either: the background task emits the same
+    /// store-error event.
+    #[cfg(feature = "l1")]
+    #[tokio::test]
+    async fn a_failed_refresh_commit_emits_the_error_kind_and_never_the_key() {
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+
+        let backend = Arc::new(FailingSet::default());
+        backend.accepting.store(true, Ordering::SeqCst);
+        let client = CacheKit::builder()
+            .backend(backend.clone())
+            // Stale from 25% of the 4 s TTL (±10%), hard expiry at 4 s.
+            .swr_threshold_ratio(0.25)
+            .build()
+            .expect("client builds");
+        assert_eq!(refresh(&client, 7).await.expect("cold fill"), 70);
+
+        tokio::time::sleep(Duration::from_millis(1400)).await;
+        backend.accepting.store(false, Ordering::SeqCst);
+        assert_eq!(refresh(&client, 7).await.expect("stale hit served"), 70);
+
+        let key = interop_key("store", "refresh", &[InteropValue::from(7u64)]).expect("key");
+        let hash = format!("key_hash={}", key_hash(&key));
+        let needles = ["op=set", "error_kind=permanent", hash.as_str()];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !has(&capture.lines(), "cachekit DEBUG", &needles) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no store-error event from the refresh: {:?}",
+                capture.lines()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let lines = capture.lines();
+        assert!(
+            !lines.iter().any(|l| l.contains(&key)),
+            "raw key leaked into an event: {lines:?}"
         );
     }
 }

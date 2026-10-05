@@ -393,12 +393,12 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             },
             quote! {
                 let __ck_sec = #client_ident.secure_cache()?;
-                let _ = __ck_sec.__complete_swr_refresh(
+                __ck_sec.__complete_swr_refresh(
                     &__ck_key,
                     __ck_val,
                     std::time::Duration::from_secs(#ttl_secs),
                     __ck_swr_token,
-                ).await;
+                ).await
             },
         )
     } else {
@@ -409,12 +409,12 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                 #client_ident.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await
             },
             quote! {
-                let _ = #client_ident.__complete_swr_refresh(
+                #client_ident.__complete_swr_refresh(
                     &__ck_key,
                     __ck_val,
                     std::time::Duration::from_secs(#ttl_secs),
                     __ck_swr_token,
-                ).await;
+                ).await
             },
         )
     };
@@ -542,7 +542,8 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                 // fill lock contested, or the lock call failing, exits at
                 // once without polling or
                 // re-reading (no wait, no billed miss). Refresh
-                // failures are deliberately absorbed — the stale value keeps
+                // failures are deliberately absorbed (a failed commit is
+                // traced, kind and key hash only) — the stale value keeps
                 // being served, a later stale read retries, and hard expiry
                 // falls through to the blocking path where errors surface.
                 // Completion is version-checked, so a newer explicit set or
@@ -563,8 +564,14 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                             let __ck_result: #ret_ty = (async #original_body).await;
                             if let Ok(ref __ck_val) = __ck_result {
                                 // Commit only if no newer set/delete replaced
-                                // the stale entry while the origin ran.
-                                #complete_refresh_expr
+                                // the stale entry while the origin ran. A lost
+                                // version check is `Ok(false)`, not a failure;
+                                // a failed commit is traced like a failed fill
+                                // store.
+                                let __ck_commit = { #complete_refresh_expr };
+                                if let Err(ref __ck_err) = __ck_commit {
+                                    cachekit::metrics::__trace_store_error(&__ck_key, __ck_err);
+                                }
                             }
                             __ck_flight.release().await;
                             __ck_result.map(|_| ())
