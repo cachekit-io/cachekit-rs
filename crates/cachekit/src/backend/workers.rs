@@ -456,9 +456,6 @@ impl WorkersCachekitIOBuilder {
             .api_url
             .unwrap_or_else(|| "https://api.cachekit.io".to_string());
 
-        // Validated (HTTPS, allowed host, no private IPs) and as the parser
-        // serialized it, trailing slash trimmed so url()/health_url() don't
-        // repeat it per-request.
         let api_url = cachekitio_base_url(&api_url, self.allow_custom_host)?;
 
         Ok(WorkersCachekitIO {

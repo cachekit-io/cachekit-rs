@@ -84,15 +84,21 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
             if let Some(v4) = embedded_ipv4(v6) {
                 return is_private_ip(std::net::IpAddr::V4(v4));
             }
-            // fe80::/10 (link-local) and fec0::/10 (site-local), fc00::/7 (unique local)
-            (v6.segments()[0] & 0xff80) == 0xfe80 || (v6.segments()[0] & 0xfe00) == 0xfc00
+            let s = v6.segments();
+            // fe80::/10 (link-local) and fec0::/10 (site-local), fc00::/7 (unique
+            // local), and local-use NAT64 64:ff9b:1::/48, which is never global
+            // and fixes no position for the IPv4 address it embeds.
+            (s[0] & 0xff80) == 0xfe80
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
         }
     }
 }
 
 /// The IPv4 address an IPv6 form stands for, checked in its place:
 /// IPv4-mapped `::ffff:a.b.c.d` and IPv4-compatible `::a.b.c.d` (which covers
-/// `::` and `::1`), NAT64 `64:ff9b::/96`, and 6to4 `2002::/16`.
+/// `::` and `::1`), IPv4-translated `::ffff:0:a.b.c.d`, NAT64 `64:ff9b::/96`,
+/// and 6to4 `2002::/16`.
 fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     let v4 = |hi: u16, lo: u16| {
         let [a, b] = hi.to_be_bytes();
@@ -100,7 +106,7 @@ fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
         std::net::Ipv4Addr::new(a, b, c, d)
     };
     match v6.segments() {
-        [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] => Some(v4(hi, lo)),
+        [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] | [0, 0, 0, 0, 0xffff, 0, hi, lo] => Some(v4(hi, lo)),
         [0x2002, hi, lo, ..] => Some(v4(hi, lo)),
         _ => v6.to_ipv4(),
     }
@@ -172,6 +178,10 @@ mod tests {
             "[2002:a00:1::]",       // 6to4 10.0.0.1
             "[2002:7f00:1::1]",     // 6to4 127.0.0.1
             "[2002:c0a8:101::]",    // 6to4 192.168.1.1
+            "[64:ff9b:1::a00:1]",   // local-use NAT64 64:ff9b:1::/48, any address
+            "[64:ff9b:1:ffff::1]",
+            "[::ffff:0:7f00:1]", // IPv4-translated 127.0.0.1
+            "[::ffff:0:a00:1]",  // IPv4-translated 10.0.0.1
         ] {
             let url = format!("https://{host}");
             assert!(
@@ -188,6 +198,7 @@ mod tests {
             "[64:ff9b::808:808]", // NAT64 of 8.8.8.8
             "[2002:808:808::1]",  // 6to4 of 8.8.8.8
             "[::ffff:8.8.8.8]",   // IPv4-mapped public
+            "[::ffff:0:808:808]", // IPv4-translated public
         ] {
             let url = format!("https://{host}");
             assert!(

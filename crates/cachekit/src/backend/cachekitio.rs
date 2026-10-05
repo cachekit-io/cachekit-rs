@@ -450,23 +450,17 @@ fn http_client_builder() -> reqwest::ClientBuilder {
 
 /// The HTTP client every native [`CachekitIO`] uses.
 #[cfg(not(target_arch = "wasm32"))]
-fn http_client() -> Result<reqwest::Client, crate::error::CachekitError> {
-    http_client_builder().build().map_err(|e| {
-        crate::error::CachekitError::Config(format!("failed to build HTTP client: {e}"))
-    })
+fn http_client() -> reqwest::Result<reqwest::Client> {
+    http_client_builder().build()
 }
 
-/// wasm32: refused. reqwest's wasm32 client sends through the platform `fetch`
-/// and has no redirect setting, so it would follow a 3xx from the API host
-/// that the native client refuses (`Policy::none()`). `WorkersCachekitIO`
-/// sets the redirect mode itself and is the wasm32 backend.
+/// wasm32: the platform's `fetch` owns pooling and timeouts; no User-Agent is set.
+/// It also cannot refuse redirects (reqwest's wasm32 client sets no redirect
+/// mode), so `CachekitIO` must not gain a wasm32 `Backend` impl; `WorkersCachekitIO`
+/// is the wasm32 backend.
 #[cfg(target_arch = "wasm32")]
-fn http_client() -> Result<reqwest::Client, crate::error::CachekitError> {
-    Err(crate::error::CachekitError::Config(
-        "CachekitIO is not supported on wasm32: its HTTP client cannot refuse redirects. \
-         Use WorkersCachekitIO (feature `workers`) instead."
-            .to_owned(),
-    ))
+fn http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder().build()
 }
 
 /// Builder for [`CachekitIO`].
@@ -519,8 +513,6 @@ impl CachekitIOBuilder {
     ///   a fragment.
     /// - the URL carries credentials, or its hostname is not permitted (see
     ///   [`validate_cachekitio_url`](crate::url_validator::validate_cachekitio_url)).
-    /// - the target is wasm32, where the HTTP client cannot refuse redirects;
-    ///   use `WorkersCachekitIO` (feature `workers`) there.
     pub fn build(self) -> Result<CachekitIO, crate::error::CachekitError> {
         use crate::error::CachekitError;
 
@@ -533,12 +525,10 @@ impl CachekitIOBuilder {
             .api_url
             .unwrap_or_else(|| "https://api.cachekit.io".to_string());
 
-        // Validated (HTTPS, allowed host, no private IPs) and as the parser
-        // serialized it, trailing slash trimmed so url()/health_url() don't
-        // repeat it per-request.
         let api_url = cachekitio_base_url(&api_url, self.allow_custom_host)?;
 
-        let client = http_client()?;
+        let client = http_client()
+            .map_err(|e| CachekitError::Config(format!("failed to build HTTP client: {e}")))?;
 
         let static_headers = static_headers(&api_key)?;
         let metrics_header_names = metrics_header_names()?;

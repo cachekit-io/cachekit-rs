@@ -201,19 +201,3 @@ fn workers_backend_uses_the_validated_url_as_serialized() {
         .expect("allowlisted host");
     assert_eq!(backend.api_url(), "https://api.cachekit.io/@evil.example");
 }
-
-/// reqwest's wasm32 client has no redirect setting, so the reqwest-backed
-/// `CachekitIO` refuses to build there; `WorkersCachekitIO` is the wasm32
-/// backend.
-#[cfg(feature = "cachekitio")]
-#[wasm_bindgen_test]
-fn cachekitio_refuses_to_build_on_wasm32() {
-    use cachekit::backend::cachekitio::CachekitIO;
-
-    let err = CachekitIO::builder()
-        .api_key("test-key-never-sent")
-        .build()
-        .expect_err("CachekitIO must not build on wasm32");
-    let msg = err.to_string();
-    assert!(msg.contains("WorkersCachekitIO"), "{msg}");
-}
