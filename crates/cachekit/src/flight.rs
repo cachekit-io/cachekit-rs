@@ -79,9 +79,13 @@ const FILL_POLL_BUDGET: u32 = 50;
 /// Per-key async mutexes for in-process fill dedup. Weak entries let finished
 /// flights drop their state without an explicit removal protocol.
 ///
-/// Each mutex guards a stand-down note for the next holder: `true` when the
-/// last holder was a background refresh that stood down on a contested
-/// distributed lock, filling nothing. Every new holder clears it.
+/// Each mutex guards a stand-down note: `true` when a background refresh
+/// stood down on a contested distributed lock, filling nothing, so a queued
+/// cold miss must contest that lock before computing. The note stays set
+/// until a holder resolves it: by acquiring as a leader, by its own lease
+/// contest making it a leader, or by [`SingleFlight::release`] after a fill
+/// was found or made. A follower dropped before then (a cancelled request)
+/// leaves it for the next follower.
 #[derive(Default)]
 pub(crate) struct FlightMap {
     entries: Mutex<HashMap<String, Weak<tokio::sync::Mutex<bool>>>>,
@@ -258,12 +262,8 @@ impl LockAttempt {
 /// Dropping without `release` is safe: the in-process lock frees immediately
 /// and a distributed lock expires server-side after its timeout.
 pub struct SingleFlight {
-    /// The per-key lock. Its value is the stand-down note for the next
-    /// holder (see [`FlightMap`]).
-    #[cfg_attr(
-        not(all(feature = "reliability", not(target_arch = "wasm32"))),
-        allow(dead_code)
-    )]
+    /// The per-key lock. Its value is the stand-down note (see
+    /// [`FlightMap`]).
     local: tokio::sync::OwnedMutexGuard<bool>,
     role: Role,
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
@@ -296,6 +296,11 @@ impl SingleFlight {
             (self.role, self.lock_id) = LockAttempt::run(&self.backend, &self.full_key)
                 .await
                 .cold_role();
+            // Leading resolves the note. A contested follower keeps it set
+            // while it polls, in case it is dropped before the fill lands.
+            if matches!(self.role, Role::Leader) {
+                *self.local = false;
+            }
         }
         match &mut self.role {
             Role::Leader => false,
@@ -318,23 +323,28 @@ impl SingleFlight {
 
     /// Release the flight. Best-effort: frees the distributed fill lock (if
     /// held) so other processes stop waiting early; errors are ignored — the
-    /// lock expires server-side regardless.
-    pub async fn release(self) {
+    /// lock expires server-side regardless. Also clears the stand-down note
+    /// (see [`FlightMap`]): the caller found or made the fill.
+    pub async fn release(mut self) {
+        *self.local = false;
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         if let (Some(lock_id), Some(lockable)) = (&self.lock_id, self.backend.as_lockable()) {
             let _ = lockable.release_lock(&self.full_key, lock_id).await;
         }
     }
 
-    /// A flight over a freshly acquired per-key lock. Clears the previous
-    /// holder's note, which only a follower acts on.
+    /// A flight over a freshly acquired per-key lock. A leader clears the
+    /// stand-down note, since it contests the lease itself; a follower leaves
+    /// it set until it resolves it (see [`FlightMap`]).
     fn new(
         mut local: tokio::sync::OwnedMutexGuard<bool>,
         role: Role,
         backend: &SharedBackend,
         full_key: &str,
     ) -> Self {
-        *local = false;
+        if !matches!(role, Role::LocalFollower { .. }) {
+            *local = false;
+        }
         #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
         let _ = (backend, full_key);
         Self {

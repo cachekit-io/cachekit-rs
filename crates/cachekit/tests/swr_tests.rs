@@ -966,6 +966,94 @@ async fn cold_miss_queued_behind_a_contested_refresh_contests_the_lease() {
 }
 
 #[cfg(feature = "reliability")]
+static BEHIND_CANCELLED_CALLS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "reliability")]
+#[cachekit(client = cache, ttl = 2, interop = "swr_behind_cancelled", namespace = "swrtest")]
+async fn swr_behind_cancelled(cache: &CacheKit, id: u64) -> Result<String, CachekitError> {
+    let n = BEHIND_CANCELLED_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    Ok(format!("u{id}-c{n}"))
+}
+
+/// Two cold misses queue behind a refresh that stands down on a contested
+/// lease, and the first is cancelled before it resolves the stand-down note.
+/// The note must survive for the second, which contests the lease and runs no
+/// origin while another process holds it.
+#[cfg(feature = "reliability")]
+#[tokio::test]
+async fn contested_refresh_note_survives_a_cancelled_follower() {
+    let (backend, mock) = ContestedBackend::new_with_handle();
+    let cache = client(backend); // ttl 2 s → threshold 0.5 s (±10%)
+    let flight_key = key("swr_behind_cancelled", 1);
+    let warmed = Instant::now();
+    assert_eq!(swr_behind_cancelled(&cache, 1).await.unwrap(), "u1-c1");
+    mock.set_mode(LOCK_CONTESTED);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Stale read; its refresh holds the key's flight inside the lock call.
+    assert_eq!(swr_behind_cancelled(&cache, 1).await.unwrap(), "u1-c1");
+    eventually("the refresh's lock call", || mock.acquires() == 2).await;
+    mock.mock.store.lock().await.clear();
+    tokio::time::sleep(
+        (warmed + Duration::from_millis(2300)).saturating_duration_since(Instant::now()),
+    )
+    .await;
+
+    // Follower 1 queues first and is cancelled once it holds the flight,
+    // before any re-check. Follower 2, a real cold miss, queues behind it.
+    let acquired = std::sync::Arc::new(Notify::new());
+    let first = tokio::spawn({
+        let (cache, flight_key, acquired) = (cache.clone(), flight_key.clone(), acquired.clone());
+        async move {
+            let _flight = cache.single_flight(&flight_key).await;
+            acquired.notify_one();
+            std::future::pending::<()>().await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let second = tokio::spawn({
+        let cache = cache.clone();
+        async move { swr_behind_cancelled(&cache, 1).await }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    mock.gate.add_permits(1); // the refresh's lock call: contested
+    acquired.notified().await;
+    first.abort();
+    eventually("follower 2's lock call", || mock.acquires() == 3).await;
+    assert_eq!(
+        BEHIND_CANCELLED_CALLS.load(Ordering::SeqCst),
+        1,
+        "no origin run while another process holds the lease"
+    );
+
+    // The holder fills, and follower 2's poll picks that fill up.
+    let holder = CacheKit::builder()
+        .backend(std::sync::Arc::new(mock.clone()))
+        .no_l1()
+        .build()
+        .expect("holder client builds");
+    holder
+        .set(&flight_key, &"u1-holder".to_owned())
+        .await
+        .unwrap();
+    let sets = mock.sets();
+    mock.gate.add_permits(1);
+    let value = tokio::time::timeout(Duration::from_secs(2), second)
+        .await
+        .expect("follower 2 finds the holder's fill")
+        .expect("cold-miss task panicked")
+        .unwrap();
+    assert_eq!(value, "u1-holder");
+    assert_eq!(
+        BEHIND_CANCELLED_CALLS.load(Ordering::SeqCst),
+        1,
+        "origin not re-run"
+    );
+    assert_eq!(mock.sets(), sets, "no PUT without the lease");
+}
+
+#[cfg(feature = "reliability")]
 static BEHIND_FAILED_CALLS: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(feature = "reliability")]
