@@ -151,44 +151,55 @@ fn config_builder_rejects_every_hex_reject_row() {
     }
 }
 
+/// Both env readers, `CachekitConfig::from_env` and the client constructor
+/// `CacheKit::from_env` built on it, under the given key variables. A valid
+/// API key is set so the client constructor can only fail on a key.
+fn env_entry_points(
+    master: &str,
+    previous: Option<&str>,
+) -> Vec<(&'static str, Result<(), CachekitError>)> {
+    let _env = EnvGuard::set(&[
+        ("CACHEKIT_MASTER_KEY", Some(master)),
+        ("CACHEKIT_PREVIOUS_MASTER_KEYS", previous),
+        ("CACHEKIT_API_KEY", Some("ck_test_key")),
+        ("CACHEKIT_API_URL", None),
+        ("CACHEKIT_DEFAULT_TTL", None),
+    ]);
+    vec![
+        (
+            "CachekitConfig::from_env",
+            CachekitConfig::from_env().map(drop),
+        ),
+        #[cfg(feature = "cachekitio")]
+        ("CacheKit::from_env", CacheKit::from_env().map(drop)),
+    ]
+}
+
 #[test]
 #[serial]
-fn config_from_env_rejects_every_hex_reject_row() {
+fn env_readers_reject_every_hex_reject_row() {
     let accept = accept_hex();
+    for (entry, result) in env_entry_points(&accept, Some(OTHER_KEY_HEX))
+        .into_iter()
+        .chain(env_entry_points(OTHER_KEY_HEX, Some(&accept)))
     {
-        let _env = EnvGuard::set(&[
-            ("CACHEKIT_MASTER_KEY", Some(&accept)),
-            ("CACHEKIT_PREVIOUS_MASTER_KEYS", Some(OTHER_KEY_HEX)),
-        ]);
-        assert!(CachekitConfig::from_env().is_ok());
+        assert!(
+            result.is_ok(),
+            "{entry} refused the accept row's key: {result:?}"
+        );
     }
     for (row, key) in reject_rows() {
-        let current = {
-            let _env = EnvGuard::set(&[
-                ("CACHEKIT_MASTER_KEY", Some(&key)),
-                ("CACHEKIT_PREVIOUS_MASTER_KEYS", None),
-            ]);
-            CachekitConfig::from_env()
-        };
-        assert_config_err(
-            current,
-            "CACHEKIT_MASTER_KEY",
-            &row,
-            "CachekitConfig::from_env",
-        );
-        let previous = {
-            let _env = EnvGuard::set(&[
-                ("CACHEKIT_MASTER_KEY", Some(OTHER_KEY_HEX)),
-                ("CACHEKIT_PREVIOUS_MASTER_KEYS", Some(&key)),
-            ]);
-            CachekitConfig::from_env()
-        };
-        assert_config_err(
-            previous,
-            "CACHEKIT_PREVIOUS_MASTER_KEYS",
-            &row,
-            "CachekitConfig::from_env (previous keys)",
-        );
+        for (entry, result) in env_entry_points(&key, None) {
+            assert_config_err(result, "CACHEKIT_MASTER_KEY", &row, entry);
+        }
+        for (entry, result) in env_entry_points(OTHER_KEY_HEX, Some(&key)) {
+            assert_config_err(
+                result,
+                "CACHEKIT_PREVIOUS_MASTER_KEYS",
+                &row,
+                &format!("{entry} (previous keys)"),
+            );
+        }
     }
 }
 
