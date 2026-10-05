@@ -609,7 +609,8 @@ async fn clones_share_l1_state() {
 //
 // A refresh runs while the stale copy is still being served, so a worker that
 // already holds this key's flight (in-process) or fill lock (cross-process)
-// means the refresh has nothing to do: it stands down at once. It must not
+// means the refresh has nothing to do: it stands down at once, as it does when
+// the lock call fails. It must not
 // poll for the other side's fill, re-read the cache (a re-read that misses is
 // a billed miss in `X-CacheKit-Misses`), or recompute and PUT without the
 // lease (`spec/saas-api.md` API-62/63).
@@ -623,14 +624,23 @@ async fn eventually(what: &str, done: impl Fn() -> bool) {
     }
 }
 
-/// Lock-capable mock: grants the fill lock until `contested` is set, then
-/// reports it held by another process. A contested `acquire_lock` first takes
-/// a permit from `gate`, so a test can hold a refresh inside the lock call.
+#[cfg(feature = "reliability")]
+const LOCK_GRANT: u8 = 0;
+#[cfg(feature = "reliability")]
+const LOCK_CONTESTED: u8 = 1;
+#[cfg(feature = "reliability")]
+const LOCK_FAILING: u8 = 2;
+
+/// Lock-capable mock. `acquire_lock` grants the fill lock in `LOCK_GRANT`
+/// mode. In the other modes it first takes a permit from `gate` (no permits
+/// until a test adds them, so a test can hold a caller inside the lock call),
+/// then reports the lock held by another process or fails.
 #[cfg(feature = "reliability")]
 #[derive(Clone)]
 struct ContestedBackend {
     mock: MockBackend,
-    contested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Every `acquire_lock` call, counted on entry.
     acquires: std::sync::Arc<AtomicU32>,
     sets: std::sync::Arc<AtomicU32>,
     gate: std::sync::Arc<tokio::sync::Semaphore>,
@@ -638,21 +648,20 @@ struct ContestedBackend {
 
 #[cfg(feature = "reliability")]
 impl ContestedBackend {
-    fn new_with_handle(gated: bool) -> (cachekit::SharedBackend, Self) {
-        let permits = if gated {
-            0
-        } else {
-            tokio::sync::Semaphore::MAX_PERMITS
-        };
+    fn new_with_handle() -> (cachekit::SharedBackend, Self) {
         let backend = Self {
             mock: MockBackend::default(),
-            contested: std::sync::Arc::default(),
+            mode: std::sync::Arc::default(),
             acquires: std::sync::Arc::default(),
             sets: std::sync::Arc::default(),
-            gate: std::sync::Arc::new(tokio::sync::Semaphore::new(permits)),
+            gate: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
         };
         let handle = backend.clone();
         (std::sync::Arc::new(backend), handle)
+    }
+
+    fn set_mode(&self, mode: u8) {
+        self.mode.store(mode, Ordering::SeqCst);
     }
 
     fn acquires(&self) -> u32 {
@@ -706,12 +715,15 @@ impl cachekit::backend::LockableBackend for ContestedBackend {
         _key: &str,
         _timeout_ms: u64,
     ) -> Result<Option<String>, cachekit::BackendError> {
-        if !self.contested.load(Ordering::SeqCst) {
+        self.acquires.fetch_add(1, Ordering::SeqCst);
+        if self.mode.load(Ordering::SeqCst) == LOCK_GRANT {
             return Ok(Some("lock-1".to_owned()));
         }
         self.gate.acquire().await.expect("gate open").forget();
-        self.acquires.fetch_add(1, Ordering::SeqCst);
-        Ok(None)
+        match self.mode.load(Ordering::SeqCst) {
+            LOCK_FAILING => Err(cachekit::BackendError::transient("lock endpoint down")),
+            _ => Ok(None),
+        }
     }
 
     async fn release_lock(
@@ -721,6 +733,53 @@ impl cachekit::backend::LockableBackend for ContestedBackend {
     ) -> Result<bool, cachekit::BackendError> {
         Ok(true)
     }
+}
+
+/// Run `stale_read`, let its refresh's lock call through, and check that the
+/// refresh stood down at once: it let go of the key's flight (a 50 ms probe
+/// takes it), and made one lock call, no read, no PUT and no
+/// origin run.
+#[cfg(feature = "reliability")]
+async fn assert_refresh_stands_down<F: std::future::Future<Output = String>>(
+    cache: &CacheKit,
+    mock: &ContestedBackend,
+    flight_key: &str,
+    calls: &AtomicU32,
+    stale_read: F,
+) {
+    let (acquires, sets, origin_runs) =
+        (mock.acquires(), mock.sets(), calls.load(Ordering::SeqCst));
+    assert_eq!(stale_read.await, "u1-c1", "stale is served");
+    let after_stale_read = cache.stats();
+    eventually("the refresh's lock call", || {
+        mock.acquires() == acquires + 1
+    })
+    .await;
+    mock.gate.add_permits(2); // the refresh's lock call, then the probe's
+
+    let probe = tokio::time::timeout(Duration::from_millis(50), cache.single_flight(flight_key))
+        .await
+        .expect("the refresh must stand down, not hold the flight to poll or compute");
+    drop(probe);
+
+    // The probe calls the lock only if it led; it queues as a follower when
+    // it arrived before the refresh let go.
+    assert!(
+        mock.acquires() <= acquires + 2,
+        "the refresh made one lock call, and no retry"
+    );
+    assert_eq!(
+        cache.stats().misses,
+        after_stale_read.misses,
+        "the refresh counted no miss"
+    );
+    assert_eq!(cache.stats(), after_stale_read, "the refresh read nothing");
+    assert_eq!(mock.sets(), sets, "the refresh sent no PUT");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        origin_runs,
+        "origin not re-run"
+    );
 }
 
 #[cfg(feature = "reliability")]
@@ -739,43 +798,54 @@ async fn swr_contested(cache: &CacheKit, id: u64) -> Result<String, CachekitErro
 #[cfg(feature = "reliability")]
 #[tokio::test]
 async fn contested_refresh_stands_down_without_polling() {
-    let (backend, mock) = ContestedBackend::new_with_handle(false);
+    let (backend, mock) = ContestedBackend::new_with_handle();
     let cache = client(backend);
     assert_eq!(swr_contested(&cache, 1).await.unwrap(), "u1-c1");
-    mock.contested.store(true, Ordering::SeqCst);
+    mock.set_mode(LOCK_CONTESTED);
     tokio::time::sleep(Duration::from_millis(1400)).await;
 
-    let sets = mock.sets();
-    assert_eq!(
-        swr_contested(&cache, 1).await.unwrap(),
-        "u1-c1",
-        "stale is served"
-    );
-    let after_stale_read = cache.stats();
-    eventually("the refresh's lock attempt", || mock.acquires() == 1).await;
-
-    // The refresh has already let go of the key's in-process flight: it did
-    // not stay to poll for the other process's fill.
-    let probe = tokio::time::timeout(
-        Duration::from_millis(50),
-        cache.single_flight(&key("swr_contested", 1)),
+    assert_refresh_stands_down(
+        &cache,
+        &mock,
+        &key("swr_contested", 1),
+        &CONTESTED_CALLS,
+        async { swr_contested(&cache, 1).await.unwrap() },
     )
-    .await
-    .expect("a contested refresh must not hold the flight to poll");
-    drop(probe);
+    .await;
+}
 
-    assert_eq!(
-        mock.acquires(),
-        2,
-        "one lock call by the refresh, one by the probe"
-    );
-    assert_eq!(cache.stats(), after_stale_read, "the refresh read nothing");
-    assert_eq!(mock.sets(), sets, "the refresh sent no PUT");
-    assert_eq!(
-        CONTESTED_CALLS.load(Ordering::SeqCst),
-        1,
-        "origin not re-run"
-    );
+#[cfg(feature = "reliability")]
+static LOCK_ERROR_CALLS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "reliability")]
+#[cachekit(client = cache, ttl = 4, interop = "swr_lock_error", namespace = "swrtest")]
+async fn swr_lock_error(cache: &CacheKit, id: u64) -> Result<String, CachekitError> {
+    let n = LOCK_ERROR_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    Ok(format!("u{id}-c{n}"))
+}
+
+/// The lock call itself fails (a 429 or 5xx from the lock endpoint): the
+/// refresh abandons instead of failing open. Unlike a cold miss it already
+/// has a value to serve, and recomputing and PUTting without the lease from
+/// every process would add load to a backend that is shedding it
+/// (`spec/saas-api.md` § Revalidation flow, step 2).
+#[cfg(feature = "reliability")]
+#[tokio::test]
+async fn refresh_abandons_when_the_lock_call_fails() {
+    let (backend, mock) = ContestedBackend::new_with_handle();
+    let cache = client(backend);
+    assert_eq!(swr_lock_error(&cache, 1).await.unwrap(), "u1-c1");
+    mock.set_mode(LOCK_FAILING);
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+
+    assert_refresh_stands_down(
+        &cache,
+        &mock,
+        &key("swr_lock_error", 1),
+        &LOCK_ERROR_CALLS,
+        async { swr_lock_error(&cache, 1).await.unwrap() },
+    )
+    .await;
 }
 
 #[cfg(feature = "reliability")]
@@ -795,47 +865,109 @@ async fn swr_contested_expiry(cache: &CacheKit, id: u64) -> Result<String, Cache
 #[cfg(feature = "reliability")]
 #[tokio::test]
 async fn contested_refresh_after_l1_expiry_neither_polls_nor_puts() {
-    let (backend, mock) = ContestedBackend::new_with_handle(true);
+    let (backend, mock) = ContestedBackend::new_with_handle();
     let cache = client(backend); // ttl 2 s → threshold 0.5 s (±10%)
     let warmed = Instant::now();
     assert_eq!(swr_contested_expiry(&cache, 1).await.unwrap(), "u1-c1");
-    mock.contested.store(true, Ordering::SeqCst);
+    mock.set_mode(LOCK_CONTESTED);
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    // Stale read; its refresh now waits inside the contested lock call.
-    let sets = mock.sets();
-    assert_eq!(swr_contested_expiry(&cache, 1).await.unwrap(), "u1-c1");
-    let after_stale_read = cache.stats();
+    // The refresh waits inside the contested lock call while the L1 copy
+    // hard-expires and L2 empties; then its lock call is answered.
+    assert_refresh_stands_down(
+        &cache,
+        &mock,
+        &key("swr_contested_expiry", 1),
+        &CONTESTED_EXPIRY_CALLS,
+        async {
+            let stale = swr_contested_expiry(&cache, 1).await.unwrap();
+            mock.mock.store.lock().await.clear();
+            tokio::time::sleep(
+                (warmed + Duration::from_millis(2300)).saturating_duration_since(Instant::now()),
+            )
+            .await;
+            stale
+        },
+    )
+    .await;
+}
 
-    // Let the L1 copy hard-expire and empty L2, then answer the lock call.
+#[cfg(feature = "reliability")]
+static BEHIND_REFRESH_CALLS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "reliability")]
+#[cachekit(client = cache, ttl = 2, interop = "swr_behind_refresh", namespace = "swrtest")]
+async fn swr_behind_refresh(cache: &CacheKit, id: u64) -> Result<String, CachekitError> {
+    let n = BEHIND_REFRESH_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    Ok(format!("u{id}-c{n}"))
+}
+
+/// A cold miss that queued behind a refresh, while the refresh waited on a
+/// contested lock, must not take the refresh's stand-down for a finished
+/// fill. It contests the lease itself and picks up the holder's fill, instead
+/// of running the origin and PUTting without the lease.
+#[cfg(feature = "reliability")]
+#[tokio::test]
+async fn cold_miss_queued_behind_a_contested_refresh_contests_the_lease() {
+    let (backend, mock) = ContestedBackend::new_with_handle();
+    let cache = client(backend); // ttl 2 s → threshold 0.5 s (±10%)
+    let warmed = Instant::now();
+    assert_eq!(swr_behind_refresh(&cache, 1).await.unwrap(), "u1-c1");
+    mock.set_mode(LOCK_CONTESTED);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Stale read; its refresh holds the key's flight inside the lock call.
+    assert_eq!(swr_behind_refresh(&cache, 1).await.unwrap(), "u1-c1");
+    eventually("the refresh's lock call", || mock.acquires() == 2).await;
+
+    // The L1 copy hard-expires and L2 is empty: the next call is a cold miss,
+    // and it queues behind the refresh.
     mock.mock.store.lock().await.clear();
     tokio::time::sleep(
         (warmed + Duration::from_millis(2300)).saturating_duration_since(Instant::now()),
     )
     .await;
-    mock.gate.add_permits(2); // the refresh's lock call, then the probe's
-    eventually("the refresh's lock attempt", || mock.acquires() == 1).await;
+    let cold = tokio::spawn({
+        let cache = cache.clone();
+        async move { swr_behind_refresh(&cache, 1).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let probe = tokio::time::timeout(
-        Duration::from_millis(200),
-        cache.single_flight(&key("swr_contested_expiry", 1)),
-    )
-    .await
-    .expect("a contested refresh must not hold the flight to poll");
-    drop(probe);
-
+    // Answer the refresh's lock call. The refresh stands down, and the queued
+    // cold miss must contest the lease rather than compute.
+    mock.gate.add_permits(1);
+    eventually("the cold miss's lock call", || mock.acquires() == 3).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
-        cache.stats().misses,
-        after_stale_read.misses,
-        "the refresh counted no miss"
+        BEHIND_REFRESH_CALLS.load(Ordering::SeqCst),
+        1,
+        "no origin run while another process holds the lease"
     );
-    assert_eq!(cache.stats(), after_stale_read, "the refresh read nothing");
-    assert_eq!(mock.sets(), sets, "no PUT without the lease");
+
+    // The holder fills, and the cold miss's poll picks that fill up.
+    let holder = CacheKit::builder()
+        .backend(std::sync::Arc::new(mock.clone()))
+        .no_l1()
+        .build()
+        .expect("holder client builds");
+    holder
+        .set(&key("swr_behind_refresh", 1), &"u1-holder".to_owned())
+        .await
+        .unwrap();
+    let sets = mock.sets();
+    mock.gate.add_permits(1);
+    let value = tokio::time::timeout(Duration::from_secs(2), cold)
+        .await
+        .expect("the cold miss finds the holder's fill")
+        .expect("cold-miss task panicked")
+        .unwrap();
+    assert_eq!(value, "u1-holder");
     assert_eq!(
-        CONTESTED_EXPIRY_CALLS.load(Ordering::SeqCst),
+        BEHIND_REFRESH_CALLS.load(Ordering::SeqCst),
         1,
         "origin not re-run"
     );
+    assert_eq!(mock.sets(), sets, "no PUT without the lease");
 }
 
 static QUEUED_CALLS: AtomicU32 = AtomicU32::new(0);

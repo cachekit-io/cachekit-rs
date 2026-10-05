@@ -471,8 +471,8 @@ repopulate both layers. Refresh dedup takes the same locks as the cold-miss sing
 (in-process, plus distributed fill locks on lock-capable backends), so N
 concurrent stale readers cost one origin execution — misses are billable;
 stampedes are not acceptable. Unlike a cold miss, a refresh never waits: if
-another worker or process already holds the key's lock, the refresh stands down
-at once without polling or re-reading the cache, records no miss, and the stale
+another worker or process already holds the key's lock, or the lock call fails,
+the refresh stands down at once without polling or re-reading the cache, records no miss, and the stale
 value keeps being served until hard expiry. A hard-expired entry always takes the normal
 blocking miss path: SWR never serves past hard expiry.
 

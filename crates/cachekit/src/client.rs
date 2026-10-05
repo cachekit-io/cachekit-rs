@@ -511,9 +511,10 @@ impl CacheKit {
     ///   expiry**: the value is returned without touching the backend or
     ///   origin, and the caller should schedule exactly one background
     ///   refresh. The `#[cachekit]` macro dedups it on the cold-miss
-    ///   [`Self::single_flight`] locks without waiting: a refresh that finds
-    ///   either lock held stands down and the stale value keeps being
-    ///   served. The accompanying [`SwrToken`] makes completion conditional,
+    ///   [`Self::single_flight`] locks without waiting for another worker's
+    ///   fill: a refresh that finds either lock held, or whose lock call
+    ///   fails, stands down and the stale value keeps being served. The
+    ///   accompanying [`SwrToken`] makes completion conditional,
     ///   so a newer set/delete always wins.
     /// - [`SwrRead::Miss`] — nothing usable anywhere: normal blocking miss.
     ///
@@ -850,7 +851,8 @@ impl CacheKit {
 
     /// Begin the single-flight for an SWR background refresh, or `None` when
     /// another worker already holds this key's in-process flight or
-    /// distributed fill lock. Unlike [`Self::single_flight`] it never waits.
+    /// distributed fill lock, or the lock call fails. Unlike
+    /// [`Self::single_flight`] it never waits for another worker's fill.
     /// Macro plumbing for `#[cachekit]` — not public API.
     #[doc(hidden)]
     pub async fn __refresh_flight(&self, key: &str) -> Option<crate::flight::SingleFlight> {
@@ -1263,8 +1265,8 @@ impl CacheKitBuilder {
     /// still served immediately, and the `#[cachekit]` macro schedules
     /// exactly one background refresh (deduplicated on the
     /// [`CacheKit::single_flight`] locks, in-process and — on lock-capable
-    /// backends — across processes; a refresh that finds either lock held
-    /// stands down instead of waiting). A hard-expired entry is never served:
+    /// backends — across processes; a refresh that finds either lock held,
+    /// or whose lock call fails, stands down instead of waiting). A hard-expired entry is never served:
     /// it falls through to a normal blocking miss.
     ///
     /// Native targets only: this knob does not exist on wasm32, under the

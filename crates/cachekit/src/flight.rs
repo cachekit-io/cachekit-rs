@@ -16,9 +16,12 @@
 //!   (fail-open — a stampede beats unavailability).
 //!
 //! The `#[cachekit]` macro wires this in automatically around its miss path.
-//! Its stale-while-revalidate refresh takes the same locks but never waits:
-//! if another worker holds either one, the refresh stands down without
-//! polling or re-reading the cache, and the stale copy keeps being served.
+//! Its stale-while-revalidate refresh takes the same locks but never waits
+//! for another worker's fill: if another worker holds either one, or the lock
+//! call fails, the refresh stands down without polling or re-reading the
+//! cache, and the stale copy keeps being served. A cold miss queued behind a
+//! worker that did not fill (a refresh that stood down, or a failed fill)
+//! contests the distributed lock itself before computing.
 //! Manual usage follows the same shape:
 //!
 //! ```no_run
@@ -180,13 +183,57 @@ enum Role {
     /// First worker in: compute without re-checking (a re-check would be a
     /// second billable miss under metered-misses pricing).
     Leader,
-    /// Queued behind a local leader that has since finished: re-check the
-    /// cache once — the leader's fill is in L1 — then compute if it missed.
+    /// Queued behind a local holder that has since finished: re-check the
+    /// cache once — a leader's fill is in L1. If that misses, the holder did
+    /// not fill (its fill failed, or it was a refresh that stood down), so
+    /// contest the distributed fill lock like a leader before computing.
     LocalFollower { rechecked: bool },
     /// Another *process* holds the distributed fill lock: poll the cache for
     /// its fill, then compute anyway when the budget runs out (fail-open).
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
     RemoteContested { polls_left: u32 },
+}
+
+/// Outcome of one distributed fill-lock attempt. The cold-miss and refresh
+/// paths apply different policies to it.
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+enum LockAttempt {
+    /// The lease was granted (its id), or the backend has no lock (`None`).
+    Held(Option<String>),
+    /// Another process holds the lease.
+    Contested,
+    /// The lock call itself failed.
+    Failed,
+}
+
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+impl LockAttempt {
+    async fn run(backend: &SharedBackend, full_key: &str) -> Self {
+        let Some(lockable) = backend.as_lockable() else {
+            return Self::Held(None);
+        };
+        match lockable.acquire_lock(full_key, FILL_LOCK_TIMEOUT_MS).await {
+            Ok(Some(lock_id)) => Self::Held(Some(lock_id)),
+            Ok(None) => Self::Contested,
+            Err(_) => Self::Failed,
+        }
+    }
+
+    /// Cold-miss policy: poll a contested lease; a lock-infrastructure error
+    /// fails open to a plain leader — suppression is an optimisation, never
+    /// an availability dependency.
+    fn cold_role(self) -> (Role, Option<String>) {
+        match self {
+            Self::Held(lock_id) => (Role::Leader, lock_id),
+            Self::Contested => (
+                Role::RemoteContested {
+                    polls_left: FILL_POLL_BUDGET,
+                },
+                None,
+            ),
+            Self::Failed => (Role::Leader, None),
+        }
+    }
 }
 
 /// Guard for a single-flight fill, returned by
@@ -200,14 +247,12 @@ pub struct SingleFlight {
     _local: tokio::sync::OwnedMutexGuard<()>,
     role: Role,
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-    dist: Option<DistLock>,
-}
-
-#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-struct DistLock {
     backend: SharedBackend,
+    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
     full_key: String,
-    lock_id: String,
+    /// Id of the distributed fill lock this flight holds, if any.
+    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+    lock_id: Option<String>,
 }
 
 impl SingleFlight {
@@ -215,10 +260,18 @@ impl SingleFlight {
     /// the cache after every `true` before computing yourself:
     ///
     /// - Leader: immediately `false` (compute, don't re-read your own miss).
-    /// - Queued behind a local leader: `true` exactly once.
+    /// - Queued behind a local holder: `true` exactly once. If the re-check
+    ///   missed, the next call contests the distributed fill lock (when the
+    ///   backend has one) and then behaves as a leader or a contested flight.
     /// - Contested cross-process: sleeps one poll interval per call, `true`
     ///   until the poll budget is spent.
     pub async fn wait_for_fill(&mut self) -> bool {
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        if matches!(self.role, Role::LocalFollower { rechecked: true }) {
+            (self.role, self.lock_id) = LockAttempt::run(&self.backend, &self.full_key)
+                .await
+                .cold_role();
+        }
         match &mut self.role {
             Role::Leader => false,
             Role::LocalFollower { rechecked } => {
@@ -243,94 +296,81 @@ impl SingleFlight {
     /// lock expires server-side regardless.
     pub async fn release(self) {
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-        if let Some(dist) = self.dist {
-            if let Some(lockable) = dist.backend.as_lockable() {
-                let _ = lockable.release_lock(&dist.full_key, &dist.lock_id).await;
-            }
+        if let (Some(lock_id), Some(lockable)) = (&self.lock_id, self.backend.as_lockable()) {
+            let _ = lockable.release_lock(&self.full_key, lock_id).await;
         }
     }
 
-    pub(crate) async fn acquire(map: &FlightMap, backend: &SharedBackend, full_key: &str) -> Self {
-        let handle = map.handle(full_key);
-        match Arc::clone(&handle).try_lock_owned() {
-            Ok(local) => Self::lead(local, backend, full_key).await,
-            Err(_) => {
-                // Contended: a local leader is filling. Queue behind it.
-                let local = handle.lock_owned().await;
-                Self {
-                    _local: local,
-                    role: Role::LocalFollower { rechecked: false },
-                    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-                    dist: None,
-                }
-            }
-        }
-    }
-
-    /// Local leader: attempt cross-process suppression via the backend's
-    /// distributed lock, when available. Lock-infrastructure errors fail
-    /// open to a plain leader — suppression is an optimisation, never an
-    /// availability dependency.
-    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-    async fn lead(
+    fn new(
         local: tokio::sync::OwnedMutexGuard<()>,
+        role: Role,
         backend: &SharedBackend,
         full_key: &str,
     ) -> Self {
-        let (role, dist) = match backend.as_lockable() {
-            Some(lockable) => match lockable.acquire_lock(full_key, FILL_LOCK_TIMEOUT_MS).await {
-                Ok(Some(lock_id)) => (
-                    Role::Leader,
-                    Some(DistLock {
-                        backend: backend.clone(),
-                        full_key: full_key.to_owned(),
-                        lock_id,
-                    }),
-                ),
-                Ok(None) => (
-                    Role::RemoteContested {
-                        polls_left: FILL_POLL_BUDGET,
-                    },
-                    None,
-                ),
-                Err(_) => (Role::Leader, None),
-            },
-            None => (Role::Leader, None),
-        };
+        #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
+        let _ = (backend, full_key);
         Self {
             _local: local,
             role,
-            dist,
+            #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+            backend: backend.clone(),
+            #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+            full_key: full_key.to_owned(),
+            #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+            lock_id: None,
         }
+    }
+
+    /// Cold-miss entry: lead (attempting cross-process suppression via the
+    /// backend's distributed lock, when available), or queue behind a local
+    /// leader.
+    pub(crate) async fn acquire(map: &FlightMap, backend: &SharedBackend, full_key: &str) -> Self {
+        let handle = map.handle(full_key);
+        let Ok(local) = Arc::clone(&handle).try_lock_owned() else {
+            // Contended: a local holder is filling. Queue behind it.
+            let local = handle.lock_owned().await;
+            return Self::new(
+                local,
+                Role::LocalFollower { rechecked: false },
+                backend,
+                full_key,
+            );
+        };
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        {
+            let (role, lock_id) = LockAttempt::run(backend, full_key).await.cold_role();
+            let mut flight = Self::new(local, role, backend, full_key);
+            flight.lock_id = lock_id;
+            flight
+        }
+        #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
+        Self::new(local, Role::Leader, backend, full_key)
     }
 
     /// Refresh-ahead entry: lead the fill, or `None` to stand down at once.
     ///
     /// A refresh runs only while a stale copy is still being served, so it
     /// never waits for another worker's fill and never re-reads the cache
-    /// (`spec/saas-api.md` API-62/63): a held in-process flight or a contested
-    /// distributed lock means someone else is already filling this key. A
-    /// lock-infrastructure error still fails open to a plain leader, as in
-    /// [`Self::lead`].
+    /// (`spec/saas-api.md` API-62/63). It leads only with the lease, or on a
+    /// backend without one. A held in-process flight, a contested lease or a
+    /// failed lock call all mean stand down: the stale copy keeps being
+    /// served, and once it hard-expires the cold-miss path takes over.
     pub(crate) async fn try_lead(
         map: &FlightMap,
         backend: &SharedBackend,
         full_key: &str,
     ) -> Option<Self> {
         let local = map.handle(full_key).try_lock_owned().ok()?;
-        let flight = Self::lead(local, backend, full_key).await;
-        matches!(flight.role, Role::Leader).then_some(flight)
-    }
-
-    #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
-    async fn lead(
-        local: tokio::sync::OwnedMutexGuard<()>,
-        _backend: &SharedBackend,
-        _full_key: &str,
-    ) -> Self {
-        Self {
-            _local: local,
-            role: Role::Leader,
+        #[cfg_attr(
+            not(all(feature = "reliability", not(target_arch = "wasm32"))),
+            allow(unused_mut)
+        )]
+        let mut flight = Self::new(local, Role::Leader, backend, full_key);
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        match LockAttempt::run(backend, full_key).await {
+            LockAttempt::Held(lock_id) => flight.lock_id = lock_id,
+            LockAttempt::Contested | LockAttempt::Failed => return None,
         }
+        Some(flight)
     }
 }

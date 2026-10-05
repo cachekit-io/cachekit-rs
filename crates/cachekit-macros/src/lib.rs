@@ -536,8 +536,9 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                 // background refresh. Dedup takes the same locks as the
                 // cold-miss single-flight but never waits on them: the first
                 // refresh task leads and re-executes the function; a task
-                // that finds the in-process flight held, or the distributed
-                // fill lock contested, exits at once without polling or
+                // that finds the in-process flight held, the distributed
+                // fill lock contested, or the lock call failing, exits at
+                // once without polling or
                 // re-reading (no wait, no billed miss). Refresh
                 // failures are deliberately absorbed — the stale value keeps
                 // being served, a later stale read retries, and hard expiry
