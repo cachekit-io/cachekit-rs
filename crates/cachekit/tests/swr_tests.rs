@@ -737,8 +737,7 @@ impl cachekit::backend::LockableBackend for ContestedBackend {
 
 /// Run `stale_read`, let its refresh's lock call through, and check that the
 /// refresh stood down at once: it let go of the key's flight (a 50 ms probe
-/// takes it), and made one lock call, no read, no PUT and no
-/// origin run.
+/// takes it), and made one lock call, no read, no PUT and no origin run.
 #[cfg(feature = "reliability")]
 async fn assert_refresh_stands_down<F: std::future::Future<Output = String>>(
     cache: &CacheKit,
@@ -755,17 +754,19 @@ async fn assert_refresh_stands_down<F: std::future::Future<Output = String>>(
         mock.acquires() == acquires + 1
     })
     .await;
-    mock.gate.add_permits(2); // the refresh's lock call, then the probe's
+    // One permit, for the refresh's lock call: a retry would block on the
+    // empty gate and fail the probe. The probe queues behind the refresh, so
+    // it makes no lock call of its own.
+    mock.gate.add_permits(1);
 
     let probe = tokio::time::timeout(Duration::from_millis(50), cache.single_flight(flight_key))
         .await
         .expect("the refresh must stand down, not hold the flight to poll or compute");
     drop(probe);
 
-    // The probe calls the lock only if it led; it queues as a follower when
-    // it arrived before the refresh let go.
-    assert!(
-        mock.acquires() <= acquires + 2,
+    assert_eq!(
+        mock.acquires(),
+        acquires + 1,
         "the refresh made one lock call, and no retry"
     );
     assert_eq!(
@@ -937,12 +938,6 @@ async fn cold_miss_queued_behind_a_contested_refresh_contests_the_lease() {
     // cold miss must contest the lease rather than compute.
     mock.gate.add_permits(1);
     eventually("the cold miss's lock call", || mock.acquires() == 3).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        BEHIND_REFRESH_CALLS.load(Ordering::SeqCst),
-        1,
-        "no origin run while another process holds the lease"
-    );
 
     // The holder fills, and the cold miss's poll picks that fill up.
     let holder = CacheKit::builder()
@@ -968,6 +963,98 @@ async fn cold_miss_queued_behind_a_contested_refresh_contests_the_lease() {
         "origin not re-run"
     );
     assert_eq!(mock.sets(), sets, "no PUT without the lease");
+}
+
+#[cfg(feature = "reliability")]
+static BEHIND_FAILED_CALLS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "reliability")]
+#[cachekit(client = cache, ttl = 2, interop = "swr_behind_failed", namespace = "swrtest")]
+async fn swr_behind_failed(cache: &CacheKit, id: u64) -> Result<String, CachekitError> {
+    let n = BEHIND_FAILED_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    Ok(format!("u{id}-c{n}"))
+}
+
+/// Only a refresh that stood down on a *contested* lease sends the follower
+/// to the lock. Behind a refresh whose lock call failed, a queued cold miss
+/// keeps the plain follower path: it computes at once, with no lock call and
+/// no poll, rather than queueing on a failing lock endpoint.
+#[cfg(feature = "reliability")]
+#[tokio::test]
+async fn cold_miss_queued_behind_a_failed_refresh_computes_without_a_lock_call() {
+    let (backend, mock) = ContestedBackend::new_with_handle();
+    let cache = client(backend); // ttl 2 s → threshold 0.5 s (±10%)
+    let warmed = Instant::now();
+    assert_eq!(swr_behind_failed(&cache, 1).await.unwrap(), "u1-c1");
+    mock.set_mode(LOCK_FAILING);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Stale read; its refresh holds the key's flight inside the lock call.
+    assert_eq!(swr_behind_failed(&cache, 1).await.unwrap(), "u1-c1");
+    eventually("the refresh's lock call", || mock.acquires() == 2).await;
+
+    mock.mock.store.lock().await.clear();
+    tokio::time::sleep(
+        (warmed + Duration::from_millis(2300)).saturating_duration_since(Instant::now()),
+    )
+    .await;
+    let cold = tokio::spawn({
+        let cache = cache.clone();
+        async move { swr_behind_failed(&cache, 1).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Fail the refresh's lock call. The gate then stays empty, so a lock call
+    // by the cold miss would hang it.
+    mock.gate.add_permits(1);
+    let value = tokio::time::timeout(Duration::from_millis(500), cold)
+        .await
+        .expect("the cold miss computes without a lock call")
+        .expect("cold-miss task panicked")
+        .unwrap();
+    assert_eq!(value, "u1-c2");
+    assert_eq!(mock.acquires(), 2, "only the refresh called the lock");
+}
+
+#[cfg(feature = "reliability")]
+static BEHIND_DROPPED_CALLS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "reliability")]
+#[cachekit(client = cache, ttl = 2, interop = "swr_behind_dropped", namespace = "swrtest")]
+async fn swr_behind_dropped(cache: &CacheKit, id: u64) -> Result<String, CachekitError> {
+    let n = BEHIND_DROPPED_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    Ok(format!("u{id}-c{n}"))
+}
+
+/// A local leader dropped without `release` (a cancelled request, a timeout,
+/// a panic) leaves its own lease live on the server. A cold miss queued
+/// behind it computes at once, as before, rather than contesting that lease
+/// and polling it for up to 5 s.
+#[cfg(feature = "reliability")]
+#[tokio::test]
+async fn cold_miss_behind_a_dropped_leader_computes_without_a_lock_call() {
+    let (backend, mock) = ContestedBackend::new_with_handle();
+    let cache = client(backend);
+    let held = cache.single_flight(&key("swr_behind_dropped", 1)).await;
+    assert_eq!(mock.acquires(), 1, "the leader took the lease");
+
+    let cold = tokio::spawn({
+        let cache = cache.clone();
+        async move { swr_behind_dropped(&cache, 1).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The dropped leader's lease is still live server-side: any lock call
+    // from now on is contested, and the empty gate would hang it.
+    mock.set_mode(LOCK_CONTESTED);
+    drop(held);
+    let value = tokio::time::timeout(Duration::from_millis(500), cold)
+        .await
+        .expect("the cold miss computes without a lock call")
+        .expect("cold-miss task panicked")
+        .unwrap();
+    assert_eq!(value, "u1-c1");
+    assert_eq!(mock.acquires(), 1, "the queued cold miss made no lock call");
 }
 
 static QUEUED_CALLS: AtomicU32 = AtomicU32::new(0);

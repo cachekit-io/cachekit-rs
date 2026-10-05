@@ -1262,11 +1262,12 @@ impl CacheKitBuilder {
     /// matching the Python and TypeScript SDKs).
     ///
     /// With SWR on, an L1 hit older than `swr_threshold_ratio` of its TTL is
-    /// still served immediately, and the `#[cachekit]` macro schedules
-    /// exactly one background refresh (deduplicated on the
+    /// still served immediately, and the `#[cachekit]` macro schedules at
+    /// most one background refresh (deduplicated on the
     /// [`CacheKit::single_flight`] locks, in-process and — on lock-capable
-    /// backends — across processes; a refresh that finds either lock held,
-    /// or whose lock call fails, stands down instead of waiting). A hard-expired entry is never served:
+    /// backends — across processes). A refresh that finds either lock held,
+    /// or whose lock call fails, stands down instead of waiting, and the
+    /// stale value keeps being served. A hard-expired entry is never served:
     /// it falls through to a normal blocking miss.
     ///
     /// Native targets only: this knob does not exist on wasm32, under the

@@ -460,7 +460,7 @@ With SWR (default when `l1` is on, native targets), an L1 entry has two phases
 before it disappears: *fresh* until `swr_threshold_ratio` of its TTL has
 elapsed, then *stale* until hard expiry. A `#[cachekit]`-wrapped call that
 hits a stale entry returns it **immediately** — no caller ever blocks on a
-merely-stale value — while exactly one background task re-executes the
+merely-stale value — while at most one background task re-executes the
 function. If the same-key mutation token is still current, the task rewrites
 both cache layers and renews L1 hard expiry with the full write-path TTL; if a
 newer `set()` or `delete()` landed through the same client (or one of its
@@ -470,11 +470,12 @@ eviction do not invalidate the token, so a valid slow refresh can still
 repopulate both layers. Refresh dedup takes the same locks as the cold-miss single-flight
 (in-process, plus distributed fill locks on lock-capable backends), so N
 concurrent stale readers cost one origin execution — misses are billable;
-stampedes are not acceptable. Unlike a cold miss, a refresh never waits: if
-another worker or process already holds the key's lock, or the lock call fails,
-the refresh stands down at once without polling or re-reading the cache, records no miss, and the stale
-value keeps being served until hard expiry. A hard-expired entry always takes the normal
-blocking miss path: SWR never serves past hard expiry.
+stampedes are not acceptable. Unlike a cold miss, a refresh never waits for
+another worker's fill: if another worker or process already holds the key's
+lock, or the lock call fails, the refresh stands down at once without polling or
+re-reading the cache, records no miss, and the stale value keeps being served
+until hard expiry. A hard-expired entry always takes the normal blocking miss
+path: SWR never serves past hard expiry.
 
 ```rust,ignore
 let cache = CacheKit::builder()

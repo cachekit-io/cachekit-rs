@@ -20,8 +20,8 @@
 //! for another worker's fill: if another worker holds either one, or the lock
 //! call fails, the refresh stands down without polling or re-reading the
 //! cache, and the stale copy keeps being served. A cold miss queued behind a
-//! worker that did not fill (a refresh that stood down, or a failed fill)
-//! contests the distributed lock itself before computing.
+//! refresh that stood down on a contested distributed lock contests that lock
+//! itself before computing, since another process may be filling.
 //! Manual usage follows the same shape:
 //!
 //! ```no_run
@@ -78,13 +78,17 @@ const FILL_POLL_BUDGET: u32 = 50;
 
 /// Per-key async mutexes for in-process fill dedup. Weak entries let finished
 /// flights drop their state without an explicit removal protocol.
+///
+/// Each mutex guards a stand-down note for the next holder: `true` when the
+/// last holder was a background refresh that stood down on a contested
+/// distributed lock, filling nothing. Every new holder clears it.
 #[derive(Default)]
 pub(crate) struct FlightMap {
-    entries: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    entries: Mutex<HashMap<String, Weak<tokio::sync::Mutex<bool>>>>,
 }
 
 impl FlightMap {
-    fn handle(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    fn handle(&self, key: &str) -> Arc<tokio::sync::Mutex<bool>> {
         let mut map = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         // ponytail: O(n) sweep once the map grows; a doubly-indexed structure
         // is not worth it until someone caches millions of distinct cold keys.
@@ -94,7 +98,7 @@ impl FlightMap {
         if let Some(existing) = map.get(key).and_then(Weak::upgrade) {
             return existing;
         }
-        let fresh = Arc::new(tokio::sync::Mutex::new(()));
+        let fresh = Arc::new(tokio::sync::Mutex::new(false));
         map.insert(key.to_owned(), Arc::downgrade(&fresh));
         fresh
     }
@@ -184,10 +188,18 @@ enum Role {
     /// second billable miss under metered-misses pricing).
     Leader,
     /// Queued behind a local holder that has since finished: re-check the
-    /// cache once — a leader's fill is in L1. If that misses, the holder did
-    /// not fill (its fill failed, or it was a refresh that stood down), so
-    /// contest the distributed fill lock like a leader before computing.
-    LocalFollower { rechecked: bool },
+    /// cache once — a leader's fill is in L1 — then compute if it missed.
+    /// `contest_lease` is set when the holder was a refresh that stood down
+    /// on a contested lease: it filled nothing and another process may be
+    /// filling, so a missed re-check contests the lease before computing.
+    LocalFollower {
+        rechecked: bool,
+        #[cfg_attr(
+            not(all(feature = "reliability", not(target_arch = "wasm32"))),
+            allow(dead_code)
+        )]
+        contest_lease: bool,
+    },
     /// Another *process* holds the distributed fill lock: poll the cache for
     /// its fill, then compute anyway when the budget runs out (fail-open).
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
@@ -198,8 +210,10 @@ enum Role {
 /// paths apply different policies to it.
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
 enum LockAttempt {
-    /// The lease was granted (its id), or the backend has no lock (`None`).
-    Held(Option<String>),
+    /// The lease was granted; carries its id.
+    Granted(String),
+    /// The backend has no distributed lock.
+    Unlockable,
     /// Another process holds the lease.
     Contested,
     /// The lock call itself failed.
@@ -210,10 +224,10 @@ enum LockAttempt {
 impl LockAttempt {
     async fn run(backend: &SharedBackend, full_key: &str) -> Self {
         let Some(lockable) = backend.as_lockable() else {
-            return Self::Held(None);
+            return Self::Unlockable;
         };
         match lockable.acquire_lock(full_key, FILL_LOCK_TIMEOUT_MS).await {
-            Ok(Some(lock_id)) => Self::Held(Some(lock_id)),
+            Ok(Some(lock_id)) => Self::Granted(lock_id),
             Ok(None) => Self::Contested,
             Err(_) => Self::Failed,
         }
@@ -224,14 +238,14 @@ impl LockAttempt {
     /// an availability dependency.
     fn cold_role(self) -> (Role, Option<String>) {
         match self {
-            Self::Held(lock_id) => (Role::Leader, lock_id),
+            Self::Granted(lock_id) => (Role::Leader, Some(lock_id)),
+            Self::Unlockable | Self::Failed => (Role::Leader, None),
             Self::Contested => (
                 Role::RemoteContested {
                     polls_left: FILL_POLL_BUDGET,
                 },
                 None,
             ),
-            Self::Failed => (Role::Leader, None),
         }
     }
 }
@@ -244,7 +258,13 @@ impl LockAttempt {
 /// Dropping without `release` is safe: the in-process lock frees immediately
 /// and a distributed lock expires server-side after its timeout.
 pub struct SingleFlight {
-    _local: tokio::sync::OwnedMutexGuard<()>,
+    /// The per-key lock. Its value is the stand-down note for the next
+    /// holder (see [`FlightMap`]).
+    #[cfg_attr(
+        not(all(feature = "reliability", not(target_arch = "wasm32"))),
+        allow(dead_code)
+    )]
+    local: tokio::sync::OwnedMutexGuard<bool>,
     role: Role,
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
     backend: SharedBackend,
@@ -260,21 +280,26 @@ impl SingleFlight {
     /// the cache after every `true` before computing yourself:
     ///
     /// - Leader: immediately `false` (compute, don't re-read your own miss).
-    /// - Queued behind a local holder: `true` exactly once. If the re-check
-    ///   missed, the next call contests the distributed fill lock (when the
-    ///   backend has one) and then behaves as a leader or a contested flight.
+    /// - Queued behind a local holder: `true` once, for the re-check, then
+    ///   `false`. If the holder was a background refresh that stood down on
+    ///   a contested distributed lock, a missed re-check first contests that
+    ///   lock and then behaves as a leader or a contested flight.
     /// - Contested cross-process: sleeps one poll interval per call, `true`
     ///   until the poll budget is spent.
     pub async fn wait_for_fill(&mut self) -> bool {
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-        if matches!(self.role, Role::LocalFollower { rechecked: true }) {
+        if let Role::LocalFollower {
+            rechecked: true,
+            contest_lease: true,
+        } = self.role
+        {
             (self.role, self.lock_id) = LockAttempt::run(&self.backend, &self.full_key)
                 .await
                 .cold_role();
         }
         match &mut self.role {
             Role::Leader => false,
-            Role::LocalFollower { rechecked } => {
+            Role::LocalFollower { rechecked, .. } => {
                 let first = !*rechecked;
                 *rechecked = true;
                 first
@@ -301,16 +326,19 @@ impl SingleFlight {
         }
     }
 
+    /// A flight over a freshly acquired per-key lock. Clears the previous
+    /// holder's note, which only a follower acts on.
     fn new(
-        local: tokio::sync::OwnedMutexGuard<()>,
+        mut local: tokio::sync::OwnedMutexGuard<bool>,
         role: Role,
         backend: &SharedBackend,
         full_key: &str,
     ) -> Self {
+        *local = false;
         #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
         let _ = (backend, full_key);
         Self {
-            _local: local,
+            local,
             role,
             #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
             backend: backend.clone(),
@@ -323,18 +351,17 @@ impl SingleFlight {
 
     /// Cold-miss entry: lead (attempting cross-process suppression via the
     /// backend's distributed lock, when available), or queue behind a local
-    /// leader.
+    /// holder.
     pub(crate) async fn acquire(map: &FlightMap, backend: &SharedBackend, full_key: &str) -> Self {
         let handle = map.handle(full_key);
         let Ok(local) = Arc::clone(&handle).try_lock_owned() else {
             // Contended: a local holder is filling. Queue behind it.
             let local = handle.lock_owned().await;
-            return Self::new(
-                local,
-                Role::LocalFollower { rechecked: false },
-                backend,
-                full_key,
-            );
+            let role = Role::LocalFollower {
+                rechecked: false,
+                contest_lease: *local,
+            };
+            return Self::new(local, role, backend, full_key);
         };
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         {
@@ -368,8 +395,15 @@ impl SingleFlight {
         let mut flight = Self::new(local, Role::Leader, backend, full_key);
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         match LockAttempt::run(backend, full_key).await {
-            LockAttempt::Held(lock_id) => flight.lock_id = lock_id,
-            LockAttempt::Contested | LockAttempt::Failed => return None,
+            LockAttempt::Granted(lock_id) => flight.lock_id = Some(lock_id),
+            LockAttempt::Unlockable => {}
+            LockAttempt::Contested => {
+                // Leave a note: a cold miss queued behind this refresh must
+                // not take the stand-down for a finished fill.
+                *flight.local = true;
+                return None;
+            }
+            LockAttempt::Failed => return None,
         }
         Some(flight)
     }
