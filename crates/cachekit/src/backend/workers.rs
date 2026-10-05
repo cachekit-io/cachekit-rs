@@ -21,7 +21,7 @@ use crate::backend::{
 use crate::error::BackendError;
 use crate::metrics::{metrics_headers, MetricsProvider};
 use crate::session::session_headers;
-use crate::url_validator::validate_cachekitio_url;
+use crate::url_validator::cachekitio_base_url;
 
 // ── WorkersCachekitIO ────────────────────────────────────────────────────────
 
@@ -442,7 +442,8 @@ impl WorkersCachekitIOBuilder {
     /// - `api_key` was not set or is empty.
     /// - the resolved URL scheme is not `https`, or the URL carries a query or
     ///   a fragment.
-    /// - the URL hostname is not permitted (see [`validate_cachekitio_url`]).
+    /// - the URL carries credentials, or its hostname is not permitted (see
+    ///   [`validate_cachekitio_url`](crate::url_validator::validate_cachekitio_url)).
     pub fn build(self) -> Result<WorkersCachekitIO, crate::error::CachekitError> {
         use crate::error::CachekitError;
 
@@ -455,11 +456,10 @@ impl WorkersCachekitIOBuilder {
             .api_url
             .unwrap_or_else(|| "https://api.cachekit.io".to_string());
 
-        // Validate URL: HTTPS, allowed host, no private IPs.
-        validate_cachekitio_url(&api_url, self.allow_custom_host)?;
-
-        // Trim trailing slash once so url()/health_url() don't repeat it per-request.
-        let api_url = api_url.trim_end_matches('/').to_string();
+        // Validated (HTTPS, allowed host, no private IPs) and as the parser
+        // serialized it, trailing slash trimmed so url()/health_url() don't
+        // repeat it per-request.
+        let api_url = cachekitio_base_url(&api_url, self.allow_custom_host)?;
 
         Ok(WorkersCachekitIO {
             api_key,

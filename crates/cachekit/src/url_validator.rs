@@ -2,13 +2,24 @@ use crate::error::CachekitError;
 
 const ALLOWED_HOSTS: &[&str] = &["api.cachekit.io", "api.staging.cachekit.io"];
 
-/// Validate that a CachekitIO API URL uses HTTPS, carries no query or
-/// fragment, is not a private IP (SSRF protection), and matches the
+/// Validate that a CachekitIO API URL uses HTTPS, carries no credentials,
+/// query or fragment, is not a private IP (SSRF protection), and matches the
 /// allow-list unless `allow_custom_host` is set.
 pub fn validate_cachekitio_url(
     url_str: &str,
     allow_custom_host: bool,
 ) -> Result<(), CachekitError> {
+    cachekitio_base_url(url_str, allow_custom_host).map(|_| ())
+}
+
+/// [`validate_cachekitio_url`], then the URL as the parser serialized it,
+/// trailing slashes trimmed: the base every request path is appended to.
+/// Requests go to that serialization, never the raw input, so a client whose
+/// URL parser differs from this one still reads the host that was checked.
+pub(crate) fn cachekitio_base_url(
+    url_str: &str,
+    allow_custom_host: bool,
+) -> Result<String, CachekitError> {
     let parsed = url::Url::parse(url_str)
         .map_err(|_| CachekitError::Config("CachekitIO API URL is malformed".to_string()))?;
 
@@ -18,8 +29,14 @@ pub fn validate_cachekitio_url(
         ));
     }
 
-    // Request paths are appended to this string, so a query or fragment here
-    // would swallow every one of them.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(CachekitError::Config(
+            "CachekitIO API URL must not carry credentials".to_string(),
+        ));
+    }
+
+    // Request paths are appended to the base URL, so a query or fragment in
+    // it would swallow every one of them.
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(CachekitError::Config(
             "CachekitIO API URL must not carry a query or a fragment".to_string(),
@@ -51,7 +68,7 @@ pub fn validate_cachekitio_url(
         }
     }
 
-    Ok(())
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
 fn is_private_ip(ip: std::net::IpAddr) -> bool {
@@ -199,6 +216,48 @@ mod tests {
         }
         assert!(validate_cachekitio_url("https://proxy.example.com/base?", true).is_err());
         assert!(validate_cachekitio_url("https://proxy.example.com/base/", true).is_ok());
+    }
+
+    #[test]
+    fn rejects_credentials() {
+        for url in [
+            "https://u:p@api.cachekit.io",
+            "https://u@api.cachekit.io",
+            "https://:p@api.cachekit.io",
+        ] {
+            for allow_custom_host in [false, true] {
+                let err = validate_cachekitio_url(url, allow_custom_host).unwrap_err();
+                assert!(
+                    err.to_string().contains("must not carry credentials"),
+                    "{url}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn base_url_is_the_parsed_serialization() {
+        // Requests go to the serialization of the URL that was checked, never
+        // the raw input, so every URL parser downstream reads the same host.
+        for (url, base) in [
+            ("https://api.cachekit.io", "https://api.cachekit.io"),
+            ("https://api.cachekit.io/", "https://api.cachekit.io"),
+            ("https://API.cachekit.io:443//", "https://api.cachekit.io"),
+            (
+                "https://api.cachekit.io\\@evil.example",
+                "https://api.cachekit.io/@evil.example",
+            ),
+            (
+                "https://api.cachekit.io\\evil",
+                "https://api.cachekit.io/evil",
+            ),
+        ] {
+            assert_eq!(cachekitio_base_url(url, false).unwrap(), base, "{url}");
+        }
+        assert_eq!(
+            cachekitio_base_url("https://proxy.example.com/base/", true).unwrap(),
+            "https://proxy.example.com/base"
+        );
     }
 
     #[test]

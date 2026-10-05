@@ -87,6 +87,7 @@ const REDIRECT_SERVER_JS: &str = r"
         }
         res.writeHead(404).end();
     });
+    server.unref();
     return new Promise((resolve) => server.listen(0, '127.0.0.1', () => {
         const origin = `http://127.0.0.1:${server.address().port}`;
         const realFetch = globalThis.fetch;
@@ -108,7 +109,9 @@ const REDIRECT_SERVER_JS: &str = r"
 
 /// The API never redirects, so a 3xx from it is an error and the backend
 /// sends nothing to the `Location` it names. The control shows the harness
-/// does follow when a request asks it to, so the zero is not vacuous.
+/// does follow when a request asks it to, so the zero is not vacuous. Every
+/// request runs before any assertion, so a failure never leaves `fetch`
+/// patched for the other tests.
 #[wasm_bindgen_test]
 async fn workers_backend_does_not_follow_redirects() {
     use cachekit::backend::workers::WorkersCachekitIO;
@@ -117,6 +120,11 @@ async fn workers_backend_does_not_follow_redirects() {
     use worker::js_sys::{global, Function, Promise, Reflect};
     use worker::wasm_bindgen::{JsCast, JsValue};
     use worker::wasm_bindgen_futures::JsFuture;
+
+    let backend = WorkersCachekitIO::builder()
+        .api_key("test-key-never-sent")
+        .build()
+        .expect("default URL is valid");
 
     let start: Promise = Function::new_no_args(REDIRECT_SERVER_JS)
         .call0(&JsValue::NULL)
@@ -130,50 +138,68 @@ async fn workers_backend_does_not_follow_redirects() {
         Reflect::get(&state, &"targetHits".into())
             .ok()
             .and_then(|v| v.as_f64())
-            .expect("targetHits is a number")
     };
 
     // Control: a request in follow mode reaches the redirect target.
     let mut init = worker::RequestInit::new();
     init.with_redirect(worker::RequestRedirect::Follow);
-    let request =
-        worker::Request::new_with_init("https://api.cachekit.io/v1/cache/redirect-302", &init)
-            .expect("control request");
-    let resp = worker::Fetch::Request(request)
-        .send()
-        .await
-        .expect("control fetch");
-    assert_eq!(resp.status_code(), 200, "control: the harness follows");
-    assert_eq!(target_hits(), 1.0);
-    Reflect::set(&state, &"targetHits".into(), &0.into()).expect("reset hits");
+    let control = match worker::Request::new_with_init(
+        "https://api.cachekit.io/v1/cache/redirect-302",
+        &init,
+    ) {
+        Ok(request) => worker::Fetch::Request(request)
+            .send()
+            .await
+            .map(|resp| resp.status_code()),
+        Err(e) => Err(e),
+    };
+    let control_hits = target_hits();
+    let _ = Reflect::set(&state, &"targetHits".into(), &0.into());
+
+    let mut results = Vec::new();
+    for status in [301, 302, 303, 307, 308] {
+        let key = format!("redirect-{status}");
+        results.push(("get", status, backend.get(&key).await.err()));
+        results.push(("set", status, backend.set(&key, vec![1], None).await.err()));
+        results.push(("delete", status, backend.delete(&key).await.err()));
+        results.push(("exists", status, backend.exists(&key).await.err()));
+    }
+    let hits = target_hits();
+
+    if let Ok(close) = Reflect::get(&state, &"close".into()) {
+        let _ = close.unchecked_into::<Function>().call0(&JsValue::NULL);
+    }
+
+    assert_eq!(control.ok(), Some(200), "control: the harness follows");
+    assert_eq!(
+        control_hits,
+        Some(1.0),
+        "control: the target saw the follow"
+    );
+    for (op, status, err) in results {
+        let err = err.unwrap_or_else(|| panic!("{op} on HTTP {status} must be an error"));
+        assert_eq!(
+            err.kind,
+            BackendErrorKind::Permanent,
+            "{op} on HTTP {status}: {err}"
+        );
+    }
+    assert_eq!(hits, Some(0.0), "a redirect was followed");
+}
+
+/// The Workers backend sends requests to the URL it validated, as the parser
+/// serialized it, never the raw input: workerd's URL parser can differ from
+/// the validator's.
+#[wasm_bindgen_test]
+fn workers_backend_uses_the_validated_url_as_serialized() {
+    use cachekit::backend::workers::WorkersCachekitIO;
 
     let backend = WorkersCachekitIO::builder()
         .api_key("test-key-never-sent")
+        .api_url("https://api.cachekit.io\\@evil.example")
         .build()
-        .expect("default URL is valid");
-    for status in [301, 302, 303, 307, 308] {
-        let key = format!("redirect-{status}");
-        let results = [
-            ("get", backend.get(&key).await.err()),
-            ("set", backend.set(&key, vec![1], None).await.err()),
-            ("delete", backend.delete(&key).await.err()),
-            ("exists", backend.exists(&key).await.err()),
-        ];
-        for (op, err) in results {
-            let err = err.unwrap_or_else(|| panic!("{op} on HTTP {status} must be an error"));
-            assert_eq!(
-                err.kind,
-                BackendErrorKind::Permanent,
-                "{op} on HTTP {status}: {err}"
-            );
-        }
-    }
-    assert_eq!(target_hits(), 0.0, "a redirect was followed");
-
-    let close: Function = Reflect::get(&state, &"close".into())
-        .expect("close")
-        .unchecked_into();
-    close.call0(&JsValue::NULL).expect("close server");
+        .expect("allowlisted host");
+    assert_eq!(backend.api_url(), "https://api.cachekit.io/@evil.example");
 }
 
 /// reqwest's wasm32 client has no redirect setting, so the reqwest-backed

@@ -597,9 +597,9 @@ Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rus
 | `CACHEKIT_DEFAULT_TTL` | ❌ | Default TTL in seconds (min 1, default: 300) |
 
 > [!CAUTION]
-> `CACHEKIT_API_URL` must use HTTPS, must not carry a query or a fragment, and
-> must not point to a private IP address. All three are enforced at
-> configuration time.
+> `CACHEKIT_API_URL` must use HTTPS, must not carry credentials, a query or a
+> fragment, and must not point to a private IP address. All of these are
+> enforced at configuration time.
 
 ---
 
