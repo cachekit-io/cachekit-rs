@@ -55,7 +55,10 @@ fn ms(n: u64) -> Duration {
 #[derive(Default)]
 struct State {
     store: HashMap<String, Vec<u8>>,
-    lock_held: bool,
+    /// Keys whose lock this process holds.
+    held: std::collections::HashSet<String>,
+    /// Another process holds every key's lock.
+    remote_holds: bool,
     /// Every completed backend call, with when it completed.
     ops: Vec<(&'static str, Instant)>,
     gets: u32,
@@ -68,6 +71,8 @@ struct Timed {
     set_fails: bool,
     /// GETs after this many hang for 30 s.
     hang_after_gets: Option<u32>,
+    /// Every call returns at once.
+    instant: bool,
 }
 
 impl Timed {
@@ -77,6 +82,7 @@ impl Timed {
             unlock_ms: UNLOCK,
             set_fails: false,
             hang_after_gets: None,
+            instant: false,
         }
     }
 
@@ -96,7 +102,7 @@ impl Timed {
     }
 
     async fn leg(&self, op: &'static str, d: u64) {
-        tokio::time::sleep(ms(d)).await;
+        tokio::time::sleep(ms(if self.instant { 0 } else { d })).await;
         self.st().ops.push((op, Instant::now()));
     }
 
@@ -185,21 +191,20 @@ impl Backend for Timed {
 impl LockableBackend for Timed {
     async fn acquire_lock(
         &self,
-        _key: &str,
+        key: &str,
         _timeout_ms: u64,
     ) -> Result<Option<String>, BackendError> {
         self.leg("lock", LOCK).await;
         let mut st = self.st();
-        if st.lock_held {
+        if st.remote_holds || !st.held.insert(key.to_owned()) {
             return Ok(None);
         }
-        st.lock_held = true;
         Ok(Some("lease".to_owned()))
     }
 
-    async fn release_lock(&self, _key: &str, _lock_id: &str) -> Result<bool, BackendError> {
+    async fn release_lock(&self, key: &str, _lock_id: &str) -> Result<bool, BackendError> {
         self.leg("unlock", self.unlock_ms).await;
-        self.st().lock_held = false;
+        self.st().held.remove(key);
         Ok(true)
     }
 }
@@ -327,9 +332,10 @@ async fn err_result_keeps_the_unlock_inline() {
 
 // ── Re-miss inside the unlock window ─────────────────────────────────────────
 
-/// A same-key re-call that misses while this process's unlock is still in
-/// flight must wait for that unlock, then lead: never contest its own lease
-/// and poll an empty cache until the deadline.
+/// A same-key re-call that misses while this client's unlock is still in
+/// flight sends the unlock itself, without waiting for the in-flight one,
+/// then leads: it never contests its own lease and polls an empty cache
+/// until the deadline.
 #[tokio::test(start_paused = true)]
 async fn re_miss_inside_the_unlock_window_leads_instead_of_polling() {
     let mut backend = Timed::new();
@@ -348,12 +354,13 @@ async fn re_miss_inside_the_unlock_window_leads_instead_of_polling() {
     // One GET (the miss), no poll GETs, and the lease was granted, not contested.
     assert_eq!(backend.gets() - gets_before, 1, "no poll GETs");
     // Detached: the leader's unlock is still in flight, so the re-call sends
-    // it itself before its own lock call, which is granted. Inline: the
-    // leader returned only after its unlock.
+    // it again before its own lock call, which is granted; the leader's
+    // original lands in between. Inline: the leader returned only after its
+    // unlock.
     let (want_ms, want_ops) = if DETACHED {
         (
             GET + 1_000 + LOCK + ORIGIN + SET,
-            vec!["get", "unlock", "lock", "set"],
+            vec!["get", "unlock", "unlock", "lock", "set"],
         )
     } else {
         (
@@ -368,6 +375,27 @@ async fn re_miss_inside_the_unlock_window_leads_instead_of_polling() {
     assert_eq!(took, want_ms);
 }
 
+/// Once the backend has answered the detached unlock, a re-miss sends no
+/// unlock of its own.
+#[tokio::test(start_paused = true)]
+async fn re_miss_after_the_unlock_was_answered_sends_no_unlock() {
+    let backend = Timed::new();
+    let cache = backend.client();
+
+    assert_eq!(fill(&cache, 12).await.unwrap(), 120);
+    tokio::time::sleep(ms(UNLOCK + 1)).await;
+    cache.delete(&fill_key(12)).await.unwrap();
+
+    let t1 = Instant::now();
+    assert_eq!(fill(&cache, 12).await.unwrap(), 120);
+    let want: &[&str] = if DETACHED {
+        &["get", "lock", "set"]
+    } else {
+        &["get", "lock", "set", "unlock"]
+    };
+    assert_eq!(backend.ops_between(t1, Instant::now()), want);
+}
+
 // ── Contested follower: bounded by the lock timeout ──────────────────────────
 
 /// Polls before this change: a fixed 50, each 100 ms plus a GET.
@@ -378,7 +406,7 @@ fn head_poll_wait(get_ms: u64) -> u64 {
 #[tokio::test(start_paused = true)]
 async fn contested_follower_whose_leader_never_fills_computes_at_the_deadline() {
     let backend = Timed::new();
-    backend.st().lock_held = true; // another process leads and never fills
+    backend.st().remote_holds = true; // another process leads and never fills
     let cache = backend.client();
     let t0 = Instant::now();
 
@@ -402,14 +430,14 @@ async fn contested_follower_whose_leader_never_fills_computes_at_the_deadline() 
 #[tokio::test(start_paused = true)]
 async fn contested_follower_whose_leader_errs_computes_at_the_deadline() {
     let backend = Timed::new();
-    backend.st().lock_held = true;
+    backend.st().remote_holds = true;
     let cache = backend.client();
     let t0 = Instant::now();
 
     // The remote leader fails at t = 1,000 ms: it unlocks and stores nothing.
     let leader_err = async {
         tokio::time::sleep(ms(1_000)).await;
-        backend.st().lock_held = false;
+        backend.st().remote_holds = false;
     };
     let (value, ()) = tokio::join!(fill(&cache, 7), leader_err);
     assert_eq!(value.unwrap(), 70);
@@ -426,7 +454,7 @@ async fn contested_follower_whose_leader_errs_computes_at_the_deadline() {
 async fn deadline_cuts_off_a_hung_poll_get() {
     let mut backend = Timed::new();
     backend.hang_after_gets = Some(1); // every poll GET hangs for 30 s
-    backend.st().lock_held = true;
+    backend.st().remote_holds = true;
     let cache = backend.client();
     let t0 = Instant::now();
 
@@ -448,7 +476,7 @@ async fn deadline_cuts_off_a_hung_poll_get() {
 #[tokio::test(start_paused = true)]
 async fn a_remote_fill_is_still_picked_up_within_one_poll() {
     let backend = Timed::new();
-    backend.st().lock_held = true;
+    backend.st().remote_holds = true;
     let cache = backend.client();
     let t0 = Instant::now();
 
@@ -530,4 +558,28 @@ fn re_miss_after_the_leaders_runtime_is_dropped_sends_the_unlock_and_leads() {
         );
         assert_eq!(backend.gets() - gets, 1, "led without polling");
     });
+}
+
+/// Open file descriptors of this process (Linux).
+fn open_fds() -> Option<usize> {
+    Some(std::fs::read_dir("/proc/self/fd").ok()?.count())
+}
+
+/// A runtime per call, dropped right after it (a sync wrapper's shape),
+/// with the unlock never sent: nothing the client keeps for that unlock may
+/// keep the dropped runtime, and its file descriptors, alive.
+#[test]
+fn dropped_per_call_runtimes_release_their_file_descriptors() {
+    let Some(before) = open_fds() else {
+        return; // no /proc: nothing to count
+    };
+    let mut backend = Timed::new();
+    backend.instant = true;
+    let cache = backend.client();
+    for id in 100..200 {
+        current_thread().block_on(async { assert_eq!(fill(&cache, id).await.unwrap(), id * 10) });
+    }
+    let after = open_fds().expect("counted before");
+    println!("100 per-call runtimes: {before} -> {after} open fds");
+    assert!(after <= before + 16, "fds retained: {before} -> {after}");
 }

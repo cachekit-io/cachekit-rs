@@ -20,10 +20,15 @@
 //! from a task spawned on the ambient tokio runtime and returns without
 //! waiting for it. That needs `l1` and a tokio runtime, and never happens
 //! under `unsync`; there, and whenever the fill was not stored, the caller
-//! awaits the unlock. If the spawned unlock has not been confirmed by the
-//! next lock attempt on that key in this process (still in flight, or its
-//! runtime idle or dropped), that attempt sends the unlock itself first, so
-//! a re-miss never contests its own lock.
+//! awaits the unlock. If the backend has not answered the spawned unlock by
+//! the next lock attempt on that key from this client or its clones (still
+//! in flight, or its runtime idle or dropped), that attempt sends the unlock
+//! itself first, so a re-miss does not contest its own lock unless that
+//! unlock fails too. If the runtime is dropped or left idle right after the
+//! call, the unlock waits for that next attempt, and until then the lease
+//! stays held server-side for up to its 5 s timeout: another process that
+//! misses the key inside that window polls for it, as it would behind any
+//! slow leader.
 //!
 //! The `#[cachekit]` macro wires this in automatically around its miss path.
 //! Its stale-while-revalidate refresh takes the same locks but never waits
@@ -57,6 +62,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
+#[cfg(all(
+    feature = "reliability",
+    feature = "l1",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
+use std::sync::atomic::AtomicBool;
 #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -97,19 +109,64 @@ const FILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// that was about to compute anyway.
 #[derive(Default)]
 pub(crate) struct FlightMap {
-    entries: Mutex<HashMap<String, Weak<tokio::sync::Mutex<KeyState>>>>,
-    /// Strong references that keep an entry with a pending unlock alive
-    /// until its lease has expired server-side (oldest first), so a re-miss
-    /// finds the unlock even when its task was cancelled with its runtime.
+    entries: Mutex<Entries>,
+}
+
+#[derive(Default)]
+struct Entries {
+    slots: HashMap<String, Slot>,
+    /// Sweep dead slots once the map grows past this: twice what the last
+    /// sweep left, so a large live set does not make every miss O(n).
+    sweep_above: usize,
+}
+
+struct Slot {
+    entry: Weak<tokio::sync::Mutex<KeyState>>,
+    /// Keeps the entry, and with it a pending unlock, alive for at least one
+    /// lease timeout after a leader detached its unlock, so a re-miss finds
+    /// the unlock even when its task was cancelled with its runtime. The
+    /// task drops the pin once the backend answers; the sweep drops expired
+    /// ones.
     #[cfg(all(
         feature = "reliability",
         feature = "l1",
         not(feature = "unsync"),
         not(target_arch = "wasm32")
     ))]
-    pins: Mutex<
-        std::collections::VecDeque<(tokio::time::Instant, Arc<tokio::sync::Mutex<KeyState>>)>,
-    >,
+    pin: Option<Pin>,
+}
+
+#[cfg(all(
+    feature = "reliability",
+    feature = "l1",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
+struct Pin {
+    until: tokio::time::Instant,
+    /// The pending unlock this pin is for (see [`PendingRelease::answered`]).
+    answered: Arc<AtomicBool>,
+    _entry: Arc<tokio::sync::Mutex<KeyState>>,
+}
+
+impl Slot {
+    /// Drop an expired pin; `true` while anything still holds the entry.
+    fn live(&mut self) -> bool {
+        #[cfg(all(
+            feature = "reliability",
+            feature = "l1",
+            not(feature = "unsync"),
+            not(target_arch = "wasm32")
+        ))]
+        if self
+            .pin
+            .as_ref()
+            .is_some_and(|pin| pin.until <= tokio::time::Instant::now())
+        {
+            self.pin = None;
+        }
+        self.entry.strong_count() > 0
+    }
 }
 
 /// What the per-key mutex in [`FlightMap`] guards.
@@ -130,6 +187,9 @@ struct KeyState {
     pending_release: Option<PendingRelease>,
 }
 
+/// A detached unlock. Holds no handle to its task: that would keep the
+/// task's runtime (and its file descriptors) alive after the runtime is
+/// dropped.
 #[cfg(all(
     feature = "reliability",
     feature = "l1",
@@ -137,10 +197,9 @@ struct KeyState {
     not(target_arch = "wasm32")
 ))]
 struct PendingRelease {
-    task: tokio::task::JoinHandle<()>,
     lock_id: String,
-    /// Set once the backend confirmed the unlock.
-    done: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once the backend answered the unlock (released, or already gone).
+    answered: Arc<AtomicBool>,
 }
 
 #[cfg(all(
@@ -150,56 +209,91 @@ struct PendingRelease {
     not(target_arch = "wasm32")
 ))]
 impl PendingRelease {
-    /// Make sure the unlock has reached the backend before this process
+    /// Make sure the unlock has reached the backend before this client
     /// contests the key again: a re-miss would otherwise find its own lease
     /// held and poll an empty cache until the lock timeout. Never waits on
-    /// the spawned task, whose runtime may be idle or gone: an unconfirmed
-    /// unlock is aborted and sent again from here. Release is owner-checked,
-    /// so a duplicate is harmless.
+    /// the spawned task, whose runtime may be idle or gone: an unanswered
+    /// unlock is sent again from here. `LockableBackend::release_lock` is
+    /// owner-checked, so a duplicate, or the task's late original, is
+    /// harmless. If this unlock fails too, the re-miss polls like any
+    /// contested follower, for at most one lock timeout.
     async fn settle(&self, backend: &SharedBackend, full_key: &str) {
-        if self.done.load(std::sync::atomic::Ordering::Acquire) {
-            return;
+        if !self.answered.load(Ordering::Acquire) {
+            release_lock(backend, full_key, &self.lock_id).await;
         }
-        self.task.abort();
-        release_lock(backend, full_key, &self.lock_id).await;
     }
 }
 
 impl FlightMap {
-    /// Keep `entry` alive for one lease timeout.
+    fn handle(&self, key: &str) -> Arc<tokio::sync::Mutex<KeyState>> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        // ponytail: O(n) sweep, amortised by doubling; a doubly-indexed
+        // structure is not worth it until someone caches millions of
+        // distinct cold keys.
+        if entries.slots.len() > entries.sweep_above.max(SWEEP_THRESHOLD) {
+            entries.slots.retain(|_, slot| slot.live());
+            entries.sweep_above = 2 * entries.slots.len();
+        }
+        if let Some(existing) = entries.slots.get(key).and_then(|slot| slot.entry.upgrade()) {
+            return existing;
+        }
+        let fresh = Arc::new(tokio::sync::Mutex::new(KeyState::default()));
+        entries.slots.insert(
+            key.to_owned(),
+            Slot {
+                entry: Arc::downgrade(&fresh),
+                #[cfg(all(
+                    feature = "reliability",
+                    feature = "l1",
+                    not(feature = "unsync"),
+                    not(target_arch = "wasm32")
+                ))]
+                pin: None,
+            },
+        );
+        fresh
+    }
+
+    /// Pin `entry` (the entry for `key`) for one lease timeout, on behalf of
+    /// the pending unlock flagged by `answered`.
     #[cfg(all(
         feature = "reliability",
         feature = "l1",
         not(feature = "unsync"),
         not(target_arch = "wasm32")
     ))]
-    fn pin(&self, entry: Arc<tokio::sync::Mutex<KeyState>>) {
-        let now = tokio::time::Instant::now();
-        let mut pins = self.pins.lock().unwrap_or_else(PoisonError::into_inner);
-        while pins.front().is_some_and(|(until, _)| *until <= now) {
-            pins.pop_front();
+    fn pin(&self, key: &str, entry: Arc<tokio::sync::Mutex<KeyState>>, answered: Arc<AtomicBool>) {
+        let until =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(FILL_LOCK_TIMEOUT_MS);
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = entries.slots.get_mut(key) {
+            slot.pin = Some(Pin {
+                until,
+                answered,
+                _entry: entry,
+            });
         }
-        pins.push_back((
-            now + std::time::Duration::from_millis(FILL_LOCK_TIMEOUT_MS),
-            entry,
-        ));
     }
-}
 
-impl FlightMap {
-    fn handle(&self, key: &str) -> Arc<tokio::sync::Mutex<KeyState>> {
-        let mut map = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        // ponytail: O(n) sweep once the map grows; a doubly-indexed structure
-        // is not worth it until someone caches millions of distinct cold keys.
-        if map.len() > SWEEP_THRESHOLD {
-            map.retain(|_, w| w.strong_count() > 0);
+    /// Drop `key`'s pin if it is still the one for the unlock flagged by
+    /// `answered`: a later leader's pin for the same key stays.
+    #[cfg(all(
+        feature = "reliability",
+        feature = "l1",
+        not(feature = "unsync"),
+        not(target_arch = "wasm32")
+    ))]
+    fn unpin(&self, key: &str, answered: &Arc<AtomicBool>) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = entries.slots.get_mut(key) {
+            if slot
+                .pin
+                .as_ref()
+                .is_some_and(|pin| Arc::ptr_eq(&pin.answered, answered))
+            {
+                slot.pin = None;
+            }
         }
-        if let Some(existing) = map.get(key).and_then(Weak::upgrade) {
-            return existing;
-        }
-        let fresh = Arc::new(tokio::sync::Mutex::new(KeyState::default()));
-        map.insert(key.to_owned(), Arc::downgrade(&fresh));
-        fresh
     }
 }
 
@@ -461,7 +555,7 @@ impl SingleFlight {
     /// again, so [`Self::release`] keeps the unlock on the caller's path.
     /// Without `l1`, under `unsync` or off a tokio runtime this is
     /// [`Self::release`]. A later lock attempt on the key re-sends an unlock
-    /// that was not confirmed (see [`PendingRelease::settle`]).
+    /// the backend has not answered (see [`PendingRelease::settle`]).
     #[doc(hidden)]
     #[cfg_attr(
         not(all(
@@ -481,30 +575,32 @@ impl SingleFlight {
         ))]
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             if let Some(lock_id) = self.lock_id.take() {
-                self.map
-                    .pin(Arc::clone(tokio::sync::OwnedMutexGuard::mutex(&self.local)));
-                let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let answered = Arc::new(AtomicBool::new(false));
+                let full_key = std::mem::take(&mut self.full_key);
+                self.map.pin(
+                    &full_key,
+                    Arc::clone(tokio::sync::OwnedMutexGuard::mutex(&self.local)),
+                    Arc::clone(&answered),
+                );
                 let unlock = {
-                    let (backend, full_key, lock_id, done) = (
+                    let (map, backend, lock_id, answered) = (
+                        self.map.clone(),
                         self.backend.clone(),
-                        std::mem::take(&mut self.full_key),
                         lock_id.clone(),
-                        Arc::clone(&done),
+                        Arc::clone(&answered),
                     );
                     async move {
                         if release_lock(&backend, &full_key, &lock_id).await {
-                            done.store(true, std::sync::atomic::Ordering::Release);
+                            answered.store(true, Ordering::Release);
+                            map.unpin(&full_key, &answered);
                         }
                     }
                 };
                 // Keep the caller's span, so a failed unlock traces under it.
                 #[cfg(feature = "tracing")]
                 let unlock = tracing::Instrument::instrument(unlock, tracing::Span::current());
-                self.local.pending_release = Some(PendingRelease {
-                    task: runtime.spawn(unlock),
-                    lock_id,
-                    done,
-                });
+                drop(runtime.spawn(unlock));
+                self.local.pending_release = Some(PendingRelease { lock_id, answered });
             }
             return;
         }
