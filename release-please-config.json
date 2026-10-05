@@ -30,7 +30,8 @@
     "crates/cachekit": {
       "package-name": "cachekit-rs",
       "changelog-path": "CHANGELOG.md",
-      "component": "cachekit-rs"
+      "component": "cachekit-rs",
+      "extra-files": ["/README.md", "/crates/cachekit-macros/README.md"]
     },
     "crates/cachekit-macros": {
       "package-name": "cachekit-macros",

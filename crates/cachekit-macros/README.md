@@ -19,9 +19,11 @@ async fn get_user(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
 
 This crate is not intended to be used directly. Add it via the `macros` feature on `cachekit-rs`:
 
+<!-- x-release-please-start-version -->
 ```toml
 [dependencies]
-cachekit-rs = { version = "0.2", features = ["macros"] }
+cachekit-rs = { version = "0.10.0", features = ["macros"] }
 ```
+<!-- x-release-please-end -->
 
 See the [cachekit-rs documentation](https://docs.rs/cachekit-rs) for full usage details.
