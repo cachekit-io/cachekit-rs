@@ -556,7 +556,6 @@ mod freshness_header_tests {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
     use super::freshness_from_headers;
-    use crate::backend::Freshness;
 
     /// Build a header map with the wire's mixed-case names; `append` keeps
     /// repeats, as a proxy that duplicates a header would.
@@ -587,71 +586,122 @@ mod freshness_header_tests {
         freshness_from_headers(&headers(&pairs)).fresh_for
     }
 
+    // ── Protocol vectors ─────────────────────────────────────────────────────
+    //
+    // `tests/vectors/freshness-headers.json`, vendored verbatim from
+    // cachekit-io/protocol `test-vectors/freshness-headers.json` 1.0.0 (merge
+    // commit `f35635445a6a7461f93061aa51332e4f0d25c614`). Do not edit the JSON
+    // here; change it upstream and re-vendor, then update `FIXTURE_SHA256`.
+
+    const FIXTURE: &str = include_str!("../../tests/vectors/freshness-headers.json");
+
+    /// sha256 of the vendored file, pinned so a local edit cannot drift from the
+    /// protocol copy unnoticed.
+    const FIXTURE_SHA256: &str = "74beb975b6855f52d9dd453279873faf8048a9c3c79a8167cfda099beec5fcd3"; // pragma: allowlist secret
+
+    /// One fixture row. `deny_unknown_fields` makes a new row field upstream
+    /// fail loudly here rather than be silently ignored.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Row<T> {
+        name: String,
+        value: Option<String>,
+        #[serde(alias = "stale", alias = "fresh_for")]
+        expected: T,
+        #[serde(rename = "note")]
+        _note: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        freshness_vectors: Vec<Row<bool>>,
+        fresh_for_vectors: Vec<Row<Option<u64>>>,
+    }
+
+    /// The headers a `GET 200` carries for one row: none when `value` is null,
+    /// otherwise one field line whose bytes are the value's characters, each
+    /// U+0000..=U+00FF standing for one byte (the fixture's contract).
+    fn row_headers(name: &str, value: Option<&str>) -> HeaderMap {
+        let Some(value) = value else {
+            return HeaderMap::new();
+        };
+        let bytes: Vec<u8> = value
+            .chars()
+            .map(|c| u8::try_from(u32::from(c)).expect("fixture value char above U+00FF"))
+            .collect();
+        headers(&[(name, &bytes)])
+    }
+
+    fn fixture() -> Fixture {
+        serde_json::from_str(FIXTURE)
+            .expect("vendored freshness-headers.json must match the fixture schema")
+    }
+
     #[test]
-    fn absent_headers_are_a_fresh_unbounded_read() {
+    fn vendored_fixture_matches_the_pinned_sha256() {
+        use sha2::{Digest, Sha256};
         assert_eq!(
-            freshness_from_headers(&HeaderMap::new()),
-            Freshness::default()
+            hex::encode(Sha256::digest(FIXTURE.as_bytes())),
+            FIXTURE_SHA256,
+            "tests/vectors/freshness-headers.json differs from the pinned protocol copy: \
+             re-vendor it from protocol and update FIXTURE_SHA256"
         );
     }
 
     #[test]
-    fn only_an_exact_fresh_label_is_fresh() {
-        assert!(!label(&[b"fresh"]));
-        assert!(!label(&[b"fresh", b"fresh"]));
-        // (d) `stale`, an unknown token, a case variant, an empty value, or any
-        // non-`fresh` copy of a repeated header all read as stale.
-        for stale in [&b"stale"[..], b"revalidating", b"Fresh", b"", b"fresh "] {
-            assert!(
-                label(&[stale]),
-                "{:?} must read as stale",
-                String::from_utf8_lossy(stale)
-            );
-        }
-        assert!(label(&[b"fresh", b"stale"]));
-    }
-
-    #[test]
-    fn fresh_for_in_grammar_parses() {
-        for (value, secs) in [
-            (&b"0"[..], 0),
-            (b"1", 1),
-            (b"0000005", 5),
-            (b"2592000", 2_592_000),
-        ] {
-            assert_eq!(fresh_for(&[value]), Some(Duration::from_secs(secs)));
-        }
-    }
-
-    /// (d) Outside 1–7 ASCII digits, or over 2,592,000, is `0`. `4297559296` is
-    /// the value a wrapping `u32` parse would turn into `2592000`.
-    #[test]
-    fn fresh_for_outside_grammar_is_zero() {
-        let invalid: [&[u8]; 11] = [
-            b"",
-            b"-1",
-            b"+5",
-            b" 5",
-            b"5s",
-            b"1.5",
-            "\u{0663}".as_bytes(), // ARABIC-INDIC DIGIT THREE: a digit, not ASCII
-            b"12345678",
-            b"2592001",
-            b"9999999",
-            b"4297559296",
-        ];
-        for value in invalid {
+    fn fixture_freshness_rows_classify_as_specified() {
+        let rows = fixture().freshness_vectors;
+        assert!(!rows.is_empty(), "fixture has no freshness rows");
+        for row in &rows {
+            let map = row_headers("X-CacheKit-Freshness", row.value.as_deref());
             assert_eq!(
-                fresh_for(&[value]),
-                Some(Duration::ZERO),
-                "{:?} must count as 0",
-                String::from_utf8_lossy(value)
+                freshness_from_headers(&map).is_stale,
+                row.expected,
+                "row {}",
+                row.name
             );
         }
+    }
+
+    #[test]
+    fn fixture_fresh_for_rows_read_as_specified() {
+        let rows = fixture().fresh_for_vectors;
+        assert!(!rows.is_empty(), "fixture has no fresh_for rows");
+        for row in &rows {
+            let map = row_headers("X-CacheKit-Fresh-For", row.value.as_deref());
+            assert_eq!(
+                freshness_from_headers(&map).fresh_for,
+                row.expected.map(Duration::from_secs),
+                "row {}",
+                row.name
+            );
+        }
+    }
+
+    // ── rs-local cases the fixture cannot carry ──────────────────────────────
+    //
+    // The fixture's rows are one field line each, and none starts or ends with
+    // white space (stacks differ on it). reqwest keeps both repeated lines and
+    // edge white space, so rs pins its own reading of them here.
+
+    #[test]
+    fn repeated_lines_are_fresh_only_when_every_copy_is_fresh() {
+        assert!(!label(&[b"fresh", b"fresh"]));
+        assert!(label(&[b"fresh", b"stale"]));
         assert_eq!(
             fresh_for(&[b"10", b"10"]),
             Some(Duration::ZERO),
             "a repeated bound counts as 0"
+        );
+    }
+
+    #[test]
+    fn edge_white_space_is_not_stripped() {
+        assert!(label(&[b"fresh "]), "`fresh ` must read as stale");
+        assert_eq!(
+            fresh_for(&[b" 5"]),
+            Some(Duration::ZERO),
+            "` 5` must count as 0"
         );
     }
 }

@@ -412,8 +412,8 @@ pub mod workers;
 // ── Path-encoding protocol vectors (test-only) ───────────────────────────────
 
 /// Loader for `tests/vectors/path-encoding.json`, vendored verbatim from
-/// cachekit-io/protocol `test-vectors/path-encoding.json` 1.1.0 (merge commit
-/// `774281b09892a064feee6049ee29beb62f068804`). Do not edit the JSON here;
+/// cachekit-io/protocol `test-vectors/path-encoding.json` 1.2.0 (merge commit
+/// `f35635445a6a7461f93061aa51332e4f0d25c614`). Do not edit the JSON here;
 /// change it upstream and re-vendor, then update `SHA256`.
 ///
 /// Every path-encoding conformance assertion reads its keys from this file, so
@@ -429,7 +429,7 @@ pub(crate) mod path_encoding_vectors {
 
     /// sha256 of the vendored file, pinned so a local edit cannot drift from the
     /// protocol copy unnoticed.
-    const SHA256: &str = "8f6fd4be5440da9cf4bbb1a112cb89c410c4e46734c7d8a9c023eaa034727ee3"; // pragma: allowlist secret
+    const SHA256: &str = "807af0d39ccf3f5afda65577787ac5adcd01ff6617468060161c84267fa7e0cb"; // pragma: allowlist secret
 
     /// One fixture row. `deny_unknown_fields` makes a new row field upstream
     /// fail loudly here rather than be silently ignored by the tests.
