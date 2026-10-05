@@ -98,13 +98,12 @@ One call that names your use case. Each preset returns a pre-configured builder 
 ⁴ Or `CacheKit::io_from_env()` to read `CACHEKIT_API_KEY`.
 ⁵ Or `CacheKit::secure_from_env(url)` to read `CACHEKIT_MASTER_KEY`, plus the decrypt-only rotation keys in `CACHEKIT_PREVIOUS_MASTER_KEYS` (see [Key Rotation](#key-rotation)). Both take the key as a hex string and decode it the same way every CacheKit SDK does. Use exactly 32 bytes (64 hex chars, `openssl rand -hex 32`) — the only length every SDK accepts. Every value read and write on the client is encrypted — plain `get` / `set` included — and L1 holds ciphertext.
 
-<!-- x-release-please-start-version -->
 ```rust
 use cachekit::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), CachekitError> {
-    // Needs: cachekit-rs = { version = "0.10.0", features = ["redis"] }
+    // Needs the `redis` feature.
     let cache = CacheKit::production("redis://localhost:6379").await?
         .namespace("api")
         .build()?;
@@ -116,7 +115,6 @@ async fn main() -> Result<(), CachekitError> {
     Ok(())
 }
 ```
-<!-- x-release-please-end -->
 
 **Resilience contract** — connection failures, at construction and mid-run:
 
