@@ -47,9 +47,7 @@ impl TtlInspectable for CachekitIO {
     }
 
     async fn refresh_ttl(&self, key: &str, ttl: Duration) -> Result<bool, BackendError> {
-        // The same whole seconds a PUT sends: a sub-second TTL goes out as 1
-        // (`spec/saas-api.md` gives PATCH the `X-CacheKit-TTL` rules). Zero
-        // stays an error.
+        // PATCH /ttl takes the X-CacheKit-TTL rules (spec/saas-api.md).
         let secs = ttl_wire_secs(ttl);
         if secs == 0 {
             return Err(BackendError::permanent(
