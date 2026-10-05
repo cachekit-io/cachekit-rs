@@ -2,9 +2,9 @@
 //! byte-verification of the shared cross-SDK vectors.
 //!
 //! Vectors: `tests/vectors/interop-mode.json`, vendored verbatim from
-//! cachekit-io/protocol test-vectors/interop-mode.json 1.2.0
-//! (<https://github.com/cachekit-io/protocol/pull/94>)
-//! (sha256 `702613766d1b92bc3a337627a96b9aedc89abfeb4d9208c2bb00c9539a0a1f40`).
+//! cachekit-io/protocol test-vectors/interop-mode.json 1.3.0
+//! (<https://github.com/cachekit-io/protocol/pull/164>)
+//! (sha256 `e1ca6c2361509f347d17f3352e0d7ab4d4b61488737bdf0056bb5769d9794e72`).
 //! Do not edit the JSON here; regenerate upstream and re-vendor.
 //!
 //! Vector inputs use the tagged-JSON convention documented in the file header
@@ -26,7 +26,7 @@ const VECTORS_JSON: &str = include_str!("vectors/interop-mode.json");
 
 /// sha256 of the vendored file, pinned so a local edit cannot drift from the
 /// protocol copy unnoticed.
-const VECTORS_SHA256: &str = "702613766d1b92bc3a337627a96b9aedc89abfeb4d9208c2bb00c9539a0a1f40"; // pragma: allowlist secret
+const VECTORS_SHA256: &str = "e1ca6c2361509f347d17f3352e0d7ab4d4b61488737bdf0056bb5769d9794e72"; // pragma: allowlist secret
 
 fn vectors() -> Json {
     serde_json::from_str(VECTORS_JSON).expect("vendored vector file must be valid JSON")
@@ -230,7 +230,7 @@ fn iso8601_to_unix_micros(s: &str) -> Result<i64, String> {
 fn key_vectors_all_pass() {
     let doc = vectors();
     let key_vectors = doc["key_vectors"].as_array().expect("key_vectors array");
-    assert_eq!(key_vectors.len(), 35, "expected 35 key vectors");
+    assert_eq!(key_vectors.len(), 44, "expected 44 key vectors");
 
     for vector in key_vectors {
         let name = vector["name"].as_str().expect("vector name");
@@ -276,7 +276,7 @@ fn key_vectors_all_pass() {
 fn value_vectors_all_pass() {
     let doc = vectors();
     let value_vectors = doc["value_vectors"].as_array().expect("value_vectors");
-    assert_eq!(value_vectors.len(), 4, "expected 4 value vectors");
+    assert_eq!(value_vectors.len(), 6, "expected 6 value vectors");
 
     for vector in value_vectors {
         let name = vector["name"].as_str().expect("vector name");
@@ -292,10 +292,169 @@ fn value_vectors_all_pass() {
         );
 
         // Interop readers must accept the exact document via the strict
-        // (exactly-one-document) deserializer.
-        cachekit::interop::deserialize::<serde_json::Value>(&encoded).unwrap_or_else(|e| {
+        // (exactly-one-document) deserializer, and read back the value.
+        let decoded = cachekit::interop::deserialize::<Msgpack>(&encoded).unwrap_or_else(|e| {
             panic!("[{name}] strict deserialize failed on canonical bytes: {e}")
         });
+        assert!(
+            decoded.is(&vector["value"]),
+            "[{name}] read back {decoded:?}"
+        );
+    }
+}
+
+// ── Reader vectors ───────────────────────────────────────────────────────────
+
+/// Any MessagePack document: the generic value the reader tests decode into.
+///
+/// `serde_json::Value` cannot be that type. It has no binary, no non-string
+/// map key and no ext, so it would itself reject three reader_accept_vectors
+/// documents that the SDK's reader accepts.
+#[derive(Debug)]
+enum Msgpack {
+    Nil,
+    Bool(bool),
+    Int(i128),
+    Float(f64),
+    Str(String),
+    Bin(Vec<u8>),
+    Array(Vec<Msgpack>),
+    /// Entries in document order.
+    Map(Vec<(Msgpack, Msgpack)>),
+    /// Decoded, not kept: no vector value names an ext.
+    Ext,
+}
+
+impl<'de> serde::Deserialize<'de> for Msgpack {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(MsgpackVisitor)
+    }
+}
+
+struct MsgpackVisitor;
+
+impl<'de> serde::de::Visitor<'de> for MsgpackVisitor {
+    type Value = Msgpack;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any MessagePack value")
+    }
+    fn visit_unit<E>(self) -> Result<Msgpack, E> {
+        Ok(Msgpack::Nil)
+    }
+    fn visit_bool<E>(self, v: bool) -> Result<Msgpack, E> {
+        Ok(Msgpack::Bool(v))
+    }
+    fn visit_i64<E>(self, v: i64) -> Result<Msgpack, E> {
+        Ok(Msgpack::Int(v.into()))
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<Msgpack, E> {
+        Ok(Msgpack::Int(v.into()))
+    }
+    fn visit_f64<E>(self, v: f64) -> Result<Msgpack, E> {
+        Ok(Msgpack::Float(v))
+    }
+    fn visit_str<E>(self, v: &str) -> Result<Msgpack, E> {
+        Ok(Msgpack::Str(v.to_owned()))
+    }
+    fn visit_bytes<E>(self, v: &[u8]) -> Result<Msgpack, E> {
+        Ok(Msgpack::Bin(v.to_vec()))
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Msgpack, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(Msgpack::Array(items))
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Msgpack, A::Error> {
+        let mut entries = Vec::new();
+        while let Some(entry) = map.next_entry()? {
+            entries.push(entry);
+        }
+        Ok(Msgpack::Map(entries))
+    }
+    /// rmp-serde hands an ext value over as a newtype holding its type and data.
+    fn visit_newtype_struct<D: serde::Deserializer<'de>>(self, d: D) -> Result<Msgpack, D::Error> {
+        <serde::de::IgnoredAny as serde::Deserialize>::deserialize(d)?;
+        Ok(Msgpack::Ext)
+    }
+}
+
+impl Msgpack {
+    /// Whether this is the value a vector's tagged JSON names. Map entry order
+    /// is not compared: a JSON object has none to compare with.
+    fn is(&self, expected: &Json) -> bool {
+        match (self, expected) {
+            (Msgpack::Nil, Json::Null) => true,
+            (Msgpack::Bool(a), Json::Bool(b)) => a == b,
+            (Msgpack::Int(a), Json::Number(n)) => {
+                n.as_i64().map(i128::from).or(n.as_u64().map(i128::from)) == Some(*a)
+            }
+            (Msgpack::Str(a), Json::String(b)) => a == b,
+            (Msgpack::Array(a), Json::Array(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.is(y))
+            }
+            (_, Json::Object(obj)) => match (self, obj.iter().next().filter(|_| obj.len() == 1)) {
+                (Msgpack::Float(a), Some((tag, v))) if tag == "$float" => {
+                    v.as_str().and_then(|s| s.parse::<f64>().ok()) == Some(*a)
+                }
+                (Msgpack::Bin(a), Some((tag, v))) if tag == "$bytes" => {
+                    v.as_str().and_then(|s| hex::decode(s).ok()).as_ref() == Some(a)
+                }
+                (Msgpack::Map(entries), _) => {
+                    entries.len() == obj.len()
+                        && obj.iter().all(|(k, v)| {
+                            entries.iter().any(|(key, value)| {
+                                matches!(key, Msgpack::Str(s) if s == k) && value.is(v)
+                            })
+                        })
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+#[test]
+fn reader_accept_vectors_all_decode() {
+    let doc = vectors();
+    let accept = doc["reader_accept_vectors"]
+        .as_array()
+        .expect("reader_accept_vectors");
+    assert_eq!(accept.len(), 6, "expected 6 reader accept vectors");
+
+    for vector in accept {
+        let name = vector["name"].as_str().expect("vector name");
+        let bytes = hex::decode(vector["input_hex"].as_str().expect("input_hex")).expect("hex");
+        let decoded = cachekit::interop::deserialize::<Msgpack>(&bytes)
+            .unwrap_or_else(|e| panic!("[{name}] reader rejected a well-formed document: {e}"));
+        if let Some(value) = vector.get("value") {
+            assert!(
+                decoded.is(value),
+                "[{name}] decoded {decoded:?}, expected {value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn reader_reject_vectors_all_reject() {
+    let doc = vectors();
+    let reject = doc["reader_reject_vectors"]
+        .as_array()
+        .expect("reader_reject_vectors");
+    assert_eq!(reject.len(), 1, "expected 1 reader reject vector");
+
+    for vector in reject {
+        let name = vector["name"].as_str().expect("vector name");
+        let bytes = hex::decode(vector["input_hex"].as_str().expect("input_hex")).expect("hex");
+        let result = cachekit::interop::deserialize::<Msgpack>(&bytes);
+        assert!(
+            result.is_err(),
+            "[{name}] MUST be rejected, but decoded {result:?}"
+        );
     }
 }
 
@@ -305,16 +464,17 @@ fn value_vectors_all_pass() {
 fn error_vectors_all_reject() {
     let doc = vectors();
     let error_vectors = doc["error_vectors"].as_array().expect("error_vectors");
-    assert_eq!(error_vectors.len(), 13, "expected 13 error vectors");
+    assert_eq!(error_vectors.len(), 34, "expected 34 error vectors");
 
     for vector in error_vectors {
         let name = vector["name"].as_str().expect("vector name");
         let namespace = vector["namespace"].as_str().unwrap_or("t");
         let operation = vector["operation"].as_str().unwrap_or("op");
 
-        // Rejection may surface at input parse (naive datetime — the SDK API
-        // cannot even represent one) or at interop_key (segment grammar,
-        // encode-time range/finiteness checks). Either satisfies "MUST reject".
+        // Rejection may surface at input parse (naive datetime, at any depth —
+        // the SDK API cannot even represent one) or at interop_key (segment
+        // grammar, encode-time range/finiteness checks). Either satisfies
+        // "MUST reject".
         let args: Result<Vec<InteropValue>, String> = vector["args"]
             .as_array()
             .expect("args array")
@@ -325,7 +485,8 @@ fn error_vectors_all_reject() {
         match args {
             Err(reason) => {
                 assert!(
-                    name == "reject_naive_datetime",
+                    ["reject_naive_datetime", "reject_naive_datetime_nested"].contains(&name)
+                        && reason.starts_with("naive datetime"),
                     "[{name}] unexpected harness-level rejection: {reason}"
                 );
             }

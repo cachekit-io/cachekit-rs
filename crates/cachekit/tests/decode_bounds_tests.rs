@@ -5,17 +5,20 @@
 //! vector's bytes — plus the depth-bound boundary.
 //!
 //! Vectors: `tests/vectors/decode-bounds.json`, vendored verbatim from
-//! `cachekit-io/protocol` `test-vectors/decode-bounds.json` v1.1.0
-//! (sha256 `907b025d2b270a0f60abd9296a8a1c864e69057c553ac7a70206b44256558916`).
+//! `cachekit-io/protocol` `test-vectors/decode-bounds.json` v1.2.0
+//! (sha256 `c52c27f724fe138e63440dc0306936b48fe389e2bd823c058b86b30d854e2e2e`).
 //! Do not edit the JSON here; regenerate upstream and re-vendor.
 //!
 //! Every reject vector must fail with the structural guard's own error
 //! (`decode bound:` from `serializer::check_structure`), not merely fail: a
 //! stock decoder rejects the same bytes mid-decode, after it has materialised
 //! part of the document, so "it errored" cannot tell a guarded reader from an
-//! unguarded one. The client reads sit below the `#[cachekit]` macro's
-//! conversion of a `Serialization` error into a cache miss, so they still see
-//! the error itself. Why 100 and not rmp-serde's 1024, and why a header walk is
+//! unguarded one. The harness does not switch on `reject_reasons`: a vector
+//! tagged `depth`, `overclaim` or `incomplete` must fail in the guard alike,
+//! so a reason added upstream needs no new arm here. The client reads sit
+//! below the `#[cachekit]` macro's conversion of a `Serialization` error into
+//! a cache miss, so they still see the error itself. Why 100 and not
+//! rmp-serde's 1024, and why a header walk is
 //! needed at all: see the rustdoc on `serializer::MAX_DECODE_DEPTH` and
 //! `check_structure`. This file fails if a dependency bump (or a new decode
 //! path bypassing `bounded_deserializer`) re-opens either bound.
@@ -35,7 +38,7 @@ const VECTORS_JSON: &str = include_str!("vectors/decode-bounds.json");
 
 /// sha256 of the vendored file, pinned so a local edit cannot drift from the
 /// protocol copy unnoticed.
-const VECTORS_SHA256: &str = "907b025d2b270a0f60abd9296a8a1c864e69057c553ac7a70206b44256558916"; // pragma: allowlist secret
+const VECTORS_SHA256: &str = "c52c27f724fe138e63440dc0306936b48fe389e2bd823c058b86b30d854e2e2e"; // pragma: allowlist secret
 
 fn vectors() -> Json {
     serde_json::from_str(VECTORS_JSON).expect("vendored vector file must be valid JSON")
@@ -165,8 +168,8 @@ fn nested_fixarray_empty_leaf(depth: usize) -> Vec<u8> {
 #[test]
 fn vector_file_shape_is_the_vendored_one() {
     let v = vectors();
-    assert_eq!(v["version"], "1.1.0");
-    assert_eq!(v["reject_vectors"].as_array().map(Vec::len), Some(17));
+    assert_eq!(v["version"], "1.2.0");
+    assert_eq!(v["reject_vectors"].as_array().map(Vec::len), Some(19));
     assert_eq!(v["accept_vectors"].as_array().map(Vec::len), Some(3));
     assert_eq!(v["spec"], "spec/interop-mode.md#decode-bounds");
 }
