@@ -991,7 +991,7 @@ mod prebuilt_header_tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::expect_used)] // test-only: a stub-server failure should panic loudly
 mod http_client_tests {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1011,11 +1011,13 @@ mod http_client_tests {
     }
 
     /// A keep-alive HTTP/1.1 stub on loopback: answers every request `200`,
-    /// records each request's header lines, and counts accepted connections.
+    /// records each request's header lines and body, and counts accepted
+    /// connections.
     struct Stub {
         url: String,
         connections: Arc<Mutex<usize>>,
         requests: Arc<Mutex<Vec<Vec<String>>>>,
+        bodies: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     const OK: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
@@ -1031,12 +1033,13 @@ mod http_client_tests {
         let url = format!("http://{}/", listener.local_addr().expect("addr"));
         let connections = Arc::new(Mutex::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let (conns, reqs) = (connections.clone(), requests.clone());
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let (conns, reqs, bods) = (connections.clone(), requests.clone(), bodies.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
                 *conns.lock().expect("lock") += 1;
-                let reqs = reqs.clone();
+                let (reqs, bods) = (reqs.clone(), bods.clone());
                 std::thread::spawn(move || {
                     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
                     loop {
@@ -1051,6 +1054,19 @@ mod http_client_tests {
                             }
                             head.push(line.trim_end().to_owned());
                         }
+                        let len = head
+                            .iter()
+                            .find_map(|h| {
+                                let (name, value) = h.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        let mut body = vec![0; len];
+                        if reader.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                        bods.lock().expect("lock").push(body);
                         let n = {
                             let mut reqs = reqs.lock().expect("lock");
                             reqs.push(head);
@@ -1073,6 +1089,7 @@ mod http_client_tests {
             url,
             connections,
             requests,
+            bodies,
         }
     }
 
@@ -1088,6 +1105,39 @@ mod http_client_tests {
         client.get(&stub.url).send().await.expect("second GET");
         let n = *stub.connections.lock().expect("lock");
         n
+    }
+
+    #[tokio::test]
+    async fn refresh_ttl_sends_a_sub_second_ttl_as_one() {
+        use crate::backend::TtlInspectable;
+        let stub = stub();
+        let backend = backend_at(&stub);
+
+        let refreshed = backend
+            .refresh_ttl("k", Duration::from_millis(500))
+            .await
+            .expect("a sub-second TTL is sent, not rejected");
+
+        assert!(refreshed);
+        let requests = stub.requests.lock().expect("lock");
+        let head = &requests[0];
+        assert!(head[0].starts_with("PATCH /v1/cache/k/ttl "), "{head:?}");
+        assert_eq!(stub.bodies.lock().expect("lock")[0], br#"{"ttl":1}"#);
+    }
+
+    #[tokio::test]
+    async fn refresh_ttl_rejects_zero_before_sending() {
+        use crate::backend::TtlInspectable;
+        let stub = stub();
+        let backend = backend_at(&stub);
+
+        let err = backend
+            .refresh_ttl("k", Duration::ZERO)
+            .await
+            .expect_err("TTL 0 is an error");
+
+        assert_eq!(err.kind, BackendErrorKind::Permanent);
+        assert!(stub.requests.lock().expect("lock").is_empty());
     }
 
     #[tokio::test]
