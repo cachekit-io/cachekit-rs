@@ -965,12 +965,9 @@ async fn secure_get_rejects_a_decrypted_plaintext_with_trailing_bytes() {
 
 // ── Master-key length (spec/intent-presets.md § Master Key Input) ─────────────
 
+#[track_caller]
 fn assert_builder_config_err(result: Result<cachekit::CacheKitBuilder, CachekitError>, what: &str) {
-    match result {
-        Err(CachekitError::Config(_)) => {}
-        Err(e) => panic!("{what}: expected Config error, got {e:?}"),
-        Ok(_) => panic!("{what}: expected Config error, got Ok"),
-    }
+    assert_builder_config_err_naming(result, "", what);
 }
 
 /// Rule 4: a raw-bytes entry point takes exactly 32 bytes.

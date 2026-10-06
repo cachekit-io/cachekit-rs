@@ -1327,7 +1327,8 @@ impl CacheKitBuilder {
     ///
     /// The master key must be exactly 32 raw bytes; anything else is a
     /// [`CachekitError::Config`]. Hex-encoded keys go to [`Self::encryption`]
-    /// — their ASCII bytes are 64 bytes long and rejected here.
+    /// (or [`Self::encryption_with_previous`] to rotate) — their ASCII bytes
+    /// are 64 bytes long and rejected here.
     /// Keys are derived per-tenant via HKDF-SHA256.
     ///
     /// The built client encrypts every value read and write, not only those
@@ -1357,7 +1358,8 @@ impl CacheKitBuilder {
     /// At most 3 previous keys; supplying more is a config error, never
     /// truncated. See [`crate::encryption::EncryptionLayer::with_previous_keys`].
     ///
-    /// Every key, current and previous, must be exactly 32 raw bytes.
+    /// Every key, current and previous, must be exactly 32 raw bytes. For
+    /// hex keys, use the hex counterpart, [`Self::encryption_with_previous`].
     ///
     /// Encrypts every value read and write, as for
     /// [`Self::encryption_from_bytes`].
@@ -1397,9 +1399,10 @@ impl CacheKitBuilder {
     /// The hex counterpart of [`Self::encryption_from_bytes_with_previous`].
     /// Every key, current and previous, is decoded as for [`Self::encryption`]
     /// and must decode to at least 32 bytes, so a key longer than 32 bytes
-    /// that [`Self::encryption`] accepted can be listed as a previous key for
-    /// any tenant. Use exactly 32 bytes (64 hex chars) for new keys, the only
-    /// length every SDK accepts.
+    /// that [`Self::encryption`] accepted can be listed as a previous key
+    /// under the tenant it was written for (the env variables always derive
+    /// for tenant `"default"`). Use exactly 32 bytes (64 hex chars) for new
+    /// keys, the only length every SDK accepts.
     ///
     /// Writes encrypt under `hex_key`; reads attempt it first, then each key
     /// in `previous_hex_keys` sequentially (attempt order = slice order).
