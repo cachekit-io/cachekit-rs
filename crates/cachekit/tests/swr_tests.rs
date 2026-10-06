@@ -561,28 +561,15 @@ async fn str_argument_refreshes_in_the_background() {
 
 // ── a custom error type refreshes too ────────────────────────────────────────
 
-/// The function's own error type: anything with `From<CachekitError>`.
-#[derive(Debug)]
-enum AppError {
-    // Only constructed here: the cache layer never fails in this test.
-    #[allow(dead_code)]
-    Cache(CachekitError),
-    Origin,
-}
-
-impl From<CachekitError> for AppError {
-    fn from(e: CachekitError) -> Self {
-        Self::Cache(e)
-    }
-}
-
 static APP_ERROR_CALLS: AtomicU32 = AtomicU32::new(0);
 
+// `Box<dyn Error>` is not `Send`, yet the refresh future must be: this
+// compiles only because the refresh drops the body's error before it awaits.
 #[cachekit(client = cache, ttl = 4, interop = "swr_app_error", namespace = "swrtest")]
-async fn swr_app_error(cache: &CacheKit, id: u64) -> Result<String, AppError> {
+async fn swr_app_error(cache: &CacheKit, id: u64) -> Result<String, Box<dyn std::error::Error>> {
     let n = APP_ERROR_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
     if n > 1 {
-        return Err(AppError::Origin);
+        return Err("origin failed".into());
     }
     Ok(format!("e{id}-c{n}"))
 }

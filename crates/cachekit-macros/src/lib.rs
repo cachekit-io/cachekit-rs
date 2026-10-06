@@ -273,8 +273,11 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   The refresh task needs a tokio runtime (skipped otherwise — the stale
 ///   value was already served) and captures arguments by owned copy
 ///   (`Clone`/`ToOwned` — already required for key derivation); the future
-///   must be `Send`. Refresh failures are absorbed: the stale value keeps
-///   serving until hard expiry, where the blocking path surfaces errors.
+///   must be `Send`, so `T` and anything the body holds across an `.await`
+///   must be too. `E` need not be: the refresh drops the body's error before
+///   it awaits again, so `Box<dyn Error>` works. Refresh failures are
+///   absorbed: the stale value keeps serving until hard expiry, where the
+///   blocking path surfaces errors.
 /// - **Graceful degradation**: on an outage-class backend failure —
 ///   transient, timeout, an open circuit breaker, or a backpressure shed —
 ///   the plain path fails *open*: the function executes uncached and its
@@ -562,17 +565,18 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                         let #client_ident = &__ck_swr_client;
                         let __ck_key = __ck_swr_key;
                         #swr_rebinds
-                        // Typed by the function's own error type, inferred
-                        // from `__ck_result` (so a one-argument `Result`
-                        // alias works too): cache-layer errors inside the
-                        // block convert through `From<CachekitError>`.
-                        let _ = async {
+                        let _: ::std::result::Result<(), cachekit::error::CachekitError> = async {
                             let Some(__ck_flight) = #client_ident.__refresh_flight(&__ck_key).await else {
                                 // Another worker is already filling this key.
                                 return Ok(());
                             };
                             let __ck_result: #ret_ty = (async #original_body).await;
-                            if let Ok(ref __ck_val) = __ck_result {
+                            // Drop the body's error here, before the next
+                            // await: holding it across one would demand
+                            // `E: Send` of the spawned refresh, and
+                            // `Box<dyn Error>` is not.
+                            let __ck_ok = __ck_result.ok();
+                            if let Some(ref __ck_val) = __ck_ok {
                                 // Commit only if no newer set/delete replaced
                                 // the stale entry while the origin ran. A lost
                                 // version check is `Ok(false)`, not a failure;
@@ -584,7 +588,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                                 }
                             }
                             __ck_flight.release().await;
-                            __ck_result.map(|_| ())
+                            Ok(())
                         }
                         .await;
                     });
