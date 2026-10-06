@@ -262,7 +262,7 @@ let cache = CacheKit::secure_from_env("redis://localhost:6379").await?.build()?;
 // Or explicitly on the client builder, for any tenant, with hex keys
 // (each decodes to at least 32 bytes, as for `.encryption()`):
 let cache = CacheKit::builder()
-    .backend(backend)
+    .backend(backend.clone())
     .encryption_with_previous(&k2_hex, &[&k1_hex], "tenant")?
     .build()?;
 
