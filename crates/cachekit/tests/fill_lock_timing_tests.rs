@@ -340,8 +340,8 @@ async fn err_result_keeps_the_unlock_inline() {
 
 /// A same-key re-call that misses while this client's unlock is still in
 /// flight sends the unlock itself, without waiting for the in-flight one,
-/// then leads: it never contests its own lease and polls an empty cache
-/// until the deadline.
+/// then leads, instead of contesting its own lease and polling an empty
+/// cache until the deadline.
 #[tokio::test(start_paused = true)]
 async fn re_miss_inside_the_unlock_window_leads_instead_of_polling() {
     let mut backend = Timed::new();
@@ -382,7 +382,10 @@ async fn re_miss_inside_the_unlock_window_leads_instead_of_polling() {
 }
 
 /// Once the backend has answered the detached unlock, a re-miss sends no
-/// unlock of its own.
+/// unlock of its own. Here that holds because the answer frees the key's
+/// entry, so the re-miss starts fresh; the unit test
+/// `an_answered_unlock_is_not_resent_while_the_entry_lives` in `flight.rs`
+/// covers an entry that outlives the answer.
 #[tokio::test(start_paused = true)]
 async fn re_miss_after_the_unlock_was_answered_sends_no_unlock() {
     let backend = Timed::new();
@@ -587,5 +590,7 @@ fn dropped_per_call_runtimes_release_their_file_descriptors() {
     }
     let after = open_fds().expect("counted before");
     println!("100 per-call runtimes: {before} -> {after} open fds");
-    assert!(after <= before + 16, "fds retained: {before} -> {after}");
+    // The count is process-wide and other tests run in parallel; the leak
+    // this guards against held about 180 fds per 100 calls.
+    assert!(after < before + 100, "fds retained: {before} -> {after}");
 }
