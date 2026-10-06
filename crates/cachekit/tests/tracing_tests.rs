@@ -605,6 +605,16 @@ mod macro_store {
 
         let key = interop_key("store", "refresh", &[InteropValue::from(7u64)]).expect("key");
         let hash = format!("key_hash={}", key_hash(&key));
+        // Pin the path: a cold-miss fill emits the same store-error line.
+        assert!(
+            has(
+                &capture.lines(),
+                "cachekit DEBUG",
+                &["op=get", "outcome=l1_stale", &hash]
+            ),
+            "second call was not a stale hit: {:?}",
+            capture.lines()
+        );
         let needles = ["op=set", "error_kind=permanent", hash.as_str()];
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while !has(&capture.lines(), "cachekit DEBUG", &needles) {

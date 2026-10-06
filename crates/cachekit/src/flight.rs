@@ -118,15 +118,56 @@ struct Entries {
     /// Sweep dead slots once the map grows past this: twice what the last
     /// sweep left, so a large live set does not make every miss O(n).
     sweep_above: usize,
+    /// When the last sweep ran. A sweep during a cold-key burst counts the
+    /// burst's flights as survivors, so the doubling alone would keep their
+    /// dead slots until the map doubles again; a sweep older than one lease
+    /// timeout, when every pin it saw has expired, is redone on the next miss.
+    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+    swept_at: Option<tokio::time::Instant>,
+}
+
+impl Entries {
+    fn sweep_due(&self) -> bool {
+        let len = self.slots.len();
+        if len <= SWEEP_THRESHOLD {
+            return false;
+        }
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        if self
+            .swept_at
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(FILL_LOCK_TIMEOUT_MS))
+        {
+            return true;
+        }
+        len > self.sweep_above
+    }
+
+    fn sweep(&mut self) {
+        self.slots.retain(|_, slot| {
+            #[cfg(all(
+                feature = "reliability",
+                feature = "l1",
+                not(feature = "unsync"),
+                not(target_arch = "wasm32")
+            ))]
+            slot.expire_pin();
+            slot.entry.strong_count() > 0
+        });
+        self.sweep_above = 2 * self.slots.len();
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        {
+            self.swept_at = Some(tokio::time::Instant::now());
+        }
+    }
 }
 
 struct Slot {
     entry: Weak<tokio::sync::Mutex<KeyState>>,
-    /// Keeps the entry, and with it a pending unlock, alive for at least one
-    /// lease timeout after a leader detached its unlock, so a re-miss finds
-    /// the unlock even when its task was cancelled with its runtime. The
-    /// task drops the pin once the backend answers; the sweep drops expired
-    /// ones.
+    /// Keeps the entry, and with it a pending unlock, alive after a leader
+    /// detached its unlock, so a re-miss finds the unlock even when its task
+    /// was cancelled with its runtime: until the backend answers the unlock
+    /// or, failing that, at least one lease timeout. An expired pin goes at
+    /// the next sweep.
     #[cfg(all(
         feature = "reliability",
         feature = "l1",
@@ -149,15 +190,14 @@ struct Pin {
     _entry: Arc<tokio::sync::Mutex<KeyState>>,
 }
 
+#[cfg(all(
+    feature = "reliability",
+    feature = "l1",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
 impl Slot {
-    /// Drop an expired pin; `true` while anything still holds the entry.
-    fn live(&mut self) -> bool {
-        #[cfg(all(
-            feature = "reliability",
-            feature = "l1",
-            not(feature = "unsync"),
-            not(target_arch = "wasm32")
-        ))]
+    fn expire_pin(&mut self) {
         if self
             .pin
             .as_ref()
@@ -165,7 +205,6 @@ impl Slot {
         {
             self.pin = None;
         }
-        self.entry.strong_count() > 0
     }
 }
 
@@ -227,12 +266,11 @@ impl PendingRelease {
 impl FlightMap {
     fn handle(&self, key: &str) -> Arc<tokio::sync::Mutex<KeyState>> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        // ponytail: O(n) sweep, amortised by doubling; a doubly-indexed
-        // structure is not worth it until someone caches millions of
-        // distinct cold keys.
-        if entries.slots.len() > entries.sweep_above.max(SWEEP_THRESHOLD) {
-            entries.slots.retain(|_, slot| slot.live());
-            entries.sweep_above = 2 * entries.slots.len();
+        // ponytail: O(n) sweep, amortised by doubling and at most one per
+        // lease timeout otherwise; a doubly-indexed structure is not worth it
+        // until someone caches millions of distinct cold keys.
+        if entries.sweep_due() {
+            entries.sweep();
         }
         if let Some(existing) = entries.slots.get(key).and_then(|slot| slot.entry.upgrade()) {
             return existing;
@@ -754,5 +792,125 @@ async fn release_lock(backend: &SharedBackend, full_key: &str, lock_id: &str) ->
             crate::metrics::trace_lock_error(full_key, "unlock", &err);
             false
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "reliability",
+    feature = "l1",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::backend::{Backend, HealthStatus, LockableBackend};
+    use crate::error::BackendError;
+
+    /// Grants every lock at once and counts unlocks.
+    #[derive(Default)]
+    struct Locks {
+        unlocks: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Backend for Locks {
+        async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+            Ok(None)
+        }
+        async fn set(
+            &self,
+            _key: &str,
+            _value: Vec<u8>,
+            _ttl: Option<std::time::Duration>,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+            Ok(false)
+        }
+        async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+            Ok(false)
+        }
+        async fn health(&self) -> Result<HealthStatus, BackendError> {
+            Ok(HealthStatus {
+                is_healthy: true,
+                latency_ms: 0.0,
+                backend_type: "locks".to_owned(),
+                details: HashMap::new(),
+            })
+        }
+        fn as_lockable(&self) -> Option<&dyn LockableBackend> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl LockableBackend for Locks {
+        async fn acquire_lock(
+            &self,
+            _key: &str,
+            _timeout_ms: u64,
+        ) -> Result<Option<String>, BackendError> {
+            Ok(Some("lease".to_owned()))
+        }
+        async fn release_lock(&self, _key: &str, _lock_id: &str) -> Result<bool, BackendError> {
+            self.unlocks.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
+    /// A cold-key burst's dead slots go within a lease timeout of the burst,
+    /// though the sweep during it counted them as live.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_dead_slots_is_swept_after_a_lease_timeout() {
+        let map = FlightMap::default();
+        let burst: Vec<_> = (0..200)
+            .map(|i| map.handle(&format!("burst:{i}")))
+            .collect();
+        drop(burst);
+
+        map.handle("early");
+        assert!(
+            map.entries.lock().unwrap().slots.len() > 200,
+            "swept before a lease timeout"
+        );
+
+        tokio::time::advance(std::time::Duration::from_millis(FILL_LOCK_TIMEOUT_MS)).await;
+        map.handle("late");
+        assert!(
+            map.entries.lock().unwrap().slots.len() <= 2,
+            "dead slots retained"
+        );
+    }
+
+    /// While something else holds the key's entry, so it survives the unpin, a
+    /// re-miss does not re-send an unlock the backend already answered.
+    #[tokio::test(start_paused = true)]
+    async fn an_answered_unlock_is_not_resent_while_the_entry_lives() {
+        let locks = Arc::new(Locks::default());
+        let backend: SharedBackend = locks.clone();
+        let map: crate::client::SharedFlight = Arc::default();
+        let _held = map.handle("k");
+
+        SingleFlight::acquire(&map, &backend, "k")
+            .await
+            .__release_detached()
+            .await;
+        while locks.unlocks.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let flight = SingleFlight::acquire(&map, &backend, "k").await;
+        assert_eq!(flight.lock_id.as_deref(), Some("lease"));
+        assert_eq!(
+            locks.unlocks.load(Ordering::SeqCst),
+            1,
+            "answered unlock re-sent"
+        );
     }
 }

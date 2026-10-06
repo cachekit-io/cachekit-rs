@@ -237,7 +237,10 @@ pub trait LockableBackend: Backend {
     ) -> Result<Option<String>, BackendError>;
     /// Release a distributed lock. Returns true if released. Must release
     /// only if `lock_id` still owns the lock: a late or duplicate release
-    /// must never free a lock acquired since.
+    /// must never free a lock acquired since. Return `Ok(false)` when
+    /// `lock_id` no longer owns the lock; `Err` only when the outcome is
+    /// unknown. The single-flight takes `Ok` as answered and never re-sends
+    /// it, and re-sends after an `Err` on the key's next lock attempt.
     async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError>;
 }
 
@@ -253,7 +256,10 @@ pub trait LockableBackend: Backend {
     ) -> Result<Option<String>, BackendError>;
     /// Release a distributed lock. Returns true if released. Must release
     /// only if `lock_id` still owns the lock: a late or duplicate release
-    /// must never free a lock acquired since.
+    /// must never free a lock acquired since. Return `Ok(false)` when
+    /// `lock_id` no longer owns the lock; `Err` only when the outcome is
+    /// unknown. The single-flight takes `Ok` as answered and never re-sends
+    /// it, and re-sends after an `Err` on the key's next lock attempt.
     async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError>;
 }
 

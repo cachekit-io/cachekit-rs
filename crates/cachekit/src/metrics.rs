@@ -292,8 +292,10 @@ pub(crate) fn trace_lock_error(full_key: &str, op: &'static str, err: &crate::Ba
 
 /// Emit the event for a `#[cachekit]` result the macro computed but could not
 /// store: a cold-miss fill, or an SWR refresh whose commit failed. Macro
-/// plumbing: the call still returns its result, so this is the only signal of
-/// a failing store — otherwise it shows only as repeat misses or refreshes.
+/// plumbing. A cold-miss call still returns its result; a failed refresh
+/// commit is dropped and the stale value keeps being served. Either way this
+/// is the only signal of a failing store — otherwise it shows only as repeat
+/// misses or refreshes.
 /// The macro stores only on an un-namespaced client, so `key` is the storage
 /// key. Like the lock-error event, it carries the error's kind, never
 /// its message: a transport error names the request URL, and an invalid-key
