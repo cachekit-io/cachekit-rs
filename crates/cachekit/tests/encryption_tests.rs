@@ -596,6 +596,134 @@ async fn rotation_drain_signal_is_visible_on_secure_cache() {
     );
 }
 
+/// The hex rotation path: an entry written under a 48-byte key for a
+/// non-default tenant stays readable after a fresh 32-byte key is promoted,
+/// with the 48-byte key listed as previous. The raw-bytes path cannot do this
+/// (its keys are exactly 32 bytes), nor can the env path (tenant "default").
+#[tokio::test]
+async fn hex_rotation_reads_a_48_byte_key_entry_for_a_custom_tenant() {
+    const TENANT: &str = "tenant-a";
+    let old_hex = "11".repeat(48);
+    let new_hex = "22".repeat(32);
+    let backend = MockBackend::shared();
+    let client = |configure: &dyn Fn(
+        cachekit::CacheKitBuilder,
+    ) -> Result<cachekit::CacheKitBuilder, CachekitError>| {
+        let builder = CacheKit::builder()
+            .backend(backend.clone())
+            .default_ttl(Duration::from_secs(60))
+            .no_l1();
+        configure(builder)
+            .expect("encryption setup")
+            .build()
+            .expect("client builds")
+    };
+    let secret = plain_secret();
+
+    let writer = client(&|b| b.encryption(&old_hex, TENANT));
+    writer.set("rotate:old", &secret).await.unwrap();
+
+    let rotated = client(&|b| b.encryption_with_previous(&new_hex, &[&old_hex], TENANT));
+    assert_eq!(
+        rotated.get::<Secret>("rotate:old").await.unwrap(),
+        Some(secret.clone()),
+        "the 48-byte-key entry must stay readable after rotation"
+    );
+    assert_eq!(
+        rotated.secure_cache().unwrap().previous_key_hits(),
+        vec![1],
+        "the read was served by the previous key"
+    );
+
+    // Writes use the new key alone: a client holding only it reads them,
+    // and a client holding only the old key does not.
+    rotated.set("rotate:new", &secret).await.unwrap();
+    let new_only = client(&|b| b.encryption(&new_hex, TENANT));
+    assert_eq!(
+        new_only.get::<Secret>("rotate:new").await.unwrap(),
+        Some(secret.clone()),
+        "a write after rotation must decrypt under the new key alone"
+    );
+    let old_only = client(&|b| b.encryption(&old_hex, TENANT));
+    let result = old_only.get::<Secret>("rotate:new").await;
+    assert!(
+        matches!(result, Err(CachekitError::Encryption(_))),
+        "a write after rotation must not be under the old key, got {result:?}"
+    );
+}
+
+#[track_caller]
+fn assert_builder_config_err_naming(
+    result: Result<cachekit::CacheKitBuilder, CachekitError>,
+    names: &str,
+    what: &str,
+) {
+    match result {
+        Err(CachekitError::Config(msg)) => {
+            assert!(
+                msg.contains(names),
+                "{what}: Config error must name {names:?}, got: {msg}"
+            )
+        }
+        Err(e) => panic!("{what}: expected Config error, got {e:?}"),
+        Ok(_) => panic!("{what}: expected Config error, got Ok"),
+    }
+}
+
+/// `encryption_with_previous` keeps the keyring rules of the hex env path,
+/// each a Config error at construction.
+#[test]
+fn encryption_with_previous_enforces_the_keyring_rules() {
+    let current = "22".repeat(32);
+    let (k1, k2, k3, k4) = (
+        "11".repeat(32),
+        "33".repeat(32),
+        "44".repeat(48),
+        "55".repeat(32),
+    );
+    let ok = |prev: &[&str], tenant: &str| {
+        CacheKit::builder().encryption_with_previous(&current, prev, tenant)
+    };
+
+    assert!(
+        ok(&[&k1, &k2, &k3], "t").is_ok(),
+        "3 previous keys are allowed"
+    );
+    assert!(ok(&[], "t").is_ok(), "no previous keys is allowed");
+    assert!(
+        ok(&[&k1], &"t".repeat(255)).is_ok(),
+        "a 255-byte tenant is allowed"
+    );
+
+    assert_builder_config_err_naming(ok(&[&k1, &k2, &k3, &k4], "t"), "keyring", "4 previous keys");
+    assert_builder_config_err_naming(
+        ok(&[&k1, &current], "t"),
+        "keyring",
+        "current key among previous",
+    );
+    assert_builder_config_err_naming(ok(&[&k1], ""), "tenant_id", "empty tenant");
+    assert_builder_config_err_naming(ok(&[&k1], &"t".repeat(256)), "tenant_id", "256-byte tenant");
+
+    for (bad, why) in [
+        ("11".repeat(31), "31-byte previous key"),
+        ("zz".repeat(32), "non-hex previous key"),
+        ("1".repeat(65), "odd-length previous key"),
+        (String::new(), "empty previous key"),
+    ] {
+        assert_builder_config_err_naming(ok(&[&k1, &bad], "t"), "previous master key 1", why);
+    }
+    for (bad, why) in [
+        ("11".repeat(31), "31-byte current key"),
+        ("zz".repeat(32), "non-hex current key"),
+    ] {
+        assert_builder_config_err_naming(
+            CacheKit::builder().encryption_with_previous(&bad, &[&k1], "t"),
+            "master key",
+            why,
+        );
+    }
+}
+
 // ── Plain methods on an encrypted client ──────────────────────────────────────
 //
 // protocol spec/intent-presets.md § Encryption Activation, rule 1: an explicit
@@ -606,7 +734,7 @@ type Configure = fn(cachekit::CacheKitBuilder) -> Result<cachekit::CacheKitBuild
 
 /// Every builder encryption spelling, each with the same key and tenant, so
 /// one independently built layer decrypts whatever any of them stores.
-const SPELLINGS: [(&str, Configure); 3] = [
+const SPELLINGS: [(&str, Configure); 4] = [
     ("encryption", |b| {
         b.encryption(&test_master_key_hex(), "test-tenant")
     }),
@@ -615,6 +743,9 @@ const SPELLINGS: [(&str, Configure); 3] = [
     }),
     ("encryption_from_bytes_with_previous", |b| {
         b.encryption_from_bytes_with_previous(TEST_MASTER_KEY, &[&[0x11; 32]], "test-tenant")
+    }),
+    ("encryption_with_previous", |b| {
+        b.encryption_with_previous(&test_master_key_hex(), &[&"11".repeat(32)], "test-tenant")
     }),
 ];
 

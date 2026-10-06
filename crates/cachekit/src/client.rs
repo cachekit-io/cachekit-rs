@@ -1391,6 +1391,52 @@ impl CacheKitBuilder {
         self.encryption_from_hex_decoded(&bytes, &[], tenant_id)
     }
 
+    /// Configure encryption from hex-encoded keys, with decrypt-only previous
+    /// master keys for key rotation.
+    ///
+    /// The hex counterpart of [`Self::encryption_from_bytes_with_previous`].
+    /// Every key, current and previous, is decoded as for [`Self::encryption`]
+    /// and must decode to at least 32 bytes, so a key longer than 32 bytes
+    /// that [`Self::encryption`] accepted can be listed as a previous key for
+    /// any tenant. Use exactly 32 bytes (64 hex chars) for new keys, the only
+    /// length every SDK accepts.
+    ///
+    /// Writes encrypt under `hex_key`; reads attempt it first, then each key
+    /// in `previous_hex_keys` sequentially (attempt order = slice order).
+    /// At most 3 previous keys, and the current key must not be among them;
+    /// either violation is a [`CachekitError::Config`], never truncated.
+    ///
+    /// ```no_run
+    /// # fn demo(backend: cachekit::client::SharedBackend, k2_hex: &str, k1_hex: &str)
+    /// #     -> Result<(), cachekit::CachekitError> {
+    /// let cache = cachekit::CacheKit::builder()
+    ///     .backend(backend)
+    ///     .encryption_with_previous(k2_hex, &[k1_hex], "tenant-a")?
+    ///     .build()?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Encrypts every value read and write, as for
+    /// [`Self::encryption_from_bytes`].
+    #[cfg(feature = "encryption")]
+    pub fn encryption_with_previous(
+        self,
+        hex_key: &str,
+        previous_hex_keys: &[&str],
+        tenant_id: &str,
+    ) -> Result<Self, CachekitError> {
+        let current = crate::config::decode_master_key_hex(hex_key, "master key")?;
+        let previous = previous_hex_keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                crate::config::decode_master_key_hex(key, &format!("previous master key {i}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let previous: Vec<&[u8]> = previous.iter().map(|key| key.as_slice()).collect();
+        self.encryption_from_hex_decoded(&current, &previous, tenant_id)
+    }
+
     /// Shared tail of the hex paths: keys already validated by
     /// `decode_master_key_hex`, so the `>= 32` floor applies, not the
     /// raw-bytes exactly-32 rule.
@@ -1445,6 +1491,18 @@ impl CacheKitBuilder {
     #[cfg(not(feature = "encryption"))]
     pub fn encryption(self, _hex_key: &str, _tenant_id: &str) -> Result<Self, CachekitError> {
         Err(encryption_feature_missing(".encryption()"))
+    }
+
+    /// Always [`CachekitError::Config`]: this build has no `encryption`
+    /// feature.
+    #[cfg(not(feature = "encryption"))]
+    pub fn encryption_with_previous(
+        self,
+        _hex_key: &str,
+        _previous_hex_keys: &[&str],
+        _tenant_id: &str,
+    ) -> Result<Self, CachekitError> {
+        Err(encryption_feature_missing(".encryption_with_previous()"))
     }
 
     /// Finalise and build the [`CacheKit`] client.

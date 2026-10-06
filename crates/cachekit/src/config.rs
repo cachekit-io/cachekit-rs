@@ -217,6 +217,8 @@ impl CachekitConfigBuilder {
     ///
     /// * `CacheKit::from_env()` and `CacheKit::secure_from_env()` read them
     ///   from `CACHEKIT_PREVIOUS_MASTER_KEYS`.
+    /// * `CacheKitBuilder::encryption_with_previous()` takes them as hex
+    ///   arguments, validated as this method validates them, for any tenant.
     /// * `CacheKitBuilder::encryption_from_bytes_with_previous()` takes them
     ///   as arguments. It requires every key to be exactly 32 raw bytes,
     ///   while this method accepts hex that decodes to 32 bytes or more.
@@ -224,9 +226,8 @@ impl CachekitConfigBuilder {
     /// Without the `encryption` feature no path accepts a master key, so
     /// none can silently drop one: `CacheKit::secure_from_env()` does not
     /// exist, `CacheKit::from_env()` returns [`CachekitError::Config`] when
-    /// `CACHEKIT_MASTER_KEY` is set, and
-    /// `CacheKitBuilder::encryption_from_bytes_with_previous()` always
-    /// returns [`CachekitError::Config`].
+    /// `CACHEKIT_MASTER_KEY` is set, and both builder methods always
+    /// return [`CachekitError::Config`].
     ///
     /// Validation is identical to [`Self::master_key`] per entry (valid hex,
     /// at least 32 bytes). At most [`MAX_PREVIOUS_MASTER_KEYS`] entries —
