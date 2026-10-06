@@ -123,6 +123,31 @@ fn builder_encryption_rejects_every_hex_reject_row() {
 }
 
 #[test]
+fn builder_encryption_with_previous_rejects_every_hex_reject_row() {
+    let accept = accept_hex();
+    assert!(CacheKit::builder()
+        .encryption_with_previous(&accept, &[OTHER_KEY_HEX], TENANT)
+        .is_ok());
+    assert!(CacheKit::builder()
+        .encryption_with_previous(OTHER_KEY_HEX, &[&accept], TENANT)
+        .is_ok());
+    for (row, key) in reject_rows() {
+        assert_config_err(
+            CacheKit::builder().encryption_with_previous(&key, &[OTHER_KEY_HEX], TENANT),
+            "master key",
+            &row,
+            "CacheKitBuilder::encryption_with_previous (current)",
+        );
+        assert_config_err(
+            CacheKit::builder().encryption_with_previous(OTHER_KEY_HEX, &[&key], TENANT),
+            "previous master key 0",
+            &row,
+            "CacheKitBuilder::encryption_with_previous (previous)",
+        );
+    }
+}
+
+#[test]
 fn config_builder_rejects_every_hex_reject_row() {
     let accept = accept_hex();
     assert!(CachekitConfigBuilder::new()

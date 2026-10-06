@@ -82,7 +82,8 @@ impl EncryptionLayer {
     /// the only length every CacheKit SDK accepts. Pass the decoded key, never
     /// the ASCII bytes of a hex string (64 bytes, which would derive a key no
     /// other SDK derives); hex keys go through
-    /// [`CacheKitBuilder::encryption`](crate::client::CacheKitBuilder::encryption).
+    /// [`CacheKitBuilder::encryption_with_previous`](crate::client::CacheKitBuilder::encryption_with_previous),
+    /// the hex counterpart for rotation.
     ///
     /// # Errors
     /// - Any key not exactly 32 bytes ([`CachekitError::Config`])

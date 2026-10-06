@@ -38,6 +38,10 @@ fn every_builder_encryption_method_is_a_config_error() {
         CacheKit::builder().encryption_from_bytes_with_previous(&key, &[&[8u8; 32]], "t"),
         ".encryption_from_bytes_with_previous()",
     );
+    assert_feature_missing(
+        CacheKit::builder().encryption_with_previous(&"07".repeat(32), &[&"08".repeat(32)], "t"),
+        ".encryption_with_previous()",
+    );
 }
 
 #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]

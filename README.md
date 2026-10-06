@@ -41,7 +41,7 @@
 | Feature | Default | Description |
 |:--------|:-------:|:------------|
 | `cachekitio` | ✅ | HTTP backend for [api.cachekit.io](https://api.cachekit.io) via [reqwest](https://crates.io/crates/reqwest) + rustls |
-| `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core). Without it, every builder encryption call (`.encryption()`, `.encryption_from_bytes()`, `.encryption_from_bytes_with_previous()`) returns a config error, and so does `from_env()` with `CACHEKIT_MASTER_KEY` set |
+| `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core). Without it, every builder encryption call (`.encryption()`, `.encryption_with_previous()`, `.encryption_from_bytes()`, `.encryption_from_bytes_with_previous()`) returns a config error, and so does `from_env()` with `CACHEKIT_MASTER_KEY` set |
 | `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka), with stale-while-revalidate (native). Not supported on `wasm32-unknown-unknown` (compile error: no clock there) |
 | `reliability` | ✅ | Retry with backoff + jitter, circuit breaker, backpressure, distributed fill locks (native only) |
 | `redis` | ❌ | Redis backend via [fred](https://crates.io/crates/fred) (native only) |
@@ -187,7 +187,7 @@ permanent error. On wasm32, use the [Workers backend](#cloudflare-workers).
 
 ## Zero-Knowledge Encryption
 
-Configure a master key — the `secure` preset, or `.encryption()` / `.encryption_from_bytes()` / `.encryption_from_bytes_with_previous()` on any builder — and every value the client reads or writes is encrypted client-side with AES-256-GCM before it reaches any cache layer. `get`, `set`, `set_with_ttl`, `interop_get`, `interop_get_swr` and `#[cachekit]` functions all encrypt; the backend and L1 only ever see ciphertext. `delete` and `exists` carry no value.
+Configure a master key — the `secure` preset, or `.encryption()` / `.encryption_with_previous()` / `.encryption_from_bytes()` / `.encryption_from_bytes_with_previous()` on any builder — and every value the client reads or writes is encrypted client-side with AES-256-GCM before it reaches any cache layer. `get`, `set`, `set_with_ttl`, `interop_get`, `interop_get_swr` and `#[cachekit]` functions all encrypt; the backend and L1 only ever see ciphertext. `delete` and `exists` carry no value.
 
 ```rust
 // Env: CACHEKIT_MASTER_KEY=<64 hex chars>
@@ -259,13 +259,22 @@ let cache = CacheKit::from_env()?.build()?;
 // The Redis `secure` preset reads the same two variables:
 let cache = CacheKit::secure_from_env("redis://localhost:6379").await?.build()?;
 
-// Or explicitly on the client builder, with exactly 32 raw bytes per key
+// Or explicitly on the client builder, for any tenant, with hex keys
+// (each decodes to at least 32 bytes, as for `.encryption()`):
+let cache = CacheKit::builder()
+    .backend(backend.clone())
+    .encryption_with_previous(&k2_hex, &[&k1_hex], "tenant")?
+    .build()?;
+
+// Or with exactly 32 raw bytes per key
 // (decoded, never the ASCII of a hex string; any other length is an error):
 let cache = CacheKit::builder()
     .backend(backend)
     .encryption_from_bytes_with_previous(&k2_bytes, &[&k1_bytes], "tenant")?
     .build()?;
 ```
+
+Use exactly 32-byte keys (64 hex chars), the only length every SDK accepts. A longer key that `.encryption(hex, tenant)` accepted can still be retired: list it as a previous key in `.encryption_with_previous()` for the same tenant. The env variables always derive for tenant `"default"`, and the raw-bytes method takes only 32-byte keys.
 
 Rotation is forward-only: a retired key is never re-promoted (re-promoting would resume a used AES-GCM nonce budget), and a config listing the current key among the previous keys is rejected at load. For the three-phase zero-miss rollout and compromise response, see the [key rotation runbook](https://docs.cachekit.io/concepts/key-rotation/).
 
