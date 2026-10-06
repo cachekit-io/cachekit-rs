@@ -559,6 +559,62 @@ async fn str_argument_refreshes_in_the_background() {
     assert_eq!(swr_str_probe(&cache, "ada").await.unwrap(), "ada-c2");
 }
 
+// ── a custom error type refreshes too ────────────────────────────────────────
+
+/// The function's own error type: anything with `From<CachekitError>`.
+#[derive(Debug)]
+enum AppError {
+    // Only constructed here: the cache layer never fails in this test.
+    #[allow(dead_code)]
+    Cache(CachekitError),
+    Origin,
+}
+
+impl From<CachekitError> for AppError {
+    fn from(e: CachekitError) -> Self {
+        Self::Cache(e)
+    }
+}
+
+static APP_ERROR_CALLS: AtomicU32 = AtomicU32::new(0);
+
+#[cachekit(client = cache, ttl = 4, interop = "swr_app_error", namespace = "swrtest")]
+async fn swr_app_error(cache: &CacheKit, id: u64) -> Result<String, AppError> {
+    let n = APP_ERROR_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+    if n > 1 {
+        return Err(AppError::Origin);
+    }
+    Ok(format!("e{id}-c{n}"))
+}
+
+/// A stale read of a function with its own error type schedules the refresh,
+/// and an origin `Err` during that refresh is absorbed: the stale value keeps
+/// being served, and the failed refresh releases its flight, so the next
+/// stale read schedules another one.
+#[tokio::test]
+async fn refresh_absorbs_a_custom_origin_error() {
+    let cache = client(MockBackend::shared());
+
+    assert_eq!(swr_app_error(&cache, 3).await.unwrap(), "e3-c1");
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+
+    // Stale: served at once; the background refresh fails at the origin.
+    assert_eq!(swr_app_error(&cache, 3).await.unwrap(), "e3-c1");
+    eventually("the first refresh", || {
+        APP_ERROR_CALLS.load(Ordering::SeqCst) == 2
+    })
+    .await;
+
+    // Still the stale value, not the refresh's error, and a second refresh
+    // runs: the failed one did not leave the key's flight held.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(swr_app_error(&cache, 3).await.unwrap(), "e3-c1");
+    eventually("the second refresh", || {
+        APP_ERROR_CALLS.load(Ordering::SeqCst) == 3
+    })
+    .await;
+}
+
 // ── config validation ────────────────────────────────────────────────────────
 
 #[tokio::test]

@@ -161,7 +161,7 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
         ReturnType::Default => {
             return Err(syn::Error::new_spanned(
                 ret,
-                "#[cachekit] function must return Result<T, CachekitError>",
+                "#[cachekit] function must return Result<T, E> where E: From<CachekitError>",
             ));
         }
     };
@@ -172,7 +172,7 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
             if seg.ident != "Result" {
                 return Err(syn::Error::new_spanned(
                     ty,
-                    "#[cachekit] function must return Result<T, CachekitError>",
+                    "#[cachekit] function must return Result<T, E> where E: From<CachekitError>",
                 ));
             }
             if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
@@ -185,7 +185,7 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 
     Err(syn::Error::new_spanned(
         ty,
-        "#[cachekit] function must return Result<T, CachekitError>",
+        "#[cachekit] function must return Result<T, E> where E: From<CachekitError>",
     ))
 }
 
@@ -219,6 +219,12 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///
 /// # Requirements
 ///
+/// - The function must return `Result<T, E>` where `E: From<CachekitError>`
+///   — `CachekitError` itself, or the application's own error type. The
+///   body's errors reach the caller unchanged and are never cached;
+///   cache-layer errors that propagate (see *Reliability behaviour*) arrive
+///   converted through `From`. The error type is taken from the return type
+///   as written, so a one-argument alias such as `anyhow::Result<T>` works.
 /// - Every non-client argument must be a plain identifier (no destructuring
 ///   patterns, no `self`) and must convert into
 ///   `cachekit::interop::InteropValue` via `From` (`bool`, `i32`/`i64`/
@@ -503,7 +509,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
         ReturnType::Default => {
             return Err(syn::Error::new_spanned(
                 &func.sig,
-                "#[cachekit] function must return Result<T, CachekitError>",
+                "#[cachekit] function must return Result<T, E> where E: From<CachekitError>",
             ));
         }
     };
@@ -556,7 +562,11 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                         let #client_ident = &__ck_swr_client;
                         let __ck_key = __ck_swr_key;
                         #swr_rebinds
-                        let _: ::std::result::Result<(), cachekit::error::CachekitError> = async {
+                        // Typed by the function's own error type, inferred
+                        // from `__ck_result` (so a one-argument `Result`
+                        // alias works too): cache-layer errors inside the
+                        // block convert through `From<CachekitError>`.
+                        let _ = async {
                             let Some(__ck_flight) = #client_ident.__refresh_flight(&__ck_key).await else {
                                 // Another worker is already filling this key.
                                 return Ok(());
