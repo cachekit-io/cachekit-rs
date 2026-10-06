@@ -17,19 +17,39 @@
 //! [`ReliabilityConfig::disabled()`](crate::reliability::ReliabilityConfig::disabled)
 //! turns the stack off entirely.
 
-use std::time::Duration;
-
-use crate::client::{CacheKit, CacheKitBuilder, SharedBackend};
-use crate::error::CachekitError;
+use crate::client::CacheKit;
+// Only the presets use these, and each preset is gated on a backend feature;
+// gate them (and `wrap`) the same way so lean feature sets lint clean.
+#[cfg(any(
+    feature = "redis",
+    all(feature = "cachekitio", not(target_arch = "wasm32"))
+))]
+use {
+    crate::client::{CacheKitBuilder, SharedBackend},
+    crate::error::CachekitError,
+    std::time::Duration,
+};
 
 // ── SharedBackend wrapping ───────────────────────────────────────────────────
 
-#[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
+#[cfg(all(
+    any(
+        feature = "redis",
+        all(feature = "cachekitio", not(target_arch = "wasm32"))
+    ),
+    not(any(target_arch = "wasm32", feature = "unsync"))
+))]
 fn wrap(b: impl crate::backend::Backend + 'static) -> SharedBackend {
     std::sync::Arc::new(b)
 }
 
-#[cfg(any(target_arch = "wasm32", feature = "unsync"))]
+#[cfg(all(
+    any(
+        feature = "redis",
+        all(feature = "cachekitio", not(target_arch = "wasm32"))
+    ),
+    any(target_arch = "wasm32", feature = "unsync")
+))]
 fn wrap(b: impl crate::backend::Backend + 'static) -> SharedBackend {
     std::rc::Rc::new(b)
 }

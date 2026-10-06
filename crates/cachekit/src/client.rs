@@ -79,6 +79,7 @@ const MAX_KEY_BYTES: usize = 1024;
 /// the entry, that refresh writes both layers and renews L1 hard expiry with
 /// the caller's full TTL. Without SWR the entry simply hard-expires at the cap
 /// and the next read blocks on L2, as before.
+#[cfg(feature = "l1")]
 const L1_BACKFILL_TTL_SECS: u64 = 30;
 
 /// L1 lifetime for a backfill from an L2 hit, or `None` when the read must not
@@ -1295,11 +1296,13 @@ impl CacheKitBuilder {
     }
 
     // Stubs for when the l1 feature is disabled — still compile cleanly.
+    /// No-op: the `l1` feature is disabled, so there is no L1 to size.
     #[cfg(not(feature = "l1"))]
     pub fn l1_capacity(self, _capacity: usize) -> Self {
         self
     }
 
+    /// No-op: the `l1` feature is disabled, so L1 is already off.
     #[cfg(not(feature = "l1"))]
     pub fn no_l1(self) -> Self {
         self
