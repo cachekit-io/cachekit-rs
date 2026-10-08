@@ -27,12 +27,12 @@ mod common;
 
 use cachekit::interop;
 use cachekit::serializer::{self, MAX_DECODE_DEPTH};
-use cachekit::{CacheKit, CachekitError, SwrRead};
+use cachekit::CachekitError;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::Value as Json;
 
-use crate::common::MockBackend;
+use crate::common::{decode_both, read_every_path};
 
 const VECTORS_JSON: &str = include_str!("vectors/decode-bounds.json");
 
@@ -49,64 +49,6 @@ fn unhex(s: &str) -> Vec<u8> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("vector input_hex must be hex"))
         .collect()
-}
-
-type Read = (&'static str, Result<Json, CachekitError>);
-
-/// Both untrusted decode entry points: auto-mode `get` and interop `interop_get`.
-fn decode_both(bytes: &[u8]) -> [Read; 2] {
-    [
-        (
-            "serializer::deserialize",
-            serializer::deserialize::<Json>(bytes),
-        ),
-        ("interop::deserialize", interop::deserialize::<Json>(bytes)),
-    ]
-}
-
-/// Every untrusted read path for `bytes`: both decoders directly, then every
-/// client read of a backend entry holding exactly `bytes`. `get`
-/// stores plain MessagePack (no envelope), so the forged entry is the vector
-/// itself. L1 is off so each read reaches the backend and its decoder.
-fn read_every_path(bytes: &[u8]) -> Vec<Read> {
-    const KEY: &str = "decode:bounds:forged";
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let (backend, handle) = MockBackend::new_with_handle();
-    let client = CacheKit::builder()
-        .backend(backend)
-        .no_l1()
-        .build()
-        .expect("client builds");
-    let found = |r: Result<Option<Json>, CachekitError>| {
-        r.map(|v| v.expect("the forged entry must be found, not missed"))
-    };
-    let mut reads = Vec::from(decode_both(bytes));
-    runtime.block_on(async {
-        handle
-            .store
-            .lock()
-            .await
-            .insert(KEY.to_owned(), bytes.to_vec());
-        reads.push(("CacheKit::get", found(client.get::<Json>(KEY).await)));
-        reads.push((
-            "CacheKit::interop_get",
-            found(client.interop_get::<Json>(KEY).await),
-        ));
-        reads.push((
-            "CacheKit::interop_get_swr",
-            client
-                .interop_get_swr::<Json>(KEY)
-                .await
-                .map(|read| match read {
-                    SwrRead::Fresh(v) => v,
-                    _ => panic!("with L1 off the forged entry must be a fresh hit"),
-                }),
-        ));
-    });
-    reads
 }
 
 /// The guard's rejection, and nothing else: a `Serialization` error whose

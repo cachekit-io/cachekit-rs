@@ -894,8 +894,8 @@ mod tests {
     // ── Protocol vectors ─────────────────────────────────────────────────────
     //
     // `tests/vectors/file-backend.json`, vendored verbatim from
-    // cachekit-io/protocol `test-vectors/file-backend.json` v1.1.0
-    // (sha256 `8d9d8c4709baf9ef3a8f2d71d21fb5a56207bc7a05c9bc7a967ac567f2604615`).
+    // cachekit-io/protocol `test-vectors/file-backend.json` v1.2.0
+    // (sha256 `b7b0c51935a3a00ab340005ae1e091797b14938f92eecae23346bdccf0d12af4`).
     // Do not edit the JSON here; regenerate upstream and re-vendor. Lives in
     // this module, not `tests/`, because `parse_header` is crate-private.
 
@@ -904,7 +904,7 @@ mod tests {
     /// sha256 of the vendored file, pinned so a local edit cannot drift from the
     /// protocol copy unnoticed.
     const FILE_BACKEND_SHA256: &str =
-        "8d9d8c4709baf9ef3a8f2d71d21fb5a56207bc7a05c9bc7a967ac567f2604615"; // pragma: allowlist secret
+        "b7b0c51935a3a00ab340005ae1e091797b14938f92eecae23346bdccf0d12af4"; // pragma: allowlist secret
 
     #[test]
     fn vendored_fixture_matches_the_pinned_sha256() {
@@ -921,7 +921,7 @@ mod tests {
         let doc: serde_json::Value =
             serde_json::from_str(FILE_BACKEND_VECTORS).expect("vector file parses");
         assert_eq!(
-            doc["version"], "1.1.0",
+            doc["version"], "1.2.0",
             "re-vendored vectors: update the pin"
         );
         doc["vectors"].as_array().expect("vectors array").clone()
@@ -931,7 +931,7 @@ mod tests {
     #[allow(clippy::panic)] // test-only: an unknown reader_action must fail loudly
     fn file_backend_vectors_read_as_specified() {
         let vectors = file_backend_vectors();
-        assert_eq!(vectors.len(), 5);
+        assert_eq!(vectors.len(), 12, "vectors in file-backend.json");
         for v in &vectors {
             let name = v["name"].as_str().expect("name");
             let file_hex = v["file_hex"].as_str().expect("file_hex");
@@ -989,6 +989,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The writer side of the entry layout: every vector a version-1 writer can
+    /// produce (no flag, reserved 0) is the file name and bytes this backend writes.
+    #[test]
+    fn writer_produces_every_writable_vector_byte_for_byte() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = backend_at(dir.path());
+        let mut written = 0;
+        for v in file_backend_vectors() {
+            if v["flags"] != 0 || v["reserved"].as_u64().unwrap_or(0) != 0 {
+                continue;
+            }
+            let name = v["name"].as_str().unwrap();
+            let path = backend.entry_path(v["key_utf8"].as_str().unwrap());
+            assert_eq!(
+                path.file_name().and_then(|f| f.to_str()),
+                v["filename"].as_str(),
+                "{name}: file name"
+            );
+            let expiry = v["expiry_unix_seconds"].as_u64().expect("expiry");
+            let payload = hex::decode(v["payload_hex"].as_str().unwrap()).unwrap();
+            write_entry(&path, build_header(expiry), &payload).expect("write");
+            assert_eq!(
+                hex::encode(fs::read(&path).expect("written file")),
+                v["file_hex"].as_str().unwrap(),
+                "{name}: file bytes"
+            );
+            written += 1;
+        }
+        assert_eq!(written, 5, "writable vectors in file-backend.json");
     }
 
     #[test]
