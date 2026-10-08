@@ -931,7 +931,7 @@ mod tests {
     #[allow(clippy::panic)] // test-only: an unknown reader_action must fail loudly
     fn file_backend_vectors_read_as_specified() {
         let vectors = file_backend_vectors();
-        assert_eq!(vectors.len(), 12);
+        assert_eq!(vectors.len(), 12, "vectors in file-backend.json");
         for v in &vectors {
             let name = v["name"].as_str().expect("name");
             let file_hex = v["file_hex"].as_str().expect("file_hex");

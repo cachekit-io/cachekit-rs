@@ -12,6 +12,8 @@ use zeroize::Zeroizing;
 use cachekit::backend::{Backend, HealthStatus};
 use cachekit::client::SharedBackend;
 use cachekit::error::BackendError;
+use cachekit::{interop, serializer, CacheKit, CachekitError, SwrRead};
+use serde::de::DeserializeOwned;
 
 /// In-memory mock backend backed by a `Mutex<HashMap>` for use in tests.
 ///
@@ -85,6 +87,65 @@ impl Backend for MockBackend {
             details: HashMap::new(),
         })
     }
+}
+
+/// One untrusted read: the path's name and what it decoded.
+pub type Read<T> = (&'static str, Result<T, CachekitError>);
+
+/// Both untrusted decode entry points: auto-mode `get` and interop `interop_get`.
+pub fn decode_both<T: DeserializeOwned>(bytes: &[u8]) -> [Read<T>; 2] {
+    [
+        (
+            "serializer::deserialize",
+            serializer::deserialize::<T>(bytes),
+        ),
+        ("interop::deserialize", interop::deserialize::<T>(bytes)),
+    ]
+}
+
+/// Every untrusted read path for `bytes`: both decoders directly, then every
+/// client read of a backend entry holding exactly `bytes`. `get`
+/// stores plain MessagePack (no envelope), so the forged entry is the input
+/// itself. L1 is off so each read reaches the backend and its decoder.
+pub fn read_every_path<T: DeserializeOwned>(bytes: &[u8]) -> Vec<Read<T>> {
+    const KEY: &str = "forged:entry";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (backend, handle) = MockBackend::new_with_handle();
+    let client = CacheKit::builder()
+        .backend(backend)
+        .no_l1()
+        .build()
+        .expect("client builds");
+    let found = |r: Result<Option<T>, CachekitError>| {
+        r.map(|v| v.expect("the forged entry must be found, not missed"))
+    };
+    let mut reads = Vec::from(decode_both::<T>(bytes));
+    runtime.block_on(async {
+        handle
+            .store
+            .lock()
+            .await
+            .insert(KEY.to_owned(), bytes.to_vec());
+        reads.push(("CacheKit::get", found(client.get::<T>(KEY).await)));
+        reads.push((
+            "CacheKit::interop_get",
+            found(client.interop_get::<T>(KEY).await),
+        ));
+        reads.push((
+            "CacheKit::interop_get_swr",
+            client
+                .interop_get_swr::<T>(KEY)
+                .await
+                .map(|read| match read {
+                    SwrRead::Fresh(v) => v,
+                    _ => panic!("with L1 off the forged entry must be a fresh hit"),
+                }),
+        ));
+    });
+    reads
 }
 
 /// RAII guard for `#[serial]` env tests: records each variable's pre-test

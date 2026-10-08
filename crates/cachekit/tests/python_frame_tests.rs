@@ -1,35 +1,38 @@
 //! Foreign auto-mode containers (`spec/wire-format.md` → SDK Storage
 //! Containers, WIRE-21: an SDK MUST NOT decode another SDK's auto-mode
 //! container), driven through every read path of this SDK's plain-MessagePack
-//! value reader.
+//! value reader on a client without encryption. An encrypting client refuses
+//! these bytes earlier, at decrypt; these vectors do not exercise that path.
 //!
 //! Vectors: `tests/vectors/python-frame.json`, vendored verbatim from
-//! cachekit-io/protocol `test-vectors/python-frame.json`
-//! (sha256 `1210a2cdf00ef420e59d4d1c75f4979385ad1cb023181b39f46d7f994761770a`).
+//! cachekit-io/protocol `test-vectors/python-frame.json` at `main@97e6a2e8`
+//! (the file carries no `version` field;
+//! sha256 `1210a2cdf00ef420e59d4d1c75f4979385ad1cb023181b39f46d7f994761770a`).
 //! Do not edit the JSON here; regenerate upstream and re-vendor.
 //!
 //! cachekit-rs stores plain MessagePack with no envelope, so the frame-parse
 //! vectors bind cachekit-py only. What binds this reader is the CK frame: its
-//! first byte `0x43` is a complete one-byte document, so a reader refuses the
-//! frame only by rejecting the bytes after it. Every CK-prefixed vector in the
-//! file is driven through both decoders and both client reads. The decoder
-//! target is `IgnoredAny`, so an outcome depends on the bytes, never on a
-//! caller's type.
+//! first byte `0x43` is a complete one-byte document, so auto mode refuses the
+//! frame by its trailing bytes, and interop mode names its `CK` prefix. Every
+//! CK-prefixed vector in the file is driven through both decoders and every
+//! client read, with `IgnoredAny` as the target, so an outcome depends on the
+//! bytes, never on a caller's type.
 //!
 //! `bare_envelope_fed_to_frame_reader` is a bare ByteStorage envelope, which is
 //! one well-formed MessagePack document: no structural check can refuse it, and
-//! this reader decodes it. `bare_envelope_is_one_document_and_decodes` records
-//! that outcome. A caller's typed read fails only if the envelope's shape does
-//! not fit the caller's type. `plain_msgpack_fed_to_frame_reader` is this SDK's
-//! own format, so it is not driven here.
+//! this reader decodes it. `bare_envelope_decodes_but_not_as_its_value` records
+//! that outcome, and pins the refusal callers do get: a typed read of the
+//! envelope's own value shape fails. `plain_msgpack_fed_to_frame_reader` is this
+//! SDK's own format, so it is not driven here.
 
 mod common;
 
-use cachekit::{interop, serializer, CacheKit, CachekitError};
+use cachekit::CachekitError;
 use serde::de::IgnoredAny;
+use serde::Deserialize;
 use serde_json::Value as Json;
 
-use crate::common::MockBackend;
+use crate::common::read_every_path;
 
 const VECTORS_JSON: &str = include_str!("vectors/python-frame.json");
 
@@ -41,61 +44,13 @@ fn vectors() -> Json {
     serde_json::from_str(VECTORS_JSON).expect("vendored vector file must be valid JSON")
 }
 
-/// `frame_hex` of the named vector, from any group.
-fn frame(name: &str) -> Vec<u8> {
-    let doc = vectors();
-    let hex = ["frame_vectors", "error_vectors", "encrypted_read_vectors"]
-        .iter()
-        .flat_map(|group| doc[group].as_array().expect("vector group"))
-        .find(|v| v["name"] == name)
-        .and_then(|v| v["frame_hex"].as_str())
-        .unwrap_or_else(|| panic!("vector {name} missing from python-frame.json"))
-        .to_owned();
-    hex::decode(hex).expect("frame_hex is hex")
-}
-
-/// Both decoders, then `get` and `interop_get` of a backend entry holding
-/// exactly `bytes`. L1 is off so each client read reaches its decoder.
-fn read_every_path(bytes: &[u8]) -> Vec<(&'static str, Result<(), CachekitError>)> {
-    const KEY: &str = "python:frame:forged";
-    let mut reads = vec![
-        (
-            "serializer::deserialize",
-            serializer::deserialize::<IgnoredAny>(bytes).map(drop),
-        ),
-        (
-            "interop::deserialize",
-            interop::deserialize::<IgnoredAny>(bytes).map(drop),
-        ),
-    ];
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let (backend, handle) = MockBackend::new_with_handle();
-    let client = CacheKit::builder()
-        .backend(backend)
-        .no_l1()
-        .build()
-        .expect("client builds");
-    let found = |r: Result<Option<IgnoredAny>, CachekitError>| {
-        r.map(|v| {
-            v.expect("the forged entry must be found, not missed");
-        })
-    };
-    runtime.block_on(async {
-        handle
-            .store
-            .lock()
-            .await
-            .insert(KEY.to_owned(), bytes.to_vec());
-        reads.push(("CacheKit::get", found(client.get(KEY).await)));
-        reads.push((
-            "CacheKit::interop_get",
-            found(client.interop_get(KEY).await),
-        ));
-    });
-    reads
+/// The refusal each path must give a CK frame: auto mode sees one document
+/// plus trailing bytes, interop mode names the frame.
+fn ck_frame_reason(path: &str) -> &'static str {
+    match path {
+        "serializer::deserialize" | "CacheKit::get" => "trailing",
+        _ => "CK frame",
+    }
 }
 
 #[test]
@@ -110,23 +65,9 @@ fn vendored_fixture_matches_the_pinned_sha256() {
 }
 
 #[test]
-fn ck_frame_fed_to_interop_reader_is_refused_on_every_path() {
-    for (path, result) in read_every_path(&frame("ck_frame_fed_to_interop_reader")) {
-        match result {
-            // Auto mode names the trailing bytes; interop mode names the CK frame.
-            Err(CachekitError::Serialization(msg)) => assert!(
-                msg.contains("trailing") || msg.contains("CK frame"),
-                "{path}: expected a trailing-bytes or CK-frame refusal, got: {msg}"
-            ),
-            other => panic!("{path}: decoded a CK frame (WIRE-21), got {other:?}"),
-        }
-    }
-}
-
-#[test]
 fn every_ck_frame_in_the_file_is_refused_on_every_path() {
     let doc = vectors();
-    let mut frames = 0;
+    let mut names = Vec::new();
     for group in ["frame_vectors", "error_vectors", "encrypted_read_vectors"] {
         for v in doc[group].as_array().expect("vector group") {
             let hex = v["frame_hex"].as_str().expect("frame_hex");
@@ -134,26 +75,70 @@ fn every_ck_frame_in_the_file_is_refused_on_every_path() {
                 continue;
             }
             let name = v["name"].as_str().expect("name");
-            for (path, result) in read_every_path(&hex::decode(hex).expect("hex")) {
-                assert!(
-                    matches!(result, Err(CachekitError::Serialization(_))),
-                    "{name}: {path} decoded a CK frame (WIRE-21), got {result:?}"
-                );
+            let bytes = hex::decode(hex).expect("frame_hex is hex");
+            for (path, result) in read_every_path::<IgnoredAny>(&bytes) {
+                let want = ck_frame_reason(path);
+                match result {
+                    Err(CachekitError::Serialization(msg)) => assert!(
+                        msg.contains(want),
+                        "{name}: {path} must refuse a CK frame naming {want:?}, got: {msg}"
+                    ),
+                    other => panic!("{name}: {path} decoded a CK frame (WIRE-21), got {other:?}"),
+                }
             }
-            frames += 1;
+            names.push(name);
         }
     }
-    assert_eq!(frames, 16, "CK-prefixed vectors in python-frame.json");
+    assert_eq!(names.len(), 16, "CK-prefixed vectors in python-frame.json");
+    assert!(
+        names.contains(&"ck_frame_fed_to_interop_reader"),
+        "the WIRE-21 vector must be among the frames swept"
+    );
+}
+
+/// The value the bare envelope wraps (`default_saas_write_msgpack_bytestorage`'s
+/// `value_json`).
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // decoded only to prove it cannot be
+struct EnvelopedValue {
+    user_id: u64,
+    name: String,
+    active: bool,
 }
 
 #[test]
-fn bare_envelope_is_one_document_and_decodes() {
-    for (path, result) in read_every_path(&frame("bare_envelope_fed_to_frame_reader")) {
+fn bare_envelope_decodes_but_not_as_its_value() {
+    let doc = vectors();
+    let hex = doc["error_vectors"]
+        .as_array()
+        .expect("error_vectors")
+        .iter()
+        .find(|v| v["name"] == "bare_envelope_fed_to_frame_reader")
+        .and_then(|v| v["frame_hex"].as_str())
+        .expect("bare_envelope_fed_to_frame_reader");
+    let bytes = hex::decode(hex).expect("frame_hex is hex");
+
+    for (path, result) in read_every_path::<IgnoredAny>(&bytes) {
         assert!(
             result.is_ok(),
             "{path}: a bare envelope is one well-formed MessagePack document, which this \
              reader decodes; if it now refuses it, update this test and the WIRE-21 record \
              in protocol's sdk-feature-matrix.md: {result:?}"
+        );
+    }
+    for (path, result) in read_every_path::<EnvelopedValue>(&bytes) {
+        assert!(
+            matches!(result, Err(CachekitError::Serialization(_))),
+            "{path}: a bare envelope must not decode as the value it wraps, got {result:?}"
+        );
+    }
+    // rmp-serde decodes by position, so a target whose four elements line up
+    // with the envelope's (bytes, 8 integers, an integer, a string) reads it.
+    type EnvelopeShaped = (IgnoredAny, Vec<u8>, u64, String);
+    for (path, result) in read_every_path::<EnvelopeShaped>(&bytes) {
+        assert!(
+            result.is_ok(),
+            "{path}: an envelope-shaped target reads a bare envelope: {result:?}"
         );
     }
 }
