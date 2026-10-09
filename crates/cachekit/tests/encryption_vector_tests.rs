@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use cachekit::{CacheKit, CachekitError, EncryptionLayer};
 use cachekit_core::encryption::key_derivation::derive_tenant_keys;
 use cachekit_core::ZeroKnowledgeEncryptor;
-use common::{interop_reads, runtime, EnvelopedValue, MockBackend};
+use common::{encrypting_client_holding, interop_reads, runtime, EnvelopedValue};
 use serde::de::IgnoredAny;
 use serde_json::Value as Json;
 
@@ -86,21 +86,13 @@ fn names(rows: &[Json]) -> Vec<&str> {
 /// reaches the backend, holding `ciphertext` at the backend key `stored_key`.
 fn client_holding(namespace: Option<&str>, stored_key: &str, ciphertext: Vec<u8>) -> CacheKit {
     let doc = vectors();
-    let (backend, handle) = MockBackend::new_with_handle();
-    let mut builder = CacheKit::builder()
-        .backend(backend)
-        .no_l1()
-        .encryption(field(&doc, "master_key_hex"), field(&doc, "tenant_id"))
-        .expect("main vector key");
-    if let Some(ns) = namespace {
-        builder = builder.namespace(ns);
-    }
-    handle
-        .store
-        .try_lock()
-        .expect("fresh store")
-        .insert(stored_key.to_owned(), ciphertext);
-    builder.build().expect("client builds")
+    encrypting_client_holding(
+        field(&doc, "master_key_hex"),
+        field(&doc, "tenant_id"),
+        namespace,
+        stored_key,
+        ciphertext,
+    )
 }
 
 // ── aad_reject_vectors ───────────────────────────────────────────────────────

@@ -2,7 +2,8 @@
 //! Containers, WIRE-21: an SDK MUST NOT decode another SDK's auto-mode
 //! container), driven through every read path of this SDK's plain-MessagePack
 //! value reader on a client without encryption. An encrypting client refuses
-//! these bytes earlier, at decrypt; these vectors do not exercise that path.
+//! every vector in the file earlier, at decrypt:
+//! `every_vector_is_refused_at_decrypt_by_an_encrypting_client`.
 //!
 //! Vectors: `tests/vectors/python-frame.json`, vendored verbatim from
 //! cachekit-io/protocol `test-vectors/python-frame.json` at `main@b4ae567a`
@@ -25,7 +26,7 @@
 //! envelope's own value shape fails), and pins the positional match: a target
 //! whose elements line up with the envelope's reads it.
 //! `plain_msgpack_fed_to_frame_reader` is this
-//! SDK's own format, so it is not driven here.
+//! SDK's own format, so it is not driven through the plain reader.
 
 mod common;
 
@@ -147,4 +148,58 @@ fn bare_envelope_decodes_but_not_as_its_value() {
             "{path}: an envelope-shaped target reads a bare envelope: {result:?}"
         );
     }
+}
+
+/// Every vector in the file, stored under the `cache_key` of the file's
+/// `encrypted_reader` and read by an encrypting client with that reader's
+/// master key and tenant. This reader parses no CK header: it hands the
+/// stored bytes whole to AES-GCM as its own ciphertext, so each vector is
+/// refused there, before a header field (`encrypted`, `compressed`, the
+/// serializer name) or a decode is reached. That is where every
+/// `encrypted_read_vectors` row meets its `fail_closed` here.
+///
+/// The refusal is pinned to the decrypt error class, not to one message:
+/// vectors shorter than a nonce and a tag fail as malformed ciphertext, the
+/// rest fail authentication.
+#[cfg(feature = "encryption")]
+#[test]
+fn every_vector_is_refused_at_decrypt_by_an_encrypting_client() {
+    use crate::common::{encrypting_client_holding, interop_reads, runtime};
+
+    let doc = vectors();
+    let reader = |k: &str| {
+        doc["encrypted_reader"][k]
+            .as_str()
+            .unwrap_or_else(|| panic!("encrypted_reader lacks {k}"))
+    };
+    let key = reader("cache_key");
+    let rt = runtime();
+    let mut count = 0;
+    for group in ["frame_vectors", "error_vectors", "encrypted_read_vectors"] {
+        for v in doc[group].as_array().expect("vector group") {
+            let name = v["name"].as_str().expect("name");
+            if group == "encrypted_read_vectors" {
+                assert_eq!(v["outcome"], "fail_closed", "{name}");
+            }
+            let bytes =
+                hex::decode(v["frame_hex"].as_str().expect("frame_hex")).expect("frame_hex is hex");
+            let client = encrypting_client_holding(
+                reader("master_key_hex"),
+                reader("tenant_id"),
+                None,
+                key,
+                bytes,
+            );
+            let mut reads = vec![("CacheKit::get", rt.block_on(client.get::<IgnoredAny>(key)))];
+            reads.extend(rt.block_on(interop_reads::<IgnoredAny>(&client, key)));
+            for (path, result) in reads {
+                match result {
+                    Err(CachekitError::Encryption(msg)) if msg.starts_with("decrypt failed: ") => {}
+                    other => panic!("{name}: {path} must be refused at decrypt, got {other:?}"),
+                }
+            }
+            count += 1;
+        }
+    }
+    assert_eq!(count, 31, "vectors in python-frame.json");
 }

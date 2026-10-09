@@ -176,6 +176,33 @@ pub fn read_every_path<T: DeserializeOwned>(bytes: &[u8]) -> Vec<Read<T>> {
     reads
 }
 
+/// An encrypting client, L1 off so every read reaches the backend, holding
+/// `bytes` at the backend key `stored_key`.
+#[cfg(feature = "encryption")]
+pub fn encrypting_client_holding(
+    master_key_hex: &str,
+    tenant_id: &str,
+    namespace: Option<&str>,
+    stored_key: &str,
+    bytes: Vec<u8>,
+) -> CacheKit {
+    let (backend, handle) = MockBackend::new_with_handle();
+    let mut builder = CacheKit::builder()
+        .backend(backend)
+        .no_l1()
+        .encryption(master_key_hex, tenant_id)
+        .expect("master key and tenant");
+    if let Some(ns) = namespace {
+        builder = builder.namespace(ns);
+    }
+    handle
+        .store
+        .try_lock()
+        .expect("fresh store")
+        .insert(stored_key.to_owned(), bytes);
+    builder.build().expect("client builds")
+}
+
 /// RAII guard for `#[serial]` env tests: records each variable's pre-test
 /// value and restores it on drop — including on assertion failure — so a
 /// test can never destroy state the surrounding shell exported.
