@@ -209,6 +209,14 @@ pub fn encrypting_client_holding(
     builder.build().expect("client builds")
 }
 
+/// The one error an AES-GCM tag mismatch reaches a reader as.
+pub const AUTH_FAILURE: &str = "decrypt failed: Authentication verification failed";
+
+/// The error a stored ciphertext shorter than a nonce and a tag (12 + 16
+/// bytes) reaches a reader as: it is refused before AES-GCM runs.
+pub const SHORT_CIPHERTEXT: &str =
+    "decrypt failed: Invalid ciphertext format: Ciphertext too short";
+
 /// RAII guard for `#[serial]` env tests: records each variable's pre-test
 /// value and restores it on drop — including on assertion failure — so a
 /// test can never destroy state the surrounding shell exported.
