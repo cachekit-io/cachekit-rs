@@ -5,9 +5,9 @@
 //! these bytes earlier, at decrypt; these vectors do not exercise that path.
 //!
 //! Vectors: `tests/vectors/python-frame.json`, vendored verbatim from
-//! cachekit-io/protocol `test-vectors/python-frame.json` at `main@97e6a2e8`
+//! cachekit-io/protocol `test-vectors/python-frame.json` at `main@b4ae567a`
 //! (the file carries no `version` field;
-//! sha256 `1210a2cdf00ef420e59d4d1c75f4979385ad1cb023181b39f46d7f994761770a`).
+//! sha256 `b677d5f14de4a3cd1fa5307d4b46eae0545a20e51e9163f96495ee7ad15600d0`).
 //! Do not edit the JSON here; regenerate upstream and re-vendor.
 //!
 //! cachekit-rs stores plain MessagePack with no envelope, so the frame-parse
@@ -40,7 +40,7 @@ const VECTORS_JSON: &str = include_str!("vectors/python-frame.json");
 
 /// sha256 of the vendored file, pinned so a local edit cannot drift from the
 /// protocol copy unnoticed.
-const VECTORS_SHA256: &str = "1210a2cdf00ef420e59d4d1c75f4979385ad1cb023181b39f46d7f994761770a"; // pragma: allowlist secret
+const VECTORS_SHA256: &str = "b677d5f14de4a3cd1fa5307d4b46eae0545a20e51e9163f96495ee7ad15600d0"; // pragma: allowlist secret
 
 fn vectors() -> Json {
     serde_json::from_str(VECTORS_JSON).expect("vendored vector file must be valid JSON")
@@ -91,7 +91,7 @@ fn every_ck_frame_in_the_file_is_refused_on_every_path() {
             names.push(name);
         }
     }
-    assert_eq!(names.len(), 16, "CK-prefixed vectors in python-frame.json");
+    assert_eq!(names.len(), 29, "CK-prefixed vectors in python-frame.json");
     let paths: Vec<_> = read_every_path::<IgnoredAny>(b"\x00")
         .into_iter()
         .map(|(path, _)| path)

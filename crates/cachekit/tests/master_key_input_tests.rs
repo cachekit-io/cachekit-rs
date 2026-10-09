@@ -1,10 +1,12 @@
 //! Master key input rows from the shared protocol vectors, driven through
-//! every public hex and raw-bytes key entry point.
+//! every public hex and raw-bytes key entry point, and the
+//! `keyring.configuration` rows, driven through every hex keyring loader.
 //!
 //! Vectors: `tests/vectors/encryption.json`, vendored verbatim from
-//! cachekit-io/protocol test-vectors/encryption.json 1.3.0
-//! (<https://github.com/cachekit-io/protocol/pull/161>)
-//! (sha256 `f701951147a47c42a968850fe6cb73a544313728e46f45fec3d811c20ed4b377`).
+//! cachekit-io/protocol test-vectors/encryption.json 1.5.0 at `main@b4ae567a`
+//! (<https://github.com/cachekit-io/protocol/pull/180> and
+//! <https://github.com/cachekit-io/protocol/pull/181>)
+//! (sha256 `1a8a3735408675bf9660ce1372f77723a9ffda8084010fa52eb756a330961589`).
 //! Do not edit the JSON here; regenerate upstream and re-vendor.
 //!
 //! Every reject must be a `Config` error from the key validator, not merely
@@ -13,7 +15,7 @@
 //! so the repeat-key check cannot fire in the decoder's place. The accepting
 //! controls show no entry point passes by refusing everything.
 //!
-//! The accept row's decrypt through the `secure` preset and the rotation read
+//! The accept rows' decrypts through the `secure` preset and the rotation read
 //! live in `src/intents.rs` (`secure_tests`): they need the crate-internal
 //! preset route, as default CI has no Redis.
 //!
@@ -34,7 +36,7 @@ const VECTORS_JSON: &str = include_str!("vectors/encryption.json");
 
 /// sha256 of the vendored file, pinned so a local edit cannot drift from the
 /// protocol copy unnoticed.
-const VECTORS_SHA256: &str = "f701951147a47c42a968850fe6cb73a544313728e46f45fec3d811c20ed4b377"; // pragma: allowlist secret
+const VECTORS_SHA256: &str = "1a8a3735408675bf9660ce1372f77723a9ffda8084010fa52eb756a330961589"; // pragma: allowlist secret
 
 /// A valid 32-byte key that no row decodes to (`default_tenant_interop`'s), for
 /// the slot a row does not fill, so a previous-key row is never refused as a
@@ -81,8 +83,8 @@ fn rows(group: &str, field: &str, count: usize) -> Vec<(String, String)> {
     rows
 }
 
-fn accept_hex() -> String {
-    rows("accept_vectors", "master_key_hex", 1).remove(0).1
+fn accept_rows() -> Vec<(String, String)> {
+    rows("accept_vectors", "master_key_hex", 2)
 }
 
 fn reject_rows() -> Vec<(String, String)> {
@@ -109,9 +111,12 @@ fn assert_config_err<T>(result: Result<T, CachekitError>, names: &str, row: &str
 
 #[test]
 fn builder_encryption_rejects_every_hex_reject_row() {
-    assert!(CacheKit::builder()
-        .encryption(&accept_hex(), TENANT)
-        .is_ok());
+    for (row, key) in accept_rows() {
+        assert!(
+            CacheKit::builder().encryption(&key, TENANT).is_ok(),
+            "{row} refused"
+        );
+    }
     for (row, key) in reject_rows() {
         assert_config_err(
             CacheKit::builder().encryption(&key, TENANT),
@@ -124,13 +129,20 @@ fn builder_encryption_rejects_every_hex_reject_row() {
 
 #[test]
 fn builder_encryption_with_previous_rejects_every_hex_reject_row() {
-    let accept = accept_hex();
-    assert!(CacheKit::builder()
-        .encryption_with_previous(&accept, &[OTHER_KEY_HEX], TENANT)
-        .is_ok());
-    assert!(CacheKit::builder()
-        .encryption_with_previous(OTHER_KEY_HEX, &[&accept], TENANT)
-        .is_ok());
+    for (row, accept) in accept_rows() {
+        assert!(
+            CacheKit::builder()
+                .encryption_with_previous(&accept, &[OTHER_KEY_HEX], TENANT)
+                .is_ok(),
+            "{row} refused as the current key"
+        );
+        assert!(
+            CacheKit::builder()
+                .encryption_with_previous(OTHER_KEY_HEX, &[&accept], TENANT)
+                .is_ok(),
+            "{row} refused as a previous key"
+        );
+    }
     for (row, key) in reject_rows() {
         assert_config_err(
             CacheKit::builder().encryption_with_previous(&key, &[OTHER_KEY_HEX], TENANT),
@@ -149,15 +161,22 @@ fn builder_encryption_with_previous_rejects_every_hex_reject_row() {
 
 #[test]
 fn config_builder_rejects_every_hex_reject_row() {
-    let accept = accept_hex();
-    assert!(CachekitConfigBuilder::new()
-        .master_key(&accept)
-        .and_then(|b| b.previous_master_keys(&[OTHER_KEY_HEX]))
-        .is_ok());
-    assert!(CachekitConfigBuilder::new()
-        .master_key(OTHER_KEY_HEX)
-        .and_then(|b| b.previous_master_keys(&[&accept]))
-        .is_ok());
+    for (row, accept) in accept_rows() {
+        assert!(
+            CachekitConfigBuilder::new()
+                .master_key(&accept)
+                .and_then(|b| b.previous_master_keys(&[OTHER_KEY_HEX]))
+                .is_ok(),
+            "{row} refused as the current key"
+        );
+        assert!(
+            CachekitConfigBuilder::new()
+                .master_key(OTHER_KEY_HEX)
+                .and_then(|b| b.previous_master_keys(&[&accept]))
+                .is_ok(),
+            "{row} refused as a previous key"
+        );
+    }
     for (row, key) in reject_rows() {
         assert_config_err(
             CachekitConfigBuilder::new().master_key(&key),
@@ -203,15 +222,13 @@ fn env_entry_points(
 #[test]
 #[serial]
 fn env_readers_reject_every_hex_reject_row() {
-    let accept = accept_hex();
-    for (entry, result) in env_entry_points(&accept, Some(OTHER_KEY_HEX))
-        .into_iter()
-        .chain(env_entry_points(OTHER_KEY_HEX, Some(&accept)))
-    {
-        assert!(
-            result.is_ok(),
-            "{entry} refused the accept row's key: {result:?}"
-        );
+    for (row, accept) in accept_rows() {
+        for (entry, result) in env_entry_points(&accept, Some(OTHER_KEY_HEX))
+            .into_iter()
+            .chain(env_entry_points(OTHER_KEY_HEX, Some(&accept)))
+        {
+            assert!(result.is_ok(), "{entry} refused {row}'s key: {result:?}");
+        }
     }
     for (row, key) in reject_rows() {
         for (entry, result) in env_entry_points(&key, None) {
@@ -224,6 +241,95 @@ fn env_readers_reject_every_hex_reject_row() {
                 &row,
                 &format!("{entry} (previous keys)"),
             );
+        }
+    }
+}
+
+// ── Keyring configuration ────────────────────────────────────────────────────
+
+/// One `keyring.configuration` row: its name, current key, decrypt-only keys
+/// and whether a conforming SDK accepts it at load.
+struct KeyringRow {
+    name: String,
+    current: String,
+    decrypt_only: Vec<String>,
+    accept: bool,
+}
+
+fn keyring_rows() -> Vec<KeyringRow> {
+    let all: Json =
+        serde_json::from_str(VECTORS_JSON).expect("vendored vector file must be valid JSON");
+    let rows: Vec<KeyringRow> = all["keyring"]["configuration"]["vectors"]
+        .as_array()
+        .expect("keyring.configuration.vectors must be an array")
+        .iter()
+        .map(|row| {
+            let name = row["name"].as_str().expect("name").to_owned();
+            let text = |v: &Json| {
+                v.as_str()
+                    .unwrap_or_else(|| panic!("{name}: hex"))
+                    .to_owned()
+            };
+            KeyringRow {
+                current: text(&row["current_master_key_hex"]),
+                decrypt_only: row["decrypt_only_master_keys_hex"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{name}: decrypt_only_master_keys_hex"))
+                    .iter()
+                    .map(text)
+                    .collect(),
+                accept: match row["verdict"].as_str() {
+                    Some("accept") => true,
+                    Some("reject") => false,
+                    other => panic!("{name}: verdict {other:?}"),
+                },
+                name,
+            }
+        })
+        .collect();
+    assert_eq!(rows.len(), 4, "keyring.configuration row count");
+    rows
+}
+
+/// Each row loads, or is refused with a `Config` error, as its verdict says,
+/// through the hex builders and through `CACHEKIT_PREVIOUS_MASTER_KEYS`
+/// (comma-separated) on both env readers.
+#[test]
+#[serial]
+fn keyring_configuration_rows_load_as_their_verdict_says() {
+    for row in keyring_rows() {
+        let decrypt_only: Vec<&str> = row.decrypt_only.iter().map(String::as_str).collect();
+        let mut loads = vec![
+            (
+                "CacheKitBuilder::encryption_with_previous".to_owned(),
+                CacheKit::builder()
+                    .encryption_with_previous(&row.current, &decrypt_only, TENANT)
+                    .map(drop),
+            ),
+            (
+                "CachekitConfigBuilder::previous_master_keys".to_owned(),
+                CachekitConfigBuilder::new()
+                    .master_key(&row.current)
+                    .and_then(|b| b.previous_master_keys(&decrypt_only))
+                    .map(drop),
+            ),
+        ];
+        loads.extend(
+            env_entry_points(&row.current, Some(&decrypt_only.join(",")))
+                .into_iter()
+                .map(|(entry, result)| {
+                    (format!("{entry} (CACHEKIT_PREVIOUS_MASTER_KEYS)"), result)
+                }),
+        );
+        for (entry, result) in loads {
+            match (row.accept, result) {
+                (true, Ok(())) | (false, Err(CachekitError::Config(_))) => {}
+                (true, Err(e)) => panic!("{} via {entry}: refused an accept row: {e:?}", row.name),
+                (false, other) => panic!(
+                    "{} via {entry}: want a Config error at load, got {other:?}",
+                    row.name
+                ),
+            }
         }
     }
 }
@@ -286,20 +392,45 @@ const RAW_LEN_ERR: &str = "exactly 32 bytes";
 
 #[test]
 fn raw_entry_points_accept_the_accept_rows_bytes() {
-    let accept = hex::decode(accept_hex()).expect("accept row is hex");
     let other = hex::decode(OTHER_KEY_HEX).expect("hex");
-    assert!(CacheKit::builder()
-        .encryption_from_bytes(&accept, TENANT)
-        .is_ok());
-    assert!(CacheKit::builder()
-        .encryption_from_bytes_with_previous(&accept, &[&other], TENANT)
-        .is_ok());
-    assert!(CacheKit::builder()
-        .encryption_from_bytes_with_previous(&other, &[&accept], TENANT)
-        .is_ok());
-    assert!(EncryptionLayer::new(&accept, TENANT).is_ok());
-    assert!(EncryptionLayer::with_previous_keys(&accept, &[&other], TENANT).is_ok());
-    assert!(EncryptionLayer::with_previous_keys(&other, &[&accept], TENANT).is_ok());
+    for (row, key) in accept_rows() {
+        let accept = hex::decode(key).expect("accept row is hex");
+        let cases: [(&str, bool); 6] = [
+            (
+                "CacheKitBuilder::encryption_from_bytes",
+                CacheKit::builder()
+                    .encryption_from_bytes(&accept, TENANT)
+                    .is_ok(),
+            ),
+            (
+                "CacheKitBuilder::encryption_from_bytes_with_previous (current)",
+                CacheKit::builder()
+                    .encryption_from_bytes_with_previous(&accept, &[&other], TENANT)
+                    .is_ok(),
+            ),
+            (
+                "CacheKitBuilder::encryption_from_bytes_with_previous (previous)",
+                CacheKit::builder()
+                    .encryption_from_bytes_with_previous(&other, &[&accept], TENANT)
+                    .is_ok(),
+            ),
+            (
+                "EncryptionLayer::new",
+                EncryptionLayer::new(&accept, TENANT).is_ok(),
+            ),
+            (
+                "EncryptionLayer::with_previous_keys (current)",
+                EncryptionLayer::with_previous_keys(&accept, &[&other], TENANT).is_ok(),
+            ),
+            (
+                "EncryptionLayer::with_previous_keys (previous)",
+                EncryptionLayer::with_previous_keys(&other, &[&accept], TENANT).is_ok(),
+            ),
+        ];
+        for (entry, ok) in cases {
+            assert!(ok, "{row} refused via {entry}");
+        }
+    }
 }
 
 #[test]
