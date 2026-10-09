@@ -610,30 +610,38 @@ mod secure_tests {
         assert!(layer.decrypt(&ciphertext, CACHE_KEY).is_err());
     }
 
-    /// protocol `encryption.json` 1.3.0 `master_key_input.accept_vectors[0]`
-    /// (`master_key_every_hex_digit`): a key holding a leading 00 byte, bytes
-    /// above 7f and every hex digit in both places, sealed under tenant
-    /// "default". Read from the copy `tests/master_key_input_tests.rs` pins.
+    /// protocol `encryption.json` 1.5.0 `master_key_input.accept_vectors`:
+    /// `master_key_every_hex_digit` (a leading 00 byte, bytes above 7f and
+    /// every hex digit in both places) and `master_key_first_byte_80` (the top
+    /// bit set), each sealed under tenant "default". Read from the copy
+    /// `tests/master_key_input_tests.rs` pins.
     struct AcceptRow {
+        name: String,
         master_key_hex: String,
         cache_key: String,
         ciphertext: Vec<u8>,
         plaintext_hex: String,
     }
 
-    fn accept_row() -> AcceptRow {
+    fn accept_rows() -> Vec<AcceptRow> {
         let all: serde_json::Value =
             serde_json::from_str(include_str!("../tests/vectors/encryption.json"))
                 .expect("vendored vector file must be valid JSON");
-        let row = &all["master_key_input"]["accept_vectors"][0];
-        assert_eq!(row["name"], "master_key_every_hex_digit");
-        let get = |k: &str| row[k].as_str().expect("accept row field").to_owned();
-        AcceptRow {
-            master_key_hex: get("master_key_hex"),
-            cache_key: get("cache_key"),
-            ciphertext: hex::decode(get("ciphertext_hex")).expect("vector hex"),
-            plaintext_hex: get("plaintext_hex"),
-        }
+        all["master_key_input"]["accept_vectors"]
+            .as_array()
+            .expect("accept_vectors must be an array")
+            .iter()
+            .map(|row| {
+                let get = |k: &str| row[k].as_str().expect("accept row field").to_owned();
+                AcceptRow {
+                    name: get("name"),
+                    master_key_hex: get("master_key_hex"),
+                    cache_key: get("cache_key"),
+                    ciphertext: hex::decode(get("ciphertext_hex")).expect("vector hex"),
+                    plaintext_hex: get("plaintext_hex"),
+                }
+            })
+            .collect()
     }
 
     fn assert_decrypts_accept_row(builder: &crate::CacheKitBuilder, row: &AcceptRow) {
@@ -644,38 +652,48 @@ mod secure_tests {
         assert_eq!(layer.tenant_id(), "default");
         let plaintext = layer
             .decrypt(&row.ciphertext, &row.cache_key)
-            .expect("master_key_every_hex_digit must decrypt");
-        assert_eq!(hex::encode(plaintext), row.plaintext_hex);
+            .map(hex::encode)
+            .map_err(|e| format!("{e:?}"));
+        assert_eq!(
+            plaintext.as_deref(),
+            Ok(row.plaintext_hex.as_str()),
+            "{} must decrypt",
+            row.name
+        );
     }
 
     /// Everything `CacheKit::secure` does before it connects, with no tenant.
     #[test]
-    fn hex_path_decrypts_master_key_input_accept_row() {
-        let row = accept_row();
-        let builder = super::secure_hex_defaults(&row.master_key_hex).expect("valid key");
-        assert_decrypts_accept_row(&builder, &row);
+    fn hex_path_decrypts_master_key_input_accept_rows() {
+        for row in accept_rows() {
+            let builder = super::secure_hex_defaults(&row.master_key_hex).expect("valid key");
+            assert_decrypts_accept_row(&builder, &row);
+        }
     }
 
     #[test]
     #[serial_test::serial]
-    fn env_path_decrypts_master_key_input_accept_row() {
-        let row = accept_row();
-        let builder = secure_env_defaults_with(Some(&row.master_key_hex), None).expect("valid key");
-        assert_decrypts_accept_row(&builder, &row);
+    fn env_path_decrypts_master_key_input_accept_rows() {
+        for row in accept_rows() {
+            let builder =
+                secure_env_defaults_with(Some(&row.master_key_hex), None).expect("valid key");
+            assert_decrypts_accept_row(&builder, &row);
+        }
     }
 
-    /// PRE-51: `master_key_input.accept_vectors[0]` (current key) and
-    /// `default_tenant.vectors[0]` (previous key), both sealed under tenant
+    /// PRE-51: each `master_key_input.accept_vectors` row (current key) and
+    /// `default_tenant.vectors[0]` (previous key), all sealed under tenant
     /// "default", read through one client. A client that ignores
     /// `CACHEKIT_PREVIOUS_MASTER_KEYS` reads only the first.
     #[test]
     #[serial_test::serial]
-    fn env_path_reads_accept_row_and_default_tenant_vector_across_rotation() {
-        let row = accept_row();
-        let builder = secure_env_defaults_with(Some(&row.master_key_hex), Some(MASTER_KEY_HEX))
-            .expect("valid rotation config");
-        assert_decrypts_accept_row(&builder, &row);
-        assert_decrypts_default_tenant_vector(builder);
+    fn env_path_reads_accept_rows_and_default_tenant_vector_across_rotation() {
+        for row in accept_rows() {
+            let builder = secure_env_defaults_with(Some(&row.master_key_hex), Some(MASTER_KEY_HEX))
+                .expect("valid rotation config");
+            assert_decrypts_accept_row(&builder, &row);
+            assert_decrypts_default_tenant_vector(builder);
+        }
     }
 
     #[test]
