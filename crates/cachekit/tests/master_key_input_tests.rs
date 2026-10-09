@@ -390,86 +390,58 @@ async fn secure_from_env_rejects_every_hex_reject_row() {
 
 const RAW_LEN_ERR: &str = "exactly 32 bytes";
 
+/// Every raw-bytes entry point, with `key` in each slot it can fill and the
+/// valid `OTHER_KEY_HEX` bytes in the other.
+fn raw_entry_points(key: &[u8]) -> [(&'static str, Result<(), CachekitError>); 6] {
+    let other = hex::decode(OTHER_KEY_HEX).expect("hex");
+    [
+        (
+            "CacheKitBuilder::encryption_from_bytes",
+            CacheKit::builder()
+                .encryption_from_bytes(key, TENANT)
+                .map(drop),
+        ),
+        (
+            "CacheKitBuilder::encryption_from_bytes_with_previous (current)",
+            CacheKit::builder()
+                .encryption_from_bytes_with_previous(key, &[&other], TENANT)
+                .map(drop),
+        ),
+        (
+            "CacheKitBuilder::encryption_from_bytes_with_previous (previous)",
+            CacheKit::builder()
+                .encryption_from_bytes_with_previous(&other, &[key], TENANT)
+                .map(drop),
+        ),
+        (
+            "EncryptionLayer::new",
+            EncryptionLayer::new(key, TENANT).map(drop),
+        ),
+        (
+            "EncryptionLayer::with_previous_keys (current)",
+            EncryptionLayer::with_previous_keys(key, &[&other], TENANT).map(drop),
+        ),
+        (
+            "EncryptionLayer::with_previous_keys (previous)",
+            EncryptionLayer::with_previous_keys(&other, &[key], TENANT).map(drop),
+        ),
+    ]
+}
+
 #[test]
 fn raw_entry_points_accept_the_accept_rows_bytes() {
-    let other = hex::decode(OTHER_KEY_HEX).expect("hex");
     for (row, key) in accept_rows() {
         let accept = hex::decode(key).expect("accept row is hex");
-        let cases: [(&str, bool); 6] = [
-            (
-                "CacheKitBuilder::encryption_from_bytes",
-                CacheKit::builder()
-                    .encryption_from_bytes(&accept, TENANT)
-                    .is_ok(),
-            ),
-            (
-                "CacheKitBuilder::encryption_from_bytes_with_previous (current)",
-                CacheKit::builder()
-                    .encryption_from_bytes_with_previous(&accept, &[&other], TENANT)
-                    .is_ok(),
-            ),
-            (
-                "CacheKitBuilder::encryption_from_bytes_with_previous (previous)",
-                CacheKit::builder()
-                    .encryption_from_bytes_with_previous(&other, &[&accept], TENANT)
-                    .is_ok(),
-            ),
-            (
-                "EncryptionLayer::new",
-                EncryptionLayer::new(&accept, TENANT).is_ok(),
-            ),
-            (
-                "EncryptionLayer::with_previous_keys (current)",
-                EncryptionLayer::with_previous_keys(&accept, &[&other], TENANT).is_ok(),
-            ),
-            (
-                "EncryptionLayer::with_previous_keys (previous)",
-                EncryptionLayer::with_previous_keys(&other, &[&accept], TENANT).is_ok(),
-            ),
-        ];
-        for (entry, ok) in cases {
-            assert!(ok, "{row} refused via {entry}");
+        for (entry, result) in raw_entry_points(&accept) {
+            assert!(result.is_ok(), "{row} refused via {entry}: {result:?}");
         }
     }
 }
 
 #[test]
 fn raw_entry_points_reject_every_raw_reject_row() {
-    let other = hex::decode(OTHER_KEY_HEX).expect("hex");
     for (row, key) in raw_reject_rows() {
-        let cases: [(&str, Result<(), CachekitError>); 6] = [
-            (
-                "CacheKitBuilder::encryption_from_bytes",
-                CacheKit::builder()
-                    .encryption_from_bytes(&key, TENANT)
-                    .map(drop),
-            ),
-            (
-                "CacheKitBuilder::encryption_from_bytes_with_previous (current)",
-                CacheKit::builder()
-                    .encryption_from_bytes_with_previous(&key, &[&other], TENANT)
-                    .map(drop),
-            ),
-            (
-                "CacheKitBuilder::encryption_from_bytes_with_previous (previous)",
-                CacheKit::builder()
-                    .encryption_from_bytes_with_previous(&other, &[&key], TENANT)
-                    .map(drop),
-            ),
-            (
-                "EncryptionLayer::new",
-                EncryptionLayer::new(&key, TENANT).map(drop),
-            ),
-            (
-                "EncryptionLayer::with_previous_keys (current)",
-                EncryptionLayer::with_previous_keys(&key, &[&other], TENANT).map(drop),
-            ),
-            (
-                "EncryptionLayer::with_previous_keys (previous)",
-                EncryptionLayer::with_previous_keys(&other, &[&key], TENANT).map(drop),
-            ),
-        ];
-        for (entry, result) in cases {
+        for (entry, result) in raw_entry_points(&key) {
             assert_config_err(result, RAW_LEN_ERR, &row, entry);
         }
     }

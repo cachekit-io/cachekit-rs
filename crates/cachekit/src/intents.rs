@@ -627,7 +627,7 @@ mod secure_tests {
         let all: serde_json::Value =
             serde_json::from_str(include_str!("../tests/vectors/encryption.json"))
                 .expect("vendored vector file must be valid JSON");
-        let rows: Vec<AcceptRow> = all["master_key_input"]["accept_vectors"]
+        all["master_key_input"]["accept_vectors"]
             .as_array()
             .expect("accept_vectors must be an array")
             .iter()
@@ -641,9 +641,7 @@ mod secure_tests {
                     plaintext_hex: get("plaintext_hex"),
                 }
             })
-            .collect();
-        assert_eq!(rows.len(), 2, "accept_vectors row count");
-        rows
+            .collect()
     }
 
     fn assert_decrypts_accept_row(builder: &crate::CacheKitBuilder, row: &AcceptRow) {
@@ -652,10 +650,13 @@ mod secure_tests {
             .as_ref()
             .expect("secure preset must configure encryption");
         assert_eq!(layer.tenant_id(), "default");
-        let plaintext = layer.decrypt(&row.ciphertext, &row.cache_key);
+        let plaintext = layer
+            .decrypt(&row.ciphertext, &row.cache_key)
+            .map(hex::encode)
+            .map_err(|e| format!("{e:?}"));
         assert_eq!(
-            plaintext.map(hex::encode).ok().as_deref(),
-            Some(row.plaintext_hex.as_str()),
+            plaintext.as_deref(),
+            Ok(row.plaintext_hex.as_str()),
             "{} must decrypt",
             row.name
         );

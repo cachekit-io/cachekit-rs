@@ -31,10 +31,9 @@ mod common;
 
 use cachekit::CachekitError;
 use serde::de::IgnoredAny;
-use serde::Deserialize;
 use serde_json::Value as Json;
 
-use crate::common::read_every_path;
+use crate::common::{read_every_path, EnvelopedValue};
 
 const VECTORS_JSON: &str = include_str!("vectors/python-frame.json");
 
@@ -111,16 +110,6 @@ fn every_ck_frame_in_the_file_is_refused_on_every_path() {
         names.contains(&"ck_frame_fed_to_interop_reader"),
         "the WIRE-21 vector must be among the frames swept"
     );
-}
-
-/// The value the bare envelope wraps (the payload of
-/// `default_saas_write_msgpack_bytestorage_bin`).
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)] // decoded only to prove it cannot be
-struct EnvelopedValue {
-    user_id: u64,
-    name: String,
-    active: bool,
 }
 
 #[test]
