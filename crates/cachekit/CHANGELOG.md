@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.11.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.10.0...cachekit-rs-v0.11.0) (2026-10-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* **serializer:** reject trailing bytes after the MessagePack document on every read (LAB-8182) ([#140](https://github.com/cachekit-io/cachekit-rs/issues/140))
+
+### Features
+
+* **encryption:** rotate hex master keys for any tenant via encryption_with_previous ([#156](https://github.com/cachekit-io/cachekit-rs/issues/156)) ([98792f8](https://github.com/cachekit-io/cachekit-rs/commit/98792f81c330e44630d3fc1d9bc147ea1df73e6a))
+
+
+### Bug Fixes
+
+* **cachekitio:** never follow redirects on Workers; tighten API URL validation and send the URL as parsed (LAB-8208) ([#143](https://github.com/cachekit-io/cachekit-rs/issues/143)) ([5839b40](https://github.com/cachekit-io/cachekit-rs/commit/5839b404afbe62ce50e37099f4a0f0abb33ac618))
+* **cachekitio:** send a sub-second refresh_ttl as 1 second (LAB-8206) ([#142](https://github.com/cachekit-io/cachekit-rs/issues/142)) ([d32b34a](https://github.com/cachekit-io/cachekit-rs/commit/d32b34a038689052cf9300975fac8f30beabb3be))
+* **flight:** sweep a cold-key burst's dead slots after a lease timeout (LAB-8330) ([#153](https://github.com/cachekit-io/cachekit-rs/issues/153)) ([05451cd](https://github.com/cachekit-io/cachekit-rs/commit/05451cd1a1272feacab2beb5090fa0c069505096))
+* **macros:** accept any E: From&lt;CachekitError&gt; in #[cachekit] ([#155](https://github.com/cachekit-io/cachekit-rs/issues/155)) ([13c3798](https://github.com/cachekit-io/cachekit-rs/commit/13c3798de4d040129b53897ef5e8c6f2e8d2b425))
+* **readme:** pin the current release and bump the pins on every release (LAB-8219) ([#141](https://github.com/cachekit-io/cachekit-rs/issues/141)) ([68409f5](https://github.com/cachekit-io/cachekit-rs/commit/68409f5f9a9da2eb3dd431583faaa3bb9cda7cfe))
+* **serializer:** reject trailing bytes after the MessagePack document on every read (LAB-8182) ([#140](https://github.com/cachekit-io/cachekit-rs/issues/140)) ([06ed843](https://github.com/cachekit-io/cachekit-rs/commit/06ed843b25f2a6f58d5279efa9c0cdf7d46d93ba))
+* **swr:** stand a refresh down on a held lock instead of polling it (LAB-8236) ([#147](https://github.com/cachekit-io/cachekit-rs/issues/147)) ([dcec81e](https://github.com/cachekit-io/cachekit-rs/commit/dcec81e944e25121dfb7c39b0520fd9997a1f41d))
+
+
+### Performance Improvements
+
+* **flight:** detach a stored fill's unlock and bound the contested poll by a deadline (LAB-7122) ([#149](https://github.com/cachekit-io/cachekit-rs/issues/149)) ([f5b13b9](https://github.com/cachekit-io/cachekit-rs/commit/f5b13b946d013245d7f1883244cead5960c4f2fd))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.10.0 to 0.11.0
+
 ## [0.10.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.9.0...cachekit-rs-v0.10.0) (2026-10-05)
 
 
