@@ -893,6 +893,11 @@ async fn plain_reads_reject_a_plaintext_entry() {
     assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
     let err = client.interop_get::<String>("legacy").await.unwrap_err();
     assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+    let err = client
+        .interop_get_swr::<String>("legacy")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
 
     client.set("legacy", &"sealed").await.unwrap();
     assert_eq!(

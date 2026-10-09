@@ -21,8 +21,10 @@
 //! `bare_envelope_fed_to_frame_reader` is a bare ByteStorage envelope, which is
 //! one well-formed MessagePack document: no structural check can refuse it, and
 //! this reader decodes it. `bare_envelope_decodes_but_not_as_its_value` records
-//! that outcome, and pins the refusal callers do get: a typed read of the
-//! envelope's own value shape fails. `plain_msgpack_fed_to_frame_reader` is this
+//! that outcome, pins the refusal callers do get (a typed read of the
+//! envelope's own value shape fails), and pins the positional match: a target
+//! whose elements line up with the envelope's reads it.
+//! `plain_msgpack_fed_to_frame_reader` is this
 //! SDK's own format, so it is not driven here.
 
 mod common;
@@ -90,14 +92,29 @@ fn every_ck_frame_in_the_file_is_refused_on_every_path() {
         }
     }
     assert_eq!(names.len(), 16, "CK-prefixed vectors in python-frame.json");
+    let paths: Vec<_> = read_every_path::<IgnoredAny>(b"\x00")
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "serializer::deserialize",
+            "interop::deserialize",
+            "CacheKit::get",
+            "CacheKit::interop_get",
+            "CacheKit::interop_get_swr",
+        ],
+        "the sweep must cover every read path"
+    );
     assert!(
         names.contains(&"ck_frame_fed_to_interop_reader"),
         "the WIRE-21 vector must be among the frames swept"
     );
 }
 
-/// The value the bare envelope wraps (`default_saas_write_msgpack_bytestorage`'s
-/// `value_json`).
+/// The value the bare envelope wraps (the payload of
+/// `default_saas_write_msgpack_bytestorage_bin`).
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)] // decoded only to prove it cannot be
 struct EnvelopedValue {
