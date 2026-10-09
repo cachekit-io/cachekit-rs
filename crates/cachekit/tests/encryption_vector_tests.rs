@@ -32,7 +32,9 @@ use std::collections::BTreeMap;
 use cachekit::{CacheKit, CachekitError, EncryptionLayer};
 use cachekit_core::encryption::key_derivation::derive_tenant_keys;
 use cachekit_core::ZeroKnowledgeEncryptor;
-use common::{encrypting_client_holding, every_read, interop_reads, runtime, EnvelopedValue};
+use common::{
+    encrypting_client_holding, every_read, interop_reads, runtime, EnvelopedValue, AUTH_FAILURE,
+};
 use serde::de::IgnoredAny;
 use serde_json::Value as Json;
 
@@ -42,9 +44,6 @@ const INTEROP_JSON: &str = include_str!("vectors/interop-mode.json");
 /// The namespace a client needs for `aad_key_with_prefix_sealed_without`:
 /// its `cache_key` is the sealed key with `app:` in front.
 const PREFIX_NAMESPACE: &str = "app";
-
-/// The one error an AES-GCM tag mismatch reaches a reader as.
-const AUTH_FAILURE: &str = "decrypt failed: Authentication verification failed";
 
 fn vectors() -> Json {
     serde_json::from_str(VECTORS_JSON).expect("vendored vector file must be valid JSON")

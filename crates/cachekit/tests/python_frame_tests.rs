@@ -158,13 +158,16 @@ fn bare_envelope_decodes_but_not_as_its_value() {
 /// serializer name) or a decode is reached. That is where every
 /// `encrypted_read_vectors` row meets its `fail_closed` here.
 ///
-/// The refusal is pinned to the decrypt error class, not to one message:
-/// vectors shorter than a nonce and a tag fail as malformed ciphertext, the
-/// rest fail authentication.
+/// Each refusal is pinned to its exact message: vectors shorter than a nonce
+/// and a tag (28 bytes) fail as malformed ciphertext (`SHORT_CIPHERTEXT`),
+/// the rest fail authentication (`AUTH_FAILURE`). A reader that parsed the
+/// CK header, or refused CK magic, before AES-GCM would fail some row here.
 #[cfg(feature = "encryption")]
 #[test]
 fn every_vector_is_refused_at_decrypt_by_an_encrypting_client() {
-    use crate::common::{encrypting_client_holding, every_read, runtime};
+    use crate::common::{
+        encrypting_client_holding, every_read, runtime, AUTH_FAILURE, SHORT_CIPHERTEXT,
+    };
 
     let doc = vectors();
     let reader = |k: &str| {
@@ -175,6 +178,7 @@ fn every_vector_is_refused_at_decrypt_by_an_encrypting_client() {
     let key = reader("cache_key");
     let rt = runtime();
     let mut count = 0;
+    let mut short = 0;
     for group in ["frame_vectors", "error_vectors", "encrypted_read_vectors"] {
         for v in doc[group].as_array().expect("vector group") {
             let name = v["name"].as_str().expect("name");
@@ -183,6 +187,12 @@ fn every_vector_is_refused_at_decrypt_by_an_encrypting_client() {
             }
             let bytes =
                 hex::decode(v["frame_hex"].as_str().expect("frame_hex")).expect("frame_hex is hex");
+            let expected = if bytes.len() < 12 + 16 {
+                short += 1;
+                SHORT_CIPHERTEXT
+            } else {
+                AUTH_FAILURE
+            };
             let client = encrypting_client_holding(
                 reader("master_key_hex"),
                 reader("tenant_id"),
@@ -192,12 +202,15 @@ fn every_vector_is_refused_at_decrypt_by_an_encrypting_client() {
             );
             for (path, result) in rt.block_on(every_read::<IgnoredAny>(&client, key)) {
                 match result {
-                    Err(CachekitError::Encryption(msg)) if msg.starts_with("decrypt failed: ") => {}
-                    other => panic!("{name}: {path} must be refused at decrypt, got {other:?}"),
+                    Err(CachekitError::Encryption(msg)) if msg == expected => {}
+                    other => {
+                        panic!("{name}: {path} must be refused with {expected:?}, got {other:?}")
+                    }
                 }
             }
             count += 1;
         }
     }
     assert_eq!(count, 31, "vectors in python-frame.json");
+    assert_eq!(short, 4, "vectors under 28 bytes");
 }
