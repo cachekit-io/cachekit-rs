@@ -164,7 +164,7 @@ fn bare_envelope_decodes_but_not_as_its_value() {
 #[cfg(feature = "encryption")]
 #[test]
 fn every_vector_is_refused_at_decrypt_by_an_encrypting_client() {
-    use crate::common::{encrypting_client_holding, interop_reads, runtime};
+    use crate::common::{encrypting_client_holding, every_read, runtime};
 
     let doc = vectors();
     let reader = |k: &str| {
@@ -190,9 +190,7 @@ fn every_vector_is_refused_at_decrypt_by_an_encrypting_client() {
                 key,
                 bytes,
             );
-            let mut reads = vec![("CacheKit::get", rt.block_on(client.get::<IgnoredAny>(key)))];
-            reads.extend(rt.block_on(interop_reads::<IgnoredAny>(&client, key)));
-            for (path, result) in reads {
+            for (path, result) in rt.block_on(every_read::<IgnoredAny>(&client, key)) {
                 match result {
                     Err(CachekitError::Encryption(msg)) if msg.starts_with("decrypt failed: ") => {}
                     other => panic!("{name}: {path} must be refused at decrypt, got {other:?}"),

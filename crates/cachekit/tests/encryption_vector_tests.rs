@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use cachekit::{CacheKit, CachekitError, EncryptionLayer};
 use cachekit_core::encryption::key_derivation::derive_tenant_keys;
 use cachekit_core::ZeroKnowledgeEncryptor;
-use common::{encrypting_client_holding, interop_reads, runtime, EnvelopedValue};
+use common::{encrypting_client_holding, every_read, interop_reads, runtime, EnvelopedValue};
 use serde::de::IgnoredAny;
 use serde_json::Value as Json;
 
@@ -233,40 +233,11 @@ fn envelope_plaintext_is_not_unwrapped() {
     let rt = runtime();
 
     let (values, maps, documents) = rt.block_on(async {
-        let mut values = vec![(
-            "CacheKit::get",
-            client.get::<EnvelopedValue>(key).await.map(drop),
-        )];
-        let mut maps = vec![(
-            "CacheKit::get",
-            client
-                .get::<BTreeMap<String, IgnoredAny>>(key)
-                .await
-                .map(drop),
-        )];
-        let mut documents = vec![(
-            "CacheKit::get",
-            client
-                .get::<Vec<IgnoredAny>>(key)
-                .await
-                .map(|v| v.map(|v| v.len())),
-        )];
-        values.extend(
-            interop_reads::<EnvelopedValue>(&client, key)
-                .await
-                .map(|(path, r)| (path, r.map(drop))),
-        );
-        maps.extend(
-            interop_reads::<BTreeMap<String, IgnoredAny>>(&client, key)
-                .await
-                .map(|(path, r)| (path, r.map(drop))),
-        );
-        documents.extend(
-            interop_reads::<Vec<IgnoredAny>>(&client, key)
-                .await
-                .map(|(path, r)| (path, r.map(|v| v.map(|v| v.len())))),
-        );
-        (values, maps, documents)
+        (
+            every_read::<EnvelopedValue>(&client, key).await,
+            every_read::<BTreeMap<String, IgnoredAny>>(&client, key).await,
+            every_read::<Vec<IgnoredAny>>(&client, key).await,
+        )
     });
     for (path, result) in values {
         assert!(
@@ -282,7 +253,9 @@ fn envelope_plaintext_is_not_unwrapped() {
     }
     for (path, result) in documents {
         assert_eq!(
-            result.unwrap_or_else(|e| panic!("{path}: one MessagePack document: {e:?}")),
+            result
+                .unwrap_or_else(|e| panic!("{path}: one MessagePack document: {e:?}"))
+                .map(|v| v.len()),
             Some(4),
             "{path}: the plaintext decodes as the envelope's 4-element array"
         );

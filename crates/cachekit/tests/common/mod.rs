@@ -134,11 +134,18 @@ pub async fn interop_reads<T: DeserializeOwned>(
     ]
 }
 
+/// Every client read of `key`: `get`, then [`interop_reads`]. The client must
+/// have L1 off.
+pub async fn every_read<T: DeserializeOwned>(client: &CacheKit, key: &str) -> Vec<Read<Option<T>>> {
+    let mut reads = vec![("CacheKit::get", client.get::<T>(key).await)];
+    reads.extend(interop_reads::<T>(client, key).await);
+    reads
+}
+
 /// The value inside the ByteStorage envelope of python-frame.json's default
 /// write payload (`default_saas_write_msgpack_bytestorage_bin`), which
 /// encryption.json's `container_envelope_to_plain_reader` also seals.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // decoded only to prove it cannot be
 pub struct EnvelopedValue {
     user_id: u64,
     name: String,
@@ -168,8 +175,7 @@ pub fn read_every_path<T: DeserializeOwned>(bytes: &[u8]) -> Vec<Read<T>> {
             .lock()
             .await
             .insert(KEY.to_owned(), bytes.to_vec());
-        reads.push(("CacheKit::get", found(client.get::<T>(KEY).await)));
-        for (path, result) in interop_reads::<T>(&client, KEY).await {
+        for (path, result) in every_read::<T>(&client, KEY).await {
             reads.push((path, found(result)));
         }
     });
