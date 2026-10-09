@@ -103,10 +103,10 @@ pub fn decode_both<T: DeserializeOwned>(bytes: &[u8]) -> [Read<T>; 2] {
     ]
 }
 
-/// Every untrusted read path for `bytes`: both decoders directly, then every
-/// client read of a backend entry holding exactly `bytes`. `get`
-/// stores plain MessagePack (no envelope), so the forged entry is the input
-/// itself. L1 is off so each read reaches the backend and its decoder.
+/// Every read path of a client without encryption for `bytes`: both decoders
+/// directly, then every client read of a backend entry holding exactly `bytes`.
+/// This SDK writes plain MessagePack (no envelope), so the forged entry is the
+/// input itself. L1 is off so each read reaches the backend and its decoder.
 pub fn read_every_path<T: DeserializeOwned>(bytes: &[u8]) -> Vec<Read<T>> {
     const KEY: &str = "forged:entry";
     let runtime = tokio::runtime::Builder::new_current_thread()
