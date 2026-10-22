@@ -1,3 +1,4 @@
+use cachekit_core::check_msgpack_structure;
 use rmp_serde::decode::ReadRefReader;
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -16,118 +17,13 @@ use crate::error::CachekitError;
 /// every profile and target (wasm32 included), and sits inside the protocol's
 /// required `32..=1024` window (`spec/interop-mode.md` → Decode bounds).
 ///
-/// Enforced by `check_structure`, which defines how depth is counted.
+/// Enforced by cachekit-core's `check_msgpack_structure`, which runs before
+/// every decode in [`deserialize`] and [`crate::interop::deserialize`]. Depth
+/// counts every array and map header on the deepest path, empty ones included;
+/// scalars, str, bin and ext are leaves.
+/// Exactly `MAX_DECODE_DEPTH` levels are accepted, and one more is rejected
+/// with a `decode bound:` error before `rmp-serde` recurses.
 pub const MAX_DECODE_DEPTH: usize = 100;
-
-/// Header-only structural walk over one MessagePack document.
-///
-/// Proves that a complete document lies within `bytes`, that it nests no deeper
-/// than [`MAX_DECODE_DEPTH`], and that no header declares more elements or bytes
-/// than the remaining input can back — every element costs at least one input
-/// byte, so `pending ≤ remaining` at every step means Σ declared ≤ input.
-/// `pending` sums what every open header still owes, so nested headers that each
-/// fit the input after them but together overclaim are rejected too. All counts
-/// are `u64`: before each header is added `pending` is at most the remaining
-/// input, and one header adds less than 2³³ (a map32 declares 2 × (2³² − 1)
-/// children), so no sum can overflow. Depth counts every array and map header
-/// on the deepest path, empty ones included; scalars, str, bin and ext are
-/// leaves. Exactly `MAX_DECODE_DEPTH` levels are accepted, one more is rejected
-/// with a `decode bound:` error before `rmp-serde` recurses. Memory is fixed: a
-/// `[u64; MAX_DECODE_DEPTH]` stack of children still owed by each open
-/// collection, whatever the input. Fails closed on the reserved marker,
-/// truncation, excess depth, and length overflow, always with a message
-/// starting `decode bound:`. Returns the document's length in bytes: the walk
-/// covers exactly one document, so its end position is where the document ends.
-///
-/// Why depth is checked here and not only by `rmp-serde`: a guard that admits
-/// a document deeper than the bound leaves the rejection to the decoder,
-/// mid-recursion, after it has materialised the outer levels.
-///
-/// Why it is needed even though `rmp-serde` reads str/bin lazily: serde's
-/// sequence visitors (`Vec<T>`, and the `Content` buffer that
-/// `#[serde(untagged)]` targets decode through) reserve
-/// `min(declared_len × size_of::<Element>(), 1 MiB)` bytes per collection from
-/// `size_hint`, so without this walk a 500-byte payload of nested
-/// `array32(0xFFFFFFFF)` headers requests `MAX_DECODE_DEPTH` MiB before the
-/// first EOF error — an OOM kill on a Cloudflare Workers isolate. Trailing
-/// bytes are left to the caller: [`bounded_deserializer`] rejects them by
-/// comparing the returned length with the input's.
-pub(crate) fn check_structure(bytes: &[u8]) -> Result<usize, CachekitError> {
-    fn reject(what: &str) -> CachekitError {
-        CachekitError::Serialization(format!("decode bound: {what}"))
-    }
-    fn be(bytes: &[u8], pos: usize, width: usize) -> Result<u64, CachekitError> {
-        let end = pos.checked_add(width).filter(|e| *e <= bytes.len());
-        let field = &bytes[pos..end.ok_or_else(|| reject("input ends inside a length prefix"))?];
-        Ok(field.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b)))
-    }
-
-    // Children still owed by each open collection, innermost last. The top frame
-    // is non-zero between elements; an ancestor may reach 0 while its last child
-    // is still open, so the pop loop drains every finished frame, and an empty
-    // collection never stays pushed.
-    let mut open = [0u64; MAX_DECODE_DEPTH];
-    let mut depth = 0usize;
-    let mut pos = 0usize;
-    let mut pending: u64 = 1; // elements still owed by open headers (the root counts as one)
-    while pending > 0 {
-        let marker = *bytes
-            .get(pos)
-            .ok_or_else(|| reject("input ends before the document is complete"))?;
-        pos += 1;
-        pending -= 1;
-        if let Some(parent) = depth.checked_sub(1) {
-            open[parent] -= 1;
-        }
-        // (prefix bytes, payload bytes after the prefix, child elements)
-        let (prefix, payload, children): (usize, u64, u64) = match marker {
-            0x00..=0x7f | 0xc0 | 0xc2 | 0xc3 | 0xe0..=0xff => (0, 0, 0),
-            0x80..=0x8f => (0, 0, 2 * u64::from(marker & 0x0f)),
-            0x90..=0x9f => (0, 0, u64::from(marker & 0x0f)),
-            0xa0..=0xbf => (0, u64::from(marker & 0x1f), 0),
-            0xc1 => return Err(reject("reserved marker 0xc1")),
-            0xc4 | 0xd9 => (1, be(bytes, pos, 1)?, 0),
-            0xc5 | 0xda => (2, be(bytes, pos, 2)?, 0),
-            0xc6 | 0xdb => (4, be(bytes, pos, 4)?, 0),
-            0xc7 => (1, be(bytes, pos, 1)? + 1, 0), // ext: length prefix, then type byte + data
-            0xc8 => (2, be(bytes, pos, 2)? + 1, 0),
-            0xc9 => (4, be(bytes, pos, 4)? + 1, 0),
-            0xca..=0xd3 => (0, 1u64 << (marker & 0x03), 0), // f32/f64/u8..u64/i8..i64: 4,8,1,2,4,8,1,2,4,8
-            0xd4..=0xd8 => (0, 1 + (1u64 << (marker - 0xd4)), 0), // fixext: type byte + 1/2/4/8/16
-            0xdc => (2, 0, be(bytes, pos, 2)?),
-            0xdd => (4, 0, be(bytes, pos, 4)?),
-            0xde => (2, 0, 2 * be(bytes, pos, 2)?),
-            0xdf => (4, 0, 2 * be(bytes, pos, 4)?),
-        };
-        pos += prefix;
-        let remaining = (bytes.len() - pos) as u64;
-        if payload > remaining {
-            return Err(reject("header declares more bytes than the input holds"));
-        }
-        pos += usize::try_from(payload)
-            .map_err(|_| reject("header declares more bytes than the input holds"))?;
-        pending += children;
-        if pending > remaining - payload {
-            return Err(reject(
-                "header declares more elements than the input can back",
-            ));
-        }
-        if matches!(marker, 0x80..=0x9f | 0xdc..=0xdf) {
-            // Every collection header is a level, an empty one included.
-            if depth == MAX_DECODE_DEPTH {
-                return Err(reject(&format!(
-                    "nesting deeper than {MAX_DECODE_DEPTH} levels"
-                )));
-            }
-            open[depth] = children;
-            depth += 1;
-        }
-        while depth > 0 && open[depth - 1] == 0 {
-            depth -= 1;
-        }
-    }
-    Ok(pos)
-}
 
 /// A decoder reading a byte slice in place.
 pub(crate) type SliceDeserializer<'a> = rmp_serde::Deserializer<ReadRefReader<'a, [u8]>>;
@@ -137,14 +33,35 @@ pub(crate) type SliceDeserializer<'a> = rmp_serde::Deserializer<ReadRefReader<'a
 ///
 /// Every decode of backend-supplied bytes (auto-mode [`deserialize`] and
 /// [`crate::interop::deserialize`]) MUST go through here so the bounds cannot
-/// drift between paths. Runs `check_structure` first (depth and allocation
-/// bound), then rejects any byte after the document it measured: no writer
-/// emits one, a lenient read would decode a foreign
-/// container by its first byte (a cachekit-py CK frame begins with `0x43`, the
-/// complete document 67), and after a decrypt the spec requires a parse
-/// mismatch to fail. It then sets `rmp-serde`'s own depth limit as a
-/// backstop just above [`MAX_DECODE_DEPTH`]: its default (1024) is deep enough
-/// to overflow a debug-build thread stack.
+/// drift between paths. It runs cachekit-core's header-only
+/// `check_msgpack_structure` walk first. The walk proves that a complete
+/// document lies within `bytes`, that it nests no deeper than
+/// [`MAX_DECODE_DEPTH`], and that no header declares more elements or bytes
+/// than the remaining input can back. Its rejection becomes a
+/// `CachekitError::Serialization` starting `decode bound:`.
+///
+/// Why depth is checked by the walk and not only by `rmp-serde`: a guard that
+/// admits a document deeper than the bound leaves the rejection to the decoder,
+/// mid-recursion, after it has materialised the outer levels.
+///
+/// Why the walk is needed even though `rmp-serde` reads str/bin lazily: serde's
+/// sequence visitors (`Vec<T>`, and the `Content` buffer that
+/// `#[serde(untagged)]` targets decode through) reserve
+/// `min(declared_len × size_of::<Element>(), 1 MiB)` bytes per collection from
+/// `size_hint`, so without the walk a 500-byte payload of nested
+/// `array32(0xFFFFFFFF)` headers requests `MAX_DECODE_DEPTH` MiB before the
+/// first EOF error — an OOM kill on a Cloudflare Workers isolate.
+///
+/// It then rejects any byte after the document: no writer emits one, a lenient
+/// read would decode a foreign container by its first byte (a cachekit-py CK
+/// frame begins with `0x43`, the complete document 67), and after a decrypt the
+/// spec requires a parse mismatch to fail. The walk leaves trailing bytes to
+/// its caller and reports no length, so the check walks `bytes` again without
+/// its last byte. A MessagePack document's own bytes fix where it ends, so it is
+/// still complete without that byte exactly when at least one byte follows it.
+/// Finally it sets `rmp-serde`'s own depth limit as a backstop just above
+/// [`MAX_DECODE_DEPTH`]: its default (1024) is deep enough to overflow a
+/// debug-build thread stack.
 ///
 /// The decoder reads the input in place (`from_read_ref`), so str and bin
 /// payloads are handed to serde as borrowed slices. The default `ReadReader`
@@ -156,15 +73,19 @@ pub(crate) type SliceDeserializer<'a> = rmp_serde::Deserializer<ReadRefReader<'a
 /// only an ext's type byte leaves the body unread and is accepted. No value
 /// this SDK writes contains ext.
 pub(crate) fn bounded_deserializer(bytes: &[u8]) -> Result<SliceDeserializer<'_>, CachekitError> {
-    let doc_len = check_structure(bytes)?;
-    // The error carries only a count: on the secure path these bytes are
-    // decrypted plaintext (CWE-532).
-    let trailing = bytes.len() - doc_len;
-    if trailing > 0 {
-        return Err(CachekitError::Serialization(format!(
-            "payload has {trailing} trailing byte(s) after the MessagePack document — \
+    check_msgpack_structure(bytes, MAX_DECODE_DEPTH)
+        .map_err(|e| CachekitError::Serialization(format!("decode bound: {e}")))?;
+    let trailing = bytes
+        .split_last()
+        .is_some_and(|(_, head)| check_msgpack_structure(head, MAX_DECODE_DEPTH).is_ok());
+    // The error names no byte: on the secure path these bytes are decrypted
+    // plaintext (CWE-532).
+    if trailing {
+        return Err(CachekitError::Serialization(
+            "payload has trailing byte(s) after the MessagePack document — \
              readers must consume exactly one document"
-        )));
+                .to_owned(),
+        ));
     }
     let mut de = rmp_serde::Deserializer::from_read_ref(bytes);
     // rmp-serde decrements its counter on entry and errors when it reaches 0, so
@@ -182,10 +103,10 @@ pub fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, CachekitError> {
     rmp_serde::to_vec_named(value).map_err(|e| CachekitError::Serialization(e.to_string()))
 }
 
-/// Deserialize `bytes` from MessagePack into `T` under the decode bounds: the
-/// `check_structure` walk (depth ≤ [`MAX_DECODE_DEPTH`], no overclaim) runs
-/// before anything is decoded, and `bytes` must hold exactly one document —
-/// trailing bytes are rejected, as in interop mode
+/// Deserialize `bytes` from MessagePack into `T` under the decode bounds:
+/// cachekit-core's structural walk (depth ≤ [`MAX_DECODE_DEPTH`], no
+/// overclaim) runs before anything is decoded, and `bytes` must hold exactly
+/// one document — trailing bytes are rejected, as in interop mode
 /// ([`crate::interop::deserialize`]).
 pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError> {
     T::deserialize(&mut bounded_deserializer(bytes)?)

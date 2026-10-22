@@ -10,7 +10,7 @@
 //! Do not edit the JSON here; regenerate upstream and re-vendor.
 //!
 //! Every reject vector must fail with the structural guard's own error
-//! (`decode bound:` from `serializer::check_structure`), not merely fail: a
+//! (`decode bound:` from the structural walk), not merely fail: a
 //! stock decoder rejects the same bytes mid-decode, after it has materialised
 //! part of the document, so "it errored" cannot tell a guarded reader from an
 //! unguarded one. The harness does not switch on `reject_reasons`: a vector
@@ -20,7 +20,7 @@
 //! a cache miss, so they still see the error itself. Why 100 and not
 //! rmp-serde's 1024, and why a header walk is
 //! needed at all: see the rustdoc on `serializer::MAX_DECODE_DEPTH` and
-//! `check_structure`. This file fails if a dependency bump (or a new decode
+//! `bounded_deserializer`. This file fails if a dependency bump (or a new decode
 //! path bypassing `bounded_deserializer`) re-opens either bound.
 
 mod common;
@@ -52,7 +52,7 @@ fn unhex(s: &str) -> Vec<u8> {
 }
 
 /// The guard's rejection, and nothing else: a `Serialization` error whose
-/// message comes from `check_structure`.
+/// message comes from the structural walk.
 fn assert_guard_rejected(what: &str, path: &str, result: Result<Json, CachekitError>) {
     let e = result
         .err()
@@ -275,7 +275,7 @@ fn closed_collections_release_their_depth() {
 
 /// A recursive `Vec`-bearing target. `#[serde(untagged)]` decodes through serde's
 /// `Content` buffer, which pre-allocates from `size_hint` like `Vec<T>` (1 MiB per
-/// level; see `check_structure`), so WITHOUT the structural walk 50 nested
+/// level; see `bounded_deserializer`), so WITHOUT the structural walk 50 nested
 /// `array32(0xFFFFFFFF)` headers (250 bytes) request 50 MiB before EOF.
 /// `serde_json::Value` happens to allocate nothing here, which is why the vector
 /// tests alone cannot catch a walk regression — this one can.
