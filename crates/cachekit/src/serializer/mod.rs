@@ -17,9 +17,10 @@ use crate::error::CachekitError;
 /// every profile and target (wasm32 included), and sits inside the protocol's
 /// required `32..=1024` window (`spec/interop-mode.md` → Decode bounds).
 ///
-/// Enforced by cachekit-core's `check_msgpack_structure`, run from
-/// [`bounded_deserializer`]. Depth counts every array and map header on the
-/// deepest path, empty ones included; scalars, str, bin and ext are leaves.
+/// Enforced by cachekit-core's `check_msgpack_structure`, which runs before
+/// every decode in [`deserialize`] and [`crate::interop::deserialize`]. Depth
+/// counts every array and map header on the deepest path, empty ones included;
+/// scalars, str, bin and ext are leaves.
 /// Exactly `MAX_DECODE_DEPTH` levels are accepted, and one more is rejected
 /// with a `decode bound:` error before `rmp-serde` recurses.
 pub const MAX_DECODE_DEPTH: usize = 100;
