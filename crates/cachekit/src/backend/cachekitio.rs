@@ -10,6 +10,8 @@ use zeroize::Zeroizing;
 use crate::backend::{
     delete_succeeded, encode_key, ttl_header, Backend, Freshness, HealthStatus, LockableBackend,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use crate::backend::{READ_TIMEOUT, WRITE_TIMEOUT};
 use crate::error::{BackendError, BackendErrorKind};
 use crate::metrics::{metrics_headers_named, MetricsProvider, METRICS_HEADER_NAMES};
 use crate::session::session_headers;
@@ -407,31 +409,17 @@ fn metrics_header_names() -> Result<[HeaderName; 5], crate::error::CachekitError
 #[cfg(not(target_arch = "wasm32"))]
 const USER_AGENT: &str = concat!("cachekit-rs/", env!("CARGO_PKG_VERSION"));
 
-/// How long an idle pooled connection is kept for reuse. Cloudflare closes an
-/// idle client HTTP/1.1 connection after 400 s, not configurable; reqwest's
-/// 90 s default dropped connections the edge would still serve, so a request
-/// after a 90-390 s gap paid DNS, TCP and TLS again. 390 s leaves a 10 s
-/// margin, and reqwest's 15 s TCP keepalive keeps NAT mappings alive meanwhile.
-/// Per-attempt budget for every request but a write, connect and TLS
-/// included: the protocol's `CACHEKIT_TIMEOUT` default (`spec/saas-api.md`),
-/// as in cachekit-py and cachekit-ts. It was 30 s, so under the retrying
-/// presets a request the service accepted and never answered held a call for
-/// ~90 s before it failed open.
-#[cfg(not(target_arch = "wasm32"))]
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Per-attempt budget for a write (`PUT`, `DELETE`): twice the read budget,
-/// because a write carries the payload and the service commits it before it
-/// answers, so a slow but healthy write must not time out and be re-sent.
-#[cfg(not(target_arch = "wasm32"))]
-const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Header on a `429` that denies a spent quota or balance rather than a rate
 /// limit; such an error is never retried within the call (see
 /// [`crate::error::QuotaDenied`]).
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // wasm32 uses the Workers backend
 const DENY_REASON_HEADER: &str = "x-cachekit-deny-reason";
 
+/// How long an idle pooled connection is kept for reuse. Cloudflare closes an
+/// idle client HTTP/1.1 connection after 400 s, not configurable; reqwest's
+/// 90 s default dropped connections the edge would still serve, so a request
+/// after a 90-390 s gap paid DNS, TCP and TLS again. 390 s leaves a 10 s
+/// margin, and reqwest's 15 s TCP keepalive keeps NAT mappings alive meanwhile.
 #[cfg(not(target_arch = "wasm32"))]
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(390);
 
@@ -454,10 +442,10 @@ fn http_client() -> reqwest::Result<reqwest::Client> {
     http_client_builder().build()
 }
 
-/// wasm32: the platform's `fetch` owns pooling and timeouts; no User-Agent is set.
-/// It also cannot refuse redirects (reqwest's wasm32 client sets no redirect
-/// mode), so `CachekitIO` must not gain a wasm32 `Backend` impl; `WorkersCachekitIO`
-/// is the wasm32 backend.
+/// wasm32: the platform's `fetch` owns pooling; this client sets no timeout and
+/// no User-Agent. It also cannot refuse redirects (reqwest's wasm32 client sets
+/// no redirect mode), so `CachekitIO` must not gain a wasm32 `Backend` impl;
+/// `WorkersCachekitIO` is the wasm32 backend, and it bounds each request itself.
 #[cfg(target_arch = "wasm32")]
 fn http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder().build()
@@ -1057,8 +1045,9 @@ mod http_client_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use super::{http_client_builder, CachekitIO, READ_TIMEOUT, WRITE_TIMEOUT};
+    use super::{http_client_builder, CachekitIO};
     use crate::backend::Backend;
+    use crate::backend::{READ_TIMEOUT, WRITE_TIMEOUT};
     use crate::error::BackendErrorKind;
 
     /// The production client minus the system proxy: an `HTTP_PROXY` or

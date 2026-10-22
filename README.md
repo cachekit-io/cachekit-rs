@@ -165,10 +165,11 @@ let cache = CacheKit::builder()
 > [!IMPORTANT]
 > Never hardcode API keys or master keys. Use environment variables or a secrets manager.
 
-On native targets each cachekit.io request attempt times out after 5 s, the
-protocol's `CACHEKIT_TIMEOUT` default and the same as cachekit-py and
-cachekit-ts; a write (`set`, `delete`) gets 10 s. The timeout covers connect,
-TLS and the response, and surfaces as `BackendErrorKind::Timeout`.
+Each cachekit.io request attempt times out after 5 s, the protocol's
+`CACHEKIT_TIMEOUT` default; a write (`set`, `delete`) gets 10 s. The timeout
+covers connect, TLS and the whole response body, and surfaces as
+`BackendErrorKind::Timeout`. The same budgets apply on native targets and on
+the [Workers backend](#cloudflare-workers).
 
 On native targets every request carries the User-Agent `cachekit-rs/<version>`,
 and an idle pooled connection is kept for 390 s (reqwest's default is 90 s).
@@ -392,6 +393,8 @@ let backend = FileBackend::builder()
 ### Cloudflare Workers
 
 `wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. It is the CachekitIO backend on wasm32. Requires the `workers` feature with default features disabled.
+
+The Workers runtime's `fetch` has no timeout of its own and can hold a request for tens of seconds, so the backend bounds each request itself: 5 s for a read and 10 s for a write (`set`, `delete`), from send through the last byte of the response body. Past that the request is aborted and the call fails with `BackendErrorKind::Timeout`. The `reliability` feature is native-only, so a Workers call makes one attempt and does not retry.
 
 <!-- x-release-please-start-version -->
 ```toml
