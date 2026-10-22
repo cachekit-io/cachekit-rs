@@ -420,3 +420,10 @@ async fn workers_backend_aborts_a_dropped_request() {
     assert!(pending, "the call was in flight when dropped");
     assert_eq!(aborted, Some(true), "dropping the call aborts its request");
 }
+
+// TEMPORARY: proves the test-wasm guard turns CI red. Never merge.
+#[wasm_bindgen_test]
+async fn temp_never_settles() {
+    let p = js_sys::Promise::new(&mut |_, _| {});
+    let _ = worker::wasm_bindgen_futures::JsFuture::from(p).await;
+}
