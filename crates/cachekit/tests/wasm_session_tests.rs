@@ -201,3 +201,123 @@ fn workers_backend_uses_the_validated_url_as_serialized() {
         .expect("allowlisted host");
     assert_eq!(backend.api_url(), "https://api.cachekit.io/@evil.example");
 }
+
+/// Points `globalThis.fetch` at two stalls: a `hang` path whose promise never
+/// settles, and a `stall-body` path that answers `200` with a body that never
+/// ends. Every request's `AbortSignal` lands in `globalThis.__ckStall.signals`.
+const STALL_FETCH_JS: &str = r"
+    const state = (globalThis.__ckStall = { signals: [] });
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (input, init) => {
+        state.signals.push(init?.signal);
+        const path = new URL(new Request(input).url).pathname;
+        if (path === '/v1/cache/stall-body') {
+            return Promise.resolve(new Response(new ReadableStream({}), { status: 200 }));
+        }
+        return new Promise(() => {});
+    };
+    state.close = () => { globalThis.fetch = realFetch; };
+";
+
+/// Run two futures to completion together; each output carries the
+/// `Date.now()` millis at which it finished.
+async fn join_timed<A: std::future::Future, B: std::future::Future>(
+    a: A,
+    b: B,
+) -> ((A::Output, f64), (B::Output, f64)) {
+    use std::task::Poll;
+    use worker::js_sys::Date;
+
+    let (mut a, mut b) = (std::pin::pin!(a), std::pin::pin!(b));
+    let (mut done_a, mut done_b) = (None, None);
+    std::future::poll_fn(|cx| {
+        if done_a.is_none() {
+            if let Poll::Ready(out) = a.as_mut().poll(cx) {
+                done_a = Some((out, Date::now()));
+            }
+        }
+        if done_b.is_none() {
+            if let Poll::Ready(out) = b.as_mut().poll(cx) {
+                done_b = Some((out, Date::now()));
+            }
+        }
+        if done_a.is_some() && done_b.is_some() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    (done_a.expect("a finished"), done_b.expect("b finished"))
+}
+
+/// The Workers runtime's `fetch` sets no timeout, so the backend bounds each
+/// attempt itself at the native budgets: 5 s for a read and 10 s for a write,
+/// body included. Each stalled call fails with `Timeout` within its budget plus
+/// 1 s and aborts its request. The three calls run concurrently, so the test
+/// takes ~10 s rather than 20 s.
+#[wasm_bindgen_test]
+async fn workers_backend_times_out_a_stalled_request() {
+    use cachekit::backend::workers::WorkersCachekitIO;
+    use cachekit::backend::Backend;
+    use cachekit::BackendErrorKind;
+    use worker::js_sys::{global, Array, Date, Function, Reflect};
+    use worker::wasm_bindgen::{JsCast, JsValue};
+
+    let backend = WorkersCachekitIO::builder()
+        .api_key("test-key-never-sent")
+        .build()
+        .expect("default URL is valid");
+
+    Function::new_no_args(STALL_FETCH_JS)
+        .call0(&JsValue::NULL)
+        .expect("patch fetch");
+    let state = Reflect::get(&global(), &"__ckStall".into()).expect("stall state");
+
+    let start = Date::now();
+    let ((get_hang, get_hang_at), (((get_body, get_body_at), (set_hang, set_hang_at)), _)) =
+        join_timed(
+            backend.get("hang"),
+            join_timed(
+                backend.get("stall-body"),
+                backend.set("hang", vec![1], None),
+            ),
+        )
+        .await;
+
+    let signals: Array = Reflect::get(&state, &"signals".into())
+        .expect("signals")
+        .unchecked_into();
+    let aborted: Vec<bool> = signals
+        .iter()
+        .map(|s| {
+            Reflect::get(&s, &"aborted".into())
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        })
+        .collect();
+    if let Ok(close) = Reflect::get(&state, &"close".into()) {
+        let _ = close.unchecked_into::<Function>().call0(&JsValue::NULL);
+    }
+
+    let calls = [
+        ("get, no response", get_hang.err(), get_hang_at, 5_000.0),
+        ("get, stalled body", get_body.err(), get_body_at, 5_000.0),
+        ("set, no response", set_hang.err(), set_hang_at, 10_000.0),
+    ];
+    for (call, err, at, budget) in calls {
+        let err = err.unwrap_or_else(|| panic!("{call}: must fail"));
+        assert_eq!(err.kind, BackendErrorKind::Timeout, "{call}: {err}");
+        let elapsed = at - start;
+        assert!(
+            elapsed >= budget - 50.0 && elapsed <= budget + 1_000.0,
+            "{call}: gave up after {elapsed} ms, budget {budget} ms"
+        );
+    }
+    assert_eq!(
+        aborted,
+        [true, true, true],
+        "every stalled request is aborted"
+    );
+}
