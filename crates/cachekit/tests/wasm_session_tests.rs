@@ -321,3 +321,102 @@ async fn workers_backend_times_out_a_stalled_request() {
         "every stalled request is aborted"
     );
 }
+
+/// Await a JS `setTimeout` of `ms`, letting pending promise callbacks run.
+async fn sleep_ms(ms: u32) {
+    use worker::js_sys::{Function, Promise};
+    use worker::wasm_bindgen::{JsCast, JsValue};
+    use worker::wasm_bindgen_futures::JsFuture;
+
+    let wait: Promise =
+        Function::new_with_args("ms", "return new Promise(r => setTimeout(r, ms));")
+            .call1(&JsValue::NULL, &ms.into())
+            .expect("sleep")
+            .unchecked_into();
+    JsFuture::from(wait).await.expect("sleep resolves");
+}
+
+/// A request that answers before its budget leaves nothing behind: its
+/// deadline timer and that timer's wasm callbacks are freed, so a long-lived
+/// isolate does not grow with traffic.
+#[wasm_bindgen_test]
+async fn workers_backend_frees_the_deadline_of_a_completed_request() {
+    use cachekit::backend::workers::WorkersCachekitIO;
+    use cachekit::backend::Backend;
+    use worker::js_sys::Function;
+    use worker::wasm_bindgen::{externref_heap_live_count, JsCast, JsValue};
+
+    let restore: Function = Function::new_no_args(
+        "const old = globalThis.fetch;
+         globalThis.fetch = () => Promise.resolve(new Response('ok'));
+         return () => { globalThis.fetch = old; };",
+    )
+    .call0(&JsValue::NULL)
+    .expect("patch fetch")
+    .unchecked_into();
+    let backend = WorkersCachekitIO::builder()
+        .api_key("test-key-never-sent")
+        .build()
+        .expect("default URL is valid");
+
+    let warmup = backend.get("warmup").await;
+    sleep_ms(0).await;
+    let before = externref_heap_live_count();
+    let mut results = Vec::new();
+    for _ in 0..200 {
+        results.push(backend.get("ok").await);
+    }
+    sleep_ms(0).await;
+    let retained = externref_heap_live_count() - before;
+    let _ = restore.call0(&JsValue::NULL);
+
+    assert_eq!(warmup.ok(), Some(Some(b"ok".to_vec())));
+    assert!(results
+        .iter()
+        .all(|r| r.as_ref().ok() == Some(&Some(b"ok".to_vec()))));
+    assert!(
+        retained < 10,
+        "200 completed requests retained {retained} live JS references"
+    );
+}
+
+/// A caller that drops a call mid-flight (say, racing it against a fallback)
+/// aborts its request rather than leaving it outstanding with no deadline.
+#[wasm_bindgen_test]
+async fn workers_backend_aborts_a_dropped_request() {
+    use cachekit::backend::workers::WorkersCachekitIO;
+    use cachekit::backend::Backend;
+    use std::task::Poll;
+    use worker::js_sys::{global, Function, Reflect};
+    use worker::wasm_bindgen::{JsCast, JsValue};
+
+    let restore: Function = Function::new_no_args(
+        "const old = globalThis.fetch;
+         globalThis.fetch = (_input, init) => {
+             globalThis.__ckDropped = init.signal;
+             return new Promise((_resolve, reject) =>
+                 init.signal.addEventListener('abort', () => reject(new Error('aborted'))));
+         };
+         return () => { globalThis.fetch = old; };",
+    )
+    .call0(&JsValue::NULL)
+    .expect("patch fetch")
+    .unchecked_into();
+    let backend = WorkersCachekitIO::builder()
+        .api_key("test-key-never-sent")
+        .build()
+        .expect("default URL is valid");
+
+    let mut call = backend.get("dropped");
+    let pending = std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx).is_pending())).await;
+    drop(call);
+    sleep_ms(0).await;
+    let aborted = Reflect::get(&global(), &"__ckDropped".into())
+        .and_then(|signal| Reflect::get(&signal, &"aborted".into()))
+        .ok()
+        .and_then(|v| v.as_bool());
+    let _ = restore.call0(&JsValue::NULL);
+
+    assert!(pending, "the call was in flight when dropped");
+    assert_eq!(aborted, Some(true), "dropping the call aborts its request");
+}

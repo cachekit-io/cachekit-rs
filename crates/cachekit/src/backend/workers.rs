@@ -42,6 +42,10 @@ struct Fetched {
 /// holds on workerd but not on Node.
 struct Timer {
     handle: JsValue,
+    /// Settles the timer's promise. `JsFuture` frees its callbacks only when
+    /// the promise settles, so a cleared timer must still resolve it, or every
+    /// request that beats its deadline leaks them.
+    resolve: Function,
 }
 
 impl Timer {
@@ -53,13 +57,17 @@ impl Timer {
             .and_then(|f| f.dyn_into().ok())
             .ok_or_else(|| BackendError::permanent("no global setTimeout"))?;
         let mut armed = Err(JsValue::UNDEFINED);
+        let mut settle = None;
         let fired = Promise::new(&mut |resolve, _reject| {
             armed = set_timeout.call2(&global, &resolve, &(after.as_millis() as f64).into());
+            settle = Some(resolve);
         });
         let handle = armed.map_err(|e| {
             BackendError::permanent(format!("failed to arm the request timeout: {e:?}"))
         })?;
-        Ok((Self { handle }, JsFuture::from(fired)))
+        let resolve = settle
+            .ok_or_else(|| BackendError::permanent("Promise::new did not run its executor"))?;
+        Ok((Self { handle, resolve }, JsFuture::from(fired)))
     }
 }
 
@@ -70,6 +78,19 @@ impl Drop for Timer {
             if let Ok(clear) = clear.dyn_into::<Function>() {
                 let _ = clear.call1(&global, &self.handle);
             }
+        }
+        let _ = self.resolve.call0(&JsValue::UNDEFINED);
+    }
+}
+
+/// Aborts its request when dropped unless disarmed, so a request is cancelled
+/// both when its budget runs out and when the caller drops the call mid-flight.
+struct AbortOnDrop(Option<worker::AbortController>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(controller) = self.0.take() {
+            controller.abort();
         }
     }
 }
@@ -230,6 +251,7 @@ impl WorkersCachekitIO {
 
         let controller = worker::AbortController::default();
         let signal = controller.signal();
+        let mut abort = AbortOnDrop(Some(controller));
         let attempt = async {
             let mut resp = worker::Fetch::Request(request)
                 .send_with_signal(&signal)
@@ -263,14 +285,18 @@ impl WorkersCachekitIO {
         })
         .await;
 
-        finished.unwrap_or_else(|| {
-            // Cancels the request and any body still streaming in.
-            controller.abort();
-            Err(BackendError::timeout(format!(
+        match finished {
+            Some(result) => {
+                abort.0 = None;
+                result
+            }
+            // `abort` drops on return, cancelling the request and any body
+            // still streaming in.
+            None => Err(BackendError::timeout(format!(
                 "{method} request timed out after {} s",
                 budget.as_secs()
-            )))
-        })
+            ))),
+        }
     }
 }
 
