@@ -210,9 +210,10 @@ jobs:
           echo "$HOME/.wbg-bin" >> "$GITHUB_PATH"
 
       - name: Run wasm32 runtime tests
-        env:
-          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
         # Consumer feature set (bluesky-thinking hotpath) — workers + cachekitio
         # + encryption + macros, no defaults. --test wasm_session_tests: the
         # native integration tests in tests/ don't build for wasm32.
-        run: cargo test -p cachekit-rs --target wasm32-unknown-unknown --no-default-features --features workers,cachekitio,encryption,macros --test wasm_session_tests
+        # Through make, not cargo directly: the target fails the run unless the
+        # summary reports every test passed, because the runner can exit 0
+        # when a test never completes (see the Makefile).
+        run: make test-wasm
