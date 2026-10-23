@@ -97,7 +97,8 @@ impl CachekitConfig {
     /// | `CACHEKIT_API_URL` | Override API base URL (must be HTTPS) |
     /// | `CACHEKIT_MASTER_KEY` | Hex-encoded master key (min 32 bytes); set but empty, not hex or not UTF-8 is an error, never unset |
     /// | `CACHEKIT_PREVIOUS_MASTER_KEYS` | Comma-separated hex-encoded decrypt-only previous master keys (max 3; blank value = unset) |
-    /// | `CACHEKIT_DEFAULT_TTL` | Default TTL in seconds (min 1) |
+    ///
+    /// No variable sets the default TTL: it stays at the 300 s default.
     pub fn from_env() -> Result<Self, CachekitError> {
         let mut config = Self::default();
 
@@ -142,19 +143,6 @@ impl CachekitConfig {
 
         config.previous_master_keys =
             previous_master_keys_from_env(config.master_key.as_deref().map(Vec::as_slice))?;
-
-        // Default TTL — minimum 1 second
-        if let Ok(val) = std::env::var("CACHEKIT_DEFAULT_TTL") {
-            let secs: u64 = val.parse().map_err(|e| {
-                CachekitError::Config(format!("CACHEKIT_DEFAULT_TTL must be an integer: {e}"))
-            })?;
-            if secs < 1 {
-                return Err(CachekitError::Config(
-                    "CACHEKIT_DEFAULT_TTL must be at least 1 second".to_owned(),
-                ));
-            }
-            config.default_ttl = Duration::from_secs(secs);
-        }
 
         Ok(config)
     }

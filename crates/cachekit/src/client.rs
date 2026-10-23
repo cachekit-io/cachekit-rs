@@ -240,6 +240,10 @@ impl CacheKit {
     /// feature on and `CACHEKIT_MASTER_KEY` set, the client encrypts every
     /// value read and write (see [Encryption](CacheKit#encryption)); without
     /// the feature, a set `CACHEKIT_MASTER_KEY` is a [`CachekitError::Config`].
+    ///
+    /// The default TTL is 300 s, and no environment variable changes it. Chain
+    /// [`CacheKitBuilder::default_ttl`] on the returned builder, or pass a TTL
+    /// per call with [`CacheKit::set_with_ttl`].
     #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
     pub fn from_env() -> Result<CacheKitBuilder, CachekitError> {
         use crate::backend::cachekitio::CachekitIO;
