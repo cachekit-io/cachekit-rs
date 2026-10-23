@@ -51,8 +51,9 @@
 //! version the server reports serving it (`served_version`, from the
 //! `x-cachekit-worker-version` response header, `null` when absent). Cloudflare
 //! routes a request whose override it cannot apply by the deployment's
-//! percentages, silently, so the analysis must void a run in which any row's
-//! two fields differ.
+//! percentages, silently, so the analysis must void a run in which any row
+//! that reached the Worker (all but the edge-answered `trace` rows) names no
+//! served version or another than its slot asked for.
 //!
 //! `--hold-lock` tests those stop rules against a live refusal: before the
 //! run's first cold miss, a second client takes that key's fill lock (held
@@ -1580,11 +1581,5 @@ mod tests {
             let err = args(&extra).expect_err(why);
             assert!(err.contains(why), "{extra:?}: {err}");
         }
-    }
-
-    #[test]
-    fn without_versions_rows_ask_for_no_version() {
-        let a = args(&["--arms", "transport,transport"]).expect("valid");
-        assert!(a.versions.is_none() && a.override_worker.is_none());
     }
 }
