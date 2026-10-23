@@ -320,18 +320,41 @@ fn ns_cell(ns: f64) -> String {
     }
 }
 
+/// Wall ns/op of one `run`, in a process of its own. In one process, a case's
+/// figure at 64 KiB depends on what ran before it: earlier large allocations
+/// move glibc's mmap and trim thresholds, and with them whether each op pays
+/// page faults (2-4x either way). A fresh process gives each case the same start.
+fn wall_in_new_process(bin: &str, case: &str, size: usize) -> Result<f64, String> {
+    let iters = (20 * instr_iters(size)).to_string();
+    let out = Command::new(bin)
+        .args(["run", case, &size.to_string(), &iters])
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("cannot start {bin}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("{bin} run {case} {size} failed: {}", out.status));
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split_once("ns/op=")
+        .and_then(|(_, ns)| ns.trim().parse().ok())
+        .ok_or_else(|| format!("no ns/op in the output of {case} {size}"))
+}
+
 /// The README's Performance table as Markdown. Each cell is the median wall
-/// time per op of five runs, each on a fresh client and backend.
+/// time per op of five runs, each in a new process.
 fn readme() -> Result<bool, String> {
+    let me = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .display()
+        .to_string();
     println!("| Operation | 64 B | 1 KiB | 64 KiB |");
     println!("|:----------|-----:|------:|-------:|");
     for (case, label) in README_ROWS {
         let mut cells = Vec::new();
         for size in SIZES {
             let runs = (0..5)
-                .map(|_| run(case, size, 20 * instr_iters(size)))
-                .collect::<Result<Vec<f64>, _>>()
-                .map_err(|e| e.to_string())?;
+                .map(|_| wall_in_new_process(&me, case, size))
+                .collect::<Result<Vec<f64>, _>>()?;
             cells.push(ns_cell(median(&runs)));
         }
         println!("| {label} | {} |", cells.join(" | "));
