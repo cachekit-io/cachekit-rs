@@ -537,7 +537,7 @@ fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
 
 ## Performance
 
-What one call costs in the client: the public `CacheKit` API over an in-memory backend, so no figure includes network time. The client comes from `CacheKit::builder()` with no reliability stack, like `minimal`; the `production`, `secure` and `io` presets also send every backend call, so every L2 hit and set, through the [reliability stack](#reliability), which these figures leave out. Each cell is the median wall time per call of five runs, each in its own process, on a single-threaded tokio runtime. Measured on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with Rust 1.99.1.
+What one call costs in the client: the public `CacheKit` API over an in-memory backend, so no figure includes network time. The client comes from `CacheKit::builder()` with no reliability stack, like `minimal`. The `production`, `secure` and `io` presets send every backend call through the [reliability stack](#reliability), so their L2 hits and sets cost more than the table shows; L1 hits never reach it. Each cell is the median wall time per call of five runs, each in its own process, on a single-threaded tokio runtime. Measured on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with Rust 1.99.1.
 
 | Operation | 64 B | 1 KiB |
 |:----------|-----:|------:|
