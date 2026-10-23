@@ -450,7 +450,7 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
 │  GET path:                                              │
-│  L1 fresh hit (~50ns) ──► return immediately            │
+│  L1 fresh hit ──► return immediately                    │
 │  L1 stale hit ──► return + background refresh (SWR)     │
 │  L1 miss ──► L2 backend ──► backfill L1 if fresh (≤30s) │
 │                                                         │
@@ -461,8 +461,8 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 │  invalidate L1 first ──► delete from L2 backend         │
 │                                                         │
 ├─────────────┬───────────────────────────────────────────┤
-│  L1 (moka)  │  L2 (cachekit.io / Redis / Workers)      │
-│  ~50ns      │  ~2–50ms                                  │
+│  L1 (moka)  │  L2 (cachekit.io / Redis / Workers)       │
+│  in-process │  one backend round trip                   │
 └─────────────┴───────────────────────────────────────────┘
 ```
 
@@ -541,6 +541,28 @@ fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
   there is no SWR; the builder knobs don't exist there, so misuse is a
   compile error rather than a silent no-op. A sync function under
   `#[cachekit]` is likewise a clear compile-time error.
+
+---
+
+## Performance
+
+What one call costs in the client: the public `CacheKit` API over an in-memory backend, so no figure includes network time. The client comes from `CacheKit::builder()` with no reliability stack, like `minimal`. The `production`, `secure` and `io` presets send every backend call through the [reliability stack](#reliability), so their L2 hits and sets cost more than the table shows; L1 hits never reach it. Each cell is the median wall time per call of five runs, each in its own process, on a single-threaded tokio runtime. Measured on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with Rust 1.99.1.
+
+| Operation | 64 B | 1 KiB |
+|:----------|-----:|------:|
+| `get`, L1 hit | 304 ns | 346 ns |
+| `get`, L2 hit | 2.2 µs | 2.9 µs |
+| `set_with_ttl` | 1.6 µs | 1.7 µs |
+| `secure_cache()` `get`, L1 hit | 1.3 µs | 1.5 µs |
+| `secure_cache()` `get`, L2 hit | 3.3 µs | 4.2 µs |
+| `secure_cache()` `set_with_ttl` | 2.2 µs | 2.6 µs |
+
+- **L1 hit**: the value comes from the in-process cache; the backend is not asked.
+- **L2 hit**: L1 does not hold the key, so `get` reads the backend, decodes the MessagePack and backfills L1. A real backend adds its round trip, which for Redis or cachekit.io is a network call.
+- **Encrypted** (`secure_cache()`): L1 holds the same ciphertext as the backend, so every hit decrypts (AES-256-GCM) and checks the AAD.
+- **Larger values**: at 64 KiB most of the time is copying and allocating. It ran to tens of microseconds for L2 hits and encrypted calls, but repeat runs disagreed by up to 3.5x, so the table stops at 1 KiB.
+
+Two earlier runs on this CPU model, which timed every cell in one process, agreed with this one within about 20% at these sizes. Hosted runners also come with other CPU models (an EPYC 9V45 run took 65-78% as long), and other machines give other figures. To print this table for your own machine, run `cargo run --release --example bench_hot_path -- readme`, or run the **Bench** workflow from the Actions tab. To compare two builds, use the instruction counts in [Measuring performance](#measuring-performance).
 
 ---
 
@@ -732,6 +754,8 @@ make bench                                  # wall ns/op: indicative only
 make bench-instr                            # instructions/op + run-to-run spread (needs valgrind)
 make bench-instr BASE=../bench-base FILTER=l2_hit   # A/B against another build
 ```
+
+`bench_hot_path readme` prints the table in [Performance](#performance).
 
 Wall time on a shared machine moves by tens of percent between runs, so
 `bench-instr` is the number a change is judged on. It counts only the timed
