@@ -441,7 +441,7 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
 │  GET path:                                              │
-│  L1 fresh hit (~50ns) ──► return immediately            │
+│  L1 fresh hit ──► return immediately                    │
 │  L1 stale hit ──► return + background refresh (SWR)     │
 │  L1 miss ──► L2 backend ──► backfill L1 if fresh (≤30s) │
 │                                                         │
@@ -452,8 +452,8 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 │  invalidate L1 first ──► delete from L2 backend         │
 │                                                         │
 ├─────────────┬───────────────────────────────────────────┤
-│  L1 (moka)  │  L2 (cachekit.io / Redis / Workers)      │
-│  ~50ns      │  ~2–50ms                                  │
+│  L1 (moka)  │  L2 (cachekit.io / Redis / Workers)       │
+│  in-process │  one backend round trip                   │
 └─────────────┴───────────────────────────────────────────┘
 ```
 
@@ -532,6 +532,27 @@ fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
   there is no SWR; the builder knobs don't exist there, so misuse is a
   compile error rather than a silent no-op. A sync function under
   `#[cachekit]` is likewise a clear compile-time error.
+
+---
+
+## Performance
+
+What one call costs in the client: the public `CacheKit` API over an in-memory backend, so no figure includes network time. Each cell is the median wall time per call of five runs on a single-threaded tokio runtime, measured on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with Rust 1.99.1.
+
+| Operation | 64 B | 1 KiB | 64 KiB |
+|:----------|-----:|------:|-------:|
+| `get`, L1 hit | 326 ns | 394 ns | 5.0 µs |
+| `get`, L2 hit | 2.0 µs | 2.4 µs | 29.3 µs |
+| `set_with_ttl` | 1.6 µs | 1.7 µs | 5.3 µs |
+| `secure_cache()` `get`, L1 hit | 1.3 µs | 1.5 µs | 15.7 µs |
+| `secure_cache()` `get`, L2 hit | 3.1 µs | 3.8 µs | 54.7 µs |
+| `secure_cache()` `set_with_ttl` | 2.3 µs | 2.6 µs | 19.1 µs |
+
+- **L1 hit**: the value comes from the in-process cache; the backend is not asked.
+- **L2 hit**: L1 does not hold the key, so `get` reads the backend, decodes the MessagePack and backfills L1. A real backend adds its round trip, which for Redis or cachekit.io is a network call.
+- **Encrypted** (`secure_cache()`): L1 holds the same ciphertext as the backend, so every hit decrypts (AES-256-GCM) and checks the AAD.
+
+To print this table for your own machine, run `cargo run --release --example bench_hot_path -- readme`, or run the **Bench** workflow from the Actions tab. Wall time moves between machines and between runs on shared runners. To compare two builds, use the instruction counts in [Measuring performance](#measuring-performance).
 
 ---
 
@@ -724,6 +745,9 @@ make bench                                  # wall ns/op: indicative only
 make bench-instr                            # instructions/op + run-to-run spread (needs valgrind)
 make bench-instr BASE=../bench-base FILTER=l2_hit   # A/B against another build
 ```
+
+`bench_hot_path readme` prints the [Performance](#performance) table: the
+plain and encrypted `get` and `set` cases, each cell the median of five runs.
 
 Wall time on a shared machine moves by tens of percent between runs, so
 `bench-instr` is the number a change is judged on. It counts only the timed
