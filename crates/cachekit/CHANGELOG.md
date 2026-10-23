@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.11.1](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.11.0...cachekit-rs-v0.11.1) (2026-10-22)
+
+
+### Bug Fixes
+
+* **workers:** bound each cachekit.io request at the native budgets (LAB-10354) ([#165](https://github.com/cachekit-io/cachekit-rs/issues/165)) ([7075f97](https://github.com/cachekit-io/cachekit-rs/commit/7075f97754b5d32d3e93b9a1de4661fb4767d544))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.11.0 to 0.11.1
+
 ## [0.11.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.10.0...cachekit-rs-v0.11.0) (2026-10-21)
 
 
