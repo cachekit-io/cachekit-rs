@@ -57,7 +57,6 @@ fn from_env_with_a_master_key_is_a_config_error() {
         ("CACHEKIT_API_URL", None),
         ("CACHEKIT_MASTER_KEY", Some(key.as_str())),
         ("CACHEKIT_PREVIOUS_MASTER_KEYS", None),
-        ("CACHEKIT_DEFAULT_TTL", None),
     ]);
     assert_feature_missing(CacheKit::from_env(), "CACHEKIT_MASTER_KEY");
 
