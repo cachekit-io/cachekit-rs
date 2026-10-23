@@ -300,6 +300,11 @@ fn instr_iters(size: usize) -> usize {
 
 // ── README table ─────────────────────────────────────────────────────────────
 
+/// Columns of the README's Performance table. At 64 KiB a case's time is
+/// mostly copying and allocation, and repeat runs disagreed by up to 3x, so
+/// the table stops at 1 KiB; `wall` still covers 64 KiB.
+const README_SIZES: [usize; 2] = [64, 1024];
+
 /// Rows of the README's Performance table: the read and write paths, plain
 /// and encrypted.
 const README_ROWS: [(&str, &str); 6] = [
@@ -347,11 +352,11 @@ fn readme() -> Result<bool, String> {
         .map_err(|e| e.to_string())?
         .display()
         .to_string();
-    println!("| Operation | 64 B | 1 KiB | 64 KiB |");
-    println!("|:----------|-----:|------:|-------:|");
+    println!("| Operation | 64 B | 1 KiB |");
+    println!("|:----------|-----:|------:|");
     for (case, label) in README_ROWS {
         let mut cells = Vec::new();
-        for size in SIZES {
+        for size in README_SIZES {
             let runs = (0..5)
                 .map(|_| wall_in_new_process(&me, case, size))
                 .collect::<Result<Vec<f64>, _>>()?;
