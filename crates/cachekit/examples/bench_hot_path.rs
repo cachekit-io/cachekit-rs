@@ -301,7 +301,7 @@ fn instr_iters(size: usize) -> usize {
 // ── README table ─────────────────────────────────────────────────────────────
 
 /// Columns of the README's Performance table. At 64 KiB a case's time is
-/// mostly copying and allocation, and repeat runs disagreed by up to 3x, so
+/// mostly copying and allocation, and repeat runs disagreed by up to 3.5x, so
 /// the table stops at 1 KiB; `wall` still covers 64 KiB.
 const README_SIZES: [usize; 2] = [64, 1024];
 

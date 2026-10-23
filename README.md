@@ -551,9 +551,9 @@ What one call costs in the client: the public `CacheKit` API over an in-memory b
 - **L1 hit**: the value comes from the in-process cache; the backend is not asked.
 - **L2 hit**: L1 does not hold the key, so `get` reads the backend, decodes the MessagePack and backfills L1. A real backend adds its round trip, which for Redis or cachekit.io is a network call.
 - **Encrypted** (`secure_cache()`): L1 holds the same ciphertext as the backend, so every hit decrypts (AES-256-GCM) and checks the AAD.
-- **Larger values**: at 64 KiB most of the time is copying and allocating. It ran to tens of microseconds for L2 hits and encrypted calls, but repeat runs disagreed by up to 3x, so the table stops at 1 KiB.
+- **Larger values**: at 64 KiB most of the time is copying and allocating. It ran to tens of microseconds for L2 hits and encrypted calls, but repeat runs disagreed by up to 3.5x, so the table stops at 1 KiB.
 
-Three runs on this CPU model agreed within about 20%. Hosted runners also come with other CPU models (an EPYC 9V45 run took 65-78% as long), and other machines give other figures. To print this table for your own machine, run `cargo run --release --example bench_hot_path -- readme`, or run the **Bench** workflow from the Actions tab. To compare two builds, use the instruction counts in [Measuring performance](#measuring-performance).
+Two earlier runs on this CPU model, which timed every cell in one process, agreed with this one within about 20% at these sizes. Hosted runners also come with other CPU models (an EPYC 9V45 run took 65-78% as long), and other machines give other figures. To print this table for your own machine, run `cargo run --release --example bench_hot_path -- readme`, or run the **Bench** workflow from the Actions tab. To compare two builds, use the instruction counts in [Measuring performance](#measuring-performance).
 
 ---
 
