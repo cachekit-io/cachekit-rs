@@ -56,9 +56,11 @@
 //! [`CachekitError::Config`].
 //!
 //! No other client encrypts. `CACHEKIT_MASTER_KEY` is a key source, never a
-//! switch: [`from_env`](CacheKit::from_env) with the variable set builds a
-//! plaintext client unless you chain
-//! [`.encryption_from_env()`](CacheKitBuilder::encryption_from_env).
+//! switch: after [`from_env`](CacheKit::from_env) with the variable set,
+//! chain [`.encryption_from_env()`](CacheKitBuilder::encryption_from_env) to
+//! encrypt with it or [`.no_encryption()`](CacheKitBuilder::no_encryption)
+//! for a plaintext client; stating neither is an error at `build()` (a
+//! transitional check, see [`from_env`](CacheKit::from_env)).
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {

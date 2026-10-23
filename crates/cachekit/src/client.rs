@@ -239,21 +239,30 @@ impl CacheKit {
     /// Creates a [`crate::backend::cachekitio::CachekitIO`] backend from the
     /// config. Requires the `cachekitio` feature.
     ///
-    /// The client does **not** encrypt, whether or not `CACHEKIT_MASTER_KEY`
-    /// is set: a key in the environment is a key source, never a switch
-    /// (protocol `spec/intent-presets.md` § Encryption Activation, rule 2).
-    /// To encrypt with the environment's keys, say so:
+    /// `CACHEKIT_MASTER_KEY` does not make the client encrypt: a key in the
+    /// environment is a key source, never a switch (protocol
+    /// `spec/intent-presets.md` § Encryption Activation, rule 2). State the
+    /// intent instead — encrypt with the environment's keys, or don't:
     ///
     /// ```no_run
     /// # fn demo() -> Result<(), cachekit::CachekitError> {
-    /// let cache = cachekit::CacheKit::from_env()?
+    /// let encrypted = cachekit::CacheKit::from_env()?
     ///     .encryption_from_env()?
     ///     .build()?;
+    /// let plaintext = cachekit::CacheKit::from_env()?.no_encryption().build()?;
     /// # Ok(()) }
     /// ```
     ///
-    /// A set key is still validated here: one that is not hex, is shorter
-    /// than 32 bytes or is not UTF-8 is a [`CachekitError::Config`].
+    /// Releases up to 0.11 encrypted whenever the variable was set. So that
+    /// such a deployment cannot silently start writing plaintext, a builder
+    /// from `from_env()` that saw `CACHEKIT_MASTER_KEY` and states neither
+    /// intent fails at [`CacheKitBuilder::build`] with
+    /// [`CachekitError::Config`]. This check is transitional and goes away
+    /// in a later release; without the variable, `from_env()?.build()?`
+    /// builds a plaintext client.
+    ///
+    /// A set key is validated here: one that is empty, not hex, shorter than
+    /// 32 bytes or not UTF-8 is a [`CachekitError::Config`].
     #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
     pub fn from_env() -> Result<CacheKitBuilder, CachekitError> {
         use crate::backend::cachekitio::CachekitIO;
@@ -285,6 +294,7 @@ impl CacheKit {
         if let Some(ns) = config.namespace {
             builder = builder.namespace(ns);
         }
+        builder.env_master_key = config.master_key.is_some();
 
         Ok(builder)
     }
@@ -871,6 +881,7 @@ impl CacheKit {
     /// # Errors
     /// Returns `CachekitError::Config` if no encryption layer is configured.
     /// Configure encryption via [`CacheKitBuilder::encryption`] /
+    /// [`CacheKitBuilder::encryption_from_env`] /
     /// [`CacheKitBuilder::encryption_from_bytes`], or start from the
     /// `CacheKit::secure(url, master_key_hex)` /
     /// `CacheKit::secure_from_env(url)` preset (`redis` feature).
@@ -880,7 +891,8 @@ impl CacheKit {
             CachekitError::Config(
                 "encryption not configured: use the CacheKit::secure(url, master_key_hex) \
                  preset, CacheKit::secure_from_env(url) to read the hex key from \
-                 CACHEKIT_MASTER_KEY, or call .encryption() on the builder"
+                 CACHEKIT_MASTER_KEY, or call .encryption() on the builder \
+                 (.encryption_from_env() to read CACHEKIT_MASTER_KEY)"
                     .to_owned(),
             )
         })
@@ -1191,6 +1203,14 @@ pub struct CacheKitBuilder {
     // pub(crate): the `secure` preset's key-path tests read the layer.
     #[cfg(feature = "encryption")]
     pub(crate) encryption: Option<SharedEncryption>,
+
+    /// [`Self::no_encryption`] was called.
+    no_encryption: bool,
+
+    /// `CacheKit::from_env` saw `CACHEKIT_MASTER_KEY`: [`Self::build`]
+    /// refuses until an encryption call or [`Self::no_encryption`] states
+    /// the intent (the transitional gate documented on `from_env`).
+    env_master_key: bool,
 
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
     reliability: Option<crate::reliability::ReliabilityConfig>,
@@ -1542,10 +1562,48 @@ impl CacheKitBuilder {
         Err(encryption_feature_missing(".encryption_from_env()"))
     }
 
+    /// State that this client does not encrypt, even with
+    /// `CACHEKIT_MASTER_KEY` set: the explicit opt-out of protocol
+    /// `spec/intent-presets.md` § Encryption Activation, rule 3.
+    ///
+    /// No client encrypts without an encryption call, so this changes
+    /// nothing on its own. It answers the transitional check on a builder
+    /// from [`CacheKit::from_env`] that saw `CACHEKIT_MASTER_KEY`, and it
+    /// records the intent at the call site. Combined with any encryption
+    /// call, or the `secure` preset, [`Self::build`] returns
+    /// [`CachekitError::Config`]: an opt-out never quietly undoes one.
+    pub fn no_encryption(mut self) -> Self {
+        self.no_encryption = true;
+        self
+    }
+
     /// Finalise and build the [`CacheKit`] client.
     ///
-    /// Returns an error if no backend was provided.
+    /// Returns an error if no backend was provided, if
+    /// [`Self::no_encryption`] was combined with an encryption call, or if
+    /// the builder came from [`CacheKit::from_env`] with
+    /// `CACHEKIT_MASTER_KEY` set and states no encryption intent.
     pub fn build(self) -> Result<CacheKit, CachekitError> {
+        #[cfg(feature = "encryption")]
+        let encrypting = self.encryption.is_some();
+        #[cfg(not(feature = "encryption"))]
+        let encrypting = false;
+        if self.no_encryption && encrypting {
+            return Err(CachekitError::Config(
+                ".no_encryption() conflicts with an encryption call (or the secure preset) \
+                 on the same builder: keep one"
+                    .to_owned(),
+            ));
+        }
+        if self.env_master_key && !encrypting && !self.no_encryption {
+            return Err(CachekitError::Config(
+                "CACHEKIT_MASTER_KEY is set, and CacheKit::from_env() no longer encrypts \
+                 because of it: chain .encryption_from_env() to encrypt with it, or \
+                 .no_encryption() to build a plaintext client"
+                    .to_owned(),
+            ));
+        }
+
         let backend = self.backend.ok_or_else(|| {
             CachekitError::Config("a backend must be provided via .backend()".to_owned())
         })?;

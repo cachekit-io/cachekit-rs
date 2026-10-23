@@ -142,6 +142,8 @@ async fn main() -> Result<(), CachekitError> {
 }
 ```
 
+With `CACHEKIT_MASTER_KEY` set, chain `.encryption_from_env()?` or `.no_encryption()` before `.build()`; see [Zero-Knowledge Encryption](#zero-knowledge-encryption).
+
 ### Builder API
 
 ```rust
@@ -216,10 +218,10 @@ let secure = cache.secure_cache()?;
                       (zero-knowledge preserved)
 ```
 
-`CACHEKIT_MASTER_KEY` is a key source, never a switch: no constructor encrypts because it is set. `CacheKit::from_env()` validates it and builds a plaintext client; chain `.encryption_from_env()?` to encrypt with it (and with `CACHEKIT_PREVIOUS_MASTER_KEYS`), for tenant `"default"`.
+`CACHEKIT_MASTER_KEY` is a key source, never a switch: no constructor encrypts because it is set. Chain `.encryption_from_env()?` to encrypt with it (and with `CACHEKIT_PREVIOUS_MASTER_KEYS`), for tenant `"default"`, or `.no_encryption()` to state a plaintext client.
 
 > [!WARNING]
-> Earlier releases encrypted on `CacheKit::from_env()` whenever `CACHEKIT_MASTER_KEY` was set; it now builds a plaintext client. To keep encrypting, change `CacheKit::from_env()?` to `CacheKit::from_env()?.encryption_from_env()?`: the keys and tenant are unchanged, so existing entries stay readable. To stop encrypting instead, move to a fresh `.namespace()` or delete the old entries first: a client that does not encrypt reads stored ciphertext as plaintext, and most such reads return an error while a rare one decodes into a wrong value.
+> Earlier releases encrypted on `CacheKit::from_env()` whenever `CACHEKIT_MASTER_KEY` was set. A `from_env()` builder that sees the key now fails at `build()` until you state the intent, so the upgrade cannot silently start writing plaintext. To keep encrypting, change `CacheKit::from_env()?` to `CacheKit::from_env()?.encryption_from_env()?`: the keys and tenant are unchanged, so existing entries stay readable. To stop encrypting, use `.no_encryption()`, and delete the old entries first: a client that does not encrypt cannot read them. `get` returns an error, a `#[cachekit]` function recomputes the value and overwrites the entry in plaintext, and a rare entry decodes into a wrong value. This check is transitional and goes away in a later release, after which a `from_env()` builder that states neither builds a plaintext client.
 
 > [!WARNING]
 > Earlier releases encrypted only through `secure_cache()`: plain `get` / `set` on a client with a key configured read and wrote plaintext. Reading such an entry now returns an `Encryption` error until it is overwritten, deleted or expires, so delete (or let expire) whatever those calls wrote before you upgrade.
@@ -624,7 +626,7 @@ Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rus
 |:---------|:--------:|:------------|
 | `CACHEKIT_API_KEY` | ✅ | API key for cachekit.io (`from_env()` and `CacheKit::io_from_env()`) |
 | `CACHEKIT_API_URL` | ❌ | Override API endpoint (default: `https://api.cachekit.io`) |
-| `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and the builder's `.encryption_from_env()`); use exactly 32 bytes (64 hex chars) — shorter, non-hex or non-UTF-8 values are rejected, never treated as unset. A key source, never a switch: `from_env()` validates it but does not encrypt |
+| `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and the builder's `.encryption_from_env()`); use exactly 32 bytes (64 hex chars) — shorter, non-hex or non-UTF-8 values are rejected, never treated as unset. A key source, never a switch: `from_env()` validates it but does not encrypt, and while it is set a `from_env()` builder needs `.encryption_from_env()` or `.no_encryption()` |
 | `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (`CacheKit::secure_from_env()` and `.encryption_from_env()`; max 3; a blank value is treated as unset) |
 | `CACHEKIT_DEFAULT_TTL` | ❌ | Default TTL in seconds (min 1, default: 300) |
 

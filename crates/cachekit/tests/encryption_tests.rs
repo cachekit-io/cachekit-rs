@@ -1050,7 +1050,7 @@ fn key_env(master: Option<&str>, previous: Option<&str>) -> common::EnvGuard {
 #[cfg(feature = "cachekitio")]
 #[test]
 #[serial_test::serial]
-fn from_env_accepts_32_and_48_byte_hex_keys() {
+fn encryption_from_env_accepts_32_and_48_byte_hex_keys() {
     for bytes in [32, 48] {
         let (current, previous) = ("22".repeat(bytes), "11".repeat(bytes));
         let _env = key_env(Some(&current), Some(&previous));
@@ -1061,36 +1061,113 @@ fn from_env_accepts_32_and_48_byte_hex_keys() {
     }
 }
 
-/// Rule 2: a set `CACHEKIT_MASTER_KEY` is a key source, never a switch — the
-/// backend holds the value's plain MessagePack bytes.
+/// Write `"plain value"` under `k` through `builder` on a fresh store and
+/// return the bytes the backend holds.
 #[cfg(feature = "cachekitio")]
-#[test]
-#[serial_test::serial]
-fn from_env_with_a_master_key_stores_plaintext() {
-    let (current, previous) = ("22".repeat(32), "11".repeat(32));
-    let _env = key_env(Some(&current), Some(&previous));
+fn stored_bytes(builder: cachekit::CacheKitBuilder) -> Option<Vec<u8>> {
     let (backend, handle) = MockBackend::new_with_handle();
-    let cache = CacheKit::from_env()
-        .expect("a valid key must not stop from_env")
+    let cache = builder
         .backend(backend)
         .no_l1()
         .build()
         .expect("client builds");
-
-    common::runtime()
-        .block_on(cache.set("k", &"plain value"))
-        .expect("set");
-
-    let stored = handle.store.try_lock().unwrap().get("k").cloned();
-    assert_eq!(
-        stored,
-        Some(cachekit::serializer::serialize(&"plain value").unwrap()),
-        "from_env() must not encrypt because CACHEKIT_MASTER_KEY is set"
-    );
     assert!(
         cache.secure_cache().is_err(),
         "no encryption layer expected"
     );
+    common::runtime()
+        .block_on(cache.set("k", &"plain value"))
+        .expect("set");
+    let stored = handle.store.try_lock().unwrap().get("k").cloned();
+    stored
+}
+
+/// Rule 2: a set `CACHEKIT_MASTER_KEY` is a key source, never a switch —
+/// with the opt-out stated, the backend holds the value's plain MessagePack
+/// bytes.
+#[cfg(feature = "cachekitio")]
+#[test]
+#[serial_test::serial]
+fn from_env_with_a_master_key_and_no_encryption_stores_plaintext() {
+    let (current, previous) = ("22".repeat(32), "11".repeat(32));
+    let _env = key_env(Some(&current), Some(&previous));
+    let builder = CacheKit::from_env().expect("a valid key must not stop from_env");
+    assert_eq!(
+        stored_bytes(builder.no_encryption()),
+        Some(cachekit::serializer::serialize(&"plain value").unwrap()),
+        "from_env() must not encrypt because CACHEKIT_MASTER_KEY is set"
+    );
+}
+
+/// The transitional gate: a `from_env()` builder that saw the key and
+/// states no intent refuses to build, naming both spellings, so a deployment
+/// that relied on the old activation cannot silently start writing
+/// plaintext. Without the key there is nothing to state.
+#[cfg(feature = "cachekitio")]
+#[test]
+#[serial_test::serial]
+fn from_env_with_a_master_key_and_no_stated_intent_does_not_build() {
+    let current = "22".repeat(32);
+    let _env = key_env(Some(&current), None);
+    match CacheKit::from_env().and_then(|b| b.build()) {
+        Err(CachekitError::Config(msg)) => assert!(
+            msg.contains(".encryption_from_env()") && msg.contains(".no_encryption()"),
+            "the error must name both spellings: {msg}"
+        ),
+        Err(e) => panic!("expected a Config error, got {e:?}"),
+        Ok(_) => panic!("from_env() with a key built without a stated intent"),
+    }
+
+    let _no_key = key_env(None, None);
+    assert_eq!(
+        stored_bytes(CacheKit::from_env().expect("from_env")),
+        Some(cachekit::serializer::serialize(&"plain value").unwrap()),
+    );
+}
+
+/// An opt-out never quietly undoes an encryption call, in either order.
+#[test]
+fn no_encryption_with_an_encryption_call_is_a_config_error() {
+    let key = test_master_key_hex();
+    for builder in [
+        CacheKit::builder()
+            .encryption(&key, "t")
+            .unwrap()
+            .no_encryption(),
+        CacheKit::builder()
+            .no_encryption()
+            .encryption(&key, "t")
+            .unwrap(),
+    ] {
+        let result = builder.backend(MockBackend::shared()).build();
+        assert!(
+            matches!(&result, Err(CachekitError::Config(msg)) if msg.contains(".no_encryption()")),
+            "expected a Config error naming .no_encryption(), got {:?}",
+            result.err()
+        );
+    }
+}
+
+/// A set, non-UTF-8 key is reported as such, never as unset.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn encryption_from_env_rejects_a_non_utf8_key_naming_it() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let _env = common::EnvGuard::set(&[
+        ("CACHEKIT_MASTER_KEY", None),
+        ("CACHEKIT_PREVIOUS_MASTER_KEYS", None),
+    ]);
+    std::env::set_var(
+        "CACHEKIT_MASTER_KEY",
+        std::ffi::OsStr::from_bytes(&[0xff; 32]),
+    );
+    match CacheKit::builder().encryption_from_env() {
+        Err(CachekitError::Config(msg)) => assert!(msg.contains("not valid UTF-8"), "{msg}"),
+        Err(e) => panic!("expected a Config error, got {e:?}"),
+        Ok(_) => panic!("a non-UTF-8 key was accepted"),
+    }
 }
 
 /// `.encryption_from_env()` encrypts under `CACHEKIT_MASTER_KEY` for tenant
@@ -1142,7 +1219,7 @@ fn encryption_from_env_uses_the_env_keys() {
 #[test]
 #[serial_test::serial]
 fn encryption_from_env_without_a_key_is_a_config_error() {
-    for master in [None, Some("")] {
+    for (master, says) in [(None, "unset"), (Some(""), "empty")] {
         let _env = key_env(master, None);
         for (entry, result) in [
             ("builder", CacheKit::builder().encryption_from_env()),
@@ -1152,9 +1229,8 @@ fn encryption_from_env_without_a_key_is_a_config_error() {
             ),
         ] {
             match result {
-                // An empty key fails from_env()'s own validation first.
                 Err(CachekitError::Config(msg)) => assert!(
-                    msg.contains("CACHEKIT_MASTER_KEY"),
+                    msg.contains("CACHEKIT_MASTER_KEY") && msg.contains(says),
                     "{entry} {master:?}: {msg}"
                 ),
                 Err(e) => panic!("{entry} {master:?}: expected a Config error, got {e:?}"),

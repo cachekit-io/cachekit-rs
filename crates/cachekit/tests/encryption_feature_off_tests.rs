@@ -2,8 +2,8 @@
 //! for encryption — each builder encryption call, `.encryption_from_env()`
 //! included: accepting a key and building a plaintext client is the silent
 //! downgrade protocol `spec/intent-presets.md` § Encryption Activation, rule 1
-//! forbids. `from_env()` with `CACHEKIT_MASTER_KEY` set asks for nothing and
-//! builds a plaintext client, as it does with the feature on (rule 2).
+//! forbids. `from_env()` with `CACHEKIT_MASTER_KEY` set asks for nothing and,
+//! as with the feature on, builds once `.no_encryption()` states the intent.
 //!
 //! The CI test job builds with `encryption`, which compiles this file to
 //! nothing. Run it with:
@@ -55,7 +55,7 @@ mod common;
 #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
 #[test]
 #[serial_test::serial]
-fn from_env_with_a_master_key_builds_and_encryption_from_env_is_a_config_error() {
+fn from_env_with_a_master_key_needs_a_stated_intent_as_with_the_feature_on() {
     let key = "07".repeat(32);
     let _env = common::EnvGuard::set(&[
         ("CACHEKIT_API_KEY", Some("test-key")),
@@ -65,11 +65,16 @@ fn from_env_with_a_master_key_builds_and_encryption_from_env_is_a_config_error()
         ("CACHEKIT_DEFAULT_TTL", None),
     ]);
     assert!(
-        CacheKit::from_env().and_then(|b| b.build()).is_ok(),
-        "from_env with a key must build, as with the feature on"
+        matches!(
+            CacheKit::from_env().and_then(|b| b.build()),
+            Err(CachekitError::Config(msg)) if msg.contains(".no_encryption()")
+        ),
+        "from_env with a key and no stated intent must not build"
     );
-    assert_feature_missing(
-        CacheKit::from_env().and_then(|b| b.encryption_from_env()),
-        ".encryption_from_env()",
+    assert!(
+        CacheKit::from_env()
+            .and_then(|b| b.no_encryption().build())
+            .is_ok(),
+        "the stated opt-out must build"
     );
 }

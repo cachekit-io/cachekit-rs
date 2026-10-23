@@ -298,7 +298,7 @@ fn keyring_rows() -> Vec<KeyringRow> {
 
 /// Each row loads, or is refused with a `Config` error, as its verdict says,
 /// through the hex builders and through `CACHEKIT_PREVIOUS_MASTER_KEYS`
-/// (comma-separated) on both env readers.
+/// (comma-separated) on every env reader.
 #[test]
 #[serial]
 fn keyring_configuration_rows_load_as_their_verdict_says() {
