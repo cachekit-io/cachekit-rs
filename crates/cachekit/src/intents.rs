@@ -90,23 +90,6 @@ fn secure_defaults(
     Ok(builder)
 }
 
-/// `CACHEKIT_MASTER_KEY` for [`CacheKit::secure_from_env`]; unset and empty
-/// are both an error, never plaintext.
-#[cfg(all(feature = "redis", feature = "encryption"))]
-fn master_key_hex_from_env() -> Result<zeroize::Zeroizing<String>, CachekitError> {
-    std::env::var("CACHEKIT_MASTER_KEY")
-        .ok()
-        .map(zeroize::Zeroizing::new)
-        .filter(|k| !k.is_empty())
-        .ok_or_else(|| {
-            CachekitError::Config(
-                "CACHEKIT_MASTER_KEY is unset or empty: set it to a 64-hex-char key or pass \
-                 the key to CacheKit::secure(url, master_key_hex)"
-                    .to_owned(),
-            )
-        })
-}
-
 /// The key handling of [`CacheKit::secure`] — decode the hex key, then the
 /// `secure` defaults — before any Redis I/O; the hex counterpart of
 /// [`secure_env_defaults`].
@@ -118,13 +101,12 @@ fn secure_hex_defaults(master_key_hex: &str) -> Result<CacheKitBuilder, Cachekit
 
 /// The whole environment read of [`CacheKit::secure_from_env`] — the current
 /// key and `CACHEKIT_PREVIOUS_MASTER_KEYS` — resolved into `secure` defaults
-/// before any Redis I/O. Previous keys go through the same reader as
-/// [`CachekitConfig::from_env`](crate::config::CachekitConfig::from_env).
+/// before any Redis I/O. The same reader as
+/// [`CacheKitBuilder::encryption_from_env`].
 #[cfg(all(feature = "redis", feature = "encryption"))]
 fn secure_env_defaults() -> Result<CacheKitBuilder, CachekitError> {
-    let master_key_hex = master_key_hex_from_env()?;
-    let master_key = crate::config::decode_master_key_hex(&master_key_hex, "CACHEKIT_MASTER_KEY")?;
-    let previous = crate::config::previous_master_keys_from_env(Some(&master_key))?;
+    let (master_key, previous) =
+        crate::config::master_keys_from_env("CacheKit::secure(url, master_key_hex)")?;
     secure_defaults(&master_key, &previous)
 }
 
@@ -393,8 +375,10 @@ impl CacheKit {
     /// the key read from `CACHEKIT_API_KEY`.
     ///
     /// Identical preset to [`io`](CacheKit::io). Reads **only**
-    /// `CACHEKIT_API_KEY` — unlike [`CacheKit::from_env`], never
-    /// `CACHEKIT_MASTER_KEY`, so no encryption is activated.
+    /// `CACHEKIT_API_KEY`, never `CACHEKIT_MASTER_KEY`: like every
+    /// constructor but `secure`, it does not encrypt unless you chain an
+    /// encryption call such as
+    /// [`.encryption_from_env()`](CacheKitBuilder::encryption_from_env).
     ///
     /// # Errors
     ///

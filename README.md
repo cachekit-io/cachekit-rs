@@ -41,7 +41,7 @@
 | Feature | Default | Description |
 |:--------|:-------:|:------------|
 | `cachekitio` | ✅ | HTTP backend for [api.cachekit.io](https://api.cachekit.io) via [reqwest](https://crates.io/crates/reqwest) + rustls |
-| `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core). Without it, every builder encryption call (`.encryption()`, `.encryption_with_previous()`, `.encryption_from_bytes()`, `.encryption_from_bytes_with_previous()`) returns a config error, and so does `from_env()` with `CACHEKIT_MASTER_KEY` set |
+| `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core). Without it, every builder encryption call (`.encryption()`, `.encryption_with_previous()`, `.encryption_from_env()`, `.encryption_from_bytes()`, `.encryption_from_bytes_with_previous()`) returns a config error |
 | `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka), with stale-while-revalidate (native). Not supported on `wasm32-unknown-unknown` (compile error: no clock there) |
 | `reliability` | ✅ | Retry with backoff + jitter, circuit breaker, backpressure, distributed fill locks (native only) |
 | `redis` | ❌ | Redis backend via [fred](https://crates.io/crates/fred) (native only) |
@@ -188,7 +188,7 @@ permanent error. On wasm32, use the [Workers backend](#cloudflare-workers).
 
 ## Zero-Knowledge Encryption
 
-Configure a master key — the `secure` preset, or `.encryption()` / `.encryption_with_previous()` / `.encryption_from_bytes()` / `.encryption_from_bytes_with_previous()` on any builder — and every value the client reads or writes is encrypted client-side with AES-256-GCM before it reaches any cache layer. `get`, `set`, `set_with_ttl`, `interop_get`, `interop_get_swr` and `#[cachekit]` functions all encrypt; the backend and L1 only ever see ciphertext. `delete` and `exists` carry no value.
+Configure a master key — the `secure` preset, or `.encryption()` / `.encryption_with_previous()` / `.encryption_from_env()` / `.encryption_from_bytes()` / `.encryption_from_bytes_with_previous()` on any builder — and every value the client reads or writes is encrypted client-side with AES-256-GCM before it reaches any cache layer. `get`, `set`, `set_with_ttl`, `interop_get`, `interop_get_swr` and `#[cachekit]` functions all encrypt; the backend and L1 only ever see ciphertext. `delete` and `exists` carry no value.
 
 ```rust
 // Env: CACHEKIT_MASTER_KEY=<64 hex chars>
@@ -215,6 +215,11 @@ let secure = cache.secure_cache()?;
                       L1 stores ciphertext
                       (zero-knowledge preserved)
 ```
+
+`CACHEKIT_MASTER_KEY` is a key source, never a switch: no constructor encrypts because it is set. `CacheKit::from_env()` validates it and builds a plaintext client; chain `.encryption_from_env()?` to encrypt with it (and with `CACHEKIT_PREVIOUS_MASTER_KEYS`), for tenant `"default"`.
+
+> [!WARNING]
+> Earlier releases encrypted on `CacheKit::from_env()` whenever `CACHEKIT_MASTER_KEY` was set; it now builds a plaintext client. To keep encrypting, change `CacheKit::from_env()?` to `CacheKit::from_env()?.encryption_from_env()?`: the keys and tenant are unchanged, so existing entries stay readable. To stop encrypting instead, move to a fresh `.namespace()` or delete the old entries first: a client that does not encrypt reads stored ciphertext as plaintext, and most such reads return an error while a rare one decodes into a wrong value.
 
 > [!WARNING]
 > Earlier releases encrypted only through `secure_cache()`: plain `get` / `set` on a client with a key configured read and wrote plaintext. Reading such an entry now returns an `Encryption` error until it is overwritten, deleted or expires, so delete (or let expire) whatever those calls wrote before you upgrade.
@@ -255,7 +260,7 @@ Rotate the master key without invalidating existing entries: promote the new key
 
 ```rust
 // Env: CACHEKIT_MASTER_KEY=<k2-hex> CACHEKIT_PREVIOUS_MASTER_KEYS=<k1-hex>
-let cache = CacheKit::from_env()?.build()?;
+let cache = CacheKit::from_env()?.encryption_from_env()?.build()?;
 
 // The Redis `secure` preset reads the same two variables:
 let cache = CacheKit::secure_from_env("redis://localhost:6379").await?.build()?;
@@ -619,8 +624,8 @@ Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rus
 |:---------|:--------:|:------------|
 | `CACHEKIT_API_KEY` | ✅ | API key for cachekit.io (`from_env()` and `CacheKit::io_from_env()`) |
 | `CACHEKIT_API_URL` | ❌ | Override API endpoint (default: `https://api.cachekit.io`) |
-| `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and `from_env()`); use exactly 32 bytes (64 hex chars) — shorter, non-hex or non-UTF-8 values are rejected, never treated as unset |
-| `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (`CacheKit::secure_from_env()` and `from_env()`; max 3; a blank value is treated as unset) |
+| `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and the builder's `.encryption_from_env()`); use exactly 32 bytes (64 hex chars) — shorter, non-hex or non-UTF-8 values are rejected, never treated as unset. A key source, never a switch: `from_env()` validates it but does not encrypt |
+| `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (`CacheKit::secure_from_env()` and `.encryption_from_env()`; max 3; a blank value is treated as unset) |
 | `CACHEKIT_DEFAULT_TTL` | ❌ | Default TTL in seconds (min 1, default: 300) |
 
 > [!CAUTION]

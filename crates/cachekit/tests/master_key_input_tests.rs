@@ -195,9 +195,10 @@ fn config_builder_rejects_every_hex_reject_row() {
     }
 }
 
-/// Both env readers, `CachekitConfig::from_env` and the client constructor
-/// `CacheKit::from_env` built on it, under the given key variables. A valid
-/// API key is set so the client constructor can only fail on a key.
+/// Every env reader — `CachekitConfig::from_env`, the client constructor
+/// `CacheKit::from_env` built on it, and the builder's
+/// `.encryption_from_env()` — under the given key variables. A valid API key
+/// is set so the client constructor can only fail on a key.
 fn env_entry_points(
     master: &str,
     previous: Option<&str>,
@@ -216,6 +217,10 @@ fn env_entry_points(
         ),
         #[cfg(feature = "cachekitio")]
         ("CacheKit::from_env", CacheKit::from_env().map(drop)),
+        (
+            "CacheKitBuilder::encryption_from_env",
+            CacheKit::builder().encryption_from_env().map(drop),
+        ),
     ]
 }
 

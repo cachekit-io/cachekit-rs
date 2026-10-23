@@ -1033,20 +1033,133 @@ fn encryption_hex_accepts_32_and_48_byte_keys() {
     }
 }
 
+// ── Env-sourced keys (protocol intent-presets.md § Encryption Activation) ────
+
+/// The `from_env()` environment with the given key variables.
+#[cfg(feature = "cachekitio")]
+fn key_env(master: Option<&str>, previous: Option<&str>) -> common::EnvGuard {
+    common::EnvGuard::set(&[
+        ("CACHEKIT_API_KEY", Some("test-key")),
+        ("CACHEKIT_API_URL", None),
+        ("CACHEKIT_DEFAULT_TTL", None),
+        ("CACHEKIT_MASTER_KEY", master),
+        ("CACHEKIT_PREVIOUS_MASTER_KEYS", previous),
+    ])
+}
+
 #[cfg(feature = "cachekitio")]
 #[test]
 #[serial_test::serial]
 fn from_env_accepts_32_and_48_byte_hex_keys() {
     for bytes in [32, 48] {
         let (current, previous) = ("22".repeat(bytes), "11".repeat(bytes));
-        let _env = common::EnvGuard::set(&[
-            ("CACHEKIT_API_KEY", Some("test-key")),
-            ("CACHEKIT_API_URL", None),
-            ("CACHEKIT_MASTER_KEY", Some(current.as_str())),
-            ("CACHEKIT_PREVIOUS_MASTER_KEYS", Some(previous.as_str())),
-        ]);
+        let _env = key_env(Some(&current), Some(&previous));
         let builder = CacheKit::from_env()
+            .and_then(|b| b.encryption_from_env())
             .unwrap_or_else(|e| panic!("{bytes}-byte hex keys must be accepted: {e}"));
         assert!(builder.build().unwrap().secure_cache().is_ok());
+    }
+}
+
+/// Rule 2: a set `CACHEKIT_MASTER_KEY` is a key source, never a switch — the
+/// backend holds the value's plain MessagePack bytes.
+#[cfg(feature = "cachekitio")]
+#[test]
+#[serial_test::serial]
+fn from_env_with_a_master_key_stores_plaintext() {
+    let (current, previous) = ("22".repeat(32), "11".repeat(32));
+    let _env = key_env(Some(&current), Some(&previous));
+    let (backend, handle) = MockBackend::new_with_handle();
+    let cache = CacheKit::from_env()
+        .expect("a valid key must not stop from_env")
+        .backend(backend)
+        .no_l1()
+        .build()
+        .expect("client builds");
+
+    common::runtime()
+        .block_on(cache.set("k", &"plain value"))
+        .expect("set");
+
+    let stored = handle.store.try_lock().unwrap().get("k").cloned();
+    assert_eq!(
+        stored,
+        Some(cachekit::serializer::serialize(&"plain value").unwrap()),
+        "from_env() must not encrypt because CACHEKIT_MASTER_KEY is set"
+    );
+    assert!(
+        cache.secure_cache().is_err(),
+        "no encryption layer expected"
+    );
+}
+
+/// `.encryption_from_env()` encrypts under `CACHEKIT_MASTER_KEY` for tenant
+/// `"default"` and decrypts with `CACHEKIT_PREVIOUS_MASTER_KEYS` — checked
+/// against clients given the same keys explicitly.
+#[cfg(feature = "cachekitio")]
+#[test]
+#[serial_test::serial]
+fn encryption_from_env_uses_the_env_keys() {
+    let (current, previous) = ("22".repeat(32), "11".repeat(32));
+    let _env = key_env(Some(&current), Some(&previous));
+    let (backend, handle) = MockBackend::new_with_handle();
+    let explicit = |hex: &str| {
+        CacheKit::builder()
+            .backend(backend.clone())
+            .no_l1()
+            .encryption(hex, "default")
+            .and_then(|b| b.build())
+            .expect("explicit client builds")
+    };
+    let cache = CacheKit::from_env()
+        .and_then(|b| b.encryption_from_env())
+        .expect("env keys are valid")
+        .backend(backend.clone())
+        .no_l1()
+        .build()
+        .expect("client builds");
+    let rt = common::runtime();
+
+    rt.block_on(cache.set("k", &"secret")).expect("set");
+    let stored = handle.store.try_lock().unwrap().get("k").cloned().unwrap();
+    assert_ne!(stored, cachekit::serializer::serialize(&"secret").unwrap());
+    let read: Option<String> = rt.block_on(explicit(&current).get("k")).expect("get");
+    assert_eq!(
+        read.as_deref(),
+        Some("secret"),
+        "written under the current key"
+    );
+
+    rt.block_on(explicit(&previous).set("old", &"rotated"))
+        .expect("set");
+    let read: Option<String> = rt.block_on(cache.get("old")).expect("get");
+    assert_eq!(read.as_deref(), Some("rotated"), "previous key decrypts");
+}
+
+/// Asked to encrypt with no key anywhere, the builder errors — never a
+/// plaintext client.
+#[cfg(feature = "cachekitio")]
+#[test]
+#[serial_test::serial]
+fn encryption_from_env_without_a_key_is_a_config_error() {
+    for master in [None, Some("")] {
+        let _env = key_env(master, None);
+        for (entry, result) in [
+            ("builder", CacheKit::builder().encryption_from_env()),
+            (
+                "from_env",
+                CacheKit::from_env().and_then(|b| b.encryption_from_env()),
+            ),
+        ] {
+            match result {
+                // An empty key fails from_env()'s own validation first.
+                Err(CachekitError::Config(msg)) => assert!(
+                    msg.contains("CACHEKIT_MASTER_KEY"),
+                    "{entry} {master:?}: {msg}"
+                ),
+                Err(e) => panic!("{entry} {master:?}: expected a Config error, got {e:?}"),
+                Ok(_) => panic!("{entry} {master:?}: encryption accepted with no key"),
+            }
+        }
     }
 }

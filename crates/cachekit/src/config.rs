@@ -17,9 +17,11 @@ pub const MAX_PREVIOUS_MASTER_KEYS: usize = 3;
 /// Configuration values for a CacheKit client.
 ///
 /// A client reads a `CachekitConfig` on one path only: `CacheKit::from_env()`
-/// builds one with [`CachekitConfig::from_env`] and applies it. No `CacheKit`
-/// constructor takes a `CachekitConfig` value, so a config made with
-/// [`CachekitConfigBuilder`] configures no client.
+/// builds one with [`CachekitConfig::from_env`] and applies it, except the
+/// key fields, which it validates and leaves unused (only an explicit
+/// encryption call such as `CacheKitBuilder::encryption_from_env()`
+/// encrypts). No `CacheKit` constructor takes a `CachekitConfig` value, so a
+/// config made with [`CachekitConfigBuilder`] configures no client.
 pub struct CachekitConfig {
     /// API key for cachekit.io authentication.
     pub api_key: Option<Zeroizing<String>>,
@@ -114,9 +116,10 @@ impl CachekitConfig {
 
         // Master key — hex-decode and validate length >= 32 bytes.
         // Deliberately NO blank-value tolerance here (unlike the previous-keys
-        // var below): a blank CACHEKIT_MASTER_KEY treated as unset would
-        // silently turn encryption off. Set but not UTF-8 (a raw key put in
-        // the environment without hex-encoding it) is an error for the same
+        // var below): a blank CACHEKIT_MASTER_KEY is a broken deploy of a key,
+        // not an unset one, so it fails here rather than at a later explicit
+        // encryption call. Set but not UTF-8 (a raw key put in the
+        // environment without hex-encoding it) is an error for the same
         // reason, never unset.
         match std::env::var("CACHEKIT_MASTER_KEY") {
             Ok(val) => {
@@ -215,8 +218,9 @@ impl CachekitConfigBuilder {
     /// these paths apply previous keys to a client; each one decrypts with
     /// the current key first, then each previous key in order:
     ///
-    /// * `CacheKit::from_env()` and `CacheKit::secure_from_env()` read them
-    ///   from `CACHEKIT_PREVIOUS_MASTER_KEYS`.
+    /// * `CacheKitBuilder::encryption_from_env()` and
+    ///   `CacheKit::secure_from_env()` read them from
+    ///   `CACHEKIT_PREVIOUS_MASTER_KEYS`.
     /// * `CacheKitBuilder::encryption_with_previous()` takes them as hex
     ///   arguments, validated as this method validates them, for any tenant.
     /// * `CacheKitBuilder::encryption_from_bytes_with_previous()` takes them
@@ -225,9 +229,8 @@ impl CachekitConfigBuilder {
     ///
     /// Without the `encryption` feature no path accepts a master key, so
     /// none can silently drop one: `CacheKit::secure_from_env()` does not
-    /// exist, `CacheKit::from_env()` returns [`CachekitError::Config`] when
-    /// `CACHEKIT_MASTER_KEY` is set, and both builder methods always
-    /// return [`CachekitError::Config`].
+    /// exist, and all three builder methods always return
+    /// [`CachekitError::Config`].
     ///
     /// Validation is identical to [`Self::master_key`] per entry (valid hex,
     /// at least 32 bytes). At most [`MAX_PREVIOUS_MASTER_KEYS`] entries —
@@ -335,10 +338,37 @@ pub(crate) fn decode_master_key_hex(
     Ok(bytes)
 }
 
+/// A decoded current master key and its decrypt-only previous keys.
+#[cfg(feature = "encryption")]
+pub(crate) type EnvKeys = (Zeroizing<Vec<u8>>, Vec<Zeroizing<Vec<u8>>>);
+
+/// `CACHEKIT_MASTER_KEY` and `CACHEKIT_PREVIOUS_MASTER_KEYS` for the explicit
+/// env-sourced encryption calls, `CacheKit::secure_from_env` and
+/// `CacheKitBuilder::encryption_from_env`. Each was asked to encrypt, so an
+/// unset, empty or non-UTF-8 key is an error, never plaintext. `instead`
+/// names the call that takes the key as an argument. Returns the current
+/// key and the previous keys.
+#[cfg(feature = "encryption")]
+pub(crate) fn master_keys_from_env(instead: &str) -> Result<EnvKeys, CachekitError> {
+    let hex_key = std::env::var("CACHEKIT_MASTER_KEY")
+        .ok()
+        .map(Zeroizing::new)
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| {
+            CachekitError::Config(format!(
+                "CACHEKIT_MASTER_KEY is unset or empty: set it to a 64-hex-char key or pass \
+                 the key to {instead}"
+            ))
+        })?;
+    let master_key = decode_master_key_hex(&hex_key, "CACHEKIT_MASTER_KEY")?;
+    let previous = previous_master_keys_from_env(Some(&master_key))?;
+    Ok((master_key, previous))
+}
+
 /// `CACHEKIT_PREVIOUS_MASTER_KEYS`, decoded and validated against the
 /// decoded current key. The one reader of the variable, shared by
-/// [`CachekitConfig::from_env`] and `CacheKit::secure_from_env` so the two
-/// env paths cannot drift. Unset or blank yields no keys.
+/// [`CachekitConfig::from_env`] and [`master_keys_from_env`] so the env
+/// paths cannot drift. Unset or blank yields no keys.
 pub(crate) fn previous_master_keys_from_env(
     master_key: Option<&[u8]>,
 ) -> Result<Vec<Zeroizing<Vec<u8>>>, CachekitError> {
