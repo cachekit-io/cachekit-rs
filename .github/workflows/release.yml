@@ -266,7 +266,7 @@ jobs:
           for crate in cachekit-macros cachekit-rs; do
             for path in target/package/"$crate"-[0-9]*.crate; do
               file=${path##*/}
-              curl -sSf --retry 5 --retry-all-errors --retry-delay 10 \
+              curl -sSf --connect-timeout 10 --max-time 60 --retry 5 --retry-all-errors --retry-delay 10 \
                 -o "$RUNNER_TEMP/uploaded/$file" "https://static.crates.io/crates/$crate/$file"
             done
           done
