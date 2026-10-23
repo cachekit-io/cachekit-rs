@@ -16,7 +16,6 @@ fn config_from_env_defaults() {
         ("CACHEKIT_API_URL", None),
         ("CACHEKIT_MASTER_KEY", None),
         ("CACHEKIT_PREVIOUS_MASTER_KEYS", None),
-        ("CACHEKIT_DEFAULT_TTL", None),
     ]);
 
     let config = CachekitConfig::from_env().expect("from_env failed with no env vars");
@@ -92,7 +91,6 @@ fn config_from_env_rejects_non_utf8_master_key() {
         ("CACHEKIT_API_URL", None),
         ("CACHEKIT_MASTER_KEY", None),
         ("CACHEKIT_PREVIOUS_MASTER_KEYS", None),
-        ("CACHEKIT_DEFAULT_TTL", None),
     ]);
     std::env::set_var(
         "CACHEKIT_MASTER_KEY",
@@ -117,24 +115,25 @@ fn config_from_env_accepts_32_byte_master_key() {
     assert_eq!(config.master_key.as_ref().unwrap().len(), 32);
 }
 
+// ── CACHEKIT_DEFAULT_TTL is not read ─────────────────────────────────────────
+
+/// The intent-preset spec forbids a process-wide default-TTL override and
+/// reserves this variable's name, so `from_env` must not read it. A value the
+/// old read applied (`1`) and values it rejected (`0`, `soon`) all leave
+/// `default_ttl` at 300 s.
 #[test]
 #[serial]
-fn config_from_env_rejects_ttl_zero() {
-    let _env = EnvGuard::set(&[("CACHEKIT_DEFAULT_TTL", Some("0"))]);
-
-    assert!(
-        CachekitConfig::from_env().is_err(),
-        "expected error for TTL=0"
-    );
-}
-
-#[test]
-#[serial]
-fn config_from_env_accepts_ttl_one() {
-    let _env = EnvGuard::set(&[("CACHEKIT_DEFAULT_TTL", Some("1"))]);
-    let config = CachekitConfig::from_env().expect("from_env failed");
-
-    assert_eq!(config.default_ttl, Duration::from_secs(1));
+fn config_from_env_ignores_cachekit_default_ttl() {
+    for value in ["1", "0", "soon"] {
+        let _env = EnvGuard::set(&[("CACHEKIT_DEFAULT_TTL", Some(value))]);
+        let config = CachekitConfig::from_env()
+            .unwrap_or_else(|e| panic!("CACHEKIT_DEFAULT_TTL={value} failed from_env: {e}"));
+        assert_eq!(
+            config.default_ttl,
+            Duration::from_secs(300),
+            "CACHEKIT_DEFAULT_TTL={value}"
+        );
+    }
 }
 
 // ── Debug redaction ───────────────────────────────────────────────────────────

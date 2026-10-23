@@ -208,7 +208,6 @@ fn env_entry_points(
         ("CACHEKIT_PREVIOUS_MASTER_KEYS", previous),
         ("CACHEKIT_API_KEY", Some("ck_test_key")),
         ("CACHEKIT_API_URL", None),
-        ("CACHEKIT_DEFAULT_TTL", None),
     ]);
     vec![
         (

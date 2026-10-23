@@ -1041,7 +1041,6 @@ fn key_env(master: Option<&str>, previous: Option<&str>) -> common::EnvGuard {
     common::EnvGuard::set(&[
         ("CACHEKIT_API_KEY", Some("test-key")),
         ("CACHEKIT_API_URL", None),
-        ("CACHEKIT_DEFAULT_TTL", None),
         ("CACHEKIT_MASTER_KEY", master),
         ("CACHEKIT_PREVIOUS_MASTER_KEYS", previous),
     ])

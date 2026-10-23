@@ -142,6 +142,8 @@ async fn main() -> Result<(), CachekitError> {
 }
 ```
 
+`from_env()` reads the [Environment Variables](#environment-variables) below. Its default TTL is 300 s, and no variable changes it: chain `.default_ttl(…)` before `.build()`, or pass a TTL per call with `set_with_ttl`.
+
 With `CACHEKIT_MASTER_KEY` set, chain `.encryption_from_env()?` or `.no_encryption()` before `.build()`; see [Zero-Knowledge Encryption](#zero-knowledge-encryption).
 
 ### Builder API
@@ -628,7 +630,6 @@ Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rus
 | `CACHEKIT_API_URL` | ❌ | Override API endpoint (default: `https://api.cachekit.io`) |
 | `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and the builder's `.encryption_from_env()`); use exactly 32 bytes (64 hex chars) — shorter, non-hex or non-UTF-8 values are rejected, never treated as unset. A key source, never a switch: `from_env()` validates it but does not encrypt, and while it is set a `from_env()` builder needs `.encryption_from_env()` or `.no_encryption()` |
 | `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (`CacheKit::secure_from_env()` and `.encryption_from_env()`; max 3; a blank value is treated as unset). `from_env()` validates it and fails on a malformed value, even for a `.no_encryption()` client |
-| `CACHEKIT_DEFAULT_TTL` | ❌ | Default TTL in seconds (min 1, default: 300) |
 
 > [!CAUTION]
 > `CACHEKIT_API_URL` must use HTTPS, must not carry credentials, a query or a

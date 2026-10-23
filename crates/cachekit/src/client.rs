@@ -263,6 +263,10 @@ impl CacheKit {
     ///
     /// A set key is validated here: one that is empty, not hex, shorter than
     /// 32 bytes or not UTF-8 is a [`CachekitError::Config`].
+    ///
+    /// The default TTL is 300 s, and no environment variable changes it. Chain
+    /// [`CacheKitBuilder::default_ttl`] on the returned builder, or pass a TTL
+    /// per call with [`CacheKit::set_with_ttl`].
     #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
     pub fn from_env() -> Result<CacheKitBuilder, CachekitError> {
         use crate::backend::cachekitio::CachekitIO;

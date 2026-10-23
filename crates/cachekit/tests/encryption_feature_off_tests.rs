@@ -62,7 +62,6 @@ fn from_env_with_a_master_key_needs_a_stated_intent_as_with_the_feature_on() {
         ("CACHEKIT_API_URL", None),
         ("CACHEKIT_MASTER_KEY", Some(key.as_str())),
         ("CACHEKIT_PREVIOUS_MASTER_KEYS", None),
-        ("CACHEKIT_DEFAULT_TTL", None),
     ]);
     assert!(
         matches!(
