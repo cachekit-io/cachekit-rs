@@ -79,7 +79,7 @@ jobs:
           [ -x "$TOOL_ROOT/bin/cargo-audit" ] || cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION" --root "$TOOL_ROOT"
           echo "$TOOL_ROOT/bin" >> "$GITHUB_PATH"
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # This job never pushes; don't leave the token in the git config
           # (zizmor: artipacked).
