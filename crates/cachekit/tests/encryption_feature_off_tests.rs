@@ -68,6 +68,8 @@ fn from_env_with_a_master_key_needs_a_stated_intent_as_with_the_feature_on() {
         matches!(
             CacheKit::from_env().and_then(|b| b.build()),
             Err(CachekitError::Config(msg)) if msg.contains(".no_encryption()")
+                && msg.contains("`encryption` cargo feature")
+                && !msg.contains(".encryption_from_env()")
         ),
         "from_env with a key and no stated intent must not build"
     );

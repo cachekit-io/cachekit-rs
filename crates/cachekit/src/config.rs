@@ -312,16 +312,13 @@ pub(crate) fn decode_master_key_hex(
     Ok(bytes)
 }
 
-/// `CACHEKIT_MASTER_KEY`, hex-decoded, or `None` when unset. The one reader
-/// of the variable, shared by [`CachekitConfig::from_env`] and
-/// [`master_keys_from_env`] so the env paths cannot drift.
-///
-/// Deliberately NO blank-value tolerance (unlike
-/// `CACHEKIT_PREVIOUS_MASTER_KEYS`): a blank key is a broken deploy of a key,
-/// not an unset one. Set but not UTF-8 (a raw key put in the environment
-/// without hex-encoding it) is an error for the same reason, never unset.
-pub(crate) fn master_key_from_env() -> Result<Option<Zeroizing<Vec<u8>>>, CachekitError> {
-    let val = match std::env::var("CACHEKIT_MASTER_KEY") {
+/// `CACHEKIT_MASTER_KEY` as set, not yet decoded, or `None` when unset. The
+/// one reader of the variable, shared by [`CachekitConfig::from_env`] and
+/// [`master_keys_from_env`] so the env paths cannot drift. Set but not UTF-8
+/// (a raw key put in the environment without hex-encoding it) is an error,
+/// never unset.
+fn master_key_hex_from_env() -> Result<Option<Zeroizing<String>>, CachekitError> {
+    match std::env::var("CACHEKIT_MASTER_KEY") {
         // `env::var` hands back an owned copy of the hex secret. Wrap it so
         // that copy is wiped on drop too — the decoded bytes are already
         // `Zeroizing`, but the hex form is the same key material. Defence in
@@ -329,14 +326,22 @@ pub(crate) fn master_key_from_env() -> Result<Option<Zeroizing<Vec<u8>>>, Cachek
         // holds the identical hex for the process lifetime and is not wiped
         // here, so this narrows post-lifetime recovery (core dumps, swap,
         // heap reuse), it does not eliminate the exposure.
-        Ok(val) => Zeroizing::new(val),
-        Err(std::env::VarError::NotPresent) => return Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(CachekitError::Config(
-                "CACHEKIT_MASTER_KEY is not valid UTF-8: set it to the key's 64 hex chars"
-                    .to_owned(),
-            ))
-        }
+        Ok(val) => Ok(Some(Zeroizing::new(val))),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(CachekitError::Config(
+            "CACHEKIT_MASTER_KEY is not valid UTF-8: set it to the key's 64 hex chars".to_owned(),
+        )),
+    }
+}
+
+/// `CACHEKIT_MASTER_KEY`, hex-decoded, or `None` when unset.
+///
+/// Deliberately NO blank-value tolerance (unlike
+/// `CACHEKIT_PREVIOUS_MASTER_KEYS`): a blank key is a broken deploy of a key,
+/// not an unset one.
+fn master_key_from_env() -> Result<Option<Zeroizing<Vec<u8>>>, CachekitError> {
+    let Some(val) = master_key_hex_from_env()? else {
+        return Ok(None);
     };
     if val.is_empty() {
         return Err(CachekitError::Config(
@@ -358,16 +363,15 @@ pub(crate) type EnvKeys = (Zeroizing<Vec<u8>>, Vec<Zeroizing<Vec<u8>>>);
 /// current key and the previous keys.
 #[cfg(feature = "encryption")]
 pub(crate) fn master_keys_from_env(explicit_key_call: &str) -> Result<EnvKeys, CachekitError> {
-    let unset_or_empty = || {
-        CachekitError::Config(format!(
-            "CACHEKIT_MASTER_KEY is unset or empty: set it to a 64-hex-char key or pass the \
-             key to {explicit_key_call}"
-        ))
-    };
-    if std::env::var_os("CACHEKIT_MASTER_KEY").is_none_or(|key| key.is_empty()) {
-        return Err(unset_or_empty());
-    }
-    let master_key = master_key_from_env()?.ok_or_else(unset_or_empty)?;
+    let hex_key = master_key_hex_from_env()?
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| {
+            CachekitError::Config(format!(
+                "CACHEKIT_MASTER_KEY is unset or empty: set it to a 64-hex-char key or pass \
+                 the key to {explicit_key_call}"
+            ))
+        })?;
+    let master_key = decode_master_key_hex(&hex_key, "CACHEKIT_MASTER_KEY")?;
     let previous = previous_master_keys_from_env(Some(&master_key))?;
     Ok((master_key, previous))
 }

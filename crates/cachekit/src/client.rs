@@ -1481,8 +1481,9 @@ impl CacheKitBuilder {
     /// builder never falls back to plaintext.
     #[cfg(feature = "encryption")]
     pub fn encryption_from_env(self) -> Result<Self, CachekitError> {
-        let (master_key, previous) =
-            crate::config::master_keys_from_env(".encryption(hex_key, tenant_id)")?;
+        let (master_key, previous) = crate::config::master_keys_from_env(
+            ".encryption_with_previous(hex_key, previous_hex_keys, \"default\")",
+        )?;
         let previous: Vec<&[u8]> = previous.iter().map(|key| key.as_slice()).collect();
         self.encryption_from_hex_decoded(&master_key, &previous, "default")
     }
@@ -1596,12 +1597,16 @@ impl CacheKitBuilder {
             ));
         }
         if self.env_master_key && !encrypting && !self.no_encryption {
-            return Err(CachekitError::Config(
-                "CACHEKIT_MASTER_KEY is set, and CacheKit::from_env() no longer encrypts \
-                 because of it: chain .encryption_from_env() to encrypt with it, or \
-                 .no_encryption() to build a plaintext client"
-                    .to_owned(),
-            ));
+            #[cfg(feature = "encryption")]
+            let msg = "CACHEKIT_MASTER_KEY is set, and CacheKit::from_env() no longer encrypts \
+                       because of it: chain .encryption_from_env() to encrypt with it, or \
+                       .no_encryption() to build a plaintext client";
+            #[cfg(not(feature = "encryption"))]
+            let msg = "CACHEKIT_MASTER_KEY is set, but this build of cachekit-rs has no \
+                       `encryption` cargo feature and cannot encrypt with it: chain \
+                       .no_encryption() to build a plaintext client, or enable the feature \
+                       to encrypt";
+            return Err(CachekitError::Config(msg.to_owned()));
         }
 
         let backend = self.backend.ok_or_else(|| {
