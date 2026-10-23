@@ -132,7 +132,7 @@ jobs:
           rustup default stable
 
       - name: Run tests before publish
-        run: cargo test --features "cachekitio,redis,encryption,l1,macros"
+        run: cargo test --locked --features "cachekitio,redis,encryption,l1,macros"
 
       - name: Verify MSRV (1.85) before publish
         # Gate: never ship a release that breaks the declared MSRV floor.
@@ -141,7 +141,7 @@ jobs:
         # of a newer-than-1.85 API across lib + tests without a heavy build.
         run: |
           rustup toolchain install 1.85 --profile minimal
-          cargo +1.85 check --all-targets --features "cachekitio,redis,encryption,l1,macros"
+          cargo +1.85 check --locked --all-targets --features "cachekitio,redis,encryption,l1,macros"
 
       - name: Package and verify both crates
         # Multi-package mode resolves cachekit-rs's dependency on the not yet
@@ -199,9 +199,10 @@ jobs:
         run: |
           for crate in cachekit-macros cachekit-rs; do
             cargo sbom --cargo-package "$crate" --output-format cyclone_dx_json_1_6 > "sbom-$crate.cdx.json"
-            count=$(jq '.components | length' "sbom-$crate.cdx.json")
+            count=$(jq -e '.components | length' "sbom-$crate.cdx.json") || {
+              echo "::error::$crate SBOM is empty or not JSON"; exit 1; }
             echo "$crate SBOM components: $count"
-            if [ "$count" -lt 1 ]; then
+            if [ "${count:-0}" -lt 1 ]; then
               echo "::error::$crate SBOM lists no components"
               exit 1
             fi
@@ -246,6 +247,7 @@ jobs:
       # check out the ref `verify` did and require the commit it reports. A
       # moved tag or a forged output fails here instead of shipping.
       - name: Check this is the commit verify tested
+        id: source
         env:
           VERIFIED_SHA: ${{ needs.verify.outputs.sha }}
         run: |
@@ -254,6 +256,7 @@ jobs:
             echo "::error::checked out $head, but verify tested '$VERIFIED_SHA'"
             exit 1
           fi
+          echo "sha=$head" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
         run: |
@@ -289,9 +292,82 @@ jobs:
       # Attest before publishing: a crates.io upload is irreversible, so a
       # Sigstore outage blocks the release instead of shipping it unattested.
       - name: Attest build provenance
+        if: steps.source.outputs.sha == github.sha
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: target/package/*.crate
+
+      # A dispatch of an older tag packages a commit other than github.sha.
+      # The generated provenance names only the workflow's commit on main, so
+      # build the same SLSA predicate from the same run facts, plus the tag's
+      # input and the commit actually packaged as a resolved dependency.
+      - name: Build provenance predicate for an older tag
+        if: steps.source.outputs.sha != github.sha
+        env:
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          OWNER_ID: ${{ github.repository_owner_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          if [ -z "$TAG" ]; then
+            echo "::error::packaged $SOURCE_SHA, not $SHA, with no tag input"
+            exit 1
+          fi
+          jq -n '{
+            buildDefinition: {
+              buildType: "https://actions.github.io/buildtypes/workflow/v1",
+              externalParameters: {
+                workflow: {
+                  ref: env.REF,
+                  repository: (env.SERVER_URL + "/" + env.REPOSITORY),
+                  path: (env.WORKFLOW_REF | ltrimstr(env.REPOSITORY + "/") | split("@")[0])
+                },
+                inputs: {tag: env.TAG}
+              },
+              internalParameters: {
+                github: {
+                  event_name: env.EVENT_NAME,
+                  repository_id: env.REPOSITORY_ID,
+                  repository_owner_id: env.OWNER_ID,
+                  runner_environment: env.RUNNER_ENVIRONMENT
+                }
+              },
+              resolvedDependencies: [
+                {
+                  uri: ("git+" + env.SERVER_URL + "/" + env.REPOSITORY + "@" + env.REF),
+                  digest: {gitCommit: env.SHA}
+                },
+                {
+                  uri: ("git+" + env.SERVER_URL + "/" + env.REPOSITORY + "@refs/tags/" + env.TAG),
+                  digest: {gitCommit: env.SOURCE_SHA}
+                }
+              ]
+            },
+            runDetails: {
+              builder: {id: (env.SERVER_URL + "/" + env.WORKFLOW_REF)},
+              metadata: {
+                invocationId: (env.SERVER_URL + "/" + env.REPOSITORY + "/actions/runs/" + env.RUN_ID + "/attempts/" + env.RUN_ATTEMPT)
+              }
+            }
+          }' > "$RUNNER_TEMP/provenance.json"
+          cat "$RUNNER_TEMP/provenance.json"
+
+      - name: Attest build provenance for an older tag
+        if: steps.source.outputs.sha != github.sha
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: target/package/*.crate
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: ${{ runner.temp }}/provenance.json
 
       - name: Attest cachekit-macros SBOM
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
