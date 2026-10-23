@@ -94,10 +94,34 @@ jobs:
           # inputs.tag is empty on push events, so github.sha keeps the default
           # checkout behaviour there.
           ref: ${{ inputs.tag || github.sha }}
+          # Full history, so the dispatch check below can see main.
+          fetch-depth: 0
           persist-credentials: false
 
-      # `sbom` and `publish` check out this exact commit, not the tag again,
-      # so a tag moved mid-run cannot change what ships after it was tested.
+      # The `release` environment admits main only, but inputs.tag can name
+      # any ref. On dispatch, require a cachekit-rs release tag whose commit
+      # is on main, so no other tree reaches `publish`. Runs before any
+      # dependency code.
+      - name: Check the dispatched tag is a release on main
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          case "$TAG" in
+            cachekit-rs-v*) ;;
+            *) echo "::error::tag must be a cachekit-rs-v* release tag, got '$TAG'"; exit 1 ;;
+          esac
+          tag_commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}") || {
+            echo "::error::'$TAG' is not a tag"; exit 1; }
+          if [ "$tag_commit" != "$(git rev-parse HEAD)" ]; then
+            echo "::error::checked out $(git rev-parse HEAD), but tag '$TAG' is $tag_commit"
+            exit 1
+          fi
+          git merge-base --is-ancestor HEAD origin/main || {
+            echo "::error::tag '$TAG' is not on main"; exit 1; }
+
+      # `sbom` and `publish` check out the same ref and fail unless they get
+      # this commit, so a tag moved mid-run cannot change what ships.
       - name: Record the tested commit
         id: sha
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -124,7 +148,7 @@ jobs:
         # published cachekit-macros version through a local overlay, then
         # builds each packaged crate — the build `publish` skips with
         # --no-verify.
-        run: cargo package -p cachekit-macros -p cachekit-rs
+        run: cargo package --locked -p cachekit-macros -p cachekit-rs
 
   # cargo-sbom only reads `cargo metadata`, so this job builds nothing from the
   # project: no dependency build script can rewrite an SBOM before upload.
@@ -134,11 +158,30 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    # `publish` downloads this exact upload and checks these digests, so an
+    # artifact replaced later in the run is refused rather than attested.
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      macros-sha256: ${{ steps.sboms.outputs.macros-sha256 }}
+      rs-sha256: ${{ steps.sboms.outputs.rs-sha256 }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ needs.verify.outputs.sha }}
+          ref: ${{ inputs.tag || github.sha }}
           persist-credentials: false
+
+      # `verify` ran dependency code, so its output is a claim, not a source:
+      # check out the ref `verify` did and require the commit it reports. A
+      # moved tag or a forged output fails here instead of shipping.
+      - name: Check this is the commit verify tested
+        env:
+          VERIFIED_SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$VERIFIED_SHA" ]; then
+            echo "::error::checked out $head, but verify tested '$VERIFIED_SHA'"
+            exit 1
+          fi
 
       - name: Install Rust toolchain
         run: |
@@ -149,6 +192,7 @@ jobs:
         run: cargo install cargo-sbom --version 0.10.0 --locked
 
       - name: Generate SBOMs
+        id: sboms
         # One CycloneDX SBOM per crate, so each .crate's SBOM attestation
         # lists that crate's own dependency graph. An empty SBOM fails the
         # release: attesting it would claim a dependency-free crate.
@@ -162,8 +206,11 @@ jobs:
               exit 1
             fi
           done
+          echo "macros-sha256=$(sha256sum sbom-cachekit-macros.cdx.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "rs-sha256=$(sha256sum sbom-cachekit-rs.cdx.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
         with:
           name: sbom
           path: sbom-*.cdx.json
@@ -192,8 +239,21 @@ jobs:
       # first-party actions/*.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ needs.verify.outputs.sha }}
+          ref: ${{ inputs.tag || github.sha }}
           persist-credentials: false
+
+      # `verify` ran dependency code, so its output is a claim, not a source:
+      # check out the ref `verify` did and require the commit it reports. A
+      # moved tag or a forged output fails here instead of shipping.
+      - name: Check this is the commit verify tested
+        env:
+          VERIFIED_SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$VERIFIED_SHA" ]; then
+            echo "::error::checked out $head, but verify tested '$VERIFIED_SHA'"
+            exit 1
+          fi
 
       - name: Install Rust toolchain
         run: |
@@ -205,7 +265,7 @@ jobs:
         # deterministically, so these are the bytes `cargo publish` uploads
         # below — the check after publishing proves it against crates.io.
         run: |
-          cargo package --no-verify -p cachekit-macros -p cachekit-rs
+          cargo package --locked --no-verify -p cachekit-macros -p cachekit-rs
           (cd target/package && sha256sum -- *.crate) > "$RUNNER_TEMP/attested.sha256"
           cat "$RUNNER_TEMP/attested.sha256"
 
@@ -213,8 +273,18 @@ jobs:
       # publish a tree with untracked files.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: sbom
+          artifact-ids: ${{ needs.sbom.outputs.artifact-id }}
           path: ${{ runner.temp }}/sbom
+
+      - name: Check the SBOMs are the ones `sbom` generated
+        env:
+          MACROS_SHA256: ${{ needs.sbom.outputs.macros-sha256 }}
+          RS_SHA256: ${{ needs.sbom.outputs.rs-sha256 }}
+        run: |
+          cd "$RUNNER_TEMP/sbom"
+          printf '%s  %s\n' \
+            "$MACROS_SHA256" sbom-cachekit-macros.cdx.json \
+            "$RS_SHA256" sbom-cachekit-rs.cdx.json | sha256sum --strict -c
 
       # Attest before publishing: a crates.io upload is irreversible, so a
       # Sigstore outage blocks the release instead of shipping it unattested.
@@ -245,7 +315,7 @@ jobs:
         # Known gap: after a PARTIAL failure (macros uploaded, cachekit-rs not),
         # a redundant dispatch still dies here on the macros duplicate — publish
         # the missing crate manually in that case.
-        run: cargo publish --no-verify -p cachekit-macros
+        run: cargo publish --locked --no-verify -p cachekit-macros
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
@@ -253,14 +323,16 @@ jobs:
         run: sleep 30
 
       - name: Publish cachekit-rs to crates.io
-        run: cargo publish --no-verify -p cachekit-rs
+        run: cargo publish --locked --no-verify -p cachekit-rs
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Check the uploaded crates are the attested files
         # Downloads what crates.io now serves and compares it with the digests
         # the attestations name. A mismatch means the attestations cover a
-        # file nobody can download: fail loudly so the release is re-attested.
+        # file nobody can download. The crates are already live and a version
+        # cannot be re-uploaded, so a re-run cannot repair it: recovery is
+        # manual, and this step only makes the mismatch impossible to miss.
         run: |
           mkdir "$RUNNER_TEMP/uploaded"
           for crate in cachekit-macros cachekit-rs; do
@@ -270,4 +342,8 @@ jobs:
                 -o "$RUNNER_TEMP/uploaded/$file" "https://static.crates.io/crates/$crate/$file"
             done
           done
-          cd "$RUNNER_TEMP/uploaded" && sha256sum -c ../attested.sha256
+          cd "$RUNNER_TEMP/uploaded"
+          if ! sha256sum --strict -c ../attested.sha256; then
+            echo "::error::crates.io serves a .crate that differs from the attested file. The version is live and cannot be re-uploaded: do not re-run; recover by hand."
+            exit 1
+          fi
