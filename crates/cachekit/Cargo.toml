@@ -136,6 +136,8 @@ required-features = ["l1", "reliability", "encryption"]
 [[example]]
 name = "wall_time_probe"
 required-features = ["cachekitio", "macros"]
+# Its argument checks have unit tests; examples skip them under `cargo test` by default.
+test = true
 
 [dev-dependencies]
 serde_json = "1"
