@@ -32,8 +32,7 @@
 //! default-on `encryption` feature.
 //! ⁴ API key by argument, or from `CACHEKIT_API_KEY` via
 //! [`io_from_env`](CacheKit::io_from_env). Neither reads
-//! `CACHEKIT_MASTER_KEY`; unlike [`from_env`](CacheKit::from_env), the `io`
-//! preset never activates encryption from the environment.
+//! `CACHEKIT_MASTER_KEY`.
 //! ⁵ Master key as a hex string, `secure(url, master_key_hex)`, or from
 //! `CACHEKIT_MASTER_KEY` via `secure_from_env(url)` — the same hex decoding
 //! either way, so one key value derives the same key bytes in every CacheKit
@@ -55,6 +54,13 @@
 //! encryption, for code that must never run unencrypted. A build without the
 //! `encryption` feature rejects every builder encryption call with
 //! [`CachekitError::Config`].
+//!
+//! No other client encrypts. `CACHEKIT_MASTER_KEY` is a key source, never a
+//! switch: after [`from_env`](CacheKit::from_env) with the variable set,
+//! chain [`.encryption_from_env()`](CacheKitBuilder::encryption_from_env) to
+//! encrypt with it or [`.no_encryption()`](CacheKitBuilder::no_encryption)
+//! for a plaintext client; stating neither is an error at `build()` (a
+//! transitional check, see [`from_env`](CacheKit::from_env)).
 //!
 //! ```no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {

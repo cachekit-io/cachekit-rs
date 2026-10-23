@@ -1,8 +1,9 @@
-//! A build without the `encryption` cargo feature rejects every way of
-//! configuring a key — the builder encryption calls, and `from_env()` with
-//! `CACHEKIT_MASTER_KEY` set: accepting a key and building a plaintext client
-//! is the silent downgrade protocol `spec/intent-presets.md` § Encryption
-//! Activation, rule 1 forbids.
+//! A build without the `encryption` cargo feature rejects every way of asking
+//! for encryption — each builder encryption call, `.encryption_from_env()`
+//! included: accepting a key and building a plaintext client is the silent
+//! downgrade protocol `spec/intent-presets.md` § Encryption Activation, rule 1
+//! forbids. `from_env()` with `CACHEKIT_MASTER_KEY` set asks for nothing and,
+//! as with the feature on, builds once `.no_encryption()` states the intent.
 //!
 //! The CI test job builds with `encryption`, which compiles this file to
 //! nothing. Run it with:
@@ -42,6 +43,10 @@ fn every_builder_encryption_method_is_a_config_error() {
         CacheKit::builder().encryption_with_previous(&"07".repeat(32), &[&"08".repeat(32)], "t"),
         ".encryption_with_previous()",
     );
+    assert_feature_missing(
+        CacheKit::builder().encryption_from_env(),
+        ".encryption_from_env()",
+    );
 }
 
 #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
@@ -50,7 +55,7 @@ mod common;
 #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
 #[test]
 #[serial_test::serial]
-fn from_env_with_a_master_key_is_a_config_error() {
+fn from_env_with_a_master_key_needs_a_stated_intent_as_with_the_feature_on() {
     let key = "07".repeat(32);
     let _env = common::EnvGuard::set(&[
         ("CACHEKIT_API_KEY", Some("test-key")),
@@ -58,13 +63,19 @@ fn from_env_with_a_master_key_is_a_config_error() {
         ("CACHEKIT_MASTER_KEY", Some(key.as_str())),
         ("CACHEKIT_PREVIOUS_MASTER_KEYS", None),
     ]);
-    assert_feature_missing(CacheKit::from_env(), "CACHEKIT_MASTER_KEY");
-
-    // Control: the same environment without the key builds, so the error
-    // above is the key's and not some other misconfiguration.
-    let _no_key = common::EnvGuard::set(&[("CACHEKIT_MASTER_KEY", None)]);
     assert!(
-        CacheKit::from_env().is_ok(),
-        "from_env without a key must build"
+        matches!(
+            CacheKit::from_env().and_then(|b| b.build()),
+            Err(CachekitError::Config(msg)) if msg.contains(".no_encryption()")
+                && msg.contains("`encryption` cargo feature")
+                && !msg.contains(".encryption_from_env()")
+        ),
+        "from_env with a key and no stated intent must not build"
+    );
+    assert!(
+        CacheKit::from_env()
+            .and_then(|b| b.no_encryption().build())
+            .is_ok(),
+        "the stated opt-out must build"
     );
 }
