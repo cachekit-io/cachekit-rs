@@ -314,10 +314,22 @@ fn master_key_hex_from_env() -> Result<Option<Zeroizing<String>>, CachekitError>
         // heap reuse), it does not eliminate the exposure.
         Ok(val) => Ok(Some(Zeroizing::new(val))),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(CachekitError::Config(
-            "CACHEKIT_MASTER_KEY is not valid UTF-8: set it to the key's 64 hex chars".to_owned(),
-        )),
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            wipe(raw);
+            Err(CachekitError::Config(
+                "CACHEKIT_MASTER_KEY is not valid UTF-8: set it to the key's 64 hex chars"
+                    .to_owned(),
+            ))
+        }
     }
+}
+
+/// Wipe the owned copy `env::var` hands back with `VarError::NotUnicode`:
+/// a non-UTF-8 key variable most likely holds a raw key exported without
+/// hex-encoding, so the copy is key material. `into_encoded_bytes` takes the
+/// buffer without copying it.
+fn wipe(raw: std::ffi::OsString) {
+    drop(Zeroizing::new(raw.into_encoded_bytes()));
 }
 
 /// `CACHEKIT_MASTER_KEY`, hex-decoded, or `None` when unset.
@@ -376,10 +388,11 @@ pub(crate) fn previous_master_keys_from_env(
         Err(std::env::VarError::NotPresent) => return Ok(Vec::new()),
         // Set but unreadable is not unset: dropping it would silently strip
         // the decrypt-only keys, and every old-key read would fail closed.
-        Err(std::env::VarError::NotUnicode(_)) => {
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            wipe(raw);
             return Err(CachekitError::Config(
                 "CACHEKIT_PREVIOUS_MASTER_KEYS is not valid UTF-8".to_owned(),
-            ))
+            ));
         }
     };
     // A wholly blank value retires the variable (the common way to disable
