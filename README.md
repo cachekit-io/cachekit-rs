@@ -537,7 +537,7 @@ fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
 
 ## Performance
 
-What one call costs in the client: the public `CacheKit` API over an in-memory backend, so no figure includes network time. Each cell is the median wall time per call of five runs, each in its own process, on a single-threaded tokio runtime. Measured on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with Rust 1.99.1.
+What one call costs in the client: the public `CacheKit` API over an in-memory backend, so no figure includes network time. The client comes from `CacheKit::builder()` with no reliability stack, like `minimal`; the `production`, `secure` and `io` presets also send every backend call, so every L2 hit and set, through the [reliability stack](#reliability), which these figures leave out. Each cell is the median wall time per call of five runs, each in its own process, on a single-threaded tokio runtime. Measured on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with Rust 1.99.1.
 
 | Operation | 64 B | 1 KiB |
 |:----------|-----:|------:|
@@ -747,9 +747,7 @@ make bench-instr                            # instructions/op + run-to-run sprea
 make bench-instr BASE=../bench-base FILTER=l2_hit   # A/B against another build
 ```
 
-`bench_hot_path readme` prints the [Performance](#performance) table: the
-plain and encrypted `get` and `set` cases at 64 B and 1 KiB, each cell the
-median of five runs, each in its own process.
+`bench_hot_path readme` prints the table in [Performance](#performance).
 
 Wall time on a shared machine moves by tens of percent between runs, so
 `bench-instr` is the number a change is judged on. It counts only the timed
