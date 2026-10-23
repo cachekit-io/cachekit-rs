@@ -11,6 +11,7 @@
 //! bench_hot_path list                          every case name
 //! bench_hot_path run <case> <size> <iters>     one case; indicative wall ns/op
 //! bench_hot_path wall [filter]                 every case; indicative wall ns/op
+//! bench_hot_path readme                        the README's Performance table
 //! bench_hot_path instr [--runs N] [--base BIN] [filter]
 //! ```
 //!
@@ -297,6 +298,47 @@ fn instr_iters(size: usize) -> usize {
     }
 }
 
+// ── README table ─────────────────────────────────────────────────────────────
+
+/// Rows of the README's Performance table: the read and write paths, plain
+/// and encrypted.
+const README_ROWS: [(&str, &str); 6] = [
+    ("l1_hit/plain", "`get`, L1 hit"),
+    ("l2_hit/plain", "`get`, L2 hit"),
+    ("set/plain", "`set_with_ttl`"),
+    ("l1_hit/enc", "`secure_cache()` `get`, L1 hit"),
+    ("l2_hit/enc", "`secure_cache()` `get`, L2 hit"),
+    ("set/enc", "`secure_cache()` `set_with_ttl`"),
+];
+
+/// "640 ns", "12.3 µs".
+fn ns_cell(ns: f64) -> String {
+    if ns < 1_000.0 {
+        format!("{ns:.0} ns")
+    } else {
+        format!("{:.1} µs", ns / 1_000.0)
+    }
+}
+
+/// The README's Performance table as Markdown. Each cell is the median wall
+/// time per op of five runs, each on a fresh client and backend.
+fn readme() -> Result<bool, String> {
+    println!("| Operation | 64 B | 1 KiB | 64 KiB |");
+    println!("|:----------|-----:|------:|-------:|");
+    for (case, label) in README_ROWS {
+        let mut cells = Vec::new();
+        for size in SIZES {
+            let runs = (0..5)
+                .map(|_| run(case, size, 20 * instr_iters(size)))
+                .collect::<Result<Vec<f64>, _>>()
+                .map_err(|e| e.to_string())?;
+            cells.push(ns_cell(median(&runs)));
+        }
+        println!("| {label} | {} |", cells.join(" | "));
+    }
+    Ok(true)
+}
+
 // ── Instruction counting ─────────────────────────────────────────────────────
 
 fn instructions(
@@ -443,7 +485,7 @@ fn instr(args: &[String]) -> Result<bool, String> {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: bench_hot_path list | run <case> <size> <iters> | wall [filter] | instr [--runs N] [--base BIN] [filter]");
+    eprintln!("usage: bench_hot_path list | run <case> <size> <iters> | wall [filter] | readme | instr [--runs N] [--base BIN] [filter]");
     ExitCode::from(2)
 }
 
@@ -481,6 +523,7 @@ fn main() -> ExitCode {
                 })
                 .map(|()| true)
         }
+        Some("readme") if args.len() == 1 => readme(),
         Some("instr") => instr(&args[1..]),
         _ => return usage(),
     };
