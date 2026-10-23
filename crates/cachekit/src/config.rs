@@ -97,8 +97,6 @@ impl CachekitConfig {
     /// | `CACHEKIT_API_URL` | Override API base URL (must be HTTPS) |
     /// | `CACHEKIT_MASTER_KEY` | Hex-encoded master key (min 32 bytes); set but empty, not hex or not UTF-8 is an error, never unset |
     /// | `CACHEKIT_PREVIOUS_MASTER_KEYS` | Comma-separated hex-encoded decrypt-only previous master keys (max 3; blank value = unset) |
-    ///
-    /// No variable sets the default TTL: it stays at the 300 s default.
     pub fn from_env() -> Result<Self, CachekitError> {
         let mut config = Self::default();
 
