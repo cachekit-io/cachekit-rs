@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to republish (e.g. cachekit-rs-v0.4.0)"
+        description: "Unpublished release tag newer than crates.io (cachekit-rs-vX.Y.Z)"
         required: true
         type: string
 
@@ -99,13 +99,14 @@ jobs:
           persist-credentials: false
 
       # The `release` environment admits main only, but inputs.tag can name
-      # any tag. On dispatch, accept only the release commit of an unpublished
-      # version: tag cachekit-rs-v<version> is on main, its commit sets both
-      # crates to <version> and its parent does not, and <version> is newer
-      # than every cachekit-rs version on crates.io, yanked ones included.
-      # Runs before any dependency code. The checkout above already resolved
-      # refs/tags/<tag>, so HEAD is the tag's commit.
-      - name: Check the dispatched tag is the release commit of an unpublished version
+      # any tag. On dispatch, accept only the release commit of a version
+      # newer than any on crates.io: tag cachekit-rs-v<version> is on main, its
+      # commit sets both crates to <version> and its parent does not, and
+      # <version> is newer than every cachekit-rs version on crates.io, yanked
+      # ones included. Runs before any dependency code. The checkout above
+      # already resolved refs/tags/<tag>, so HEAD is the tag's commit. python3
+      # runs in isolated mode (-I): it never imports from the checkout.
+      - name: Check the dispatched tag is the release commit of a version newer than crates.io
         if: github.event_name == 'workflow_dispatch'
         env:
           TAG: ${{ inputs.tag }}
@@ -121,7 +122,7 @@ jobs:
           manifest_version() {
             local toml
             toml=$(git show "$1:crates/$2/Cargo.toml") || return 1
-            python3 -c 'import sys, tomllib; v = tomllib.loads(sys.stdin.read())["package"]["version"]; print(v) if isinstance(v, str) else sys.exit("not a literal version")' <<<"$toml"
+            python3 -I -c 'import sys, tomllib; v = tomllib.loads(sys.stdin.read())["package"]["version"]; print(v) if isinstance(v, str) else sys.exit("not a literal version")' <<<"$toml"
           }
           for crate in cachekit cachekit-macros; do
             at_tag=$(manifest_version HEAD "$crate") || {
@@ -141,7 +142,7 @@ jobs:
           index=$(curl -sSf --connect-timeout 10 --max-time 60 --retry 5 --retry-all-errors --retry-delay 10 \
             https://index.crates.io/ca/ch/cachekit-rs) || {
             echo "::error::cannot read the cachekit-rs crates.io index"; exit 1; }
-          python3 -c '
+          python3 -I -c '
           import json, re, sys
           def fail(msg):
               print(f"::error::{msg}")
@@ -332,11 +333,11 @@ jobs:
 
       # Attest before publishing: a crates.io upload is irreversible, so a
       # Sigstore outage blocks the release instead of shipping it unattested.
-      # On a dispatch of an older tag, this provenance names the workflow's
-      # commit on main, not the tag's. The packaged commit is still bound to
-      # the attested digest: cargo records it in each crate's
-      # .cargo_vcs_info.json, and verify checked that it is the release commit
-      # of an unpublished version on main.
+      # On a dispatch of a tag whose commit main has moved past, this
+      # provenance names the workflow's commit on main, not the tag's. The
+      # packaged commit is still bound to the attested digest: cargo records it
+      # in each crate's .cargo_vcs_info.json, and verify checked that it is the
+      # release commit, on main, of a version newer than any on crates.io.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
