@@ -109,14 +109,39 @@ fn validate_key(key: &str) -> Result<(), CachekitError> {
             key.len()
         )));
     }
-    for b in key.bytes() {
-        if b < 0x20 || b == 0x7F {
+    if has_control_byte(key.as_bytes()) {
+        // Rejection only: find the first offending byte to name it.
+        if let Some(b) = key.bytes().find(|&b| is_control_byte(b)) {
             return Err(CachekitError::InvalidKey(format!(
                 "key contains illegal control character 0x{b:02X}"
             )));
         }
     }
     Ok(())
+}
+
+/// A byte no key may hold: a control character below 0x20, or DEL.
+const fn is_control_byte(b: u8) -> bool {
+    (b < 0x20) | (b == 0x7F)
+}
+
+/// Whether any byte of `bytes` is a control byte.
+///
+/// Every key on every operation passes through here, so it reads 16 bytes at
+/// a time: a block's compares are folded with no early exit, which the
+/// compiler turns into a few SIMD instructions where a byte loop spends a
+/// branch per byte. When the length is not a multiple of 16, the last block
+/// overlaps the one before it instead of leaving a byte-at-a-time tail.
+fn has_control_byte(bytes: &[u8]) -> bool {
+    fn any_control(block: &[u8]) -> bool {
+        block
+            .iter()
+            .fold(false, |found, &b| found | is_control_byte(b))
+    }
+    if bytes.len() < 16 {
+        return any_control(bytes);
+    }
+    bytes.chunks_exact(16).any(any_control) || any_control(&bytes[bytes.len() - 16..])
 }
 
 // ── Stale-while-revalidate ───────────────────────────────────────────────────
@@ -1708,6 +1733,93 @@ impl CacheKitBuilder {
             #[cfg(feature = "encryption")]
             encryption: self.encryption,
         })
+    }
+}
+
+#[cfg(test)]
+mod validate_key_tests {
+    use super::{validate_key, MAX_KEY_BYTES};
+    use crate::error::CachekitError;
+
+    /// The byte loop `validate_key` ran before it checked 16 bytes at a time:
+    /// the behaviour it must keep, error text included.
+    fn byte_loop(key: &str) -> Result<(), String> {
+        if key.is_empty() {
+            return Err("key must not be empty".to_owned());
+        }
+        if key.len() > MAX_KEY_BYTES {
+            return Err(format!(
+                "key is {} bytes (limit: {MAX_KEY_BYTES})",
+                key.len()
+            ));
+        }
+        for b in key.bytes() {
+            if b < 0x20 || b == 0x7F {
+                return Err(format!("key contains illegal control character 0x{b:02X}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn check(key: &str) {
+        let got = validate_key(key).map_err(|e| match e {
+            CachekitError::InvalidKey(msg) => msg,
+            other => format!("not InvalidKey: {other:?}"),
+        });
+        assert_eq!(got, byte_loop(key), "key {key:?}");
+    }
+
+    /// Every ASCII character, plus a 2-, 3- and 4-byte character (whose bytes
+    /// are all 0x80 or more), at every position of every key length from 0
+    /// to 48: every block boundary and overlap of the 16-byte check.
+    #[test]
+    fn same_verdict_and_message_as_the_byte_loop() {
+        let fillers: Vec<char> = (0u8..0x80)
+            .map(char::from)
+            .chain(['é', '€', '😀'])
+            .collect();
+        for len in 0..=48 {
+            for pos in 0..len {
+                for &c in &fillers {
+                    let mut key: String = "k".repeat(pos);
+                    key.push(c);
+                    key.push_str(&"k".repeat(len - pos - 1));
+                    check(&key);
+                }
+            }
+            check(&"k".repeat(len));
+        }
+    }
+
+    /// With two offending bytes the message names the first, wherever the
+    /// two fall relative to the blocks.
+    #[test]
+    fn names_the_first_offending_byte() {
+        for len in 2..=48 {
+            for first in 0..len {
+                for second in first + 1..len {
+                    let mut key = vec![b'k'; len];
+                    key[first] = 0x7F;
+                    key[second] = 0x01;
+                    check(&String::from_utf8_lossy(&key));
+                }
+            }
+        }
+    }
+
+    /// Near the length limit, where the last block overlaps the most.
+    #[test]
+    fn long_keys_around_the_limit() {
+        for len in MAX_KEY_BYTES - 40..=MAX_KEY_BYTES + 1 {
+            for pos in (0..len).filter(|p| *p < 40 || *p % 16 < 2 || *p % 16 > 13 || len - p < 40) {
+                for c in ['\u{0}', '\u{1F}', ' ', '~', '\u{7F}', 'é'] {
+                    let mut key: String = "k".repeat(pos);
+                    key.push(c);
+                    key.push_str(&"k".repeat(len - pos - 1));
+                    check(&key);
+                }
+            }
+        }
     }
 }
 
