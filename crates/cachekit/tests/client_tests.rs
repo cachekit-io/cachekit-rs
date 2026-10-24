@@ -437,7 +437,7 @@ mod freshness {
 
     /// (c) `Fresh-For: 1` bounds the backfill to 1 s although the cap is 30 s,
     /// and the SWR path cannot serve the copy once that bound has passed.
-    /// Real time: moka's clock is `std::time::Instant`, which tokio cannot
+    /// Real time: L1's clock is `std::time::Instant`, which tokio cannot
     /// pause.
     #[tokio::test]
     async fn fresh_for_bounds_the_backfill_and_its_swr_service() {

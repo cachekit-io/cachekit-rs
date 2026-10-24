@@ -28,7 +28,7 @@
 | **CacheKit** | `get` / `set` / `delete` / `exists` with automatic L1 → L2 layering; with a master key configured, every value is AES-256-GCM encrypted before storage (zero-knowledge) |
 | **SecureCache** | The same encryption as a handle (`cache.secure_cache()`) that refuses a client without a key |
 | **Backend** | Pluggable trait — cachekit.io SaaS, Redis, Memcached, local File, Cloudflare Workers |
-| **L1 Cache** | In-process [moka](https://crates.io/crates/moka) cache with write-through + backfill |
+| **L1 Cache** | In-process cache ([quick_cache](https://crates.io/crates/quick_cache)) with per-entry TTL, write-through + backfill |
 
 > [!TIP]
 > For the Python SDK with decorators, see [`cachekit`](https://github.com/cachekit-io/cachekit).
@@ -42,7 +42,7 @@
 |:--------|:-------:|:------------|
 | `cachekitio` | ✅ | HTTP backend for [api.cachekit.io](https://api.cachekit.io) via [reqwest](https://crates.io/crates/reqwest) + rustls |
 | `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core). Without it, every builder encryption call (`.encryption()`, `.encryption_with_previous()`, `.encryption_from_env()`, `.encryption_from_bytes()`, `.encryption_from_bytes_with_previous()`) returns a config error |
-| `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka), with stale-while-revalidate (native). Not supported on `wasm32-unknown-unknown` (compile error: no clock there) |
+| `l1` | ✅ | In-process L1 cache via [quick_cache](https://crates.io/crates/quick_cache), with per-entry TTL and stale-while-revalidate (native). Not supported on `wasm32-unknown-unknown` (compile error: no clock there) |
 | `reliability` | ✅ | Retry with backoff + jitter, circuit breaker, backpressure, distributed fill locks (native only) |
 | `redis` | ❌ | Redis backend via [fred](https://crates.io/crates/fred) (native only) |
 | `memcached` | ❌ | Memcached backend via [rust-memcache](https://crates.io/crates/memcache) (native only) |
@@ -70,12 +70,12 @@ cachekit-rs = { version = "0.12.0", default-features = false, features = ["worke
 > [!WARNING]
 > **Mutually exclusive features:**
 > - `workers` + `redis` — Workers runtime cannot use fred
-> - `workers` + `l1` — moka requires std threads unavailable in wasm32
+> - `workers` + `l1` — L1 reads `std::time::Instant`, which has no clock on wasm32-unknown-unknown, the Workers target
 > - `workers` + `reliability` — retry/breaker timers need tokio `time`, unavailable in wasm32
 > - `workers` + `memcached` — Workers runtime has no TCP sockets
 > - `workers` + `file` — Workers runtime has no filesystem
 >
-> `l1` is also a compile error on `wasm32-unknown-unknown` with any feature set: `std::time::Instant` has no clock there, so building the client would panic. Build for that target with `default-features = false, features = ["encryption"]` plus your backend feature (`workers` for cachekit.io); `wasm32-wasip1` keeps L1.
+> `l1` is also a compile error on `wasm32-unknown-unknown` with any feature set: `std::time::Instant` has no clock there, so the client's first L1 read or write would panic. Build for that target with `default-features = false, features = ["encryption"]` plus your backend feature (`workers` for cachekit.io); `wasm32-wasip1` keeps L1.
 
 ---
 
@@ -442,7 +442,7 @@ Optional extension traits: `TtlInspectable` (TTL queries), `LockableBackend` (di
 
 ## Dual-Layer Caching
 
-When the `l1` feature is enabled (default), CacheKit maintains an in-process [moka](https://crates.io/crates/moka) cache in front of the backend:
+When the `l1` feature is enabled (default), CacheKit keeps an in-process cache in front of the backend. [quick_cache](https://crates.io/crates/quick_cache) stores the entries and chooses what to evict; CacheKit adds per-entry TTL and stale-while-revalidate on top:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -461,7 +461,7 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 │  invalidate L1 first ──► delete from L2 backend         │
 │                                                         │
 ├─────────────┬───────────────────────────────────────────┤
-│  L1 (moka)  │  L2 (cachekit.io / Redis / Workers)       │
+│  L1         │  L2 (cachekit.io / Redis / Workers)       │
 │  in-process │  one backend round trip                   │
 └─────────────┴───────────────────────────────────────────┘
 ```
@@ -473,7 +473,9 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
 | **Encrypted L1** | A client with encryption configured stores ciphertext in L1 (never plaintext) |
 | **Evict on decrypt failure** | A read on an encrypted client that fails decryption drops the key's L1 copy and returns the error; the backend entry is kept, so the next read reaches the backend: a hit once the entry is replaced with ciphertext the client can decrypt, a miss once it expires or is deleted |
-| **Default capacity** | 1,000 entries (configurable via `.l1_capacity()`) |
+| **Capacity** | 1,000 entries by default (`.l1_capacity()` sets it); L1 never holds more. It is split into shards: capacity ÷ 128 rounded down to a power of two, from 1 to 64 (4 at the default). A full shard evicts even while others have room |
+| **Eviction** | Scan-resistant (quick_cache's CLOCK-Pro variant, close to S3-FIFO): a run of keys written once and never read does not flush the entries being read, as it would under LRU. `exists()` does not count as a read |
+| **Expiry** | An entry is never served past its TTL. An expired entry leaves memory when a read finds it, when eviction reaches it, or when `l1_entry_count()` sweeps; until then it holds its place, so an idle L1 can keep up to its capacity in expired entries |
 | **Live counters** | `cache.stats()` reports L1 hits / L2 hits / misses; `cache.l1_entry_count()` the current occupancy — see [Observability](#observability) |
 | **Stale-while-revalidate** | On by default (native; `minimal` turns it off): `#[cachekit]` serves an L1 hit past `swr_threshold_ratio` × entry TTL (default 0.5, ±10% jitter) immediately and refreshes it in the background — see below |
 
@@ -620,7 +622,7 @@ let breaker = cache.circuit_state();       // Option<CircuitState>: Closed / Ope
 | Surface | What you get |
 |:--------|:-------------|
 | `CacheKit::stats()` | `L1Stats { l1_hits, l2_hits, misses, l1_enabled }` for every value read (`get`, `interop_get`, SWR and `SecureCache` variants). `exists` and reads that fail with a backend error are not counted. |
-| `CacheKit::l1_entry_count()` | Exact L1 occupancy (runs moka's pending housekeeping first — poll it, don't put it on a hot path). |
+| `CacheKit::l1_entry_count()` | Exact L1 occupancy. Sweeps expired entries out first, a pass over every entry, so poll it; don't put it on a hot path. |
 | `CacheKit::circuit_state()` | Live breaker state (`reliability` feature); `None` when the client has no breaker. |
 | SaaS telemetry headers | The cachekit.io backends send `X-CacheKit-L1-Hits` / `L2-Hits` / `Misses` / `L1-Hit-Rate` from the **same counters**, wired automatically by `CacheKitBuilder::build()`. A `.metrics_provider(..)` set on the backend builder still takes precedence. One backend instance reports one client — the first built over it; once that client is gone the headers fall back to `disabled`. |
 | `tracing` feature | One `debug` event per completed operation, per failed fill-lock call, and per `#[cachekit]` result the macro could not store, on the `cachekit` target, and breaker transitions on `cachekit::reliability` (`warn` on open, `info` for half-open / closed). |
@@ -677,7 +679,7 @@ cachekit-rs/
 │   │       ├── session.rs     # SDK session tracking
 │   │       ├── url_validator.rs # SSRF-safe URL validation
 │   │       ├── serializer/    # MessagePack serialization
-│   │       ├── l1/            # moka-based L1 cache (feature = "l1")
+│   │       ├── l1/            # L1 cache: quick_cache plus TTL and SWR (feature = "l1")
 │   │       └── backend/
 │   │           ├── mod.rs     # Backend + TtlInspectable + LockableBackend traits
 │   │           ├── cachekitio.rs      # cachekit.io HTTP backend

@@ -86,7 +86,7 @@ const L1_BACKFILL_TTL_SECS: u64 = 30;
 /// L1 lifetime for a backfill from an L2 hit, or `None` when the read must not
 /// be backfilled (`spec/saas-api.md` § Remaining Freshness). A stale label or a
 /// zero `Fresh-For` forbids it; a present `Fresh-For` is a hard bound under the
-/// 30 s cap, which SWR cannot outlive because moka drops the entry at its TTL.
+/// 30 s cap, which SWR cannot outlive because L1 never serves an entry past its TTL.
 /// With no header the cap applies unchanged.
 #[cfg(feature = "l1")]
 fn l1_backfill_ttl(default_ttl: Duration, freshness: Freshness) -> Option<Duration> {
@@ -410,7 +410,7 @@ impl CacheKit {
         };
 
         // Check before touching L2. The mutation state lives independently of
-        // the moka entry, so hard expiry or capacity eviction does not look
+        // the L1 entry, so hard expiry or capacity eviction does not look
         // like an explicit set/delete and waste a valid origin result.
         if !mutation.is_current(&token.state, token.version) {
             return Ok(false);
@@ -557,8 +557,9 @@ impl CacheKit {
     ///   so a newer set/delete always wins.
     /// - [`SwrRead::Miss`] — nothing usable anywhere: normal blocking miss.
     ///
-    /// A hard-expired L1 entry is a [`SwrRead::Miss`], never `Stale` — moka
-    /// drops entries at their TTL, so SWR cannot serve past hard expiry.
+    /// A hard-expired L1 entry is a [`SwrRead::Miss`], never `Stale` — L1
+    /// never serves an entry past its TTL, so SWR cannot serve past hard
+    /// expiry.
     ///
     /// With SWR disabled ([`CacheKitBuilder::swr_enabled`]`(false)`), without
     /// the `l1` feature, on wasm32, or under `unsync`, this behaves exactly
@@ -845,9 +846,9 @@ impl CacheKit {
     /// Number of entries currently held in L1, or `None` when L1 is disabled
     /// (or the `l1` feature is off).
     ///
-    /// Exact at the time of the call: moka's pending expirations and
-    /// evictions are applied first, which makes this a housekeeping call, not
-    /// a free counter read — poll it, don't put it on a hot path.
+    /// Exact at the time of the call: expired entries are swept out first,
+    /// a pass over every entry that makes this a housekeeping call, not a
+    /// free counter read — poll it, don't put it on a hot path.
     pub fn l1_entry_count(&self) -> Option<u64> {
         #[cfg(feature = "l1")]
         let count = self.l1.as_ref().map(crate::l1::L1Cache::entry_count);
