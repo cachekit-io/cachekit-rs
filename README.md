@@ -118,12 +118,12 @@ async fn main() -> Result<(), CachekitError> {
 
 **Resilience contract** — connection failures, at construction and mid-run:
 
-- `production` / `secure` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely.
+- `production` / `secure` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely. To get the same policy on a backend you build yourself, for example one `RedisBackend` shared by several clients through `CacheKitBuilder::backend`, call `RedisBackendBuilder::auto_reconnect()` (see [Redis](#redis)). A backend built without it is fail-fast like `minimal`.
 - `minimal` is **fail-fast**: a dropped connection is not re-established — every subsequent operation that reaches Redis errors until you rebuild the client. Reads served from a warm L1 entry still return without contacting Redis.
 - **Initial** connections fail fast for every Redis preset: a bad URL or unreachable Redis errors immediately at construction, never enters a retry loop. `io` opens no connection at construction: an empty API key fails at construction, while an invalid key or unreachable endpoint surfaces at the first request.
 - `secure` / `secure_from_env` validate the master key (and `secure_from_env` any previous keys) **before** any Redis connection is attempted — a missing, non-hex or short key, or a malformed `CACHEKIT_PREVIOUS_MASTER_KEYS`, is a deterministic local error, never masked by (or paying for) network I/O, and never a fallback to plaintext.
 - Auto-reconnect is connection-level repair, distinct from the per-operation [reliability stack](#reliability) (retry, circuit breaker, backpressure) that `production` / `secure` / `io` also enable. `minimal` has neither — every failure is yours to handle.
-- Every Redis command has a **5 s timeout** (matching cachekit-py and cachekit-ts), so a stalled or unreachable server returns `BackendErrorKind::Timeout` instead of hanging. `minimal` fails after ~5 s. `production` / `secure` retry a timeout up to 3 attempts, so one op can take ~15 s before it errors, and those timeouts count toward opening the circuit breaker. Under `production` / `secure`, a connection that stops answering is also closed and re-established, typically 6-8 s after the stalled command was sent (fred checks every 2 s for a pending reply older than 5 s).
+- Every Redis command has a **5 s timeout** (matching cachekit-py and cachekit-ts), so a stalled or unreachable server returns `BackendErrorKind::Timeout` instead of hanging. `minimal` fails after ~5 s. `production` / `secure` retry a timeout up to 3 attempts, so one op can take ~15 s before it errors, and those timeouts count toward opening the circuit breaker. Under `production` / `secure`, a connection that stops answering is also closed and re-established, typically 6-8 s after the stalled command was sent (fred checks every 2 s for a pending reply older than 5 s). On a backend you build yourself, `RedisBackendBuilder::command_timeout` sets a different budget; it is per attempt, and it is also the stalled-reply threshold when `auto_reconnect()` is on.
 
 ### From Environment Variables
 
@@ -173,7 +173,10 @@ Each cachekit.io request attempt times out after 5 s, the protocol's
 `CACHEKIT_TIMEOUT` default; a write (`set`, `delete`) gets 10 s. The timeout
 covers connect, TLS and the whole response body, and surfaces as
 `BackendErrorKind::Timeout`. The same budgets apply on native targets and on
-the [Workers backend](#cloudflare-workers).
+the [Workers backend](#cloudflare-workers). On native targets,
+`CachekitIO::builder().read_timeout(..)` and `.write_timeout(..)` change them
+(zero is rejected at `build()`); connecting still gives up after 5 s. Under the
+[reliability stack](#reliability) the budget is per attempt.
 
 On native targets every request carries the User-Agent `cachekit-rs/<version>`,
 and an idle pooled connection is kept for 390 s (reqwest's default is 90 s).
@@ -341,7 +344,7 @@ How fresh a cachekit.io read is, and how long a deleted project's data stays rea
 
 ### Redis
 
-Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Each command times out after 5 s with `BackendErrorKind::Timeout`. A timed-out command may still run on the server: harmless for `get`/`set`/`delete`, and a timed-out lock acquire leaves the lock to expire on its own TTL. Requires the `redis` feature flag.
+Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Each command times out after 5 s with `BackendErrorKind::Timeout`; `.command_timeout(Duration)` changes that (zero is rejected at `build()`). A timed-out command may still run on the server: harmless for `get`/`set`/`delete`, and a timed-out lock acquire leaves the lock to expire on its own TTL. Requires the `redis` feature flag.
 
 <!-- x-release-please-start-version -->
 ```toml
@@ -350,13 +353,18 @@ cachekit-rs = { version = "0.11.1", features = ["redis"] }
 <!-- x-release-please-end -->
 
 ```rust
+use std::time::Duration;
 use cachekit::backend::redis::RedisBackend;
 
 let backend = RedisBackend::builder()
     .url("redis://localhost:6379")
+    .auto_reconnect()                            // optional: the production/secure policy
+    .command_timeout(Duration::from_millis(500)) // optional: default 5 s
     .build()?;
 backend.connect().await?;  // explicit connect required
 ```
+
+Without `.auto_reconnect()` the backend is fail-fast: after Redis restarts, every operation errors until you rebuild it.
 
 ### Memcached
 
@@ -580,6 +588,8 @@ With the `reliability` feature (default, native only), the `production`, `secure
 | **Stale-while-revalidate** | Stale-but-unexpired L1 hits are served immediately while one single-flight-deduplicated background task re-executes the function ([details](#stale-while-revalidate-swr)) | on by default with `l1` (native); threshold 0.5 × entry TTL ±10% jitter |
 
 Retry sits *inside* the breaker (one exhausted retry sequence = one breaker failure) and backpressure sits *outside* both — one permit per logical operation, held across the whole retry sequence, so retry amplification is bounded and shed calls never skew breaker state. Degradation, single-flight, and SWR sit in the `#[cachekit]` macro around the read path — the same composition as the TypeScript SDK's `ReliabilityExecutor` and the Python decorator.
+
+To give operations a tighter budget than the 5 s default, set it on the backend builder (`RedisBackendBuilder::command_timeout`, `CachekitIOBuilder::read_timeout` / `write_timeout`), not with `tokio::time::timeout` around each call. The backend's timeout is an error the stack sees: it is retried, each attempt gets the full budget (one op can take about three budgets plus backoff), and an op that ends in a timeout counts as one breaker failure. A call cancelled from outside records nothing, so a backend slower than your budget would never open the breaker and every op would wait out your full timeout.
 
 ```rust,ignore
 use std::time::Duration;
