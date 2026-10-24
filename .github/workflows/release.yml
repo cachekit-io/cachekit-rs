@@ -137,22 +137,31 @@ jobs:
           done
 
           # The sparse index lists every published version, yanked ones too.
-          # sort -V orders plain X.Y.Z correctly; a prerelease on the index can
-          # only make this check stricter.
+          # Ranked in SemVer order, where a prerelease sits below its release.
           index=$(curl -sSf --connect-timeout 10 --max-time 60 --retry 5 --retry-all-errors --retry-delay 10 \
             https://index.crates.io/ca/ch/cachekit-rs) || {
             echo "::error::cannot read the cachekit-rs crates.io index"; exit 1; }
-          published=$(jq -er .vers <<<"$index") || {
-            echo "::error::the cachekit-rs crates.io index is not valid"; exit 1; }
-          newest=$(sort -V <<<"$published" | tail -n 1)
-          if [ -z "$newest" ]; then
-            echo "::error::the cachekit-rs crates.io index lists no versions"; exit 1
-          fi
-          # The lower of the two is $version when it is older or equal.
-          if [ "$(printf '%s\n' "$version" "$newest" | sort -V | head -n 1)" = "$version" ]; then
-            echo "::error::$version is not newer than $newest, the newest cachekit-rs on crates.io"; exit 1
-          fi
-          echo "$TAG is the release commit of $version; crates.io's newest is $newest"
+          python3 -c '
+          import json, re, sys
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+          def rank(v):
+              m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?", v) if isinstance(v, str) else None
+              if not m:
+                  fail(f"the cachekit-rs crates.io index lists {v!r}, which is not a SemVer version")
+              return int(m[1]), int(m[2]), int(m[3]), m[4] is None
+          try:
+              published = [json.loads(line)["vers"] for line in sys.stdin.read().splitlines() if line.strip()]
+          except (ValueError, KeyError, TypeError):
+              fail("the cachekit-rs crates.io index is not valid")
+          if not published:
+              fail("the cachekit-rs crates.io index lists no versions")
+          version, newest = sys.argv[1], max(published, key=rank)
+          if rank(version) <= rank(newest):
+              fail(f"{version} is not newer than {newest}, the newest cachekit-rs on crates.io")
+          print(f"{sys.argv[2]} is the release commit of {version}; crates.io newest is {newest}")
+          ' "$version" "$TAG" <<<"$index"
 
       # `sbom` and `publish` check out the same ref and fail unless they get
       # this commit, so a tag moved mid-run cannot change what ships.
