@@ -573,8 +573,8 @@ impl SingleFlight {
     /// Release the flight. Best-effort: frees the distributed fill lock (if
     /// held) so other processes stop waiting early. A failed release is
     /// traced (feature `tracing`) and otherwise ignored: the lock expires
-    /// server-side regardless. Leaves the stand-down note as it is (see
-    /// [`FlightMap`]), since a caller may release after an error, with no fill.
+    /// server-side regardless. Leaves the stand-down note as it is (see the
+    /// `FlightMap` docs), since a caller may release after an error, with no fill.
     pub async fn release(self) {
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         if let Some(lock_id) = &self.lock_id {

@@ -549,28 +549,41 @@ mod secure_tests {
         assert!(secure_env_defaults_with(Some(&"22".repeat(32)), None).is_ok());
     }
 
-    /// Run `secure_env_defaults` under the given env, restoring both
-    /// variables before anything can panic.
+    /// Run `f` with each variable set (`Some`) or removed (`None`),
+    /// restoring every one before anything can panic.
+    fn with_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
+        let saved: Vec<_> = vars
+            .iter()
+            .map(|(var, _)| (*var, std::env::var_os(var)))
+            .collect();
+        for (var, val) in vars {
+            match val {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        let out = f();
+        for (var, val) in saved {
+            match val {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        out
+    }
+
+    /// Run `secure_env_defaults` under the given env.
     fn secure_env_defaults_with(
         master: Option<&str>,
         previous: Option<&str>,
     ) -> Result<crate::CacheKitBuilder, crate::CachekitError> {
-        const VARS: [&str; 2] = ["CACHEKIT_MASTER_KEY", "CACHEKIT_PREVIOUS_MASTER_KEYS"];
-        let saved = VARS.map(std::env::var_os);
-        for (var, val) in VARS.iter().zip([master, previous]) {
-            match val {
-                Some(v) => std::env::set_var(var, v),
-                None => std::env::remove_var(var),
-            }
-        }
-        let resolved = super::secure_env_defaults();
-        for (var, val) in VARS.iter().zip(saved) {
-            match val {
-                Some(v) => std::env::set_var(var, v),
-                None => std::env::remove_var(var),
-            }
-        }
-        resolved
+        with_env(
+            &[
+                ("CACHEKIT_MASTER_KEY", master),
+                ("CACHEKIT_PREVIOUS_MASTER_KEYS", previous),
+            ],
+            super::secure_env_defaults,
+        )
     }
 
     #[test]
@@ -579,6 +592,31 @@ mod secure_tests {
         assert_decrypts_default_tenant_vector(
             secure_env_defaults_with(Some(MASTER_KEY_HEX), None).expect("valid key"),
         );
+    }
+
+    /// The env constructor with no tenant: `.encryption_from_env()` on the
+    /// builder `from_env()` returns resolves "default", and a namespace on
+    /// that builder never becomes the tenant.
+    #[cfg(feature = "cachekitio")]
+    #[test]
+    #[serial_test::serial]
+    fn from_env_encryption_from_env_decrypts_default_tenant_vector(
+    ) -> Result<(), crate::CachekitError> {
+        let builder = with_env(
+            &[
+                ("CACHEKIT_MASTER_KEY", Some(MASTER_KEY_HEX)),
+                ("CACHEKIT_PREVIOUS_MASTER_KEYS", None),
+                ("CACHEKIT_API_KEY", Some("test-key")),
+                ("CACHEKIT_API_URL", None),
+            ],
+            || {
+                crate::CacheKit::from_env()?
+                    .namespace("my-app")
+                    .encryption_from_env()
+            },
+        )?;
+        assert_decrypts_default_tenant_vector(builder);
+        Ok(())
     }
 
     /// An entry written under k1 must still decrypt after the

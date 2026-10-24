@@ -55,15 +55,15 @@
 ```toml
 # Defaults: SaaS + encryption + L1
 [dependencies]
-cachekit-rs = "0.11.1"
+cachekit-rs = "0.12.0"
 
 # With Redis backend
 [dependencies]
-cachekit-rs = { version = "0.11.1", features = ["redis"] }
+cachekit-rs = { version = "0.12.0", features = ["redis"] }
 
 # For Cloudflare Workers (no L1, no Redis)
 [dependencies]
-cachekit-rs = { version = "0.11.1", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.12.0", default-features = false, features = ["workers", "encryption"] }
 ```
 <!-- x-release-please-end -->
 
@@ -190,6 +190,23 @@ probe count, so detection there takes about 165 s. On wasm32 the platform's
 
 Neither CachekitIO client follows a redirect: a 3xx from the API is a
 permanent error. On wasm32, use the [Workers backend](#cloudflare-workers).
+
+### Values and binary payloads
+
+`get` and `set` take any serde type and store it as MessagePack. serde treats a plain `Vec<u8>` as a sequence, so it is stored as a MessagePack array of integers: up to twice the size, with a per-byte encode and decode. For bodies, blobs and other large byte payloads, mark the field with [`serde_bytes`](https://crates.io/crates/serde_bytes) (a crate you add yourself) so it is stored as one MessagePack `bin` value:
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Response {
+    status: u16,
+    #[serde(with = "serde_bytes")]
+    body: Vec<u8>,
+}
+```
+
+For a bare byte value, store a `serde_bytes::ByteBuf`. Either form decodes into either type, so switching a field to `serde_bytes` still reads entries written before the switch.
+
+`SecureCache` borrows the `CacheKit` it came from, so keep the client and call `secure_cache()` where you need the handle; it is cheap enough to call per operation.
 
 ---
 
@@ -348,7 +365,7 @@ Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.11.1", features = ["redis"] }
+cachekit-rs = { version = "0.12.0", features = ["redis"] }
 ```
 <!-- x-release-please-end -->
 
@@ -366,6 +383,8 @@ backend.connect().await?;  // explicit connect required
 
 Without `.auto_reconnect()` the backend is fail-fast: after Redis restarts, every operation errors until you rebuild it.
 
+`connect` returns fred's `ConnectHandle`, the task driving the connection. Discarding it, as above and in the presets, leaves the connection and any auto-reconnect running; keep it only to await the error, if any, that finally closed the connection.
+
 ### Memcached
 
 Memcached via [rust-memcache](https://crates.io/crates/memcache) (single server, connection-pooled, per-socket timeouts — a hung server errors one operation instead of wedging the backend). Keys are validated against protocol metacharacters (whitespace/control bytes) before anything reaches the wire, keeping the key space identical to cachekit-py's.
@@ -376,7 +395,7 @@ TTLs above memcached's 30-day ceiling are clamped (larger values would be misrea
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.11.1", features = ["memcached"] }
+cachekit-rs = { version = "0.12.0", features = ["memcached"] }
 ```
 <!-- x-release-please-end -->
 
@@ -395,7 +414,7 @@ Local disk cache, **byte-compatible with cachekit-py's File backend** — a py a
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.11.1", features = ["file"] }
+cachekit-rs = { version = "0.12.0", features = ["file"] }
 ```
 <!-- x-release-please-end -->
 
@@ -415,7 +434,7 @@ The Workers runtime's `fetch` has no timeout of its own and can hold a request f
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.11.1", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.12.0", default-features = false, features = ["workers", "encryption"] }
 ```
 <!-- x-release-please-end -->
 

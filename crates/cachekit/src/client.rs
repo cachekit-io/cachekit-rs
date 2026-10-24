@@ -451,6 +451,10 @@ impl CacheKit {
     /// Returns `None` if the key does not exist.
     /// Checks L1 cache before hitting the backend.
     ///
+    /// Values are MessagePack. A `Vec<u8>` field written by [`Self::set`]
+    /// as a plain `Vec<u8>` decodes back here unchanged, but it is stored as
+    /// an array of integers; see [`Self::set`] for the compact form.
+    ///
     /// # Errors
     ///
     /// On a client with encryption configured, returns
@@ -691,6 +695,30 @@ impl CacheKit {
     ///
     /// Encrypts first on a client with encryption configured — see
     /// [`Self::set_with_ttl`].
+    ///
+    /// # Binary payloads
+    ///
+    /// Values are serialized as MessagePack through serde. serde treats a
+    /// plain `Vec<u8>` (or `&[u8]`) as a sequence, so it is stored as a
+    /// MessagePack array of integers: up to 2 bytes per byte, and a per-element
+    /// encode and decode. Mark the field with `serde_bytes` to store it as a
+    /// single MessagePack `bin` value instead. `serde_bytes` is a crate you add
+    /// to your own `Cargo.toml`:
+    ///
+    /// ```ignore
+    /// #[derive(serde::Serialize, serde::Deserialize)]
+    /// struct Response {
+    ///     status: u16,
+    ///     #[serde(with = "serde_bytes")]
+    ///     body: Vec<u8>,
+    /// }
+    ///
+    /// cache.set("resp", &Response { status: 200, body }).await?;
+    /// ```
+    ///
+    /// For a bare byte value, store a `serde_bytes::ByteBuf`. Either form
+    /// decodes into either type on [`Self::get`], so switching a field to
+    /// `serde_bytes` still reads entries written before the switch.
     pub async fn set<T: Serialize>(&self, key: &str, value: &T) -> Result<(), CachekitError> {
         self.set_with_ttl(key, value, self.default_ttl).await
     }
@@ -964,6 +992,12 @@ impl CacheKit {
 /// L1 stores ciphertext to maintain zero-knowledge guarantees. The client's
 /// own value methods route through these same methods once encryption is
 /// configured, so the handle and the client read each other's entries.
+///
+/// The handle borrows its [`CacheKit`] (`SecureCache<'a>` holds `&'a CacheKit`),
+/// so it cannot be stored in the same struct as the client it came from.
+/// Store the `CacheKit` and call [`CacheKit::secure_cache()`] where you need
+/// the handle: it only checks that encryption is configured and copies two
+/// references, so calling it per operation is cheap.
 #[cfg(feature = "encryption")]
 pub struct SecureCache<'a> {
     client: &'a CacheKit,
@@ -999,6 +1033,10 @@ impl SecureCache<'_> {
     }
 
     /// Encrypt and store `value` under `key` with an explicit `ttl`.
+    ///
+    /// A positive sub-second `ttl` is sent to the backend as 1 second.
+    ///
+    /// Returns [`CachekitError::Config`] if `ttl` is zero.
     ///
     /// The client namespace is not checked here: an interop key written on a
     /// namespaced client lands under `{namespace}:{interop_key}`, which no
