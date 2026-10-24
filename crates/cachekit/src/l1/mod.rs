@@ -109,8 +109,9 @@ impl L1Cache {
                 DefaultLifecycle::default(),
             ),
             // `build` fails only when a capacity is unset, and both are set
-            // above. Fall back to quick_cache's own shard count rather than
-            // panic while a client is being built.
+            // above. Should a later quick_cache also refuse the shard count,
+            // `with` leaves shards at its own default, so the client still
+            // builds instead of panicking.
             Err(_) => Store::with(
                 capacity,
                 weight,
