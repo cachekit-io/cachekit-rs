@@ -65,9 +65,16 @@ impl RedisBackend {
 
     /// Connect to Redis and wait until the connection is established.
     ///
-    /// This must be called before any cache operations. The returned
-    /// `ConnectHandle` drives the connection task — hold onto it for the
-    /// lifetime of the backend (or join it on shutdown).
+    /// This must be called before any cache operations.
+    ///
+    /// The returned `ConnectHandle` is fred's handle to the spawned task that
+    /// drives the connection (a tokio `JoinHandle`). Dropping it detaches the
+    /// task without stopping it: the connection, and any auto-reconnect,
+    /// keeps running for as long as the backend is alive. The intent presets
+    /// drop it for that reason. Keep it only to observe how the connection
+    /// ended: the task resolves when the connection closes for good (on a
+    /// fail-fast backend, the first dropped connection), with the error that
+    /// closed it. Do not `abort` it while the backend is still in use.
     pub async fn connect(&self) -> Result<ConnectHandle, BackendError> {
         self.client.init().await.map_err(redis_err)
     }
