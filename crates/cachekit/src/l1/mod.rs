@@ -133,10 +133,11 @@ impl L1Cache {
     /// [`Self::get`] without the copy: the stored buffer, by refcount.
     pub(crate) fn get_shared(&self, key: &str) -> Option<Bytes> {
         let entry = self.store.get(key)?;
-        if entry.is_live(Instant::now()) {
+        let now = Instant::now();
+        if entry.is_live(now) {
             return Some(entry.data);
         }
-        self.remove_expired(key, &entry);
+        self.remove_expired(key, now);
         None
     }
 
@@ -147,10 +148,11 @@ impl L1Cache {
         let Some(entry) = self.store.peek(key) else {
             return false;
         };
-        if entry.is_live(Instant::now()) {
+        let now = Instant::now();
+        if entry.is_live(now) {
             return true;
         }
-        self.remove_expired(key, &entry);
+        self.remove_expired(key, now);
         false
     }
 
@@ -187,7 +189,7 @@ impl L1Cache {
         };
         let now = Instant::now();
         if !entry.is_live(now) {
-            self.remove_expired(key, &entry);
+            self.remove_expired(key, now);
             return SharedSwrRead::Miss;
         }
         let threshold = entry.ttl.as_secs_f64() * threshold_ratio * entry.freshness_jitter;
@@ -246,22 +248,23 @@ impl L1Cache {
         self.store.retain(|_, entry| entry.is_live(now));
     }
 
-    /// Remove `seen`, an expired entry a read just found under `key`, unless
-    /// a write replaced it in the meantime. A replacement was created later,
-    /// and its buffer cannot sit at `seen`'s address while `seen` holds that
-    /// buffer alive; either difference spares it.
-    fn remove_expired(&self, key: &str, seen: &L1Entry) {
-        self.store.remove_if(key, |current| {
-            current.created_at == seen.created_at && current.data.as_ptr() == seen.data.as_ptr()
-        });
+    /// Remove the entry under `key` if it has expired by `now`, the instant a
+    /// read just found it expired. A write may have replaced that entry in
+    /// the meantime, so the check runs on whichever entry is current, under
+    /// the shard's write lock: a live replacement stays. Comparing the two
+    /// entries instead would not do, since two writes can share a clock
+    /// reading and an empty value's buffer.
+    fn remove_expired(&self, key: &str, now: Instant) {
+        self.store.remove_if(key, |current| !current.is_live(now));
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)] // test-only: a failed thread or fixture should panic loudly
 mod tests {
-    use super::{shard_count, L1Cache, L1SwrRead};
-    use std::time::Duration;
+    use super::{shard_count, L1Cache, L1Entry, L1SwrRead};
+    use bytes::Bytes;
+    use std::time::{Duration, Instant};
 
     const LONG: Duration = Duration::from_secs(60);
 
@@ -355,11 +358,38 @@ mod tests {
     fn expired_removal_spares_a_newer_write() {
         let cache = L1Cache::new(16);
         cache.set("k", b"old", Duration::from_millis(1));
-        let seen = cache.store.get("k").expect("just written");
         std::thread::sleep(Duration::from_millis(20));
+        let read_at = Instant::now();
         cache.set("k", b"new", LONG);
-        cache.remove_expired("k", &seen);
+        cache.remove_expired("k", read_at);
         assert_eq!(cache.get("k").as_deref(), Some(&b"new"[..]));
+    }
+
+    /// Two writes can share a clock reading, and every empty value shares one
+    /// buffer, so nothing in the expired entry a read saw tells it apart from
+    /// a live replacement. The removal has to judge the current entry's own
+    /// expiry instead.
+    #[test]
+    fn expired_removal_spares_a_replacement_with_the_same_stamp_and_buffer() {
+        let cache = L1Cache::new(16);
+        let stamp = Instant::now();
+        let written = |ttl| L1Entry {
+            data: Bytes::new(),
+            ttl,
+            created_at: stamp,
+            expires_at: stamp.checked_add(ttl),
+            freshness_jitter: 1.0,
+        };
+        cache
+            .store
+            .insert("k".to_owned(), written(Duration::from_nanos(1)));
+        let read_at = stamp + Duration::from_millis(1);
+        cache.store.insert("k".to_owned(), written(LONG));
+        cache.remove_expired("k", read_at);
+        assert!(
+            cache.store.peek("k").is_some(),
+            "the live replacement was removed"
+        );
     }
 
     #[test]
