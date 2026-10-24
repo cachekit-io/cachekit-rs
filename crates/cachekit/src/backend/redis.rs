@@ -6,7 +6,7 @@ use fred::interfaces::LuaInterface;
 use fred::prelude::*;
 use fred::types::ConnectHandle;
 
-use crate::backend::{Backend, HealthStatus, LockableBackend, TtlInspectable};
+use crate::backend::{nonzero_timeout, Backend, HealthStatus, LockableBackend, TtlInspectable};
 use crate::error::{BackendError, BackendErrorKind};
 
 // ── Error mapping ─────────────────────────────────────────────────────────────
@@ -77,6 +77,12 @@ impl RedisBackend {
     /// closed it, if any. Do not `abort` it while the backend is still in use.
     pub async fn connect(&self) -> Result<ConnectHandle, BackendError> {
         self.client.init().await.map_err(redis_err)
+    }
+
+    /// The fred client, so tests can read the options `build` gave it.
+    #[cfg(test)]
+    pub(crate) fn client(&self) -> &RedisClient {
+        &self.client
     }
 }
 
@@ -211,9 +217,10 @@ impl LockableBackend for RedisBackend {
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
-/// Per-command deadline. fred's default is 0 (no timeout), so a stalled or
-/// black-holed server would hold every op until TCP gives up and the circuit
-/// breaker could never open. 5 s matches cachekit-py and cachekit-ts.
+/// Default per-command deadline ([`RedisBackendBuilder::command_timeout`]).
+/// fred's default is 0 (no timeout), so a stalled or black-holed server would
+/// hold every op until TCP gives up and the circuit breaker could never open.
+/// 5 s matches cachekit-py and cachekit-ts.
 pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// fred client options for [`RedisBackendBuilder::build`].
@@ -221,15 +228,19 @@ pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// The unresponsive-connection check is enabled only with a reconnect policy:
 /// fred closes a connection it deems unresponsive, and without a policy it is
 /// never re-established, so one stall past the threshold would leave the
-/// client failing permanently.
-pub(crate) fn fred_options(reconnects: bool) -> (PerformanceConfig, ConnectionConfig) {
+/// client failing permanently. Its threshold is the command timeout, so a
+/// connection that cannot answer within the budget is replaced.
+pub(crate) fn fred_options(
+    reconnects: bool,
+    command_timeout: Duration,
+) -> (PerformanceConfig, ConnectionConfig) {
     let perf = PerformanceConfig {
-        default_command_timeout: COMMAND_TIMEOUT,
+        default_command_timeout: command_timeout,
         ..Default::default()
     };
     let mut connection = ConnectionConfig::default();
     if reconnects {
-        connection.unresponsive.max_timeout = Some(COMMAND_TIMEOUT);
+        connection.unresponsive.max_timeout = Some(command_timeout);
     }
     (perf, connection)
 }
@@ -240,6 +251,7 @@ pub(crate) fn fred_options(reconnects: bool) -> (PerformanceConfig, ConnectionCo
 pub struct RedisBackendBuilder {
     url: Option<String>,
     reconnect: Option<ReconnectPolicy>,
+    command_timeout: Option<Duration>,
 }
 
 impl RedisBackendBuilder {
@@ -253,14 +265,57 @@ impl RedisBackendBuilder {
     }
 
     /// Automatically re-establish dropped connections with exponential
-    /// backoff (100 ms → 30 s, retrying indefinitely).
+    /// backoff (100 ms → 30 s, retrying indefinitely). Off by default.
+    ///
+    /// Also turns on fred's unresponsive-connection check: a connection with
+    /// a reply pending for longer than the
+    /// [command timeout](Self::command_timeout) is closed and re-established
+    /// (fred checks every 2 s). Without a reconnect policy that check stays
+    /// off, because a closed connection would never come back.
     ///
     /// Initial connections still fail fast — fred's `fail_fast` default stays
     /// on, so the policy only governs reconnecting a connection that was
-    /// previously established. Used by the reliability-first intent presets
-    /// (`CacheKit::production`, `CacheKit::secure`).
-    pub(crate) fn auto_reconnect(mut self) -> Self {
+    /// previously established. This is the policy `CacheKit::production` and
+    /// `CacheKit::secure` use. Call it when you build a backend yourself, for
+    /// example one backend shared by several clients through
+    /// [`CacheKitBuilder::backend`](crate::CacheKitBuilder::backend), so it
+    /// recovers after a Redis restart instead of failing every operation.
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), cachekit::CachekitError> {
+    /// use cachekit::backend::redis::RedisBackend;
+    ///
+    /// let backend = RedisBackend::builder()
+    ///     .url("redis://localhost:6379")
+    ///     .auto_reconnect()
+    ///     .build()?;
+    /// let _connection = backend.connect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn auto_reconnect(mut self) -> Self {
         self.reconnect = Some(ReconnectPolicy::new_exponential(0, 100, 30_000, 2));
+        self
+    }
+
+    /// Deadline for each Redis command (default 5 s). A command past it fails
+    /// with `BackendErrorKind::Timeout`, and may still run on the server.
+    ///
+    /// The budget is per attempt. When the reliability stack wraps the
+    /// backend (`CacheKit::production`, `CacheKit::secure`, or
+    /// `CacheKitBuilder::reliability`),
+    /// each retry gets a fresh budget, so with the default 3 attempts one
+    /// operation can take about three budgets plus backoff before it errors.
+    /// The stack sets no overall deadline for Redis. Each operation that ends
+    /// in a timeout counts as one failure toward opening the circuit breaker,
+    /// which a `tokio::time::timeout` around the call does not: a cancelled
+    /// call records no outcome. With [`auto_reconnect`](Self::auto_reconnect)
+    /// the budget is also the unresponsive-connection threshold.
+    ///
+    /// `build` rejects `Duration::ZERO` with `CachekitError::Config`; fred
+    /// reads zero as "no timeout".
+    pub fn command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = Some(timeout);
         self
     }
 
@@ -268,8 +323,8 @@ impl RedisBackendBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if `url` was not provided or is not a valid Redis URL.
-    /// The connection itself is lazy — call [`RedisBackend::connect`] to establish it.
+    /// Returns an error if `url` was not provided or is not a valid Redis URL,
+    /// or if the command timeout is zero. The connection itself is lazy — call [`RedisBackend::connect`] to establish it.
     pub fn build(self) -> Result<RedisBackend, crate::error::CachekitError> {
         use crate::error::CachekitError;
 
@@ -285,13 +340,17 @@ impl RedisBackendBuilder {
             ))
         })?;
 
-        let (perf, connection) = fred_options(self.reconnect.is_some());
+        let command_timeout =
+            nonzero_timeout("command_timeout", self.command_timeout, COMMAND_TIMEOUT)?;
+
+        let (perf, connection) = fred_options(self.reconnect.is_some(), command_timeout);
         let client = RedisClient::new(config, Some(perf), Some(connection), self.reconnect);
         Ok(RedisBackend { client })
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)] // test-only: a builder failure should panic loudly
 mod tests {
     use super::*;
 
@@ -319,16 +378,116 @@ mod tests {
     fn command_timeout_is_five_seconds_on_every_build() {
         assert_eq!(COMMAND_TIMEOUT, Duration::from_secs(5));
         for reconnects in [false, true] {
-            let (perf, _) = fred_options(reconnects);
+            let (perf, _) = fred_options(reconnects, COMMAND_TIMEOUT);
             assert_eq!(perf.default_command_timeout, COMMAND_TIMEOUT);
         }
     }
 
     #[test]
     fn unresponsive_recycling_only_with_reconnect_policy() {
-        let (_, connection) = fred_options(false);
+        let (_, connection) = fred_options(false, COMMAND_TIMEOUT);
         assert_eq!(connection.unresponsive.max_timeout, None);
-        let (_, connection) = fred_options(true);
+        let (_, connection) = fred_options(true, COMMAND_TIMEOUT);
         assert_eq!(connection.unresponsive.max_timeout, Some(COMMAND_TIMEOUT));
+    }
+
+    const URL: &str = "redis://localhost:6379";
+
+    #[test]
+    fn auto_reconnect_is_off_by_default() {
+        let backend = RedisBackend::builder().url(URL).build().expect("builds");
+        assert_eq!(backend.client().client_reconnect_policy(), None);
+        assert_eq!(
+            backend
+                .client()
+                .connection_config()
+                .unresponsive
+                .max_timeout,
+            None
+        );
+    }
+
+    #[test]
+    fn auto_reconnect_sets_the_exponential_policy_and_unresponsive_check() {
+        let backend = RedisBackend::builder()
+            .url(URL)
+            .auto_reconnect()
+            .build()
+            .expect("builds");
+        assert_eq!(
+            backend.client().client_reconnect_policy(),
+            Some(ReconnectPolicy::new_exponential(0, 100, 30_000, 2))
+        );
+        assert_eq!(
+            backend
+                .client()
+                .connection_config()
+                .unresponsive
+                .max_timeout,
+            Some(COMMAND_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn configured_command_timeout_reaches_fred() {
+        let budget = Duration::from_millis(250);
+        let backend = RedisBackend::builder()
+            .url(URL)
+            .command_timeout(budget)
+            .build()
+            .expect("builds");
+        assert_eq!(
+            backend.client().perf_config().default_command_timeout,
+            budget
+        );
+        assert_eq!(
+            backend
+                .client()
+                .connection_config()
+                .unresponsive
+                .max_timeout,
+            None
+        );
+
+        let backend = RedisBackend::builder()
+            .url(URL)
+            .command_timeout(budget)
+            .auto_reconnect()
+            .build()
+            .expect("builds");
+        assert_eq!(
+            backend.client().perf_config().default_command_timeout,
+            budget
+        );
+        assert_eq!(
+            backend
+                .client()
+                .connection_config()
+                .unresponsive
+                .max_timeout,
+            Some(budget)
+        );
+    }
+
+    #[test]
+    fn default_command_timeout_reaches_fred() {
+        let backend = RedisBackend::builder().url(URL).build().expect("builds");
+        assert_eq!(
+            backend.client().perf_config().default_command_timeout,
+            COMMAND_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn zero_command_timeout_is_a_config_error() {
+        let err = RedisBackend::builder()
+            .url(URL)
+            .command_timeout(Duration::ZERO)
+            .build()
+            .expect_err("zero is rejected");
+        assert!(
+            matches!(&err, crate::error::CachekitError::Config(m) if m.contains("command_timeout")),
+            "{err:?}"
+        );
     }
 }

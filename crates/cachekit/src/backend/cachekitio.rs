@@ -11,7 +11,7 @@ use crate::backend::{
     delete_succeeded, encode_key, ttl_header, Backend, Freshness, HealthStatus, LockableBackend,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use crate::backend::{READ_TIMEOUT, WRITE_TIMEOUT};
+use crate::backend::{nonzero_timeout, READ_TIMEOUT, WRITE_TIMEOUT};
 use crate::error::{BackendError, BackendErrorKind};
 use crate::metrics::{metrics_headers_named, MetricsProvider, METRICS_HEADER_NAMES};
 use crate::session::session_headers;
@@ -35,6 +35,14 @@ pub struct CachekitIO {
     /// builder when the user supplies one, otherwise by the client at build
     /// time via [`Backend::attach_metrics`] (first writer wins).
     metrics_provider: OnceLock<MetricsProvider>,
+    /// Per-attempt budget for every request but `set` and `delete`
+    /// ([`CachekitIOBuilder::read_timeout`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    read_timeout: Duration,
+    /// Per-attempt budget for `set` and `delete`
+    /// ([`CachekitIOBuilder::write_timeout`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    write_timeout: Duration,
 }
 
 /// Redact `api_key` from debug output.
@@ -99,11 +107,16 @@ impl CachekitIO {
         format!("{}/v1/cache/health", self.api_url)
     }
 
-    /// Apply the bearer token, session and metrics headers to a request builder.
+    /// Apply the read budget and the bearer token, session and metrics headers
+    /// to a request builder. A write sets its own budget afterwards.
     pub(crate) fn with_standard_headers(
         &self,
         mut req: reqwest::RequestBuilder,
     ) -> reqwest::RequestBuilder {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            req = req.timeout(self.read_timeout);
+        }
         for (name, value) in &self.static_headers {
             req = req.header(name.clone(), value.clone());
         }
@@ -266,7 +279,7 @@ impl Backend for CachekitIO {
     ) -> Result<(), BackendError> {
         let resp = self
             .put_request(key, value, ttl)?
-            .timeout(WRITE_TIMEOUT)
+            .timeout(self.write_timeout)
             .send()
             .await
             .map_err(|e| reqwest_err_sanitized(e, self.api_key.as_str()))?;
@@ -285,7 +298,7 @@ impl Backend for CachekitIO {
         let req = self.with_standard_headers(self.client.delete(self.url(key)?));
 
         let resp = req
-            .timeout(WRITE_TIMEOUT)
+            .timeout(self.write_timeout)
             .send()
             .await
             .map_err(|e| reqwest_err_sanitized(e, self.api_key.as_str()))?;
@@ -459,6 +472,10 @@ pub struct CachekitIOBuilder {
     api_url: Option<String>,
     allow_custom_host: bool,
     metrics_provider: Option<MetricsProvider>,
+    #[cfg(not(target_arch = "wasm32"))]
+    read_timeout: Option<Duration>,
+    #[cfg(not(target_arch = "wasm32"))]
+    write_timeout: Option<Duration>,
 }
 
 impl CachekitIOBuilder {
@@ -490,6 +507,45 @@ impl CachekitIOBuilder {
         self
     }
 
+    /// Per-attempt timeout for every request but a write: `get`, `exists`,
+    /// `health`, the TTL calls and the lock calls (default 5 s, the protocol's
+    /// `CACHEKIT_TIMEOUT`). It runs from send through the last byte of the
+    /// response body and surfaces as `BackendErrorKind::Timeout`. A new
+    /// connection's DNS, TCP and TLS count against it, and never take more
+    /// than 5 s whatever the budget.
+    ///
+    /// The budget is per attempt. When the reliability stack wraps this
+    /// backend through `CacheKitBuilder::reliability`,
+    /// each retry gets a fresh budget, so with the default 3 attempts one read
+    /// can take about three budgets plus backoff before it errors. Each
+    /// operation that ends in a timeout counts as one failure toward opening
+    /// the circuit breaker, which a `tokio::time::timeout` around the call
+    /// does not: a cancelled call records no outcome. (`CacheKit::io` builds
+    /// its own backend with the default budgets and also caps all attempts of
+    /// a read at 5 s; a backend passed to `CacheKitBuilder::backend` gets no
+    /// such cap.)
+    ///
+    /// `build` rejects `Duration::ZERO` with `CachekitError::Config`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = Some(timeout);
+        self
+    }
+
+    /// Per-attempt timeout for a write, `set` or `delete` (default 10 s, twice
+    /// the read budget: a write carries the payload, and the service commits
+    /// it before it answers). Otherwise as
+    /// [`read_timeout`](Self::read_timeout): it covers the whole request,
+    /// applies per attempt under the reliability stack, and counts toward
+    /// the circuit breaker.
+    ///
+    /// `build` rejects `Duration::ZERO` with `CachekitError::Config`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = Some(timeout);
+        self
+    }
+
     /// Consume the builder and construct a [`CachekitIO`].
     ///
     /// # Errors
@@ -501,6 +557,7 @@ impl CachekitIOBuilder {
     ///   a fragment.
     /// - the URL carries credentials, or its hostname is not permitted (see
     ///   [`validate_cachekitio_url`](crate::url_validator::validate_cachekitio_url)).
+    /// - the read or write timeout is zero.
     pub fn build(self) -> Result<CachekitIO, crate::error::CachekitError> {
         use crate::error::CachekitError;
 
@@ -514,6 +571,12 @@ impl CachekitIOBuilder {
             .unwrap_or_else(|| "https://api.cachekit.io".to_string());
 
         let api_url = cachekitio_base_url(&api_url, self.allow_custom_host)?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let (read_timeout, write_timeout) = (
+            nonzero_timeout("read_timeout", self.read_timeout, READ_TIMEOUT)?,
+            nonzero_timeout("write_timeout", self.write_timeout, WRITE_TIMEOUT)?,
+        );
 
         let client = http_client()
             .map_err(|e| CachekitError::Config(format!("failed to build HTTP client: {e}")))?;
@@ -530,6 +593,10 @@ impl CachekitIOBuilder {
             metrics_provider: self
                 .metrics_provider
                 .map_or_else(OnceLock::new, OnceLock::from),
+            #[cfg(not(target_arch = "wasm32"))]
+            read_timeout,
+            #[cfg(not(target_arch = "wasm32"))]
+            write_timeout,
         })
     }
 }
@@ -1216,13 +1283,98 @@ mod http_client_tests {
     /// A production [`CachekitIO`] aimed at `stub` over plain HTTP: the
     /// builder only accepts `https`, so the test swaps the client and URL.
     fn backend_at(stub: &Stub) -> CachekitIO {
-        let mut backend = CachekitIO::builder()
+        backend_built_at(stub, CachekitIO::builder())
+    }
+
+    /// [`backend_at`] from `builder`, keeping the budgets it sets: they live
+    /// on the backend, not on the swapped client.
+    fn backend_built_at(stub: &Stub, builder: super::CachekitIOBuilder) -> CachekitIO {
+        let mut backend = builder
             .api_key("ck_test_key")
             .build()
             .expect("builder succeeds for the default host");
         backend.client = client();
         backend.api_url = stub.url.trim_end_matches('/').to_owned();
         backend
+    }
+
+    const BUDGET: Duration = Duration::from_millis(200);
+
+    /// A warmed backend on a stub that stalls every request after the first,
+    /// built with `builder`.
+    async fn stalled_backend(builder: super::CachekitIOBuilder) -> (Stub, CachekitIO) {
+        let stub = stub_with(first_only);
+        let backend = backend_built_at(&stub, builder);
+        backend
+            .exists("warm")
+            .await
+            .expect("first request pools a connection");
+        (stub, backend)
+    }
+
+    /// `op` fails with `Timeout` after `BUDGET` and well under 1 s, on the
+    /// real clock.
+    async fn times_out_at_budget<T: std::fmt::Debug>(
+        op: impl std::future::Future<Output = Result<T, crate::error::BackendError>>,
+    ) {
+        let start = std::time::Instant::now();
+        let err = op.await.expect_err("an unanswered request times out");
+        let elapsed = start.elapsed();
+        assert_eq!(err.kind, BackendErrorKind::Timeout, "{err:?}");
+        assert!(
+            elapsed >= BUDGET && elapsed < Duration::from_secs(1),
+            "took {elapsed:?}, budget {BUDGET:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_read_timeout_bounds_an_unanswered_read() {
+        let (_stub, backend) = stalled_backend(CachekitIO::builder().read_timeout(BUDGET)).await;
+        times_out_at_budget(backend.get("k")).await;
+    }
+
+    #[tokio::test]
+    async fn a_configured_write_timeout_bounds_an_unanswered_write() {
+        let (_stub, backend) = stalled_backend(CachekitIO::builder().write_timeout(BUDGET)).await;
+        times_out_at_budget(backend.set("k", b"v".to_vec(), None)).await;
+        times_out_at_budget(backend.delete("k")).await;
+    }
+
+    /// The read budget does not shorten a write, nor the write budget a read.
+    #[tokio::test]
+    async fn each_budget_leaves_the_other_at_its_default() {
+        let (_stub, backend) = stalled_backend(CachekitIO::builder().read_timeout(BUDGET)).await;
+        let (result, elapsed) = paused_elapsed(backend.set("k", b"v".to_vec(), None)).await;
+        assert_eq!(result.expect_err("stalled").kind, BackendErrorKind::Timeout);
+        assert_budget(elapsed, WRITE_TIMEOUT);
+
+        let (_stub, backend) = stalled_backend(CachekitIO::builder().write_timeout(BUDGET)).await;
+        let (result, elapsed) = paused_elapsed(backend.get("k")).await;
+        assert_eq!(result.expect_err("stalled").kind, BackendErrorKind::Timeout);
+        assert_budget(elapsed, READ_TIMEOUT);
+    }
+
+    #[test]
+    fn a_zero_timeout_is_a_config_error() {
+        for (builder, setter) in [
+            (
+                CachekitIO::builder().read_timeout(Duration::ZERO),
+                "read_timeout",
+            ),
+            (
+                CachekitIO::builder().write_timeout(Duration::ZERO),
+                "write_timeout",
+            ),
+        ] {
+            let err = builder
+                .api_key("ck_test_key")
+                .build()
+                .expect_err("zero is rejected");
+            assert!(
+                matches!(&err, crate::error::CachekitError::Config(m) if m.contains(setter)),
+                "{err:?}"
+            );
+        }
     }
 
     /// How long `op` takes on the tokio clock, paused once the stub's first
@@ -1400,6 +1552,44 @@ mod http_client_tests {
                 stub.requests.lock().expect("lock").len(),
                 5,
                 "one request per op"
+            );
+        }
+
+        /// A backend passed to `CacheKitBuilder::backend` with the default
+        /// stack (retry, breaker, no deadline): each read that runs out of
+        /// its configured budget on every attempt is one breaker failure.
+        #[tokio::test]
+        async fn configured_read_timeouts_open_the_breaker() {
+            let (_stub, backend) =
+                stalled_backend(CachekitIO::builder().read_timeout(BUDGET)).await;
+            #[cfg(not(feature = "unsync"))]
+            let shared: SharedBackend = Arc::new(backend);
+            #[cfg(feature = "unsync")]
+            let shared: SharedBackend = std::rc::Rc::new(backend);
+            let (backend, breaker) = wrap_reliable(shared, ReliabilityConfig::default(), None);
+            let breaker = breaker.expect("default stack has a breaker");
+
+            let (results, elapsed) = paused_elapsed(async {
+                let mut kinds = Vec::new();
+                for _ in 0..5 {
+                    kinds.push(backend.get("k").await.expect_err("stalled").kind);
+                }
+                kinds
+            })
+            .await;
+
+            assert!(
+                results.iter().all(|k| *k == BackendErrorKind::Timeout),
+                "{results:?}"
+            );
+            assert_eq!(results.len(), 5);
+            // 5 ops x (3 x 200 ms + at most 450 ms backoff); the default
+            // budget would take 5 x 15.3 s.
+            assert!(elapsed < Duration::from_secs(6), "took {elapsed:?}");
+            assert_eq!(breaker.state(), crate::reliability::CircuitState::Open);
+            assert_eq!(
+                backend.get("k").await.expect_err("open").kind,
+                BackendErrorKind::CircuitOpen
             );
         }
 
