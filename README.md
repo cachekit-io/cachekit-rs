@@ -188,6 +188,23 @@ probe count, so detection there takes about 165 s. On wasm32 the platform's
 Neither CachekitIO client follows a redirect: a 3xx from the API is a
 permanent error. On wasm32, use the [Workers backend](#cloudflare-workers).
 
+### Values and binary payloads
+
+`get` and `set` take any serde type and store it as MessagePack. serde treats a plain `Vec<u8>` as a sequence, so it is stored as a MessagePack array of integers: up to twice the size, with a per-byte encode and decode. For bodies, blobs and other large byte payloads, mark the field with [`serde_bytes`](https://crates.io/crates/serde_bytes) (a crate you add yourself) so it is stored as one MessagePack `bin` value:
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Response {
+    status: u16,
+    #[serde(with = "serde_bytes")]
+    body: Vec<u8>,
+}
+```
+
+For a bare byte value, store a `serde_bytes::ByteBuf`. Either form decodes into either type, so switching a field to `serde_bytes` still reads entries written before the switch.
+
+`SecureCache` borrows the `CacheKit` it came from, so keep the client and call `secure_cache()` where you need the handle; it is cheap enough to call per operation.
+
 ---
 
 ## Zero-Knowledge Encryption
@@ -357,6 +374,8 @@ let backend = RedisBackend::builder()
     .build()?;
 backend.connect().await?;  // explicit connect required
 ```
+
+`connect` returns fred's `ConnectHandle`, the task driving the connection. Discarding it, as above and in the presets, leaves the connection and any auto-reconnect running; keep it only to await the error, if any, that finally closed the connection.
 
 ### Memcached
 
