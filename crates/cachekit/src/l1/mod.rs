@@ -314,6 +314,16 @@ mod tests {
         }
     }
 
+    /// Capacity is a ceiling, not a reservation: quick_cache allocates its
+    /// tables as entries arrive, so a large capacity costs nothing up front.
+    #[test]
+    fn a_large_capacity_reserves_nothing_up_front() {
+        let cache = L1Cache::new(5_000_000);
+        assert_eq!(cache.store.memory_used().total(), 0);
+        cache.set("k", b"v", LONG);
+        assert!(cache.store.memory_used().total() > 0);
+    }
+
     #[test]
     fn zero_capacity_holds_nothing() {
         let cache = L1Cache::new(0);
