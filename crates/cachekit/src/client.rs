@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -305,15 +306,18 @@ impl CacheKit {
 
     // ── Namespacing ───────────────────────────────────────────────────────────
 
-    fn namespaced_key(&self, key: &str) -> String {
+    /// `key` behind the client's namespace prefix. Without a namespace the
+    /// storage key is `key` itself, borrowed: an L1 hit then allocates
+    /// nothing for its key.
+    fn namespaced_key<'k>(&self, key: &'k str) -> Cow<'k, str> {
         match &self.namespace {
-            Some(ns) => format!("{ns}:{key}"),
-            None => key.to_owned(),
+            Some(ns) => Cow::Owned(format!("{ns}:{key}")),
+            None => Cow::Borrowed(key),
         }
     }
 
     /// Validate key and return the namespaced version.
-    fn resolve_key(&self, key: &str) -> Result<String, CachekitError> {
+    fn resolve_key<'k>(&self, key: &'k str) -> Result<Cow<'k, str>, CachekitError> {
         validate_key(key)?;
         Ok(self.namespaced_key(key))
     }
@@ -1044,7 +1048,7 @@ impl SecureCache<'_> {
         let full_key = self.client.resolve_key(key)?;
         let plaintext = serializer::serialize(value)?;
         let ciphertext = self.encryption.encrypt(&plaintext, &full_key)?;
-        Ok((full_key, ciphertext))
+        Ok((full_key.into_owned(), ciphertext))
     }
 
     /// Retrieve, decrypt, and deserialize a value stored under `key`.
