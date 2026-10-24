@@ -1,5 +1,150 @@
 # Changelog
 
+## [0.12.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.11.1...cachekit-rs-v0.12.0) (2026-10-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* **encryption:** `CacheKit::from_env()` no longer encrypts because `CACHEKIT_MASTER_KEY` is set. While the variable is set, a `from_env()` builder fails at `build()` with `CachekitError::Config` until you chain `.encryption_from_env()` (encrypt with the same keys and tenant as before, so existing entries stay readable) or `.no_encryption()` (a plaintext client: delete the old encrypted entries first, because a client that does not encrypt cannot read them and a `#[cachekit]` function overwrites them in plaintext). A build without the `encryption` feature now raises that error at `build()`, not at `from_env()`, and accepts `.no_encryption()`.
+* **config:** from_env ignores CACHEKIT_DEFAULT_TTL; pass a TTL per call or chain .default_ttl() (LAB-4664) ([#172](https://github.com/cachekit-io/cachekit-rs/issues/172))
+
+### Features
+
+* **encryption:** from_env() no longer encrypts because CACHEKIT_MASTER_KEY is set (LAB-4669) ([#173](https://github.com/cachekit-io/cachekit-rs/issues/173)) ([63a5399](https://github.com/cachekit-io/cachekit-rs/commit/63a5399d450eb0c5d79be6a410347f04ec32ff97))
+
+
+### Bug Fixes
+
+* **config:** from_env ignores CACHEKIT_DEFAULT_TTL; pass a TTL per call or chain .default_ttl() (LAB-4664) ([#172](https://github.com/cachekit-io/cachekit-rs/issues/172)) ([dcae57c](https://github.com/cachekit-io/cachekit-rs/commit/dcae57c3823a4d0b3e44b6b1e5949a003e710eb0))
+* **readme:** replace the unmeasured latency figures with measured ones (LAB-10638) ([#171](https://github.com/cachekit-io/cachekit-rs/issues/171)) ([d9d6394](https://github.com/cachekit-io/cachekit-rs/commit/d9d6394baf60ee6af803b516757f4710b6438988))
+
+
+### Performance Improvements
+
+* **client:** borrow the key and check it 16 bytes at a time (LAB-10665) ([#178](https://github.com/cachekit-io/cachekit-rs/issues/178)) ([af59b91](https://github.com/cachekit-io/cachekit-rs/commit/af59b91ad0d68da2b2cbb233c802e585860b29fc))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.11.1 to 0.12.0
+
+## [0.11.1](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.11.0...cachekit-rs-v0.11.1) (2026-10-22)
+
+
+### Bug Fixes
+
+* **workers:** bound each cachekit.io request at the native budgets (LAB-10354) ([#165](https://github.com/cachekit-io/cachekit-rs/issues/165)) ([7075f97](https://github.com/cachekit-io/cachekit-rs/commit/7075f97754b5d32d3e93b9a1de4661fb4767d544))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.11.0 to 0.11.1
+
+## [0.11.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.10.0...cachekit-rs-v0.11.0) (2026-10-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **serializer:** reject trailing bytes after the MessagePack document on every read (LAB-8182) ([#140](https://github.com/cachekit-io/cachekit-rs/issues/140))
+
+### Features
+
+* **encryption:** rotate hex master keys for any tenant via encryption_with_previous ([#156](https://github.com/cachekit-io/cachekit-rs/issues/156)) ([98792f8](https://github.com/cachekit-io/cachekit-rs/commit/98792f81c330e44630d3fc1d9bc147ea1df73e6a))
+
+
+### Bug Fixes
+
+* **cachekitio:** never follow redirects on Workers; tighten API URL validation and send the URL as parsed (LAB-8208) ([#143](https://github.com/cachekit-io/cachekit-rs/issues/143)) ([5839b40](https://github.com/cachekit-io/cachekit-rs/commit/5839b404afbe62ce50e37099f4a0f0abb33ac618))
+* **cachekitio:** send a sub-second refresh_ttl as 1 second (LAB-8206) ([#142](https://github.com/cachekit-io/cachekit-rs/issues/142)) ([d32b34a](https://github.com/cachekit-io/cachekit-rs/commit/d32b34a038689052cf9300975fac8f30beabb3be))
+* **flight:** sweep a cold-key burst's dead slots after a lease timeout (LAB-8330) ([#153](https://github.com/cachekit-io/cachekit-rs/issues/153)) ([05451cd](https://github.com/cachekit-io/cachekit-rs/commit/05451cd1a1272feacab2beb5090fa0c069505096))
+* **macros:** accept any E: From&lt;CachekitError&gt; in #[cachekit] ([#155](https://github.com/cachekit-io/cachekit-rs/issues/155)) ([13c3798](https://github.com/cachekit-io/cachekit-rs/commit/13c3798de4d040129b53897ef5e8c6f2e8d2b425))
+* **readme:** pin the current release and bump the pins on every release (LAB-8219) ([#141](https://github.com/cachekit-io/cachekit-rs/issues/141)) ([68409f5](https://github.com/cachekit-io/cachekit-rs/commit/68409f5f9a9da2eb3dd431583faaa3bb9cda7cfe))
+* **serializer:** reject trailing bytes after the MessagePack document on every read (LAB-8182) ([#140](https://github.com/cachekit-io/cachekit-rs/issues/140)) ([06ed843](https://github.com/cachekit-io/cachekit-rs/commit/06ed843b25f2a6f58d5279efa9c0cdf7d46d93ba))
+* **swr:** stand a refresh down on a held lock instead of polling it (LAB-8236) ([#147](https://github.com/cachekit-io/cachekit-rs/issues/147)) ([dcec81e](https://github.com/cachekit-io/cachekit-rs/commit/dcec81e944e25121dfb7c39b0520fd9997a1f41d))
+
+
+### Performance Improvements
+
+* **flight:** detach a stored fill's unlock and bound the contested poll by a deadline (LAB-7122) ([#149](https://github.com/cachekit-io/cachekit-rs/issues/149)) ([f5b13b9](https://github.com/cachekit-io/cachekit-rs/commit/f5b13b946d013245d7f1883244cead5960c4f2fd))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.10.0 to 0.11.0
+
+## [0.10.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.9.0...cachekit-rs-v0.10.0) (2026-10-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* **encryption:** on a client with both encryption and `.namespace()` configured, entries written before this release no longer authenticate: reading one returns `CachekitError::Encryption`, never a miss, on every read until it is overwritten, deleted or expires. Delete those entries, or move to a fresh namespace, when upgrading rather than waiting out the TTL. There is no fallback to the old AAD. Clients without a namespace are unaffected.
+* **encryption:** a client with encryption configured (`.encryption()`, `.encryption_from_bytes()`, `.encryption_from_bytes_with_previous()`, the `secure` / `secure_from_env` presets, or `CacheKit::from_env()` with `CACHEKIT_MASTER_KEY` set) now encrypts every value read and write, not only those made through `secure_cache()`: plain `get`, `set`, `set_with_ttl`, `interop_get`, `interop_get_swr` and non-`secure` `#[cachekit]` functions store and read AES-256-GCM ciphertext, and L1 holds ciphertext. Entries those calls wrote in plaintext before this release are not migrated: reading one now returns `CachekitError::Encryption`, never a silent miss, until it is overwritten, deleted or expires, so delete or let expire what they wrote before upgrading. Builds without the `encryption` feature now get `CachekitError::Config` from all three builder encryption methods, and from `CacheKit::from_env()` when `CACHEKIT_MASTER_KEY` is set, instead of a plaintext client. On every build, a `CACHEKIT_MASTER_KEY` that is set but not valid UTF-8 is now a `Config` error from `CachekitConfig::from_env()` and `CacheKit::from_env()`, where it was read as unset and gave a plaintext client.
+* **l1:** refuse l1 on wasm32-unknown-unknown at compile time (LAB-7884) ([#127](https://github.com/cachekit-io/cachekit-rs/issues/127))
+
+### Bug Fixes
+
+* **backend:** send X-CacheKit-TTL, not the deprecated X-TTL, on writes (LAB-7676) ([#124](https://github.com/cachekit-io/cachekit-rs/issues/124)) ([a43963e](https://github.com/cachekit-io/cachekit-rs/commit/a43963e94eef88f18895f5c04ff3662f404e1d42))
+* **cachekitio:** 5 s read / 10 s write timeouts inside one retry deadline, no retry on quota 429s (LAB-7123) ([#134](https://github.com/cachekit-io/cachekit-rs/issues/134)) ([a7685a5](https://github.com/cachekit-io/cachekit-rs/commit/a7685a53106c5cb17f86b00b34cb8d6374ee002a))
+* **cachekitio:** DELETE never reports existence, so a 404 is an error (LAB-5580) ([#116](https://github.com/cachekit-io/cachekit-rs/issues/116)) ([4b11ab7](https://github.com/cachekit-io/cachekit-rs/commit/4b11ab771f6a8ffbcf76b4726fb903ec01b0d0e9))
+* **encryption:** bind the namespaced storage key in the AES-GCM AAD (LAB-6396) ([#135](https://github.com/cachekit-io/cachekit-rs/issues/135)) ([26995d5](https://github.com/cachekit-io/cachekit-rs/commit/26995d57c426ca0aaf171a583f6ab702a0b0b979))
+* **encryption:** encrypt every value read and write once a key is configured (LAB-4676) ([#133](https://github.com/cachekit-io/cachekit-rs/issues/133)) ([5a963d9](https://github.com/cachekit-io/cachekit-rs/commit/5a963d9dcbc3b7de103b02610b8203e2bf2c56ee))
+* **l1:** correct the wasm32-unknown-unknown guard text (LAB-7919) ([#128](https://github.com/cachekit-io/cachekit-rs/issues/128)) ([706db14](https://github.com/cachekit-io/cachekit-rs/commit/706db1436bc9160d2d15489e37c5a0ab5dc49de2))
+* **l1:** refuse l1 on wasm32-unknown-unknown at compile time (LAB-7884) ([#127](https://github.com/cachekit-io/cachekit-rs/issues/127)) ([0684e55](https://github.com/cachekit-io/cachekit-rs/commit/0684e557c64dd862952ff12084da1ceb2ca9ed7f))
+* **ttl:** send a sub-second write TTL as 1 and bound L1 by the wire TTL (LAB-7733) ([#131](https://github.com/cachekit-io/cachekit-rs/issues/131)) ([109ead8](https://github.com/cachekit-io/cachekit-rs/commit/109ead8f4e677c9b817b0ff630d7ed0dea743f3e))
+
+
+### Performance Improvements
+
+* **cachekitio:** keep pooled connections 390 s and send a cachekit-rs User-Agent (LAB-7085) ([#125](https://github.com/cachekit-io/cachekit-rs/issues/125)) ([64a0b77](https://github.com/cachekit-io/cachekit-rs/commit/64a0b77970cd6640a7c58942c99be9acfcd36d03))
+* **cachekitio:** prebuild static request headers and drop per-request formatting, copies and UUID jitter (LAB-7088) ([#126](https://github.com/cachekit-io/cachekit-rs/issues/126)) ([7ae6765](https://github.com/cachekit-io/cachekit-rs/commit/7ae67655bcaeb1a3456c8fd80ce86b68ec91e83c))
+* **l1:** store L1 payloads as shared Bytes instead of copying on every hit (LAB-7089) ([#123](https://github.com/cachekit-io/cachekit-rs/issues/123)) ([d14def6](https://github.com/cachekit-io/cachekit-rs/commit/d14def6af6dd236292c8e964a491bdd64ca229ec))
+* **serializer:** decode with rmp-serde's borrowed slice reader (LAB-7090) ([#122](https://github.com/cachekit-io/cachekit-rs/issues/122)) ([282d864](https://github.com/cachekit-io/cachekit-rs/commit/282d864959ecad6c4a31abafbb8d26c04d17ec21))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.9.0 to 0.10.0
+
+## [0.9.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.8.0...cachekit-rs-v0.9.0) (2026-10-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* **encryption:** the raw-bytes master-key APIs (`EncryptionLayer::new`, `EncryptionLayer::with_previous_keys`, `CacheKitBuilder::encryption_from_bytes` and `CacheKitBuilder::encryption_from_bytes_with_previous`) now require keys of exactly 32 bytes, current and previous, and return `CachekitError::Config` for any other length. Callers that pass longer keys to a raw-bytes API, including hex keys decoded manually, now get an error at construction. Use exactly 32-byte keys, the only length every SDK accepts (`openssl rand -hex 32`), or pass the hex string to `.encryption()` or use `CacheKit::from_env()`.
+* **interop:** an interop namespace or operation containing `..` now fails: `interop_key` returns `InvalidKey`, and `#[cachekit]` does not compile. Rename the segment; its keys become a full cache miss.
+
+### Bug Fixes
+
+* **cachekitio:** reject the empty cache key; test path encoding from the protocol fixture (LAB-6551) ([#100](https://github.com/cachekit-io/cachekit-rs/issues/100)) ([4d11fc1](https://github.com/cachekit-io/cachekit-rs/commit/4d11fc1e856dadddc53bc1fdcfc4ba5d8ff50668))
+* **encryption:** raw-bytes master keys must be exactly 32 bytes (LAB-4663) ([#103](https://github.com/cachekit-io/cachekit-rs/issues/103)) ([f85d121](https://github.com/cachekit-io/cachekit-rs/commit/f85d1210df3cf73af2656b57939f088cef9f3c48))
+* **file:** return a miss for entries with nonzero flags or reserved bytes (LAB-7153) ([#107](https://github.com/cachekit-io/cachekit-rs/issues/107)) ([6d48ece](https://github.com/cachekit-io/cachekit-rs/commit/6d48ecece00532d42755cd593da255a90ada7750))
+* **intents:** secure_from_env reads CACHEKIT_PREVIOUS_MASTER_KEYS (LAB-6591) ([#102](https://github.com/cachekit-io/cachekit-rs/issues/102)) ([dda7f42](https://github.com/cachekit-io/cachekit-rs/commit/dda7f42900bc9eabed8e932df783d279c55fa674))
+* **interop:** reject double-dot interop segments (LAB-5906) ([#98](https://github.com/cachekit-io/cachekit-rs/issues/98)) ([8480457](https://github.com/cachekit-io/cachekit-rs/commit/84804578390cefb2dd5ecf5cbcdef234b9b3b414))
+* **l1:** honour X-CacheKit-Freshness and Fresh-For before backfilling L1 (LAB-7155) ([#109](https://github.com/cachekit-io/cachekit-rs/issues/109)) ([658b198](https://github.com/cachekit-io/cachekit-rs/commit/658b198808092bea55d2ff1a5888065a52fc1b25))
+* **redis:** set a 5 s command timeout on the fred client (LAB-7154) ([#108](https://github.com/cachekit-io/cachekit-rs/issues/108)) ([72db7c7](https://github.com/cachekit-io/cachekit-rs/commit/72db7c74ef09442b98e0ce28b79ba068fd603486))
+
+
+### Performance Improvements
+
+* **bench:** instruction-gated hot-path bench and a client wall-time probe (LAB-7057) ([#110](https://github.com/cachekit-io/cachekit-rs/issues/110)) ([d561d70](https://github.com/cachekit-io/cachekit-rs/commit/d561d70e38b27382d62ebb4749e90590b93c0f80))
+* **file:** stripe the in-process lock per key so reads skip unrelated fsyncs (LAB-7086) ([#106](https://github.com/cachekit-io/cachekit-rs/issues/106)) ([e9980df](https://github.com/cachekit-io/cachekit-rs/commit/e9980dfb519e124c568ce47a45e7d996291f36b5))
+* **file:** sweep orphaned temp files on first set, not on build (LAB-7381) ([#113](https://github.com/cachekit-io/cachekit-rs/issues/113)) ([222a916](https://github.com/cachekit-io/cachekit-rs/commit/222a916cb16c7435d97bcd6c17415aa81455ebce))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.8.0 to 0.9.0
+
 ## [0.8.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.7.0...cachekit-rs-v0.8.0) (2026-09-29)
 
 

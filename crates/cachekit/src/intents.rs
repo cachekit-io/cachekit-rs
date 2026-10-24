@@ -17,19 +17,39 @@
 //! [`ReliabilityConfig::disabled()`](crate::reliability::ReliabilityConfig::disabled)
 //! turns the stack off entirely.
 
-use std::time::Duration;
-
-use crate::client::{CacheKit, CacheKitBuilder, SharedBackend};
-use crate::error::CachekitError;
+use crate::client::CacheKit;
+// Only the presets use these, and each preset is gated on a backend feature;
+// gate them (and `wrap`) the same way so lean feature sets lint clean.
+#[cfg(any(
+    feature = "redis",
+    all(feature = "cachekitio", not(target_arch = "wasm32"))
+))]
+use {
+    crate::client::{CacheKitBuilder, SharedBackend},
+    crate::error::CachekitError,
+    std::time::Duration,
+};
 
 // ── SharedBackend wrapping ───────────────────────────────────────────────────
 
-#[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
+#[cfg(all(
+    any(
+        feature = "redis",
+        all(feature = "cachekitio", not(target_arch = "wasm32"))
+    ),
+    not(any(target_arch = "wasm32", feature = "unsync"))
+))]
 fn wrap(b: impl crate::backend::Backend + 'static) -> SharedBackend {
     std::sync::Arc::new(b)
 }
 
-#[cfg(any(target_arch = "wasm32", feature = "unsync"))]
+#[cfg(all(
+    any(
+        feature = "redis",
+        all(feature = "cachekitio", not(target_arch = "wasm32"))
+    ),
+    any(target_arch = "wasm32", feature = "unsync")
+))]
 fn wrap(b: impl crate::backend::Backend + 'static) -> SharedBackend {
     std::rc::Rc::new(b)
 }
@@ -51,36 +71,43 @@ fn minimal_defaults(backend: SharedBackend) -> CacheKitBuilder {
     builder
 }
 
-/// `secure` builder defaults and key resolution, split from the eager Redis
-/// connect so the key path is unit-testable without a live server. `source`
-/// names the key's origin in error messages.
+/// `secure` builder defaults, split from the eager Redis connect so the key
+/// path is unit-testable without a live server. Takes hex-decoded key bytes
+/// only (so `>= 32`, not the raw-bytes exactly-32 rule) and reads no
+/// environment: [`CacheKit::secure`] passes no previous keys.
 #[cfg(all(feature = "redis", feature = "encryption"))]
-fn secure_defaults(master_key_hex: &str, source: &str) -> Result<CacheKitBuilder, CachekitError> {
-    let master_key = crate::config::decode_master_key_hex(master_key_hex, source)?;
+fn secure_defaults(
+    master_key: &[u8],
+    previous_keys: &[zeroize::Zeroizing<Vec<u8>>],
+) -> Result<CacheKitBuilder, CachekitError> {
+    let previous: Vec<&[u8]> = previous_keys.iter().map(|k| k.as_slice()).collect();
     let builder = CacheKitBuilder::default()
         .default_ttl(Duration::from_secs(600))
         .l1_capacity(1000)
-        .encryption_from_bytes(&master_key, "default")?;
+        .encryption_from_hex_decoded(master_key, &previous, "default")?;
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
     let builder = builder.reliability(crate::reliability::ReliabilityConfig::default());
     Ok(builder)
 }
 
-/// `CACHEKIT_MASTER_KEY` for [`CacheKit::secure_from_env`]; unset and empty
-/// are both an error, never plaintext.
+/// The key handling of [`CacheKit::secure`] — decode the hex key, then the
+/// `secure` defaults — before any Redis I/O; the hex counterpart of
+/// [`secure_env_defaults`].
 #[cfg(all(feature = "redis", feature = "encryption"))]
-fn master_key_hex_from_env() -> Result<zeroize::Zeroizing<String>, CachekitError> {
-    std::env::var("CACHEKIT_MASTER_KEY")
-        .ok()
-        .map(zeroize::Zeroizing::new)
-        .filter(|k| !k.is_empty())
-        .ok_or_else(|| {
-            CachekitError::Config(
-                "CACHEKIT_MASTER_KEY is unset or empty: set it to a 64-hex-char key or pass \
-                 the key to CacheKit::secure(url, master_key_hex)"
-                    .to_owned(),
-            )
-        })
+fn secure_hex_defaults(master_key_hex: &str) -> Result<CacheKitBuilder, CachekitError> {
+    let master_key = crate::config::decode_master_key_hex(master_key_hex, "master_key_hex")?;
+    secure_defaults(&master_key, &[])
+}
+
+/// The whole environment read of [`CacheKit::secure_from_env`] — the current
+/// key and `CACHEKIT_PREVIOUS_MASTER_KEYS` — resolved into `secure` defaults
+/// before any Redis I/O. The same reader as
+/// [`CacheKitBuilder::encryption_from_env`].
+#[cfg(all(feature = "redis", feature = "encryption"))]
+fn secure_env_defaults() -> Result<CacheKitBuilder, CachekitError> {
+    let (master_key, previous) =
+        crate::config::master_keys_from_env("CacheKit::secure(url, master_key_hex)")?;
+    secure_defaults(&master_key, &previous)
 }
 
 /// Attach an eagerly connected, auto-reconnecting Redis backend to a
@@ -191,7 +218,10 @@ impl CacheKit {
     ///   **auto-reconnects** after a dropped connection with exponential
     ///   backoff, 100 ms → 30 s, retrying indefinitely)
     /// * L1 cache: **on** (1 000 entries, stores ciphertext)
-    /// * Encryption: **AES-256-GCM** with HKDF-SHA256
+    /// * Encryption: **AES-256-GCM** with HKDF-SHA256, on every value read
+    ///   and write, not only those through the
+    ///   [`secure_cache()`](CacheKit::secure_cache) handle (see
+    ///   [Encryption](CacheKit#encryption))
     /// * Reliability: **on** — retry with backoff + jitter, circuit
     ///   breaker, backpressure (max 100 concurrent backend ops)
     /// * Default TTL: **600 s**
@@ -208,10 +238,10 @@ impl CacheKit {
     /// `openssl rand -hex 32`.
     ///
     /// Use [`CacheKit::secure_from_env`] to read the key from
-    /// `CACHEKIT_MASTER_KEY`. There is no raw-bytes preset: decoded key bytes
-    /// go to [`CacheKitBuilder::encryption_from_bytes`], and the ASCII bytes
-    /// of a hex string must never go there — they derive a key no other SDK
-    /// derives.
+    /// `CACHEKIT_MASTER_KEY`. There is no raw-bytes preset: exactly 32
+    /// decoded key bytes go to [`CacheKitBuilder::encryption_from_bytes`],
+    /// which rejects any other length — including the 64 ASCII bytes of a
+    /// hex string, which would derive a key no other SDK derives.
     ///
     /// The key is validated **before** any Redis connection is attempted — a
     /// bad key is a deterministic local error, never masked by (or paying
@@ -232,7 +262,8 @@ impl CacheKit {
     /// let cache = cachekit::CacheKit::secure("redis://localhost:6379", &master_key_hex)
     ///     .await?
     ///     .build()?;
-    /// let secure = cache.secure_cache()?;
+    /// // Encrypted before it leaves the process; L1 holds the ciphertext.
+    /// cache.set("user:42:ssn", &"123-45-6789").await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -241,25 +272,36 @@ impl CacheKit {
         redis_url: &str,
         master_key_hex: &str,
     ) -> Result<CacheKitBuilder, CachekitError> {
-        connect_secure(
-            redis_url,
-            secure_defaults(master_key_hex, "master_key_hex")?,
-        )
-        .await
+        connect_secure(redis_url, secure_hex_defaults(master_key_hex)?).await
     }
 
-    /// **Secure**, master key from the environment — [`CacheKit::secure`]
-    /// with the hex key read from `CACHEKIT_MASTER_KEY`.
+    /// **Secure**, keys from the environment — [`CacheKit::secure`] with the
+    /// hex key read from `CACHEKIT_MASTER_KEY`, plus decrypt-only rotation
+    /// keys from `CACHEKIT_PREVIOUS_MASTER_KEYS`.
     ///
-    /// Identical preset to [`secure`](CacheKit::secure), same hex decoding,
-    /// so the same `CACHEKIT_MASTER_KEY` value derives the same key bytes as
-    /// every other CacheKit SDK. Use exactly **32 bytes (64 hex chars)**, the
-    /// only length every SDK accepts. Never falls back to plaintext.
+    /// Reads exactly two variables:
+    ///
+    /// * `CACHEKIT_MASTER_KEY` (required) — the current key; writes encrypt
+    ///   under it. Same hex decoding as [`secure`](CacheKit::secure), so the
+    ///   same value derives the same key bytes as every other CacheKit SDK.
+    ///   Use exactly **32 bytes (64 hex chars)**, the only length every SDK
+    ///   accepts.
+    /// * `CACHEKIT_PREVIOUS_MASTER_KEYS` (optional) — comma-separated hex
+    ///   keys, at most 3, tried in order when the current key fails to
+    ///   decrypt. Unset or blank means none. Validated exactly as
+    ///   [`CachekitConfig::from_env`](crate::CachekitConfig::from_env)
+    ///   validates it; the current key must not appear in the list.
+    ///
+    /// Otherwise the identical preset to [`secure`](CacheKit::secure), tenant
+    /// `"default"` for every key. Never falls back to plaintext.
     ///
     /// # Errors
     ///
-    /// Returns [`CachekitError::Config`] when `CACHEKIT_MASTER_KEY` is unset,
-    /// empty, not hex, or shorter than 32 bytes — all before any Redis I/O.
+    /// Returns [`CachekitError::Config`] — all before any Redis I/O — when
+    /// `CACHEKIT_MASTER_KEY` is unset, empty, not hex, or shorter than 32
+    /// bytes, or when `CACHEKIT_PREVIOUS_MASTER_KEYS` is set but not valid
+    /// UTF-8, or is non-blank with an empty or invalid entry, more than 3
+    /// entries, or a repeat of the current key.
     /// Otherwise as [`secure`](CacheKit::secure).
     ///
     /// # Example
@@ -269,18 +311,15 @@ impl CacheKit {
     /// let cache = cachekit::CacheKit::secure_from_env("redis://localhost:6379")
     ///     .await?
     ///     .build()?;
-    /// let secure = cache.secure_cache()?;
+    /// cache.set("user:42:ssn", &"123-45-6789").await?; // encrypted
+    /// // Reads served by each CACHEKIT_PREVIOUS_MASTER_KEYS entry, for rotation.
+    /// let drain = cache.secure_cache()?.previous_key_hits();
     /// # Ok(())
     /// # }
     /// ```
     #[cfg(all(feature = "redis", feature = "encryption"))]
     pub async fn secure_from_env(redis_url: &str) -> Result<CacheKitBuilder, CachekitError> {
-        let master_key_hex = master_key_hex_from_env()?;
-        connect_secure(
-            redis_url,
-            secure_defaults(&master_key_hex, "CACHEKIT_MASTER_KEY")?,
-        )
-        .await
+        connect_secure(redis_url, secure_env_defaults()?).await
     }
 
     /// **CachekitIO** — managed SaaS cache, zero infrastructure.
@@ -288,7 +327,8 @@ impl CacheKit {
     /// * Backend: [cachekit.io](https://cachekit.io) HTTP API
     /// * L1 cache: **on** (1 000 entries)
     /// * Encryption: **no** (add via
-    ///   [`.encryption()`](CacheKitBuilder::encryption))
+    ///   [`.encryption()`](CacheKitBuilder::encryption), which then encrypts
+    ///   every value read and write)
     /// * Reliability: **on** — retry with backoff + jitter, circuit
     ///   breaker, backpressure (max 100 concurrent backend ops)
     /// * Default TTL: **3 600 s**
@@ -323,7 +363,11 @@ impl CacheKit {
             .default_ttl(Duration::from_secs(3600))
             .l1_capacity(1000);
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-        let builder = builder.reliability(crate::reliability::ReliabilityConfig::default());
+        let builder = {
+            let mut builder = builder.reliability(crate::reliability::ReliabilityConfig::default());
+            builder.retry_deadlines = Some(crate::reliability::CACHEKITIO_DEADLINES);
+            builder
+        };
         Ok(builder)
     }
 
@@ -331,8 +375,10 @@ impl CacheKit {
     /// the key read from `CACHEKIT_API_KEY`.
     ///
     /// Identical preset to [`io`](CacheKit::io). Reads **only**
-    /// `CACHEKIT_API_KEY` — unlike [`CacheKit::from_env`], never
-    /// `CACHEKIT_MASTER_KEY`, so no encryption is activated.
+    /// `CACHEKIT_API_KEY`, never `CACHEKIT_MASTER_KEY`: like every
+    /// constructor but `secure`, it does not encrypt unless you chain an
+    /// encryption call such as
+    /// [`.encryption_from_env()`](CacheKitBuilder::encryption_from_env).
     ///
     /// # Errors
     ///
@@ -395,7 +441,8 @@ mod tests {
 #[cfg(all(test, feature = "redis", feature = "encryption"))]
 #[allow(clippy::expect_used)] // test-only: a failing build here should panic loudly
 mod secure_tests {
-    // protocol test-vectors/encryption.json v1.2.0, `default_tenant.vectors[0]`
+    // protocol test-vectors/encryption.json `default_tenant.vectors[0]`
+    // (unchanged since v1.2.0; the vendored copy is tests/vectors/encryption.json)
     // (`default_tenant_interop`): spec/intent-presets.md § Master Key Input
     // rule 5 — with no tenant configured, the preset must derive and bind AAD
     // under the literal "default", byte-for-byte with every other SDK.
@@ -418,27 +465,314 @@ mod secure_tests {
         assert_eq!(hex::encode(plaintext), PLAINTEXT_HEX);
     }
 
+    /// § Encryption Activation rule 1 on the preset: plain `set` on a
+    /// `secure` client puts only ciphertext in the backend and in L1, and
+    /// plain `get` decrypts it. Driven through `secure_defaults` so it runs
+    /// without Redis.
+    #[tokio::test]
+    async fn plain_set_on_secure_preset_stores_ciphertext() {
+        const VALUE: &str = "ssn 123-45-6789";
+        let backend = crate::backend::MemoryBackend::default();
+        let master_key = hex::decode(MASTER_KEY_HEX).expect("vector hex");
+        let cache = super::secure_defaults(&master_key, &[])
+            .expect("valid key")
+            .backend(super::wrap(backend.clone()))
+            .build()
+            .expect("secure defaults must build");
+
+        cache.set(CACHE_KEY, &VALUE).await.expect("plain set");
+
+        let stored = backend
+            .store
+            .lock()
+            .await
+            .get(CACHE_KEY)
+            .cloned()
+            .expect("plain set reached the backend");
+        let plaintext = crate::serializer::serialize(&VALUE).expect("serializes");
+        assert_ne!(stored, plaintext, "backend holds plaintext");
+        let independent = crate::EncryptionLayer::new(&master_key, "default").expect("valid key");
+        assert_eq!(
+            independent
+                .decrypt(&stored, CACHE_KEY)
+                .expect("backend bytes are ciphertext under the preset's key and tenant"),
+            plaintext
+        );
+        #[cfg(feature = "l1")]
+        assert_eq!(
+            cache
+                .l1
+                .as_ref()
+                .expect("secure preset enables L1")
+                .get_shared(CACHE_KEY)
+                .as_deref(),
+            Some(stored.as_slice()),
+            "L1 holds the same ciphertext as the backend"
+        );
+
+        assert_eq!(
+            cache.get::<String>(CACHE_KEY).await.expect("plain get"),
+            Some(VALUE.to_owned())
+        );
+    }
+
     #[test]
     fn hex_path_decrypts_default_tenant_vector() {
         assert_decrypts_default_tenant_vector(
-            super::secure_defaults(MASTER_KEY_HEX, "master_key_hex").expect("valid key"),
+            super::secure_defaults(&hex::decode(MASTER_KEY_HEX).expect("vector hex"), &[])
+                .expect("valid key"),
         );
+    }
+
+    /// Rule 3: the hex path accepts a key decoding to more than 32 bytes;
+    /// the raw-bytes exactly-32 rule must not leak into it.
+    #[test]
+    fn hex_path_accepts_48_byte_key() {
+        let long = [0x61u8; 48];
+        assert!(super::secure_defaults(&long, &[]).is_ok());
+        let previous = [zeroize::Zeroizing::new(vec![0x62u8; 48])];
+        assert!(super::secure_defaults(&long, &previous).is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_path_accepts_48_byte_keys() {
+        let (k2, k1) = ("22".repeat(48), "11".repeat(48));
+        assert!(secure_env_defaults_with(Some(&k2), Some(&k1)).is_ok());
+        assert!(secure_env_defaults_with(Some(&"22".repeat(32)), None).is_ok());
+    }
+
+    /// Run `secure_env_defaults` under the given env, restoring both
+    /// variables before anything can panic.
+    fn secure_env_defaults_with(
+        master: Option<&str>,
+        previous: Option<&str>,
+    ) -> Result<crate::CacheKitBuilder, crate::CachekitError> {
+        const VARS: [&str; 2] = ["CACHEKIT_MASTER_KEY", "CACHEKIT_PREVIOUS_MASTER_KEYS"];
+        let saved = VARS.map(std::env::var_os);
+        for (var, val) in VARS.iter().zip([master, previous]) {
+            match val {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        let resolved = super::secure_env_defaults();
+        for (var, val) in VARS.iter().zip(saved) {
+            match val {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        resolved
     }
 
     #[test]
     #[serial_test::serial]
     fn env_path_decrypts_default_tenant_vector() {
-        let saved = std::env::var_os("CACHEKIT_MASTER_KEY");
-        std::env::set_var("CACHEKIT_MASTER_KEY", MASTER_KEY_HEX);
-        let resolved = super::master_key_hex_from_env();
-        // Restore before anything can panic.
-        match saved {
-            Some(v) => std::env::set_var("CACHEKIT_MASTER_KEY", v),
-            None => std::env::remove_var("CACHEKIT_MASTER_KEY"),
-        }
-        let master_key_hex = resolved.expect("CACHEKIT_MASTER_KEY is set");
         assert_decrypts_default_tenant_vector(
-            super::secure_defaults(&master_key_hex, "CACHEKIT_MASTER_KEY").expect("valid key"),
+            secure_env_defaults_with(Some(MASTER_KEY_HEX), None).expect("valid key"),
         );
+    }
+
+    /// An entry written under k1 must still decrypt after the
+    /// env-var rotation runbook promotes k2 and moves k1 to the previous list.
+    #[test]
+    #[serial_test::serial]
+    fn env_path_decrypts_under_previous_key_after_rotation() {
+        let k2 = "22".repeat(32);
+        let rotated = secure_env_defaults_with(Some(&k2), Some(MASTER_KEY_HEX))
+            .expect("valid rotation config");
+        // The default-tenant vector was written under k1 (MASTER_KEY_HEX).
+        assert_decrypts_default_tenant_vector(rotated);
+
+        // Control: without the previous key, k2 alone fails closed.
+        let layer = secure_env_defaults_with(Some(&k2), None)
+            .expect("valid key")
+            .encryption
+            .expect("secure preset must configure encryption");
+        let ciphertext = hex::decode(CIPHERTEXT_HEX).expect("vector hex");
+        assert!(layer.decrypt(&ciphertext, CACHE_KEY).is_err());
+    }
+
+    /// protocol `encryption.json` 1.5.0 `master_key_input.accept_vectors`:
+    /// `master_key_every_hex_digit` (a leading 00 byte, bytes above 7f and
+    /// every hex digit in both places) and `master_key_first_byte_80` (the top
+    /// bit set), each sealed under tenant "default". Read from the copy
+    /// `tests/master_key_input_tests.rs` pins.
+    struct AcceptRow {
+        name: String,
+        master_key_hex: String,
+        cache_key: String,
+        ciphertext: Vec<u8>,
+        plaintext_hex: String,
+    }
+
+    fn accept_rows() -> Vec<AcceptRow> {
+        let all: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/vectors/encryption.json"))
+                .expect("vendored vector file must be valid JSON");
+        all["master_key_input"]["accept_vectors"]
+            .as_array()
+            .expect("accept_vectors must be an array")
+            .iter()
+            .map(|row| {
+                let get = |k: &str| row[k].as_str().expect("accept row field").to_owned();
+                AcceptRow {
+                    name: get("name"),
+                    master_key_hex: get("master_key_hex"),
+                    cache_key: get("cache_key"),
+                    ciphertext: hex::decode(get("ciphertext_hex")).expect("vector hex"),
+                    plaintext_hex: get("plaintext_hex"),
+                }
+            })
+            .collect()
+    }
+
+    fn assert_decrypts_accept_row(builder: &crate::CacheKitBuilder, row: &AcceptRow) {
+        let layer = builder
+            .encryption
+            .as_ref()
+            .expect("secure preset must configure encryption");
+        assert_eq!(layer.tenant_id(), "default");
+        let plaintext = layer
+            .decrypt(&row.ciphertext, &row.cache_key)
+            .map(hex::encode)
+            .map_err(|e| format!("{e:?}"));
+        assert_eq!(
+            plaintext.as_deref(),
+            Ok(row.plaintext_hex.as_str()),
+            "{} must decrypt",
+            row.name
+        );
+    }
+
+    /// Everything `CacheKit::secure` does before it connects, with no tenant.
+    #[test]
+    fn hex_path_decrypts_master_key_input_accept_rows() {
+        for row in accept_rows() {
+            let builder = super::secure_hex_defaults(&row.master_key_hex).expect("valid key");
+            assert_decrypts_accept_row(&builder, &row);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_path_decrypts_master_key_input_accept_rows() {
+        for row in accept_rows() {
+            let builder =
+                secure_env_defaults_with(Some(&row.master_key_hex), None).expect("valid key");
+            assert_decrypts_accept_row(&builder, &row);
+        }
+    }
+
+    /// PRE-51: each `master_key_input.accept_vectors` row (current key) and
+    /// `default_tenant.vectors[0]` (previous key), all sealed under tenant
+    /// "default", read through one client. A client that ignores
+    /// `CACHEKIT_PREVIOUS_MASTER_KEYS` reads only the first.
+    #[test]
+    #[serial_test::serial]
+    fn env_path_reads_accept_rows_and_default_tenant_vector_across_rotation() {
+        for row in accept_rows() {
+            let builder = secure_env_defaults_with(Some(&row.master_key_hex), Some(MASTER_KEY_HEX))
+                .expect("valid rotation config");
+            assert_decrypts_accept_row(&builder, &row);
+            assert_decrypts_default_tenant_vector(builder);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_path_blank_previous_keys_is_unset() {
+        assert_decrypts_default_tenant_vector(
+            secure_env_defaults_with(Some(MASTER_KEY_HEX), Some("  ")).expect("blank is unset"),
+        );
+    }
+
+    /// Set but unreadable is not unset: a non-UTF-8 value must fail, never
+    /// silently drop the decrypt-only keys.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn env_path_rejects_non_utf8_previous_keys() {
+        use std::os::unix::ffi::OsStringExt;
+        let saved = std::env::var_os("CACHEKIT_PREVIOUS_MASTER_KEYS");
+        std::env::set_var(
+            "CACHEKIT_PREVIOUS_MASTER_KEYS",
+            std::ffi::OsString::from_vec(vec![0x31, 0xff, 0x31]),
+        );
+        let saved_master = std::env::var_os("CACHEKIT_MASTER_KEY");
+        std::env::set_var("CACHEKIT_MASTER_KEY", MASTER_KEY_HEX);
+        let resolved = super::secure_env_defaults();
+        for (var, val) in [
+            ("CACHEKIT_PREVIOUS_MASTER_KEYS", saved),
+            ("CACHEKIT_MASTER_KEY", saved_master),
+        ] {
+            match val {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        assert!(
+            matches!(
+                &resolved,
+                Err(crate::CachekitError::Config(msg)) if msg.contains("CACHEKIT_PREVIOUS_MASTER_KEYS")
+            ),
+            "non-UTF-8 previous keys must be a Config error naming the variable; got {:?}",
+            resolved.err()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_path_rejects_invalid_previous_keys() {
+        let k2 = "22".repeat(32);
+        let four = ["11", "33", "44", "55"].map(|b| b.repeat(32)).join(",");
+        for (previous, why) in [
+            ("not-hex", "invalid hex"),
+            (&*format!("{MASTER_KEY_HEX},"), "empty entry"),
+            (&*"11".repeat(31), "short key"),
+            (&*four, "more than 3"),
+            (&*k2, "current key repeated"),
+        ] {
+            assert!(
+                matches!(
+                    secure_env_defaults_with(Some(&k2), Some(previous)),
+                    Err(crate::CachekitError::Config(_))
+                ),
+                "{why} must be a Config error"
+            );
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "cachekitio",
+    feature = "reliability",
+    not(target_arch = "wasm32")
+))]
+#[allow(clippy::expect_used)] // test-only
+mod io_deadline_tests {
+    use crate::reliability::CACHEKITIO_DEADLINES;
+    use crate::CacheKit;
+
+    #[test]
+    fn io_sets_the_cachekitio_retry_deadlines() {
+        let builder = CacheKit::io("ck_test_key").expect("io builds");
+        assert_eq!(builder.retry_deadlines, Some(CACHEKITIO_DEADLINES));
+    }
+
+    /// A backend swapped in after `io` must not inherit budgets sized for
+    /// cachekit.io.
+    #[test]
+    fn replacing_the_backend_drops_the_deadlines() {
+        let other = crate::backend::cachekitio::CachekitIO::builder()
+            .api_key("ck_test_key")
+            .build()
+            .expect("builds");
+        let builder = CacheKit::io("ck_test_key")
+            .expect("io builds")
+            .backend(super::wrap(other));
+        assert_eq!(builder.retry_deadlines, None);
     }
 }

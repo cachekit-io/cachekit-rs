@@ -21,6 +21,25 @@ pub struct HealthStatus {
     pub details: HashMap<String, String>,
 }
 
+// ── Freshness ────────────────────────────────────────────────────────────────
+
+/// The server's freshness for one read: the protocol's `X-CacheKit-Freshness`
+/// label and `X-CacheKit-Fresh-For` bound (`spec/saas-api.md` § Remaining
+/// Freshness). The client reads it to bound the L1 backfill.
+///
+/// The default is a fresh read with no server bound, which leaves the client's
+/// configured local TTL unchanged.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Freshness {
+    /// The read was labelled stale, or with a token the client does not know.
+    /// The L1 must not backfill it.
+    pub is_stale: bool,
+    /// Remaining server freshness, or `None` when the header was absent. Zero
+    /// forbids the backfill.
+    pub fresh_for: Option<Duration>,
+}
+
 // ── Backend trait ─────────────────────────────────────────────────────────────
 
 /// Async cache backend abstraction.
@@ -34,6 +53,23 @@ pub trait Backend: Send + Sync {
     /// Retrieve the raw bytes stored under `key`, or `None` if absent.
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError>;
 
+    /// Retrieve `key` together with the server's [`Freshness`] for it.
+    ///
+    /// Client plumbing for the L1 backfill, not part of the documented surface.
+    /// The default wraps [`Self::get`] as a fresh read with no bound, so a
+    /// backend without a freshness signal keeps today's behaviour. A backend
+    /// that wraps another must forward this method, or the signal is lost.
+    #[doc(hidden)]
+    async fn get_with_freshness(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, Freshness)>, BackendError> {
+        Ok(self
+            .get(key)
+            .await?
+            .map(|bytes| (bytes, Freshness::default())))
+    }
+
     /// Store `value` under `key`, optionally expiring after `ttl`.
     async fn set(
         &self,
@@ -43,6 +79,10 @@ pub trait Backend: Send + Sync {
     ) -> Result<(), BackendError>;
 
     /// Remove `key` and return `true` if it existed.
+    ///
+    /// `CachekitIO` and `WorkersCachekitIO` return `true` on every successful
+    /// delete, whether or not the key existed: the server does not report
+    /// existence on `DELETE`.
     async fn delete(&self, key: &str) -> Result<bool, BackendError>;
 
     /// Return `true` if `key` exists without fetching the value.
@@ -86,6 +126,23 @@ pub trait Backend {
     /// Retrieve the raw bytes stored under `key`, or `None` if absent.
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError>;
 
+    /// Retrieve `key` together with the server's [`Freshness`] for it.
+    ///
+    /// Client plumbing for the L1 backfill, not part of the documented surface.
+    /// The default wraps [`Self::get`] as a fresh read with no bound, so a
+    /// backend without a freshness signal keeps today's behaviour. A backend
+    /// that wraps another must forward this method, or the signal is lost.
+    #[doc(hidden)]
+    async fn get_with_freshness(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, Freshness)>, BackendError> {
+        Ok(self
+            .get(key)
+            .await?
+            .map(|bytes| (bytes, Freshness::default())))
+    }
+
     /// Store `value` under `key`, optionally expiring after `ttl`.
     async fn set(
         &self,
@@ -95,6 +152,10 @@ pub trait Backend {
     ) -> Result<(), BackendError>;
 
     /// Remove `key` and return `true` if it existed.
+    ///
+    /// `CachekitIO` and `WorkersCachekitIO` return `true` on every successful
+    /// delete, whether or not the key existed: the server does not report
+    /// existence on `DELETE`.
     async fn delete(&self, key: &str) -> Result<bool, BackendError>;
 
     /// Return `true` if `key` exists without fetching the value.
@@ -174,7 +235,12 @@ pub trait LockableBackend: Backend {
         key: &str,
         timeout_ms: u64,
     ) -> Result<Option<String>, BackendError>;
-    /// Release a distributed lock. Returns true if released.
+    /// Release a distributed lock. Returns true if released. Must release
+    /// only if `lock_id` still owns the lock: a late or duplicate release
+    /// must never free a lock acquired since. Return `Ok(false)` when
+    /// `lock_id` no longer owns the lock; `Err` only when the outcome is
+    /// unknown. The single-flight takes `Ok` as answered and never re-sends
+    /// it, and re-sends after an `Err` on the key's next lock attempt.
     async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError>;
 }
 
@@ -188,7 +254,12 @@ pub trait LockableBackend: Backend {
         key: &str,
         timeout_ms: u64,
     ) -> Result<Option<String>, BackendError>;
-    /// Release a distributed lock. Returns true if released.
+    /// Release a distributed lock. Returns true if released. Must release
+    /// only if `lock_id` still owns the lock: a late or duplicate release
+    /// must never free a lock acquired since. Return `Ok(false)` when
+    /// `lock_id` no longer owns the lock; `Err` only when the outcome is
+    /// unknown. The single-flight takes `Ok` as answered and never re-sends
+    /// it, and re-sends after an `Err` on the key's next lock attempt.
     async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError>;
 }
 
@@ -220,15 +291,19 @@ pub(crate) async fn run_blocking<T>(
 /// the native `cachekitio` and wasm `workers` backends (DRY: every CachekitIO
 /// path is built through this one fallible chokepoint).
 ///
-/// Almost every key is just [`urlencoding::encode`]. The exception is a key
-/// whose encoded form is one of the **five reserved path segments** — `.`,
-/// `..`, `health`, `ttl`, `lock` — which is **rejected** with a permanent
-/// [`BackendError`] rather than sent. This is the client's half of the protocol
-/// `spec/saas-api.md` § Cache-Key Path Encoding, rule 2.
+/// Almost every key is just [`urlencoding::encode`]. The exceptions are the
+/// empty key and a key whose encoded form is one of the **five reserved path
+/// segments** — `.`, `..`, `health`, `ttl`, `lock` — which are **rejected** with
+/// a permanent [`BackendError`] rather than sent. This is the client's half of
+/// the protocol `spec/saas-api.md` § Cache-Key Path Encoding, rule 2.
 ///
-/// Two distinct hazards, both landing the app's bearer token on a route the SaaS
+/// Three distinct hazards, each taking the request off the key's own
+/// `/v1/cache/{key}` path and sending the app's bearer token somewhere the SaaS
 /// `cache-key-validator` never vets (CWE-22):
 ///
+/// - **The empty key.** It encodes to an empty segment, so `/v1/cache/{key}`
+///   becomes `/v1/cache/` and `/v1/cache/{key}/ttl` becomes `/v1/cache//ttl`,
+///   neither of which addresses a stored entry.
 /// - **Dot segments (`.`, `..`).** A dot is RFC-3986 *unreserved*, so
 ///   `urlencoding::encode("..") == ".."` unchanged, and `reqwest`'s WHATWG URL
 ///   parser (rust-url) removes that dot-segment **before the request leaves the
@@ -248,8 +323,9 @@ pub(crate) async fn run_blocking<T>(
 /// Only an *entirely*-reserved segment is caught: `a:..`, `..a`, `x..y` are
 /// inert and sent per rule 1 with their dots raw. Canonical and interop keys
 /// always contain `:` and never meet this rule, so for every non-reserved key
-/// the output is byte-identical to `urlencoding::encode` — preserving cross-SDK
-/// wire parity. rust-url's uniform rejection matches the cachekit-ts twin;
+/// the output is byte-identical to `urlencoding::encode` — the same bytes as
+/// cachekit-py; cachekit-ts may leave `! * ' ( )` raw, which decodes to the same
+/// key (spec rule 4). rust-url's uniform rejection matches the cachekit-ts twin;
 /// it diverges from cachekit-py's older `%2E` rewrite
 /// (`src/cachekit/backends/cachekitio/backend.py:247-250` @ `f000ba3`), whose
 /// RFC-3986 client kept `%2E%2E` on the wire — the spec now mandates uniform
@@ -257,18 +333,80 @@ pub(crate) async fn run_blocking<T>(
 #[cfg(any(feature = "cachekitio", feature = "workers", test))]
 pub(crate) fn encode_key(key: &str) -> Result<std::borrow::Cow<'_, str>, BackendError> {
     let encoded = urlencoding::encode(key);
-    // spec/saas-api.md § Cache-Key Path Encoding rule 2: reject a key whose
-    // encoded form is exactly one of the five reserved segments.
-    if matches!(encoded.as_ref(), "." | ".." | "health" | "ttl" | "lock") {
+    // spec/saas-api.md § Cache-Key Path Encoding rule 2: reject the empty key
+    // and a key whose encoded form is exactly one of the five reserved segments.
+    if matches!(
+        encoded.as_ref(),
+        "" | "." | ".." | "health" | "ttl" | "lock"
+    ) {
         return Err(BackendError::permanent(
-            "cache key must not be a reserved path segment (`.`, `..`, `health`, \
-             `ttl`, `lock`): the client URL parser or the SaaS router would route \
-             it off the `/v1/cache/{key}` path (CWE-22), so it cannot be \
-             addressed on the wire",
+            "cache key must not be empty or a reserved path segment (`.`, `..`, \
+             `health`, `ttl`, `lock`): the request path would leave \
+             `/v1/cache/{key}` (CWE-22), so it cannot be addressed on the wire",
         ));
     }
     Ok(encoded)
 }
+
+/// Whether a `DELETE /v1/cache/{key}` status is a success. The server answers
+/// `200` whether or not the key existed and never `404` (`spec/saas-api.md`),
+/// so success carries no existence signal and every other status, `404`
+/// included, takes the caller's error path. Shared by the native and Workers
+/// backends so their mappings cannot drift.
+#[cfg(any(feature = "cachekitio", feature = "workers", test))]
+pub(crate) fn delete_succeeded(status: u16) -> bool {
+    matches!(status, 200 | 204)
+}
+
+/// The whole seconds a write's TTL goes on the wire as. `spec/saas-api.md`
+/// says a positive sub-second TTL MUST be ceiled to 1, never truncated to 0.
+/// From 1 s up it truncates, so the wire TTL stays an upper bound on the
+/// requested one and the writer's L1 copy can be bounded by it. Zero stays
+/// zero: TTL 0 is an error, and the server rejects it with `400`.
+#[cfg(any(
+    feature = "cachekitio",
+    feature = "workers",
+    feature = "l1",
+    feature = "tracing",
+    test
+))]
+pub(crate) fn ttl_wire_secs(ttl: Duration) -> u64 {
+    if ttl.is_zero() {
+        return 0;
+    }
+    ttl.as_secs().max(1)
+}
+
+/// The `PUT /v1/cache/{key}` header that carries a write's TTL in whole
+/// seconds ([`ttl_wire_secs`]). `spec/saas-api.md` says SDKs MUST send
+/// `X-CacheKit-TTL` only: the legacy `X-TTL` goes away in protocol 2.0, and a
+/// write that sends only it would then be stored with no expiry. Shared by the
+/// native and Workers backends so their wire forms cannot drift.
+#[cfg(any(feature = "cachekitio", feature = "workers", test))]
+pub(crate) fn ttl_header(ttl: Duration) -> (&'static str, String) {
+    ("X-CacheKit-TTL", ttl_wire_secs(ttl).to_string())
+}
+
+/// Per-attempt budget for every cachekit.io request but a write, from connect
+/// through the last body byte: the protocol's `CACHEKIT_TIMEOUT` default
+/// (`spec/saas-api.md`). It was 30 s, so under the retrying presets a request
+/// the service accepted and never answered held a call for ~90 s before it
+/// failed open. Shared by the native and Workers backends so their budgets
+/// cannot drift.
+#[cfg(any(
+    all(feature = "cachekitio", not(target_arch = "wasm32")),
+    feature = "workers"
+))]
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-attempt budget for a write (`set`, `delete`): twice the read budget,
+/// because a write carries the payload and the service commits it before it
+/// answers, so a slow but healthy write must not time out and be re-sent.
+#[cfg(any(
+    all(feature = "cachekitio", not(target_arch = "wasm32")),
+    feature = "workers"
+))]
+pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── Feature-gated backend modules ─────────────────────────────────────────────
 
@@ -302,79 +440,242 @@ pub mod file;
 #[cfg(feature = "workers")]
 pub mod workers;
 
+// ── Path-encoding protocol vectors (test-only) ───────────────────────────────
+
+/// Loader for `tests/vectors/path-encoding.json`, vendored verbatim from
+/// cachekit-io/protocol `test-vectors/path-encoding.json` 1.2.0 (merge commit
+/// `f35635445a6a7461f93061aa51332e4f0d25c614`). Do not edit the JSON here;
+/// change it upstream and re-vendor, then update `SHA256`.
+///
+/// Every path-encoding conformance assertion reads its keys from this file, so
+/// a row added upstream reaches the rs suite with no test edit. The only
+/// rs-local list is `RS_NEAR_MISSES`, which can add acceptances but never hide
+/// a reject row.
+#[cfg(test)]
+#[allow(clippy::expect_used)] // test-only: a malformed vendored fixture should panic loudly
+pub(crate) mod path_encoding_vectors {
+    use serde::Deserialize;
+
+    const JSON: &str = include_str!("../../tests/vectors/path-encoding.json");
+
+    /// sha256 of the vendored file, pinned so a local edit cannot drift from the
+    /// protocol copy unnoticed.
+    const SHA256: &str = "807af0d39ccf3f5afda65577787ac5adcd01ff6617468060161c84267fa7e0cb"; // pragma: allowlist secret
+
+    /// One fixture row. `deny_unknown_fields` makes a new row field upstream
+    /// fail loudly here rather than be silently ignored by the tests.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct Vector {
+        pub(crate) key: String,
+        pub(crate) encoded: Option<String>,
+        #[serde(default)]
+        pub(crate) reject: bool,
+        // Declared only so `deny_unknown_fields` accepts them. `decoded` and the
+        // `encodeURIComponent` alternates are verified by the protocol's own CI.
+        #[serde(rename = "decoded")]
+        _decoded: Option<String>,
+        #[serde(rename = "encoded_alternates", default)]
+        _encoded_alternates: Vec<String>,
+        #[serde(rename = "note")]
+        _note: String,
+    }
+
+    #[derive(Deserialize)]
+    struct Fixture {
+        vectors: Vec<Vector>,
+    }
+
+    fn all() -> Vec<Vector> {
+        serde_json::from_str::<Fixture>(JSON)
+            .expect("vendored path-encoding.json must match the fixture schema")
+            .vectors
+    }
+
+    /// Keys spec rule 2 reserves: a conformant client refuses to build a URL.
+    pub(crate) fn reject_keys() -> Vec<String> {
+        all()
+            .into_iter()
+            .filter(|v| v.reject)
+            .map(|v| v.key)
+            .collect()
+    }
+
+    /// Rows a conformant client sends.
+    pub(crate) fn transmittable() -> Vec<Vector> {
+        all().into_iter().filter(|v| !v.reject).collect()
+    }
+
+    /// rs-local, acceptance-only regressions that are NOT fixture rows: route-token
+    /// near-misses that a prefix, case-insensitive or `contains` guard would
+    /// wrongly reject. The fixture has none of those; its `x/../../health` row
+    /// covers the suffix case, and `a:..` / `..a` cover the dot cases.
+    pub(crate) const RS_NEAR_MISSES: &[&str] = &["healthy", "HEALTH", "ttls", "unlock"];
+
+    #[test]
+    fn vendored_fixture_matches_the_pinned_sha256() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            hex::encode(Sha256::digest(JSON.as_bytes())),
+            SHA256,
+            "tests/vectors/path-encoding.json differs from the pinned protocol copy: \
+             re-vendor it from protocol and update SHA256"
+        );
+    }
+}
+
 // ── encode_key unit tests (CWE-22) ───────────────────────────────────────────
 
 #[cfg(test)]
 #[allow(clippy::expect_used)] // test-only: an encoding failure on a safe key should panic loudly
 mod encode_key_tests {
     use super::encode_key;
-
-    /// The five reserved path segments of spec rule 2 — no wire form is
-    /// transmittable, so a conformant client rejects before building the URL.
-    const RESERVED_SEGMENTS: &[&str] = &[".", "..", "health", "ttl", "lock"];
-
-    /// Non-reserved vectors: canonical key, dot near-misses (`..` embedded, not a
-    /// whole segment), route-token near-misses (`healthy`, `HEALTH`, embedded
-    /// `x/../../health`), reserved chars, `%`, sub-delims, spaces, empty. Mirrors
-    /// the transmittable rows of `protocol/test-vectors/path-encoding.json`.
-    const SAFE_VECTORS: &[&str] = &[
-        "a:..",
-        "..a",
-        "a..",
-        ".hidden",
-        "default:../../admin",
-        "x/../../health",
-        "healthy",
-        "HEALTH",
-        "ttls",
-        "unlock",
-        "ns:default:func:m.f:args:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:",
-        "a b",
-        "k?x=1#f",
-        "100%",
-        "f(x)!*'",
-        "",
-    ];
+    use super::path_encoding_vectors::{reject_keys, transmittable, RS_NEAR_MISSES};
 
     #[test]
-    fn reserved_segments_are_rejected() {
-        // spec/saas-api.md rule 2: `.`/`..` collapse in the URL parser and
-        // `health`/`ttl`/`lock` are route tokens; none is addressable on the
-        // `/v1/cache/{key}` path (see
+    fn fixture_reject_rows_are_rejected() {
+        // spec/saas-api.md rule 2: the empty key, `.`/`..` and the route tokens
+        // are not addressable on `/v1/cache/{key}` (builder-level coverage:
         // `cachekitio::path_encoding_tests::reserved_segments_rejected_by_every_builder`).
-        for k in RESERVED_SEGMENTS {
+        let keys = reject_keys();
+        assert!(!keys.is_empty(), "fixture has no reject rows");
+        for k in &keys {
             assert!(
                 encode_key(k).is_err(),
-                "reserved segment {k:?} must be rejected"
+                "reserved key {k:?} must be rejected"
             );
         }
-        // Near-miss acceptance (`healthy`, `HEALTH`, `x/../../health`, …) is
-        // covered by `SAFE_VECTORS` in the two tests below — a `contains`/
-        // case-insensitive regression there panics on `.expect`.
     }
 
     #[test]
-    fn safe_keys_are_byte_identical_to_urlencoding() {
-        // AC-1: nothing but an exact `.`/`..` segment may change encoding, or the
-        // SDKs diverge on the wire.
-        for k in SAFE_VECTORS {
-            let enc = encode_key(k).expect("safe key must encode");
+    fn fixture_transmittable_rows_encode_to_the_reference_form() {
+        // The fixture accepts `[encoded] + encoded_alternates`; rs holds itself to
+        // `encoded`, the reference form, so its wire bytes stay identical to
+        // cachekit-py's (the alternates cover cachekit-ts's raw `! * ' ( )`).
+        let rows = transmittable();
+        assert!(!rows.is_empty(), "fixture has no transmittable rows");
+        for row in &rows {
+            let enc = encode_key(&row.key).expect("transmittable fixture key must encode");
             assert_eq!(
-                enc,
-                urlencoding::encode(k),
-                "encode_key diverged from urlencoding for {k:?}"
+                Some(enc.as_ref()),
+                row.encoded.as_deref(),
+                "encode_key({:?}) is not the fixture's reference form",
+                row.key
             );
         }
     }
 
     #[test]
-    fn safe_keys_decode_once_back_to_the_original() {
-        // AC-3: the SaaS validator does a single `decodeURIComponent`; every safe
-        // vector must survive that exact round-trip untouched.
-        for k in SAFE_VECTORS {
-            let enc = encode_key(k).expect("safe key must encode");
-            let decoded = urlencoding::decode(&enc).expect("single decode succeeds");
-            assert_eq!(decoded, *k, "decode-once round-trip changed {k:?}");
+    fn near_misses_are_not_rejected() {
+        for k in RS_NEAR_MISSES {
+            assert!(encode_key(k).is_ok(), "near-miss key {k:?} must encode");
         }
+    }
+}
+
+// ── delete_succeeded unit tests ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod delete_status_tests {
+    use super::delete_succeeded;
+
+    #[test]
+    fn delete_success_is_200_or_204() {
+        assert!(delete_succeeded(200));
+        assert!(delete_succeeded(204));
+    }
+
+    #[test]
+    fn delete_404_is_not_a_miss() {
+        // The server never answers DELETE with 404, so it is an error, not `Ok(false)`.
+        assert!(!delete_succeeded(404));
+        for status in [201, 400, 401, 403, 429, 500, 503] {
+            assert!(!delete_succeeded(status), "{status}");
+        }
+    }
+}
+
+// ── ttl_header unit tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod ttl_header_tests {
+    use std::time::Duration;
+
+    use super::{ttl_header, ttl_wire_secs};
+
+    #[test]
+    fn ttl_header_is_the_canonical_name_in_whole_seconds() {
+        assert_eq!(
+            ttl_header(Duration::from_millis(60_900)),
+            ("X-CacheKit-TTL", "60".to_owned())
+        );
+    }
+
+    #[test]
+    fn ttl_header_sends_a_sub_second_ttl_as_one() {
+        assert_eq!(
+            ttl_header(Duration::from_millis(500)),
+            ("X-CacheKit-TTL", "1".to_owned())
+        );
+    }
+
+    #[test]
+    fn wire_secs_ceil_sub_second_and_truncate_the_rest() {
+        assert_eq!(ttl_wire_secs(Duration::from_millis(500)), 1);
+        assert_eq!(ttl_wire_secs(Duration::from_nanos(1)), 1);
+        assert_eq!(ttl_wire_secs(Duration::from_secs(60)), 60);
+        assert_eq!(ttl_wire_secs(Duration::from_millis(60_900)), 60);
+    }
+
+    #[test]
+    fn wire_secs_keep_zero_as_zero() {
+        assert_eq!(ttl_wire_secs(Duration::ZERO), 0);
+    }
+}
+
+// ── In-memory backend for crate-internal tests ───────────────────────────────
+
+/// In-memory [`Backend`] for crate-internal tests that must see the bytes
+/// that actually reached the backend. Clones share one store.
+#[cfg(test)]
+#[allow(dead_code)] // its tests are feature-gated; builds without them still compile it
+#[derive(Clone, Default)]
+pub(crate) struct MemoryBackend {
+    pub(crate) store: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+#[cfg(test)]
+#[cfg_attr(not(any(target_arch = "wasm32", feature = "unsync")), async_trait)]
+#[cfg_attr(any(target_arch = "wasm32", feature = "unsync"), async_trait(?Send))]
+impl Backend for MemoryBackend {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        Ok(self.store.lock().await.get(key).cloned())
+    }
+
+    async fn set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        self.store.lock().await.insert(key.to_owned(), value);
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> Result<bool, BackendError> {
+        Ok(self.store.lock().await.remove(key).is_some())
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, BackendError> {
+        Ok(self.store.lock().await.contains_key(key))
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Ok(HealthStatus {
+            is_healthy: true,
+            latency_ms: 0.0,
+            backend_type: "memory".to_owned(),
+            details: HashMap::new(),
+        })
     }
 }

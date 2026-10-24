@@ -5,33 +5,40 @@
 //! vector's bytes — plus the depth-bound boundary.
 //!
 //! Vectors: `tests/vectors/decode-bounds.json`, vendored verbatim from
-//! `cachekit-io/protocol` `test-vectors/decode-bounds.json` v1.1.0
-//! (sha256 `907b025d2b270a0f60abd9296a8a1c864e69057c553ac7a70206b44256558916`).
+//! `cachekit-io/protocol` `test-vectors/decode-bounds.json` v1.2.0
+//! (sha256 `c52c27f724fe138e63440dc0306936b48fe389e2bd823c058b86b30d854e2e2e`).
 //! Do not edit the JSON here; regenerate upstream and re-vendor.
 //!
 //! Every reject vector must fail with the structural guard's own error
-//! (`decode bound:` from `serializer::check_structure`), not merely fail: a
+//! (`decode bound:` from the structural walk), not merely fail: a
 //! stock decoder rejects the same bytes mid-decode, after it has materialised
 //! part of the document, so "it errored" cannot tell a guarded reader from an
-//! unguarded one. The client reads sit below the `#[cachekit]` macro's
-//! conversion of a `Serialization` error into a cache miss, so they still see
-//! the error itself. Why 100 and not rmp-serde's 1024, and why a header walk is
+//! unguarded one. The harness does not switch on `reject_reasons`: a vector
+//! tagged `depth`, `overclaim` or `incomplete` must fail in the guard alike,
+//! so a reason added upstream needs no new arm here. The client reads sit
+//! below the `#[cachekit]` macro's conversion of a `Serialization` error into
+//! a cache miss, so they still see the error itself. Why 100 and not
+//! rmp-serde's 1024, and why a header walk is
 //! needed at all: see the rustdoc on `serializer::MAX_DECODE_DEPTH` and
-//! `check_structure`. This file fails if a dependency bump (or a new decode
+//! `bounded_deserializer`. This file fails if a dependency bump (or a new decode
 //! path bypassing `bounded_deserializer`) re-opens either bound.
 
 mod common;
 
 use cachekit::interop;
 use cachekit::serializer::{self, MAX_DECODE_DEPTH};
-use cachekit::{CacheKit, CachekitError, SwrRead};
+use cachekit::CachekitError;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::Value as Json;
 
-use crate::common::MockBackend;
+use crate::common::{decode_both, read_every_path};
 
 const VECTORS_JSON: &str = include_str!("vectors/decode-bounds.json");
+
+/// sha256 of the vendored file, pinned so a local edit cannot drift from the
+/// protocol copy unnoticed.
+const VECTORS_SHA256: &str = "c52c27f724fe138e63440dc0306936b48fe389e2bd823c058b86b30d854e2e2e"; // pragma: allowlist secret
 
 fn vectors() -> Json {
     serde_json::from_str(VECTORS_JSON).expect("vendored vector file must be valid JSON")
@@ -44,66 +51,8 @@ fn unhex(s: &str) -> Vec<u8> {
         .collect()
 }
 
-type Read = (&'static str, Result<Json, CachekitError>);
-
-/// Both untrusted decode entry points: auto-mode `get` and interop `interop_get`.
-fn decode_both(bytes: &[u8]) -> [Read; 2] {
-    [
-        (
-            "serializer::deserialize",
-            serializer::deserialize::<Json>(bytes),
-        ),
-        ("interop::deserialize", interop::deserialize::<Json>(bytes)),
-    ]
-}
-
-/// Every untrusted read path for `bytes`: both decoders directly, then every
-/// client read of a backend entry holding exactly `bytes`. `get`
-/// stores plain MessagePack (no envelope), so the forged entry is the vector
-/// itself. L1 is off so each read reaches the backend and its decoder.
-fn read_every_path(bytes: &[u8]) -> Vec<Read> {
-    const KEY: &str = "decode:bounds:forged";
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let (backend, handle) = MockBackend::new_with_handle();
-    let client = CacheKit::builder()
-        .backend(backend)
-        .no_l1()
-        .build()
-        .expect("client builds");
-    let found = |r: Result<Option<Json>, CachekitError>| {
-        r.map(|v| v.expect("the forged entry must be found, not missed"))
-    };
-    let mut reads = Vec::from(decode_both(bytes));
-    runtime.block_on(async {
-        handle
-            .store
-            .lock()
-            .await
-            .insert(KEY.to_owned(), bytes.to_vec());
-        reads.push(("CacheKit::get", found(client.get::<Json>(KEY).await)));
-        reads.push((
-            "CacheKit::interop_get",
-            found(client.interop_get::<Json>(KEY).await),
-        ));
-        reads.push((
-            "CacheKit::interop_get_swr",
-            client
-                .interop_get_swr::<Json>(KEY)
-                .await
-                .map(|read| match read {
-                    SwrRead::Fresh(v) => v,
-                    _ => panic!("with L1 off the forged entry must be a fresh hit"),
-                }),
-        ));
-    });
-    reads
-}
-
 /// The guard's rejection, and nothing else: a `Serialization` error whose
-/// message comes from `check_structure`.
+/// message comes from the structural walk.
 fn assert_guard_rejected(what: &str, path: &str, result: Result<Json, CachekitError>) {
     let e = result
         .err()
@@ -161,10 +110,21 @@ fn nested_fixarray_empty_leaf(depth: usize) -> Vec<u8> {
 #[test]
 fn vector_file_shape_is_the_vendored_one() {
     let v = vectors();
-    assert_eq!(v["version"], "1.1.0");
-    assert_eq!(v["reject_vectors"].as_array().map(Vec::len), Some(17));
+    assert_eq!(v["version"], "1.2.0");
+    assert_eq!(v["reject_vectors"].as_array().map(Vec::len), Some(19));
     assert_eq!(v["accept_vectors"].as_array().map(Vec::len), Some(3));
     assert_eq!(v["spec"], "spec/interop-mode.md#decode-bounds");
+}
+
+#[test]
+fn vendored_fixture_matches_the_pinned_sha256() {
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        hex::encode(Sha256::digest(VECTORS_JSON.as_bytes())),
+        VECTORS_SHA256,
+        "tests/vectors/decode-bounds.json differs from the pinned protocol copy: \
+         re-vendor it from protocol and update VECTORS_SHA256"
+    );
 }
 
 #[test]
@@ -315,7 +275,7 @@ fn closed_collections_release_their_depth() {
 
 /// A recursive `Vec`-bearing target. `#[serde(untagged)]` decodes through serde's
 /// `Content` buffer, which pre-allocates from `size_hint` like `Vec<T>` (1 MiB per
-/// level; see `check_structure`), so WITHOUT the structural walk 50 nested
+/// level; see `bounded_deserializer`), so WITHOUT the structural walk 50 nested
 /// `array32(0xFFFFFFFF)` headers (250 bytes) request 50 MiB before EOF.
 /// `serde_json::Value` happens to allocate nothing here, which is why the vector
 /// tests alone cannot catch a walk regression — this one can.

@@ -161,7 +161,7 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
         ReturnType::Default => {
             return Err(syn::Error::new_spanned(
                 ret,
-                "#[cachekit] function must return Result<T, CachekitError>",
+                "#[cachekit] function must return Result<T, E> where E: From<CachekitError>",
             ));
         }
     };
@@ -172,7 +172,7 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
             if seg.ident != "Result" {
                 return Err(syn::Error::new_spanned(
                     ty,
-                    "#[cachekit] function must return Result<T, CachekitError>",
+                    "#[cachekit] function must return Result<T, E> where E: From<CachekitError>",
                 ));
             }
             if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
@@ -185,7 +185,7 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 
     Err(syn::Error::new_spanned(
         ty,
-        "#[cachekit] function must return Result<T, CachekitError>",
+        "#[cachekit] function must return Result<T, E> where E: From<CachekitError>",
     ))
 }
 
@@ -210,10 +210,21 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   error — the CachekitIO server parses those key prefixes); operations are
 ///   unaffected. Neither segment may contain `..` (a compile error — the
 ///   server rejects `..` anywhere in a key); a lone `.` is fine.
-/// - `secure` (optional flag): Use encrypted cache via `cache.secure_cache()`.
+/// - `secure` (optional flag): require encryption — every call fails with
+///   `CachekitError::Config` on a client without it — and fail closed on
+///   every backend error (see *Reliability behaviour*). The flag is not what
+///   encrypts: on a client with encryption configured, a function without it
+///   stores and reads ciphertext too, because the client's value methods
+///   encrypt.
 ///
 /// # Requirements
 ///
+/// - The function must return `Result<T, E>` where `E: From<CachekitError>`
+///   — `CachekitError` itself, or the application's own error type. The
+///   body's errors reach the caller unchanged and are never cached;
+///   cache-layer errors that propagate (see *Reliability behaviour*) arrive
+///   converted through `From`. The error type is taken from the return type
+///   as written, so a one-argument alias such as `anyhow::Result<T>` works.
 /// - Every non-client argument must be a plain identifier (no destructuring
 ///   patterns, no `self`) and must convert into
 ///   `cachekit::interop::InteropValue` via `From` (`bool`, `i32`/`i64`/
@@ -229,13 +240,14 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   namespaced client.
 /// - A stored entry that cannot be decoded as the return type
 ///   (`CachekitError::Serialization`) is treated as a miss and overwritten
-///   (self-healing). On `secure` functions this covers only post-decrypt
-///   decode failures: an entry that fails AES-GCM authentication raises
-///   `CachekitError::Encryption`, which propagates (fail-closed). The failed
-///   read drops the key's L1 copy and leaves the backend entry in place, so
-///   the next call reads the backend again: it fails while that entry
-///   remains, succeeds once any process replaces it with ciphertext this
-///   client can decrypt, and is a miss once it expires or is deleted.
+///   (self-healing). On a client with encryption configured, `secure` or
+///   not, this covers only post-decrypt decode failures: an entry that fails
+///   AES-GCM authentication raises `CachekitError::Encryption`, which
+///   propagates (fail-closed). The failed read drops the key's L1 copy and
+///   leaves the backend entry in place, so the next call reads the backend
+///   again: it fails while that entry remains, succeeds once any process
+///   replaces it with ciphertext this client can decrypt, and is a miss once
+///   it expires or is deleted.
 ///
 /// # Requirements (continued)
 ///
@@ -252,15 +264,20 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   merely-stale entry — while one background task re-executes the function.
 ///   Its version-checked commit rewrites both layers only if no newer set or
 ///   delete replaced the stale entry; a successful commit renews the L1 hard
-///   expiry with the full write-path TTL. Refresh dedup rides
-///   [`CacheKit::single_flight`]: N concurrent stale readers trigger exactly
-///   one re-execution per process (and, on lock-capable backends, per
-///   fleet). Hard-expired entries always take the normal blocking miss path.
+///   expiry with the full write-path TTL. Refresh dedup takes the
+///   `CacheKit::single_flight` locks without waiting on them: N concurrent
+///   stale readers trigger at most one re-execution per process (and, on
+///   lock-capable backends, per fleet), and none while the lock call fails,
+///   in which case the stale value serves until hard expiry. Hard-expired
+///   entries always take the normal blocking miss path.
 ///   The refresh task needs a tokio runtime (skipped otherwise — the stale
 ///   value was already served) and captures arguments by owned copy
 ///   (`Clone`/`ToOwned` — already required for key derivation); the future
-///   must be `Send`. Refresh failures are absorbed: the stale value keeps
-///   serving until hard expiry, where the blocking path surfaces errors.
+///   must be `Send`, so `T` and anything the body holds across an `.await`
+///   must be too. `E` need not be: the refresh drops the body's error before
+///   it awaits again, so `Box<dyn Error>` works. Refresh failures are
+///   absorbed: the stale value keeps serving until hard expiry, where the
+///   blocking path surfaces errors.
 /// - **Graceful degradation**: on an outage-class backend failure —
 ///   transient, timeout, an open circuit breaker, or a backpressure shed —
 ///   the plain path fails *open*: the function executes uncached and its
@@ -269,7 +286,9 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   (a wrong API key must fail loudly, not silently disable caching
 ///   forever). With `secure`, *every* backend and decryption error fails
 ///   *closed* and propagates: an encrypted workload never silently
-///   degrades.
+///   degrades. Without the flag, a client with encryption configured still
+///   propagates decryption errors and still encrypts what it writes; only
+///   the outage-class backend errors above fail open.
 /// - **Cold-miss single-flight**: concurrent calls that miss on the same
 ///   key are collapsed to one execution per process (and per fleet, when
 ///   the backend supports distributed fill locks — CachekitIO and Redis do,
@@ -379,16 +398,16 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             },
             quote! {
                 let __ck_sec = #client_ident.secure_cache()?;
-                let _ = __ck_sec.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await;
+                __ck_sec.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await
             },
             quote! {
                 let __ck_sec = #client_ident.secure_cache()?;
-                let _ = __ck_sec.__complete_swr_refresh(
+                __ck_sec.__complete_swr_refresh(
                     &__ck_key,
                     __ck_val,
                     std::time::Duration::from_secs(#ttl_secs),
                     __ck_swr_token,
-                ).await;
+                ).await
             },
         )
     } else {
@@ -396,15 +415,15 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             quote! { #client_ident.interop_get::<#ok_type>(&__ck_key).await },
             quote! { #client_ident.interop_get_swr::<#ok_type>(&__ck_key).await },
             quote! {
-                let _ = #client_ident.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await;
+                #client_ident.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await
             },
             quote! {
-                let _ = #client_ident.__complete_swr_refresh(
+                #client_ident.__complete_swr_refresh(
                     &__ck_key,
                     __ck_val,
                     std::time::Duration::from_secs(#ttl_secs),
                     __ck_swr_token,
-                ).await;
+                ).await
             },
         )
     };
@@ -493,7 +512,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
         ReturnType::Default => {
             return Err(syn::Error::new_spanned(
                 &func.sig,
-                "#[cachekit] function must return Result<T, CachekitError>",
+                "#[cachekit] function must return Result<T, E> where E: From<CachekitError>",
             ));
         }
     };
@@ -525,11 +544,15 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                 Ok(cachekit::SwrRead::Fresh(__ck_cached)) => return Ok(__ck_cached),
                 // Stale (past the freshness threshold, before hard expiry):
                 // serve the cached value immediately and schedule ONE
-                // background refresh. Dedup rides the same single-flight as
-                // the cold-miss path: the first refresh task leads and
-                // re-executes the function; concurrent tasks queue, see the
-                // (still-present) entry, and exit without computing. Refresh
-                // failures are deliberately absorbed — the stale value keeps
+                // background refresh. Dedup takes the same locks as the
+                // cold-miss single-flight but never waits on them: the first
+                // refresh task leads and re-executes the function; a task
+                // that finds the in-process flight held, the distributed
+                // fill lock contested, or the lock call failing, exits at
+                // once without polling or
+                // re-reading (no wait, no billed miss). Refresh
+                // failures are deliberately absorbed (a failed commit is
+                // traced, kind and key hash only) — the stale value keeps
                 // being served, a later stale read retries, and hard expiry
                 // falls through to the blocking path where errors surface.
                 // Completion is version-checked, so a newer explicit set or
@@ -543,24 +566,29 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                         let __ck_key = __ck_swr_key;
                         #swr_rebinds
                         let _: ::std::result::Result<(), cachekit::error::CachekitError> = async {
-                            let mut __ck_flight = #client_ident.single_flight(&__ck_key).await;
-                            while __ck_flight.wait_for_fill().await {
-                                if matches!(#get_expr, Ok(Some(_))) {
-                                    // Another worker is already on it (the
-                                    // stale entry is still present, or the
-                                    // leader has refreshed) — stand down.
-                                    __ck_flight.release().await;
-                                    return Ok(());
+                            let Some(__ck_flight) = #client_ident.__refresh_flight(&__ck_key).await else {
+                                // Another worker is already filling this key.
+                                return Ok(());
+                            };
+                            let __ck_result: #ret_ty = (async #original_body).await;
+                            // Drop the body's error here, before the next
+                            // await: holding it across one would demand
+                            // `E: Send` of the spawned refresh, and
+                            // `Box<dyn Error>` is not.
+                            let __ck_ok = __ck_result.ok();
+                            if let Some(ref __ck_val) = __ck_ok {
+                                // Commit only if no newer set/delete replaced
+                                // the stale entry while the origin ran. A lost
+                                // version check is `Ok(false)`, not a failure;
+                                // a failed commit is traced like a failed fill
+                                // store.
+                                let __ck_commit = { #complete_refresh_expr };
+                                if let Err(ref __ck_err) = __ck_commit {
+                                    cachekit::metrics::__trace_store_error(&__ck_key, __ck_err);
                                 }
                             }
-                            let __ck_result: #ret_ty = (async #original_body).await;
-                            if let Ok(ref __ck_val) = __ck_result {
-                                // Commit only if no newer set/delete replaced
-                                // the stale entry while the origin ran.
-                                #complete_refresh_expr
-                            }
                             __ck_flight.release().await;
-                            __ck_result.map(|_| ())
+                            Ok(())
                         }
                         .await;
                     });
@@ -574,10 +602,14 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
 
             // Cold-miss single-flight: collapse concurrent fills of this key
             // to one execution (misses are billable). While another worker is
-            // filling, re-check the cache instead of recomputing.
+            // filling, re-check the cache instead of recomputing. A re-check
+            // still running at a contested flight's deadline counts as a miss.
             let mut __ck_flight = #client_ident.single_flight(&__ck_key).await;
             while __ck_flight.wait_for_fill().await {
-                match #get_expr {
+                let Some(__ck_read) = __ck_flight.__bounded_poll(async { #get_expr }).await else {
+                    continue;
+                };
+                match __ck_read {
                     Ok(Some(__ck_cached)) => {
                         __ck_flight.release().await;
                         return Ok(__ck_cached);
@@ -595,12 +627,26 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             // Execute original function body
             let __ck_result: #ret_ty = (async #original_body).await;
 
-            // Cache on success
-            if let Ok(ref __ck_val) = __ck_result {
-                #set_expr
+            // Cache on success. A failed store still returns the result, so
+            // it is traced (kind and key hash only). A stored fill releases
+            // the distributed lock without waiting for the unlock; after an
+            // error or a failed store a re-call would miss again, so the
+            // unlock stays inline and that re-call never contests this
+            // call's own lock.
+            let __ck_stored = if let Ok(ref __ck_val) = __ck_result {
+                let __ck_store = { #set_expr };
+                if let Err(ref __ck_err) = __ck_store {
+                    cachekit::metrics::__trace_store_error(&__ck_key, __ck_err);
+                }
+                __ck_store.is_ok()
+            } else {
+                false
+            };
+            if __ck_stored {
+                __ck_flight.__release_detached().await;
+            } else {
+                __ck_flight.release().await;
             }
-
-            __ck_flight.release().await;
             __ck_result
         }
     };

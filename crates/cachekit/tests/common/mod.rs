@@ -12,6 +12,9 @@ use zeroize::Zeroizing;
 use cachekit::backend::{Backend, HealthStatus};
 use cachekit::client::SharedBackend;
 use cachekit::error::BackendError;
+use cachekit::{interop, serializer, CacheKit, CachekitError, SwrRead};
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
 
 /// In-memory mock backend backed by a `Mutex<HashMap>` for use in tests.
 ///
@@ -86,6 +89,133 @@ impl Backend for MockBackend {
         })
     }
 }
+
+/// One untrusted read: the path's name and what it decoded.
+pub type Read<T> = (&'static str, Result<T, CachekitError>);
+
+/// Both untrusted decode entry points: auto-mode `get` and interop `interop_get`.
+pub fn decode_both<T: DeserializeOwned>(bytes: &[u8]) -> [Read<T>; 2] {
+    [
+        (
+            "serializer::deserialize",
+            serializer::deserialize::<T>(bytes),
+        ),
+        ("interop::deserialize", interop::deserialize::<T>(bytes)),
+    ]
+}
+
+/// A current-thread runtime for driving a client from a sync test.
+pub fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+}
+
+/// Every interop read of `key`: `interop_get` and `interop_get_swr`, with the
+/// SWR read flattened to the value or a miss. The client must have L1 off.
+pub async fn interop_reads<T: DeserializeOwned>(
+    client: &CacheKit,
+    key: &str,
+) -> [Read<Option<T>>; 2] {
+    [
+        ("CacheKit::interop_get", client.interop_get::<T>(key).await),
+        (
+            "CacheKit::interop_get_swr",
+            client
+                .interop_get_swr::<T>(key)
+                .await
+                .map(|read| match read {
+                    SwrRead::Fresh(v) => Some(v),
+                    SwrRead::Miss => None,
+                    SwrRead::Stale(..) => panic!("with L1 off no read is stale"),
+                }),
+        ),
+    ]
+}
+
+/// Every client read of `key`: `get`, then [`interop_reads`]. The client must
+/// have L1 off.
+pub async fn every_read<T: DeserializeOwned>(client: &CacheKit, key: &str) -> Vec<Read<Option<T>>> {
+    let mut reads = vec![("CacheKit::get", client.get::<T>(key).await)];
+    reads.extend(interop_reads::<T>(client, key).await);
+    reads
+}
+
+/// The value inside the ByteStorage envelope of python-frame.json's default
+/// write payload (`default_saas_write_msgpack_bytestorage_bin`), which
+/// encryption.json's `container_envelope_to_plain_reader` also seals.
+#[derive(Debug, Deserialize)]
+pub struct EnvelopedValue {
+    user_id: u64,
+    name: String,
+    active: bool,
+}
+
+/// Every read path of a client without encryption for `bytes`: both decoders
+/// directly, then every client read of a backend entry holding exactly `bytes`.
+/// This SDK writes plain MessagePack (no envelope), so the forged entry is the
+/// input itself. L1 is off so each read reaches the backend and its decoder.
+pub fn read_every_path<T: DeserializeOwned>(bytes: &[u8]) -> Vec<Read<T>> {
+    const KEY: &str = "forged:entry";
+    let runtime = runtime();
+    let (backend, handle) = MockBackend::new_with_handle();
+    let client = CacheKit::builder()
+        .backend(backend)
+        .no_l1()
+        .build()
+        .expect("client builds");
+    let found = |r: Result<Option<T>, CachekitError>| {
+        r.map(|v| v.expect("the forged entry must be found, not missed"))
+    };
+    let mut reads = Vec::from(decode_both::<T>(bytes));
+    runtime.block_on(async {
+        handle
+            .store
+            .lock()
+            .await
+            .insert(KEY.to_owned(), bytes.to_vec());
+        for (path, result) in every_read::<T>(&client, KEY).await {
+            reads.push((path, found(result)));
+        }
+    });
+    reads
+}
+
+/// An encrypting client, L1 off so every read reaches the backend, holding
+/// `bytes` at the backend key `stored_key`.
+#[cfg(feature = "encryption")]
+pub fn encrypting_client_holding(
+    master_key_hex: &str,
+    tenant_id: &str,
+    namespace: Option<&str>,
+    stored_key: &str,
+    bytes: Vec<u8>,
+) -> CacheKit {
+    let (backend, handle) = MockBackend::new_with_handle();
+    let mut builder = CacheKit::builder()
+        .backend(backend)
+        .no_l1()
+        .encryption(master_key_hex, tenant_id)
+        .expect("master key and tenant");
+    if let Some(ns) = namespace {
+        builder = builder.namespace(ns);
+    }
+    handle
+        .store
+        .try_lock()
+        .expect("fresh store")
+        .insert(stored_key.to_owned(), bytes);
+    builder.build().expect("client builds")
+}
+
+/// The one error an AES-GCM tag mismatch reaches a reader as.
+pub const AUTH_FAILURE: &str = "decrypt failed: Authentication verification failed";
+
+/// The error a stored ciphertext shorter than a nonce and a tag (12 + 16
+/// bytes) reaches a reader as: it is refused before AES-GCM runs.
+pub const SHORT_CIPHERTEXT: &str =
+    "decrypt failed: Invalid ciphertext format: Ciphertext too short";
 
 /// RAII guard for `#[serial]` env tests: records each variable's pre-test
 /// value and restores it on drop — including on assertion failure — so a

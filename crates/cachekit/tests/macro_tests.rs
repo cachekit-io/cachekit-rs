@@ -475,6 +475,54 @@ async fn macro_secure_evicts_l1_after_decrypt_failure() {
     assert_eq!(POISONED_RUNS.load(SeqCst), 1);
 }
 
+#[cfg(feature = "encryption")]
+static PLAIN_ENCRYPTED_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(feature = "encryption")]
+#[cachekit(client = cache, ttl = 60, interop = "plain_on_encrypted", namespace = "reliab")]
+async fn plain_on_encrypted(cache: &CacheKit, id: u64) -> Result<User, CachekitError> {
+    PLAIN_ENCRYPTED_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(User {
+        name: format!("user {id}"),
+    })
+}
+
+/// A plain (non-`secure`) function on a client with encryption configured
+/// fills with ciphertext and reads it back: the macro calls the client's value
+/// methods, and on such a client those encrypt.
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn macro_plain_fill_on_encrypted_client_stores_ciphertext() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let (shared, backend) = common::MockBackend::new_with_handle();
+    let cache = CacheKit::builder()
+        .backend(shared)
+        .no_l1()
+        .encryption_from_bytes(&[7u8; 32], "default")
+        .expect("encryption configures")
+        .build()
+        .expect("client builds");
+    let key = interop_key("reliab", "plain_on_encrypted", &[InteropValue::from(3u64)]).unwrap();
+
+    let user = plain_on_encrypted(&cache, 3).await.unwrap();
+    let stored = backend
+        .store
+        .lock()
+        .await
+        .get(&key)
+        .cloned()
+        .expect("the fill reached the backend");
+    let decrypted = cachekit::EncryptionLayer::new(&[7u8; 32], "default")
+        .unwrap()
+        .decrypt(&stored, &key)
+        .expect("the fill is ciphertext under the client's key");
+    assert_eq!(decrypted, cachekit::serializer::serialize(&user).unwrap());
+
+    assert_eq!(plain_on_encrypted(&cache, 3).await.unwrap(), user);
+    assert_eq!(PLAIN_ENCRYPTED_RUNS.load(SeqCst), 1, "second call is a hit");
+}
+
 static SLOW_OP_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[cachekit(client = cache, ttl = 60, interop = "slow_op", namespace = "flight")]
@@ -802,4 +850,131 @@ async fn macro_fails_open_when_backpressure_sheds() {
     );
 
     holder.abort();
+}
+
+// ── Custom error types ───────────────────────────────────────────────────────
+//
+// A decorated function may return its own error type: any `E` with
+// `From<CachekitError>` works, so the body can fail with a domain error that
+// `CachekitError` has no variant for. Every cache-layer error reaches the
+// caller converted through `From`.
+
+/// An application error the body returns directly, plus the cache layer's.
+#[derive(Debug)]
+enum AppError {
+    Cache(CachekitError),
+    NotFound(u64),
+}
+
+impl From<CachekitError> for AppError {
+    fn from(e: CachekitError) -> Self {
+        Self::Cache(e)
+    }
+}
+
+static APP_ERROR_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cachekit(client = cache, ttl = 60, interop = "app_error_op", namespace = "apperr")]
+async fn app_error_op(cache: &CacheKit, id: u64) -> Result<User, AppError> {
+    APP_ERROR_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if id == 0 {
+        return Err(AppError::NotFound(id));
+    }
+    Ok(User {
+        name: format!("app {id}"),
+    })
+}
+
+#[tokio::test]
+async fn macro_supports_a_custom_error_type() {
+    let (cache, backend) = mock_client_counting();
+
+    // Miss: the body runs and its value is stored.
+    let user = app_error_op(&cache, 9).await.expect("miss runs the body");
+    assert_eq!(user.name, "app 9");
+    assert_eq!(backend.sets(), 1);
+
+    // Hit: served from the cache, the body does not run again.
+    assert_eq!(app_error_op(&cache, 9).await.expect("hit"), user);
+    assert_eq!(backend.sets(), 1, "a hit does not write");
+    assert_eq!(
+        APP_ERROR_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a hit does not run the body"
+    );
+
+    // The body's own error reaches the caller as-is and is not cached.
+    let err = app_error_op(&cache, 0).await.expect_err("origin error");
+    assert!(matches!(err, AppError::NotFound(0)), "got: {err:?}");
+    assert_eq!(backend.sets(), 1, "an error is not cached");
+
+    // A cache-layer error that propagates arrives converted through `From`.
+    let down = CacheKit::builder()
+        .backend(AuthFailBackend::shared())
+        .no_l1()
+        .build()
+        .expect("client builds");
+    let err = app_error_op(&down, 9)
+        .await
+        .expect_err("auth error propagates");
+    assert!(
+        matches!(err, AppError::Cache(CachekitError::Backend(_))),
+        "got: {err:?}"
+    );
+}
+
+/// The error type is taken from the return type as written, so a
+/// one-argument `Result` alias (the `anyhow::Result<T>` shape) works too.
+mod result_alias {
+    use super::{cachekit, AppError, CacheKit, User};
+
+    type Result<T> = std::result::Result<T, AppError>;
+
+    #[cachekit(client = cache, ttl = 60, interop = "alias_op", namespace = "apperr")]
+    pub(super) async fn alias_op(cache: &CacheKit, id: u64) -> Result<User> {
+        Ok(User {
+            name: format!("alias {id}"),
+        })
+    }
+}
+
+#[tokio::test]
+async fn macro_supports_a_single_argument_result_alias() {
+    let (cache, backend) = mock_client_counting();
+
+    let user = result_alias::alias_op(&cache, 4).await.expect("miss");
+    assert_eq!(user.name, "alias 4");
+    assert_eq!(result_alias::alias_op(&cache, 4).await.expect("hit"), user);
+    assert_eq!(backend.sets(), 1, "the second call is a hit");
+}
+
+#[cfg(feature = "encryption")]
+#[cachekit(
+    client = cache,
+    ttl = 60,
+    interop = "secure_app_error_op",
+    namespace = "apperr",
+    secure
+)]
+async fn secure_app_error_op(cache: &CacheKit, id: u64) -> Result<User, AppError> {
+    Ok(User {
+        name: format!("secret app {id}"),
+    })
+}
+
+/// The `secure` path converts its cache-layer errors through `From` too: on
+/// a client without encryption every call fails with `CachekitError::Config`,
+/// delivered here as `AppError::Cache`.
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn macro_secure_path_converts_cache_errors_into_a_custom_error() {
+    let (cache, _) = mock_client_counting();
+
+    let err = secure_app_error_op(&cache, 1)
+        .await
+        .expect_err("secure requires encryption");
+    assert!(
+        matches!(err, AppError::Cache(CachekitError::Config(_))),
+        "got: {err:?}"
+    );
 }

@@ -12,10 +12,32 @@
 //!   `LockableBackend` — CachekitIO and Redis do): the leader additionally
 //!   takes a distributed fill lock. If another process already holds it,
 //!   this process polls the cache for the other side's fill instead of
-//!   recomputing, and computes anyway once the poll budget is exhausted
-//!   (fail-open — a stampede beats unavailability).
+//!   recomputing, and computes anyway once the lock timeout, measured from
+//!   its own lock attempt, has passed: by then the other side's lock has
+//!   expired (fail-open — a stampede beats unavailability).
+//!
+//! Once a leader's fill is stored, the `#[cachekit]` macro sends its unlock
+//! from a task spawned on the ambient tokio runtime and returns without
+//! waiting for it. That needs `l1` and a tokio runtime, and never happens
+//! under `unsync`; there, and whenever the fill was not stored, the caller
+//! awaits the unlock. If the backend has not answered the spawned unlock by
+//! the next lock attempt on that key from this client or its clones (still
+//! in flight, or its runtime idle or dropped), that attempt sends the unlock
+//! itself first, so a re-miss does not contest its own lock unless that
+//! unlock fails too. If the runtime is dropped or left idle right after the
+//! call, the unlock waits for that next attempt, and until then the lease
+//! stays held server-side for up to its 5 s timeout: another process that
+//! misses the key inside that window polls for it, as it would behind any
+//! slow leader.
 //!
 //! The `#[cachekit]` macro wires this in automatically around its miss path.
+//! Its stale-while-revalidate refresh takes the same locks but never waits
+//! for another worker's fill: if another worker holds either one, or the lock
+//! call fails, the refresh stands down without polling or re-reading the
+//! cache, and the stale copy keeps being served. A cold miss queued behind a
+//! holder that found the distributed lock contested and let go without a
+//! fill (a refresh that stood down, a cancelled or failed poll) contests that
+//! lock itself before computing, since another process may be filling.
 //! Manual usage follows the same shape:
 //!
 //! ```no_run
@@ -40,6 +62,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
+#[cfg(all(
+    feature = "reliability",
+    feature = "l1",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
+use std::sync::atomic::AtomicBool;
 #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -64,33 +93,245 @@ const FILL_LOCK_TIMEOUT_MS: u64 = 5_000;
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
 const FILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Poll budget: 50 × 100 ms ≈ the fill lock timeout.
-#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-const FILL_POLL_BUDGET: u32 = 50;
-
 // ── FlightMap ────────────────────────────────────────────────────────────────
 
 /// Per-key async mutexes for in-process fill dedup. Weak entries let finished
 /// flights drop their state without an explicit removal protocol.
+///
+/// Each mutex guards a stand-down note: `true` when the last holder to try
+/// the distributed lock found it contested, so it may have filled nothing (a
+/// refresh stands down; a cold miss polls and may be cancelled or fail), and
+/// a queued cold miss whose re-check misses must contest that lock before
+/// computing. A holder that leads clears the note: on acquire, or when its
+/// own lease contest makes it a leader. A follower leaves it as it found it,
+/// whether it finds a fill, errors out or is dropped, so the next follower
+/// still sees it. A stale `true` costs at most one lock call, by a follower
+/// that was about to compute anyway.
 #[derive(Default)]
 pub(crate) struct FlightMap {
-    entries: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    entries: Mutex<Entries>,
+}
+
+#[derive(Default)]
+struct Entries {
+    slots: HashMap<String, Slot>,
+    /// Sweep dead slots once the map grows past this: twice what the last
+    /// sweep left, so a large live set does not make every miss O(n).
+    sweep_above: usize,
+    /// When the last sweep ran. A sweep during a cold-key burst counts the
+    /// burst's flights as survivors, so the doubling alone would keep their
+    /// dead slots until the map doubles again; a sweep older than one lease
+    /// timeout, when every pin it saw has expired, is redone on the next miss.
+    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+    swept_at: Option<tokio::time::Instant>,
+}
+
+impl Entries {
+    fn sweep_due(&self) -> bool {
+        let len = self.slots.len();
+        if len <= SWEEP_THRESHOLD {
+            return false;
+        }
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        if self
+            .swept_at
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(FILL_LOCK_TIMEOUT_MS))
+        {
+            return true;
+        }
+        len > self.sweep_above
+    }
+
+    fn sweep(&mut self) {
+        self.slots.retain(|_, slot| {
+            #[cfg(all(
+                feature = "reliability",
+                feature = "l1",
+                not(feature = "unsync"),
+                not(target_arch = "wasm32")
+            ))]
+            slot.expire_pin();
+            slot.entry.strong_count() > 0
+        });
+        self.sweep_above = 2 * self.slots.len();
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        {
+            self.swept_at = Some(tokio::time::Instant::now());
+        }
+    }
+}
+
+struct Slot {
+    entry: Weak<tokio::sync::Mutex<KeyState>>,
+    /// Keeps the entry, and with it a pending unlock, alive after a leader
+    /// detached its unlock, so a re-miss finds the unlock even when its task
+    /// was cancelled with its runtime: until the backend answers the unlock
+    /// or, failing that, at least one lease timeout. An expired pin goes at
+    /// the next sweep.
+    #[cfg(all(
+        feature = "reliability",
+        feature = "l1",
+        not(feature = "unsync"),
+        not(target_arch = "wasm32")
+    ))]
+    pin: Option<Pin>,
+}
+
+#[cfg(all(
+    feature = "reliability",
+    feature = "l1",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
+struct Pin {
+    until: tokio::time::Instant,
+    /// The pending unlock this pin is for (see [`PendingRelease::answered`]).
+    answered: Arc<AtomicBool>,
+    _entry: Arc<tokio::sync::Mutex<KeyState>>,
+}
+
+#[cfg(all(
+    feature = "reliability",
+    feature = "l1",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
+impl Slot {
+    fn expire_pin(&mut self) {
+        if self
+            .pin
+            .as_ref()
+            .is_some_and(|pin| pin.until <= tokio::time::Instant::now())
+        {
+            self.pin = None;
+        }
+    }
+}
+
+/// What the per-key mutex in [`FlightMap`] guards.
+#[derive(Default)]
+struct KeyState {
+    /// The stand-down note (see [`FlightMap`]).
+    stand_down: bool,
+    /// An unlock spawned by a leader that stored its fill and returned
+    /// without waiting for it ([`SingleFlight::__release_detached`]).
+    // `l1` stands in for tokio's `rt` feature (spawn), which `reliability`
+    // alone does not enable.
+    #[cfg(all(
+        feature = "reliability",
+        feature = "l1",
+        not(feature = "unsync"),
+        not(target_arch = "wasm32")
+    ))]
+    pending_release: Option<PendingRelease>,
+}
+
+/// A detached unlock. Holds no handle to its task: that would keep the
+/// task's runtime (and its file descriptors) alive after the runtime is
+/// dropped.
+#[cfg(all(
+    feature = "reliability",
+    feature = "l1",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
+struct PendingRelease {
+    lock_id: String,
+    /// Set once the backend answered the unlock (released, or already gone).
+    answered: Arc<AtomicBool>,
+}
+
+#[cfg(all(
+    feature = "reliability",
+    feature = "l1",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
+impl PendingRelease {
+    /// Make sure the unlock has reached the backend before this client
+    /// contests the key again: a re-miss would otherwise find its own lease
+    /// held and poll an empty cache until the lock timeout. Never waits on
+    /// the spawned task, whose runtime may be idle or gone: an unanswered
+    /// unlock is sent again from here. `LockableBackend::release_lock` is
+    /// owner-checked, so a duplicate, or the task's late original, is
+    /// harmless. If this unlock fails too, the re-miss polls like any
+    /// contested follower, for at most one lock timeout.
+    async fn settle(&self, backend: &SharedBackend, full_key: &str) {
+        if !self.answered.load(Ordering::Acquire) {
+            release_lock(backend, full_key, &self.lock_id).await;
+        }
+    }
 }
 
 impl FlightMap {
-    fn handle(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        // ponytail: O(n) sweep once the map grows; a doubly-indexed structure
-        // is not worth it until someone caches millions of distinct cold keys.
-        if map.len() > SWEEP_THRESHOLD {
-            map.retain(|_, w| w.strong_count() > 0);
+    fn handle(&self, key: &str) -> Arc<tokio::sync::Mutex<KeyState>> {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        // ponytail: O(n) sweep, amortised by doubling and at most one per
+        // lease timeout otherwise; a doubly-indexed structure is not worth it
+        // until someone caches millions of distinct cold keys.
+        if entries.sweep_due() {
+            entries.sweep();
         }
-        if let Some(existing) = map.get(key).and_then(Weak::upgrade) {
+        if let Some(existing) = entries.slots.get(key).and_then(|slot| slot.entry.upgrade()) {
             return existing;
         }
-        let fresh = Arc::new(tokio::sync::Mutex::new(()));
-        map.insert(key.to_owned(), Arc::downgrade(&fresh));
+        let fresh = Arc::new(tokio::sync::Mutex::new(KeyState::default()));
+        entries.slots.insert(
+            key.to_owned(),
+            Slot {
+                entry: Arc::downgrade(&fresh),
+                #[cfg(all(
+                    feature = "reliability",
+                    feature = "l1",
+                    not(feature = "unsync"),
+                    not(target_arch = "wasm32")
+                ))]
+                pin: None,
+            },
+        );
         fresh
+    }
+
+    /// Pin `entry` (the entry for `key`) for one lease timeout, on behalf of
+    /// the pending unlock flagged by `answered`.
+    #[cfg(all(
+        feature = "reliability",
+        feature = "l1",
+        not(feature = "unsync"),
+        not(target_arch = "wasm32")
+    ))]
+    fn pin(&self, key: &str, entry: Arc<tokio::sync::Mutex<KeyState>>, answered: Arc<AtomicBool>) {
+        let until =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(FILL_LOCK_TIMEOUT_MS);
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = entries.slots.get_mut(key) {
+            slot.pin = Some(Pin {
+                until,
+                answered,
+                _entry: entry,
+            });
+        }
+    }
+
+    /// Drop `key`'s pin if it is still the one for the unlock flagged by
+    /// `answered`: a later leader's pin for the same key stays.
+    #[cfg(all(
+        feature = "reliability",
+        feature = "l1",
+        not(feature = "unsync"),
+        not(target_arch = "wasm32")
+    ))]
+    fn unpin(&self, key: &str, answered: &Arc<AtomicBool>) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = entries.slots.get_mut(key) {
+            if slot
+                .pin
+                .as_ref()
+                .is_some_and(|pin| Arc::ptr_eq(&pin.answered, answered))
+            {
+                slot.pin = None;
+            }
+        }
     }
 }
 
@@ -177,13 +418,80 @@ enum Role {
     /// First worker in: compute without re-checking (a re-check would be a
     /// second billable miss under metered-misses pricing).
     Leader,
-    /// Queued behind a local leader that has since finished: re-check the
-    /// cache once — the leader's fill is in L1 — then compute if it missed.
-    LocalFollower { rechecked: bool },
+    /// Queued behind a local holder that has since finished: re-check the
+    /// cache once — a leader's fill is in L1 — then compute if it missed.
+    /// `contest_lease` is the stand-down note this follower found (see
+    /// [`FlightMap`]): another process may be filling, so a missed re-check
+    /// contests the lease before computing.
+    LocalFollower {
+        rechecked: bool,
+        #[cfg_attr(
+            not(all(feature = "reliability", not(target_arch = "wasm32"))),
+            allow(dead_code)
+        )]
+        contest_lease: bool,
+    },
     /// Another *process* holds the distributed fill lock: poll the cache for
-    /// its fill, then compute anyway when the budget runs out (fail-open).
+    /// its fill, then compute anyway at `deadline` (fail-open). The deadline
+    /// is the lock timeout after this flight's own lock attempt, so the other
+    /// process's lock, taken earlier, has expired by then.
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-    RemoteContested { polls_left: u32 },
+    RemoteContested { deadline: tokio::time::Instant },
+}
+
+/// Outcome of one distributed fill-lock attempt. The cold-miss and refresh
+/// paths apply different policies to it.
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+enum LockAttempt {
+    /// The lease was granted; carries its id.
+    Granted(String),
+    /// The backend has no distributed lock.
+    Unlockable,
+    /// Another process holds the lease, which has expired by `deadline`:
+    /// one lock timeout after this attempt started.
+    Contested { deadline: tokio::time::Instant },
+    /// The lock call itself failed.
+    Failed,
+}
+
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+impl LockAttempt {
+    /// Must be called with the key's in-process lock held (`state`).
+    async fn run(state: &mut KeyState, backend: &SharedBackend, full_key: &str) -> Self {
+        let Some(lockable) = backend.as_lockable() else {
+            return Self::Unlockable;
+        };
+        // Cleared only once settled, so a cancelled settle is redone by the
+        // next attempt.
+        #[cfg(all(feature = "l1", not(feature = "unsync")))]
+        if let Some(pending) = &state.pending_release {
+            pending.settle(backend, full_key).await;
+            state.pending_release = None;
+        }
+        #[cfg(not(all(feature = "l1", not(feature = "unsync"))))]
+        let _ = state;
+        let timeout = std::time::Duration::from_millis(FILL_LOCK_TIMEOUT_MS);
+        let deadline = tokio::time::Instant::now() + timeout;
+        match lockable.acquire_lock(full_key, FILL_LOCK_TIMEOUT_MS).await {
+            Ok(Some(lock_id)) => Self::Granted(lock_id),
+            Ok(None) => Self::Contested { deadline },
+            Err(err) => {
+                crate::metrics::trace_lock_error(full_key, "lock", &err);
+                Self::Failed
+            }
+        }
+    }
+
+    /// Cold-miss policy: poll a contested lease; a lock-infrastructure error
+    /// fails open to a plain leader — suppression is an optimisation, never
+    /// an availability dependency.
+    fn cold_role(self) -> (Role, Option<String>) {
+        match self {
+            Self::Granted(lock_id) => (Role::Leader, Some(lock_id)),
+            Self::Unlockable | Self::Failed => (Role::Leader, None),
+            Self::Contested { deadline } => (Role::RemoteContested { deadline }, None),
+        }
+    }
 }
 
 /// Guard for a single-flight fill, returned by
@@ -194,17 +502,24 @@ enum Role {
 /// Dropping without `release` is safe: the in-process lock frees immediately
 /// and a distributed lock expires server-side after its timeout.
 pub struct SingleFlight {
-    _local: tokio::sync::OwnedMutexGuard<()>,
+    /// The per-key lock, guarding the key's [`KeyState`].
+    local: tokio::sync::OwnedMutexGuard<KeyState>,
+    /// The map `local` came from, to pin it while an unlock is pending.
+    #[cfg(all(
+        feature = "reliability",
+        feature = "l1",
+        not(feature = "unsync"),
+        not(target_arch = "wasm32")
+    ))]
+    map: crate::client::SharedFlight,
     role: Role,
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-    dist: Option<DistLock>,
-}
-
-#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-struct DistLock {
     backend: SharedBackend,
+    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
     full_key: String,
-    lock_id: String,
+    /// Id of the distributed fill lock this flight holds, if any.
+    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+    lock_id: Option<String>,
 }
 
 impl SingleFlight {
@@ -212,104 +527,390 @@ impl SingleFlight {
     /// the cache after every `true` before computing yourself:
     ///
     /// - Leader: immediately `false` (compute, don't re-read your own miss).
-    /// - Queued behind a local leader: `true` exactly once.
+    /// - Queued behind a local holder: `true` once, for the re-check, then
+    ///   `false`. If the holder found the distributed lock contested and let
+    ///   go without a fill, a missed re-check first contests that lock and
+    ///   then behaves as a leader or a contested flight.
     /// - Contested cross-process: sleeps one poll interval per call, `true`
-    ///   until the poll budget is spent.
+    ///   until the lock timeout (5 s), measured from this flight's lock
+    ///   attempt, has passed. A hung re-check is not cut short here;
+    ///   `#[cachekit]` bounds its own.
     pub async fn wait_for_fill(&mut self) -> bool {
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        if let Role::LocalFollower {
+            rechecked: true,
+            contest_lease: true,
+        } = self.role
+        {
+            (self.role, self.lock_id) =
+                LockAttempt::run(&mut self.local, &self.backend, &self.full_key)
+                    .await
+                    .cold_role();
+            self.note_role();
+        }
         match &mut self.role {
             Role::Leader => false,
-            Role::LocalFollower { rechecked } => {
+            Role::LocalFollower { rechecked, .. } => {
                 let first = !*rechecked;
                 *rechecked = true;
                 first
             }
             #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-            Role::RemoteContested { polls_left } => {
-                if *polls_left == 0 {
+            Role::RemoteContested { deadline } => {
+                let deadline = *deadline;
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
                     return false;
                 }
-                *polls_left -= 1;
-                tokio::time::sleep(FILL_POLL_INTERVAL).await;
-                true
+                // The last sleep stops at the deadline, and no re-check
+                // follows it: the other side's lock has expired by then.
+                tokio::time::sleep(FILL_POLL_INTERVAL.min(deadline - now)).await;
+                tokio::time::Instant::now() < deadline
             }
         }
     }
 
     /// Release the flight. Best-effort: frees the distributed fill lock (if
-    /// held) so other processes stop waiting early; errors are ignored — the
-    /// lock expires server-side regardless.
+    /// held) so other processes stop waiting early. A failed release is
+    /// traced (feature `tracing`) and otherwise ignored: the lock expires
+    /// server-side regardless. Leaves the stand-down note as it is (see
+    /// [`FlightMap`]), since a caller may release after an error, with no fill.
     pub async fn release(self) {
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-        if let Some(dist) = self.dist {
-            if let Some(lockable) = dist.backend.as_lockable() {
-                let _ = lockable.release_lock(&dist.full_key, &dist.lock_id).await;
-            }
+        if let Some(lock_id) = &self.lock_id {
+            release_lock(&self.backend, &self.full_key, lock_id).await;
         }
     }
 
-    pub(crate) async fn acquire(map: &FlightMap, backend: &SharedBackend, full_key: &str) -> Self {
-        let handle = map.handle(full_key);
-        match Arc::clone(&handle).try_lock_owned() {
-            Ok(local) => Self::lead(local, backend, full_key).await,
-            Err(_) => {
-                // Contended: a local leader is filling. Queue behind it.
-                let local = handle.lock_owned().await;
-                Self {
-                    _local: local,
-                    role: Role::LocalFollower { rechecked: false },
-                    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-                    dist: None,
-                }
+    /// Release after the fill was stored, without waiting for the unlock
+    /// round trip. Macro plumbing for `#[cachekit]` — not public API.
+    ///
+    /// The unlock is spawned onto the ambient tokio runtime and the per-key
+    /// lock frees at once, so the caller and its same-key local followers
+    /// return one round trip sooner. Remote waiters poll the cache, not the
+    /// lock, and the fill is already stored. Only call it after a stored
+    /// fill: after an error or a failed store, a quick re-call would miss
+    /// again, so [`Self::release`] keeps the unlock on the caller's path.
+    /// Without `l1`, under `unsync` or off a tokio runtime this is
+    /// [`Self::release`]. A later lock attempt on the key re-sends an unlock
+    /// the backend has not answered (see [`PendingRelease::settle`]).
+    #[doc(hidden)]
+    #[cfg_attr(
+        not(all(
+            feature = "reliability",
+            feature = "l1",
+            not(feature = "unsync"),
+            not(target_arch = "wasm32")
+        )),
+        allow(unused_mut)
+    )]
+    pub async fn __release_detached(mut self) {
+        #[cfg(all(
+            feature = "reliability",
+            feature = "l1",
+            not(feature = "unsync"),
+            not(target_arch = "wasm32")
+        ))]
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            if let Some(lock_id) = self.lock_id.take() {
+                let answered = Arc::new(AtomicBool::new(false));
+                let full_key = std::mem::take(&mut self.full_key);
+                self.map.pin(
+                    &full_key,
+                    Arc::clone(tokio::sync::OwnedMutexGuard::mutex(&self.local)),
+                    Arc::clone(&answered),
+                );
+                let unlock = {
+                    let (map, backend, lock_id, answered) = (
+                        self.map.clone(),
+                        self.backend.clone(),
+                        lock_id.clone(),
+                        Arc::clone(&answered),
+                    );
+                    async move {
+                        if release_lock(&backend, &full_key, &lock_id).await {
+                            answered.store(true, Ordering::Release);
+                            map.unpin(&full_key, &answered);
+                        }
+                    }
+                };
+                // Keep the caller's span, so a failed unlock traces under it.
+                #[cfg(feature = "tracing")]
+                let unlock = tracing::Instrument::instrument(unlock, tracing::Span::current());
+                drop(runtime.spawn(unlock));
+                self.local.pending_release = Some(PendingRelease { lock_id, answered });
             }
+            return;
+        }
+        self.release().await;
+    }
+
+    /// Run one poll re-check, cut off at a contested flight's deadline.
+    /// `None` means the deadline passed first; treat it as a miss.
+    /// Macro plumbing for `#[cachekit]` — not public API.
+    #[doc(hidden)]
+    pub async fn __bounded_poll<F: std::future::Future>(&self, read: F) -> Option<F::Output> {
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        if let Role::RemoteContested { deadline } = self.role {
+            return tokio::time::timeout_at(deadline, read).await.ok();
+        }
+        Some(read.await)
+    }
+
+    /// Record this flight's role in the stand-down note (see [`FlightMap`]):
+    /// a leader clears it, a contested flight sets it, since it fills nothing
+    /// unless its poll runs out, and a follower leaves it as found.
+    fn note_role(&mut self) {
+        match self.role {
+            Role::Leader => self.local.stand_down = false,
+            Role::LocalFollower { .. } => {}
+            #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+            Role::RemoteContested { .. } => self.local.stand_down = true,
         }
     }
 
-    /// Local leader: attempt cross-process suppression via the backend's
-    /// distributed lock, when available. Lock-infrastructure errors fail
-    /// open to a plain leader — suppression is an optimisation, never an
-    /// availability dependency.
-    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-    async fn lead(
-        local: tokio::sync::OwnedMutexGuard<()>,
+    /// A flight over a freshly acquired per-key lock, its role recorded in
+    /// the stand-down note.
+    fn new(
+        map: &crate::client::SharedFlight,
+        local: tokio::sync::OwnedMutexGuard<KeyState>,
+        role: Role,
         backend: &SharedBackend,
         full_key: &str,
     ) -> Self {
-        let (role, dist) = match backend.as_lockable() {
-            Some(lockable) => match lockable.acquire_lock(full_key, FILL_LOCK_TIMEOUT_MS).await {
-                Ok(Some(lock_id)) => (
-                    Role::Leader,
-                    Some(DistLock {
-                        backend: backend.clone(),
-                        full_key: full_key.to_owned(),
-                        lock_id,
-                    }),
-                ),
-                Ok(None) => (
-                    Role::RemoteContested {
-                        polls_left: FILL_POLL_BUDGET,
-                    },
-                    None,
-                ),
-                Err(_) => (Role::Leader, None),
-            },
-            None => (Role::Leader, None),
-        };
-        Self {
-            _local: local,
+        #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
+        let _ = (backend, full_key);
+        #[cfg(not(all(
+            feature = "reliability",
+            feature = "l1",
+            not(feature = "unsync"),
+            not(target_arch = "wasm32")
+        )))]
+        let _ = map;
+        let mut flight = Self {
+            local,
+            #[cfg(all(
+                feature = "reliability",
+                feature = "l1",
+                not(feature = "unsync"),
+                not(target_arch = "wasm32")
+            ))]
+            map: map.clone(),
             role,
-            dist,
+            #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+            backend: backend.clone(),
+            #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+            full_key: full_key.to_owned(),
+            #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+            lock_id: None,
+        };
+        flight.note_role();
+        flight
+    }
+
+    /// Cold-miss entry: lead (attempting cross-process suppression via the
+    /// backend's distributed lock, when available), or queue behind a local
+    /// holder.
+    pub(crate) async fn acquire(
+        map: &crate::client::SharedFlight,
+        backend: &SharedBackend,
+        full_key: &str,
+    ) -> Self {
+        let handle = map.handle(full_key);
+        #[cfg_attr(
+            not(all(feature = "reliability", not(target_arch = "wasm32"))),
+            allow(unused_mut)
+        )]
+        let Ok(mut local) = Arc::clone(&handle).try_lock_owned() else {
+            // Contended: a local holder is filling. Queue behind it.
+            let local = handle.lock_owned().await;
+            let role = Role::LocalFollower {
+                rechecked: false,
+                contest_lease: local.stand_down,
+            };
+            return Self::new(map, local, role, backend, full_key);
+        };
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        {
+            let (role, lock_id) = LockAttempt::run(&mut local, backend, full_key)
+                .await
+                .cold_role();
+            let mut flight = Self::new(map, local, role, backend, full_key);
+            flight.lock_id = lock_id;
+            flight
+        }
+        #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
+        Self::new(map, local, Role::Leader, backend, full_key)
+    }
+
+    /// Refresh-ahead entry: lead the fill, or `None` to stand down at once.
+    ///
+    /// A refresh runs only while a stale copy is still being served, so it
+    /// never waits for another worker's fill and never re-reads the cache
+    /// (`spec/saas-api.md` API-62/63). It leads only with the lease, or on a
+    /// backend without one. A held in-process flight, a contested lease or a
+    /// failed lock call all mean stand down: the stale copy keeps being
+    /// served, and once it hard-expires the cold-miss path takes over.
+    pub(crate) async fn try_lead(
+        map: &crate::client::SharedFlight,
+        backend: &SharedBackend,
+        full_key: &str,
+    ) -> Option<Self> {
+        let local = map.handle(full_key).try_lock_owned().ok()?;
+        #[cfg_attr(
+            not(all(feature = "reliability", not(target_arch = "wasm32"))),
+            allow(unused_mut)
+        )]
+        let mut flight = Self::new(map, local, Role::Leader, backend, full_key);
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        match LockAttempt::run(&mut flight.local, backend, full_key).await {
+            LockAttempt::Granted(lock_id) => flight.lock_id = Some(lock_id),
+            LockAttempt::Unlockable => {}
+            LockAttempt::Contested { .. } => {
+                // Leave a note: a cold miss queued behind this refresh must
+                // not take the stand-down for a finished fill.
+                flight.local.stand_down = true;
+                return None;
+            }
+            LockAttempt::Failed => return None,
+        }
+        Some(flight)
+    }
+}
+
+/// Free a distributed fill lock; `true` once the backend answered. Best-effort:
+/// a failed unlock is traced (feature `tracing`) and otherwise ignored, since
+/// the lock expires server-side regardless.
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+async fn release_lock(backend: &SharedBackend, full_key: &str, lock_id: &str) -> bool {
+    let Some(lockable) = backend.as_lockable() else {
+        return false;
+    };
+    match lockable.release_lock(full_key, lock_id).await {
+        Ok(_) => true,
+        Err(err) => {
+            crate::metrics::trace_lock_error(full_key, "unlock", &err);
+            false
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "reliability",
+    feature = "l1",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::backend::{Backend, HealthStatus, LockableBackend};
+    use crate::error::BackendError;
+
+    /// Grants every lock at once and counts unlocks.
+    #[derive(Default)]
+    struct Locks {
+        unlocks: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Backend for Locks {
+        async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+            Ok(None)
+        }
+        async fn set(
+            &self,
+            _key: &str,
+            _value: Vec<u8>,
+            _ttl: Option<std::time::Duration>,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+            Ok(false)
+        }
+        async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+            Ok(false)
+        }
+        async fn health(&self) -> Result<HealthStatus, BackendError> {
+            Ok(HealthStatus {
+                is_healthy: true,
+                latency_ms: 0.0,
+                backend_type: "locks".to_owned(),
+                details: HashMap::new(),
+            })
+        }
+        fn as_lockable(&self) -> Option<&dyn LockableBackend> {
+            Some(self)
         }
     }
 
-    #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
-    async fn lead(
-        local: tokio::sync::OwnedMutexGuard<()>,
-        _backend: &SharedBackend,
-        _full_key: &str,
-    ) -> Self {
-        Self {
-            _local: local,
-            role: Role::Leader,
+    #[async_trait]
+    impl LockableBackend for Locks {
+        async fn acquire_lock(
+            &self,
+            _key: &str,
+            _timeout_ms: u64,
+        ) -> Result<Option<String>, BackendError> {
+            Ok(Some("lease".to_owned()))
         }
+        async fn release_lock(&self, _key: &str, _lock_id: &str) -> Result<bool, BackendError> {
+            self.unlocks.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
+    /// A cold-key burst's dead slots go within a lease timeout of the burst,
+    /// though the sweep during it counted them as live.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_dead_slots_is_swept_after_a_lease_timeout() {
+        let map = FlightMap::default();
+        let burst: Vec<_> = (0..200)
+            .map(|i| map.handle(&format!("burst:{i}")))
+            .collect();
+        drop(burst);
+
+        map.handle("early");
+        assert!(
+            map.entries.lock().unwrap().slots.len() > 200,
+            "swept before a lease timeout"
+        );
+
+        tokio::time::advance(std::time::Duration::from_millis(FILL_LOCK_TIMEOUT_MS)).await;
+        map.handle("late");
+        assert!(
+            map.entries.lock().unwrap().slots.len() <= 2,
+            "dead slots retained"
+        );
+    }
+
+    /// While something else holds the key's entry, so it survives the unpin, a
+    /// re-miss does not re-send an unlock the backend already answered.
+    #[tokio::test(start_paused = true)]
+    async fn an_answered_unlock_is_not_resent_while_the_entry_lives() {
+        let locks = Arc::new(Locks::default());
+        let backend: SharedBackend = locks.clone();
+        let map: crate::client::SharedFlight = Arc::default();
+        let _held = map.handle("k");
+
+        SingleFlight::acquire(&map, &backend, "k")
+            .await
+            .__release_detached()
+            .await;
+        while locks.unlocks.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let flight = SingleFlight::acquire(&map, &backend, "k").await;
+        assert_eq!(flight.lock_id.as_deref(), Some("lease"));
+        assert_eq!(
+            locks.unlocks.load(Ordering::SeqCst),
+            1,
+            "answered unlock re-sent"
+        );
     }
 }

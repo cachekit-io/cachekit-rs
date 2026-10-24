@@ -13,14 +13,26 @@
 //!   the new entry, never a torn one.
 //! - **Expiry is lazy**: expired and corrupt entries are unlinked when a
 //!   read touches them, exactly like cachekit-py.
+//! - **Orphan sweep on first write**: temp files older than 60 s, left by
+//!   crashed writers (py's or rs's — both use the `.tmp.` marker), are
+//!   removed by each backend instance's first `set`, once. cachekit-py sweeps
+//!   at startup instead; rs defers it because the sweep reads the whole
+//!   directory, and a short-lived reader of a large cache (a CLI hit) would
+//!   pay that on every run. Only writers leave orphans, so a reader-only
+//!   process never needs it.
 //!
-//! ## Concurrency model (py parity)
+//! ## Concurrency model
 //!
-//! - **In-process**: every operation serializes on a backend-wide mutex —
-//!   the equivalent of cachekit-py's `threading.RLock`. This closes the
-//!   expire-unlink vs. concurrent-set lost-write race within a process.
-//!   (ponytail: one backend-wide lock, matching py; shard per-key if
-//!   contention ever matters.)
+//! - **In-process**: operations on the same key serialize on one of
+//!   64 mutexes (`LOCK_STRIPES`), picked by the first byte of the entry's
+//!   Blake2b-128 filename. This closes the expire-unlink vs. concurrent-set
+//!   lost-write race within a process: that race only ever involves one entry
+//!   path, so one key always maps to one stripe. Keys on different stripes
+//!   do not wait on each other's fsync; two keys share a stripe about 1 time
+//!   in 64 and then still serialize (cachekit-py serializes everything on
+//!   one `threading.RLock`, because its RLock also guards LRU and size
+//!   bookkeeping; rs has none yet — porting eviction or size caps adds shared
+//!   cross-key state, and these stripes must be revisited then).
 //! - **Cross-process** (unix): advisory `flock` — shared on reads, exclusive
 //!   on the in-place expiry rewrite — matching py's `fcntl.flock` usage,
 //!   non-blocking with contention surfacing as a timeout error like py.
@@ -48,7 +60,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -66,7 +78,8 @@ const EXPIRY_OFFSET: u64 = 6;
 /// TTL ceiling (10 years), matching cachekit-py's `MAX_TTL_SECONDS` overflow guard.
 const MAX_TTL_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 
-/// Orphaned temp files older than this are swept at build time (py parity).
+/// Orphaned temp files older than this are swept by a backend's first `set`
+/// (py uses the same threshold, but sweeps at startup).
 const TEMP_FILE_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// Process-global sequence folded into temp-file names so two writes of the
@@ -97,18 +110,26 @@ enum ParsedHeader {
     Corrupt,
     /// Past its expiry timestamp — unlink on sight.
     Expired,
+    /// Nonzero reserved byte or flags: a transform this reader does not
+    /// implement. A miss that MUST NOT delete, rewrite, or return the payload.
+    Unsupported,
     /// Readable entry; `expiry` is 0 for never-expires.
     Live { expiry: u64 },
 }
 
-fn parse_header(bytes: &[u8]) -> ParsedHeader {
+/// `now` is the reader clock in Unix seconds (a parameter so tests can pin it).
+fn parse_header(bytes: &[u8], now: u64) -> ParsedHeader {
     if bytes.len() < HEADER_SIZE || &bytes[0..2] != MAGIC || bytes[2] != FORMAT_VERSION {
         return ParsedHeader::Corrupt;
+    }
+    if bytes[3] != 0 || bytes[4..6] != [0, 0] {
+        return ParsedHeader::Unsupported;
     }
     let mut expiry_be = [0u8; 8];
     expiry_be.copy_from_slice(&bytes[6..14]);
     let expiry = u64::from_be_bytes(expiry_be);
-    if expiry > 0 && now_secs() > expiry {
+    // Expired once the clock reaches the deadline (spec: `now >= expiry`).
+    if expiry > 0 && now >= expiry {
         return ParsedHeader::Expired;
     }
     ParsedHeader::Live { expiry }
@@ -253,7 +274,7 @@ fn still_linked(path: &Path, opened: &fs::File) -> bool {
     }
 }
 
-// ── Sync cores (run on the blocking pool, under the backend-wide lock) ───────
+// ── Sync cores (run on the blocking pool, under the key's stripe lock) ───────
 
 fn read_entry(path: &Path) -> Result<Option<Vec<u8>>, BackendError> {
     let mut file = match open_opts(true, false).open(path) {
@@ -266,11 +287,12 @@ fn read_entry(path: &Path) -> Result<Option<Vec<u8>>, BackendError> {
     file.read_to_end(&mut data)
         .map_err(|e| file_err(e, "failed to read cache file"))?;
 
-    match parse_header(&data) {
+    match parse_header(&data, now_secs()) {
         ParsedHeader::Corrupt | ParsedHeader::Expired => {
             unlink_if_same_inode(path, &file);
             Ok(None)
         }
+        ParsedHeader::Unsupported => Ok(None),
         ParsedHeader::Live { .. } => Ok(Some(data.split_off(HEADER_SIZE))),
     }
 }
@@ -286,11 +308,12 @@ fn probe_header(path: &Path) -> Result<Option<u64>, BackendError> {
     flock_nb(&file, false)?;
     let (header, filled) =
         fill_header(&mut file).map_err(|e| file_err(e, "failed to read cache file header"))?;
-    match parse_header(&header[..filled]) {
+    match parse_header(&header[..filled], now_secs()) {
         ParsedHeader::Corrupt | ParsedHeader::Expired => {
             unlink_if_same_inode(path, &file);
             Ok(None)
         }
+        ParsedHeader::Unsupported => Ok(None),
         ParsedHeader::Live { expiry } => Ok(Some(expiry)),
     }
 }
@@ -355,12 +378,14 @@ fn rewrite_expiry(path: &Path, new_expiry: u64) -> Result<bool, BackendError> {
 
     let (header, filled) =
         fill_header(&mut file).map_err(|e| file_err(e, "failed to read cache file header"))?;
-    match parse_header(&header[..filled]) {
+    match parse_header(&header[..filled], now_secs()) {
         ParsedHeader::Corrupt | ParsedHeader::Expired => {
             // An expired entry is absent, not refreshable (py parity).
             unlink_if_same_inode(path, &file);
             return Ok(false);
         }
+        // Never rewrite an entry we cannot interpret.
+        ParsedHeader::Unsupported => return Ok(false),
         ParsedHeader::Live { .. } => {}
     }
 
@@ -386,8 +411,8 @@ fn rewrite_expiry(path: &Path, new_expiry: u64) -> Result<bool, BackendError> {
 
 fn temp_path(target: &Path) -> PathBuf {
     // `{name}.tmp.{pid}.{nanos}.{seq}` — contains the `.tmp.` marker py's
-    // startup sweep globs for, so a shared directory gets cross-SDK orphan
-    // cleanup. The process-global sequence makes the name collision-proof
+    // startup sweep and rs's first-write sweep look for, so a shared
+    // directory gets cross-SDK orphan cleanup. The process-global sequence makes the name collision-proof
     // even for same-key writes landing in the same nanosecond tick.
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -438,10 +463,33 @@ fn cleanup_temp_files(cache_dir: &Path) {
 #[derive(Debug, Clone)]
 pub struct FileBackend {
     cache_dir: PathBuf,
-    /// Backend-wide op serialization — py `RLock` parity. Clones share it.
+    /// Per-key op serialization, striped by filename. Clones share them.
     /// Async so contended waiters cost a queued future, not a parked
     /// blocking-pool thread (a hot backend must not monopolize the pool).
-    lock: Arc<tokio::sync::Mutex<()>>,
+    stripes: Arc<[Arc<tokio::sync::Mutex<()>>; LOCK_STRIPES]>,
+    /// Whether this backend has swept orphaned temp files yet; the first
+    /// `set` does it. Clones share it, so an instance sweeps once.
+    swept: Arc<AtomicBool>,
+}
+
+/// Number of in-process lock stripes (a power of two, at most 256: the stripe
+/// is the low bits of the filename's first byte).
+const LOCK_STRIPES: usize = 64;
+
+fn new_stripes() -> Arc<[Arc<tokio::sync::Mutex<()>>; LOCK_STRIPES]> {
+    Arc::new(std::array::from_fn(|_| {
+        Arc::new(tokio::sync::Mutex::new(()))
+    }))
+}
+
+/// Stripe for an entry path: the first byte of its lowercase-hex Blake2b-128
+/// filename, so every op on one key takes the same stripe.
+fn stripe_of(path: &Path) -> usize {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.get(..2))
+        .and_then(|b| u8::from_str_radix(b, 16).ok())
+        .map_or(0, |b| usize::from(b) % LOCK_STRIPES)
 }
 
 impl FileBackend {
@@ -462,7 +510,8 @@ impl FileBackend {
         self.cache_dir.join(crate::metrics::key_hash(key))
     }
 
-    /// Run `f` on the blocking pool holding the backend-wide lock.
+    /// Run `f` on the blocking pool holding lock stripe `stripe` (see
+    /// [`stripe_of`]).
     ///
     /// The lock is acquired in async context BEFORE the hop to the blocking
     /// pool: N contended ops queue as futures instead of parking N blocking
@@ -471,9 +520,10 @@ impl FileBackend {
     /// releases when the I/O finishes.
     async fn locked<T: Send + 'static>(
         &self,
+        stripe: usize,
         f: impl FnOnce() -> Result<T, BackendError> + Send + 'static,
     ) -> Result<T, BackendError> {
-        let guard = Arc::clone(&self.lock).lock_owned().await;
+        let guard = Arc::clone(&self.stripes[stripe]).lock_owned().await;
         run_blocking(move || {
             let _guard = guard;
             f()
@@ -490,7 +540,8 @@ impl FileBackend {
 impl Backend for FileBackend {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
         let path = self.entry_path(key);
-        self.locked(move || read_entry(&path)).await
+        self.locked(stripe_of(&path), move || read_entry(&path))
+            .await
     }
 
     async fn set(
@@ -501,6 +552,9 @@ impl Backend for FileBackend {
     ) -> Result<(), BackendError> {
         // None = never expires (expiry field 0). Sub-second TTLs round up to
         // 1s (Redis-backend parity); absurd TTLs are rejected like py.
+        // The deadline is stored in whole seconds rounded down, as the spec,
+        // py and ts write it, so an N-second TTL lives N-1 to N seconds.
+        // Rounding up here would make rs entries outlive py/ts ones by 1s.
         let expiry = match ttl {
             None => 0,
             Some(d) => {
@@ -514,19 +568,39 @@ impl Backend for FileBackend {
             }
         };
 
+        if !self.swept.load(Ordering::Relaxed) {
+            // No stripe: the sweep touches only temp files past the orphan
+            // threshold, never an entry, and one stripe could not fence the
+            // other stripes' writes anyway. Swapped inside the closure, so
+            // only a sweep that actually runs uses up the flag; once running,
+            // it finishes even if this set is cancelled.
+            let swept = Arc::clone(&self.swept);
+            let dir = self.cache_dir.clone();
+            run_blocking(move || {
+                if !swept.swap(true, Ordering::Relaxed) {
+                    cleanup_temp_files(&dir);
+                }
+                Ok(())
+            })
+            .await?;
+        }
+
         let path = self.entry_path(key);
-        self.locked(move || write_entry(&path, build_header(expiry), &value))
-            .await
+        self.locked(stripe_of(&path), move || {
+            write_entry(&path, build_header(expiry), &value)
+        })
+        .await
     }
 
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
         let path = self.entry_path(key);
-        self.locked(move || delete_entry(&path)).await
+        self.locked(stripe_of(&path), move || delete_entry(&path))
+            .await
     }
 
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
         let path = self.entry_path(key);
-        self.locked(move || Ok(probe_header(&path)?.is_some()))
+        self.locked(stripe_of(&path), move || Ok(probe_header(&path)?.is_some()))
             .await
     }
 
@@ -572,7 +646,8 @@ impl Backend for FileBackend {
 impl TtlInspectable for FileBackend {
     async fn ttl(&self, key: &str) -> Result<Option<Duration>, BackendError> {
         let path = self.entry_path(key);
-        self.locked(move || entry_ttl(&path)).await
+        self.locked(stripe_of(&path), move || entry_ttl(&path))
+            .await
     }
 
     async fn refresh_ttl(&self, key: &str, ttl: Duration) -> Result<bool, BackendError> {
@@ -594,7 +669,8 @@ impl TtlInspectable for FileBackend {
 
         let new_expiry = now_secs().saturating_add(secs);
         let path = self.entry_path(key);
-        self.locked(move || rewrite_expiry(&path, new_expiry)).await
+        self.locked(stripe_of(&path), move || rewrite_expiry(&path, new_expiry))
+            .await
     }
 }
 
@@ -620,9 +696,10 @@ impl FileBackendBuilder {
     /// On unix, a **pre-existing** directory must be owned by the current
     /// user and not group/other-writable — a default like `/tmp/cachekit`
     /// pre-created by another local user would otherwise let them poison
-    /// plaintext cache entries (CWE-377). Also sweeps orphaned temp files
-    /// left by crashed writers (py parity). The one-time directory setup
-    /// does its I/O inline; per-operation I/O runs on the blocking pool.
+    /// plaintext cache entries (CWE-377). Does not scan the directory: the
+    /// sweep of orphaned temp files runs on the backend's first `set` (see the
+    /// [module docs](self)). The one-time directory setup does its I/O
+    /// inline; per-operation I/O runs on the blocking pool.
     ///
     /// # Errors
     ///
@@ -689,11 +766,10 @@ impl FileBackendBuilder {
             }
         }
 
-        cleanup_temp_files(&cache_dir);
-
         Ok(FileBackend {
             cache_dir,
-            lock: Arc::new(tokio::sync::Mutex::new(())),
+            stripes: new_stripes(),
+            swept: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -716,7 +792,8 @@ mod tests {
     fn backend_at(dir: &Path) -> FileBackend {
         FileBackend {
             cache_dir: dir.to_path_buf(),
-            lock: Arc::new(tokio::sync::Mutex::new(())),
+            stripes: new_stripes(),
+            swept: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -814,6 +891,196 @@ mod tests {
         assert!(!short.exists());
     }
 
+    // ── Protocol vectors ─────────────────────────────────────────────────────
+    //
+    // `tests/vectors/file-backend.json`, vendored verbatim from
+    // cachekit-io/protocol `test-vectors/file-backend.json` v1.2.0
+    // (sha256 `b7b0c51935a3a00ab340005ae1e091797b14938f92eecae23346bdccf0d12af4`).
+    // Do not edit the JSON here; regenerate upstream and re-vendor. Lives in
+    // this module, not `tests/`, because `parse_header` is crate-private.
+
+    const FILE_BACKEND_VECTORS: &str = include_str!("../../tests/vectors/file-backend.json");
+
+    /// sha256 of the vendored file, pinned so a local edit cannot drift from the
+    /// protocol copy unnoticed.
+    const FILE_BACKEND_SHA256: &str =
+        "b7b0c51935a3a00ab340005ae1e091797b14938f92eecae23346bdccf0d12af4"; // pragma: allowlist secret
+
+    #[test]
+    fn vendored_fixture_matches_the_pinned_sha256() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            hex::encode(Sha256::digest(FILE_BACKEND_VECTORS.as_bytes())),
+            FILE_BACKEND_SHA256,
+            "tests/vectors/file-backend.json differs from the pinned protocol copy: \
+             re-vendor it from protocol and update FILE_BACKEND_SHA256"
+        );
+    }
+
+    fn file_backend_vectors() -> Vec<serde_json::Value> {
+        let doc: serde_json::Value =
+            serde_json::from_str(FILE_BACKEND_VECTORS).expect("vector file parses");
+        assert_eq!(
+            doc["version"], "1.2.0",
+            "re-vendored vectors: update the pin"
+        );
+        doc["vectors"].as_array().expect("vectors array").clone()
+    }
+
+    #[test]
+    #[allow(clippy::panic)] // test-only: an unknown reader_action must fail loudly
+    fn file_backend_vectors_read_as_specified() {
+        let vectors = file_backend_vectors();
+        assert_eq!(vectors.len(), 12, "vectors in file-backend.json");
+        for v in &vectors {
+            let name = v["name"].as_str().expect("name");
+            let file_hex = v["file_hex"].as_str().expect("file_hex");
+            let original = hex::decode(file_hex).expect("file_hex is hex");
+            let action = v["reader_action"].as_str().expect("reader_action");
+
+            for probe in ["read_entry", "probe_header"] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let path = write_raw(dir.path(), "entry", file_hex);
+                let found = match probe {
+                    "read_entry" => {
+                        let got = read_entry(&path).expect("read should not error");
+                        if action == "return_payload" {
+                            let want = hex::decode(v["payload_hex"].as_str().unwrap()).unwrap();
+                            assert_eq!(got.as_deref(), Some(want.as_slice()), "{name}/{probe}");
+                        }
+                        got.is_some()
+                    }
+                    _ => probe_header(&path)
+                        .expect("probe should not error")
+                        .is_some(),
+                };
+                match action {
+                    "return_payload" | "miss_preserve" => {
+                        assert_eq!(found, action == "return_payload", "{name}/{probe}");
+                        assert_eq!(
+                            fs::read(&path).expect("file must remain"),
+                            original,
+                            "{name}/{probe}: file must be byte-for-byte unchanged"
+                        );
+                    }
+                    // The spec lets a reader lazily remove an expired entry.
+                    "miss_expired" => assert!(!found, "{name}/{probe}"),
+                    other => panic!("{name}: unknown reader_action {other}"),
+                }
+            }
+
+            // Evaluate at the vector's exact clock, where one is given.
+            if let Some(now) = v["reader_now_unix_seconds"].as_u64() {
+                let parsed = parse_header(&original, now);
+                match action {
+                    "miss_expired" => {
+                        assert!(matches!(parsed, ParsedHeader::Expired), "{name} at {now}")
+                    }
+                    "miss_preserve" => {
+                        assert!(
+                            matches!(parsed, ParsedHeader::Unsupported),
+                            "{name} at {now}"
+                        )
+                    }
+                    _ => assert!(
+                        matches!(parsed, ParsedHeader::Live { .. }),
+                        "{name} at {now}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The writer side of the entry layout: every vector a version-1 writer can
+    /// produce (no flag, reserved 0) is the file name and bytes this backend writes.
+    #[test]
+    fn writer_produces_every_writable_vector_byte_for_byte() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = backend_at(dir.path());
+        let mut written = 0;
+        for v in file_backend_vectors() {
+            if v["flags"] != 0 || v["reserved"].as_u64().unwrap_or(0) != 0 {
+                continue;
+            }
+            let name = v["name"].as_str().unwrap();
+            let path = backend.entry_path(v["key_utf8"].as_str().unwrap());
+            assert_eq!(
+                path.file_name().and_then(|f| f.to_str()),
+                v["filename"].as_str(),
+                "{name}: file name"
+            );
+            let expiry = v["expiry_unix_seconds"].as_u64().expect("expiry");
+            let payload = hex::decode(v["payload_hex"].as_str().unwrap()).unwrap();
+            write_entry(&path, build_header(expiry), &payload).expect("write");
+            assert_eq!(
+                hex::encode(fs::read(&path).expect("written file")),
+                v["file_hex"].as_str().unwrap(),
+                "{name}: file bytes"
+            );
+            written += 1;
+        }
+        assert_eq!(written, 5, "writable vectors in file-backend.json");
+    }
+
+    #[test]
+    fn unsupported_header_is_a_miss_on_every_path_and_never_touched() {
+        for v in file_backend_vectors() {
+            if v["reader_action"] != "miss_preserve" {
+                continue;
+            }
+            let name = v["name"].as_str().unwrap();
+            let file_hex = v["file_hex"].as_str().unwrap();
+            let original = hex::decode(file_hex).unwrap();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = write_raw(dir.path(), "entry", file_hex);
+
+            assert_eq!(read_entry(&path).expect("get"), None, "{name}: get");
+            assert_eq!(probe_header(&path).expect("exists"), None, "{name}: exists");
+            assert_eq!(entry_ttl(&path).expect("ttl"), None, "{name}: ttl");
+            assert!(
+                !rewrite_expiry(&path, now_secs() + 3600).expect("refresh_ttl"),
+                "{name}: refresh_ttl"
+            );
+            assert_eq!(
+                fs::read(&path).expect("file must remain"),
+                original,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn expiry_is_reached_at_the_deadline_second() {
+        let header = build_header(1_000);
+        assert!(matches!(
+            parse_header(&header, 999),
+            ParsedHeader::Live { expiry: 1_000 }
+        ));
+        assert!(matches!(
+            parse_header(&header, 1_000),
+            ParsedHeader::Expired
+        ));
+        assert!(matches!(
+            parse_header(&header, 1_001),
+            ParsedHeader::Expired
+        ));
+        // 0 = never expires, whatever the clock says.
+        assert!(matches!(
+            parse_header(&build_header(0), u64::MAX),
+            ParsedHeader::Live { expiry: 0 }
+        ));
+    }
+
+    #[test]
+    fn corrupt_header_wins_over_flags() {
+        // Wrong version with a nonzero flag is still corrupt (unlinkable):
+        // the flag check runs after magic and version.
+        let mut header = build_header(0);
+        header[2] = 2;
+        header[5] = 1;
+        assert!(matches!(parse_header(&header, 0), ParsedHeader::Corrupt));
+    }
+
     #[test]
     fn ttl_semantics_match_py() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -869,19 +1136,24 @@ mod tests {
         assert!(!rewrite_expiry(&dir.path().join("nope"), new_expiry).expect("no error"));
     }
 
-    #[test]
-    fn temp_file_sweep_removes_stale_keeps_fresh() {
-        let dir = tempfile::tempdir().expect("tempdir");
-
-        let stale = dir.path().join("abc.tmp.123.456");
+    /// A `.tmp.` orphan two minutes old: past the sweep's 60 s threshold.
+    fn plant_stale_temp(dir: &Path) -> PathBuf {
+        let stale = dir.join("abc.tmp.123.456");
         fs::write(&stale, b"orphan").expect("write");
-        let two_minutes_ago = SystemTime::now() - Duration::from_secs(120);
         fs::File::options()
             .write(true)
             .open(&stale)
             .expect("open")
-            .set_modified(two_minutes_ago)
+            .set_modified(SystemTime::now() - Duration::from_secs(120))
             .expect("set mtime");
+        stale
+    }
+
+    #[test]
+    fn temp_file_sweep_removes_stale_keeps_fresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let stale = plant_stale_temp(dir.path());
 
         let fresh = dir.path().join("def.tmp.123.789");
         fs::write(&fresh, b"in flight").expect("write");
@@ -894,6 +1166,70 @@ mod tests {
         assert!(!stale.exists(), "stale temp file must be swept");
         assert!(fresh.exists(), "fresh temp file must be kept");
         assert!(entry.exists(), "cache entries must never be swept");
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_runs_on_first_set_not_on_build() {
+        // A short-lived reader (a CLI hit) must not pay a whole-directory
+        // scan: build and reads leave orphans alone, the first write sweeps.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_dir = dir.path().join("cache");
+        let build = || {
+            FileBackend::builder()
+                .cache_dir(&cache_dir)
+                .build()
+                .expect("build")
+        };
+        drop(build()); // creates the directory owner-only
+
+        let stale = plant_stale_temp(&cache_dir);
+
+        let backend = build();
+        assert!(stale.exists(), "build must not scan the directory");
+
+        assert!(backend.get("k").await.expect("get").is_none());
+        assert!(backend.exists("k").await.is_ok());
+        assert!(stale.exists(), "reads must not sweep");
+
+        // Clones share the once-per-instance flag: one sweep, not one per clone.
+        let clone = backend.clone();
+        clone.set("k", b"v".to_vec(), None).await.expect("set");
+        assert!(!stale.exists(), "first set must sweep stale orphans");
+        assert!(
+            backend.swept.load(Ordering::Relaxed),
+            "clones share the flag"
+        );
+    }
+
+    // A set parked on its stripe needs the blocking pool; `unsync` runs I/O inline.
+    #[cfg(not(feature = "unsync"))]
+    #[tokio::test]
+    async fn first_set_sweeps_without_waiting_for_its_stripe() {
+        // The sweep touches only temp files past the orphan threshold, never
+        // an entry, so it must neither wait for nor hold the key's stripe.
+        let (_dir, backend) = private_backend();
+        let stale = plant_stale_temp(backend.cache_dir());
+        let stripe = stripe_of(&backend.entry_path("k"));
+        let held = Arc::clone(&backend.stripes[stripe]).lock_owned().await;
+
+        let set = {
+            let b = backend.clone();
+            tokio::spawn(async move { b.set("k", b"v".to_vec(), None).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stale.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the sweep must not wait for the set's stripe");
+        assert!(
+            !set.is_finished(),
+            "the write itself still waits for its stripe"
+        );
+
+        drop(held);
+        set.await.expect("join").expect("set");
     }
 
     // ── Hardening ────────────────────────────────────────────────────────────
@@ -986,6 +1322,124 @@ mod tests {
         // not block and does not misreport the entry as missing.
         let err = read_entry(&path).expect_err("contended read must error");
         assert_eq!(err.kind, BackendErrorKind::Timeout, "{err}");
+    }
+
+    /// A 0700 tempdir and a backend built on it through the public builder.
+    fn private_backend() -> (tempfile::TempDir, FileBackend) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        let backend = FileBackend::builder()
+            .cache_dir(dir.path())
+            .build()
+            .expect("build");
+        (dir, backend)
+    }
+
+    #[test]
+    fn stripe_is_the_filename_first_byte() {
+        // Pinned digest from filename_hash_matches_py_blake2b16_hex: 0xbc… → 0xbc % 64.
+        let backend = backend_at(Path::new("/cache"));
+        assert_eq!(
+            stripe_of(&backend.entry_path("ns:app:func:m.f:args:abc:v1")),
+            0xbc % LOCK_STRIPES
+        );
+        for i in 0..1000 {
+            let key = format!("k{i}");
+            let name = crate::metrics::key_hash(&key);
+            let first = u8::from_str_radix(&name[..2], 16).expect("hex");
+            assert_eq!(
+                stripe_of(&backend.entry_path(&key)),
+                usize::from(first) % LOCK_STRIPES
+            );
+        }
+    }
+
+    // A blocking op held mid-flight needs the blocking pool; `unsync` runs I/O inline.
+    #[cfg(not(feature = "unsync"))]
+    #[tokio::test]
+    async fn an_in_flight_op_blocks_its_key_and_no_other() {
+        let (_dir, backend) = private_backend();
+        let held = "held";
+        let held_stripe = stripe_of(&backend.entry_path(held));
+        let other = (0..)
+            .map(|i| format!("other{i}"))
+            .find(|k| stripe_of(&backend.entry_path(k)) != held_stripe)
+            .expect("a key on another stripe");
+        backend.set(held, b"h".to_vec(), None).await.expect("set");
+        backend.set(&other, b"o".to_vec(), None).await.expect("set");
+
+        // Stand in for a write to `held` stuck in its fsync: an op that takes
+        // whatever lock the backend uses for `held` and parks until released.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let in_flight = {
+            let b = backend.clone();
+            tokio::spawn(async move {
+                b.locked(held_stripe, move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(())
+                })
+                .await
+            })
+        };
+        started_rx.await.expect("in-flight op started");
+
+        let other_get = tokio::time::timeout(Duration::from_secs(5), backend.get(&other))
+            .await
+            .expect("a read of another key must not wait on an unrelated in-flight write");
+        assert_eq!(other_get.expect("get").as_deref(), Some(b"o".as_slice()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), backend.get(held))
+                .await
+                .is_err(),
+            "same-key ops must still serialize behind the in-flight op"
+        );
+
+        release_tx.send(()).expect("release");
+        in_flight.await.expect("join").expect("in-flight op");
+        assert_eq!(
+            backend.get(held).await.expect("get").as_deref(),
+            Some(b"h".as_slice())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn interleaved_cross_key_set_get_loses_no_update() {
+        // Many keys, so tasks land on shared and distinct stripes alike: every
+        // read sees its own task's latest write, and every final value is the
+        // last one written.
+        let (_dir, backend) = private_backend();
+        let tasks: Vec<_> = (0..16)
+            .map(|t| {
+                let b = backend.clone();
+                tokio::spawn(async move {
+                    let key = format!("task{t}");
+                    for round in 0..25u32 {
+                        let value = format!("{t}:{round}").into_bytes();
+                        b.set(&key, value.clone(), None).await.expect("set");
+                        assert_eq!(
+                            b.get(&key).await.expect("get"),
+                            Some(value),
+                            "task {t} round {round}: update lost"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.expect("join");
+        }
+        for t in 0..16 {
+            assert_eq!(
+                backend.get(&format!("task{t}")).await.expect("get"),
+                Some(format!("{t}:24").into_bytes())
+            );
+        }
     }
 
     #[tokio::test]

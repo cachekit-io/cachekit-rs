@@ -363,47 +363,6 @@ async fn secure_interop_get_swr_evicts_l1_after_decrypt_failure() {
     ));
 }
 
-// SWR staleness exists only on native builds with L1 (see swr_tests.rs).
-#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
-#[tokio::test]
-async fn secure_interop_get_swr_evicts_stale_l1_after_decrypt_failure() {
-    // The Stale arm reads straight from L1, so the undecryptable bytes must
-    // already be there: a plain write puts plaintext in this client's L1.
-    let (shared, backend) = MockBackend::new_with_handle();
-    let client = CacheKit::builder()
-        .backend(shared)
-        .l1_capacity(100)
-        .swr_threshold_ratio(0.001)
-        .encryption_from_bytes(TEST_MASTER_KEY, "test-tenant")
-        .expect("encryption setup")
-        .build()
-        .expect("client builds");
-    client
-        .set_with_ttl("poisoned-stale", &"plaintext", Duration::from_secs(60))
-        .await
-        .unwrap();
-    // Real time, not tokio's paused clock: L1 ages entries by std Instant, so
-    // a paused sleep leaves the entry Fresh. threshold = 0.001 × 60 s = 60 ms
-    // (±10%); hard expiry at 60 s.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let secure = client.secure_cache().unwrap();
-    let err = secure
-        .interop_get_swr::<String>("poisoned-stale")
-        .await
-        .unwrap_err();
-    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
-    // Served from L1, so the entry had not hard-expired into the L2 path.
-    let stats = client.stats();
-    assert_eq!((stats.l1_hits, stats.l2_hits), (1, 0), "{stats:?}");
-
-    backend.store.lock().await.remove("poisoned-stale");
-    assert!(matches!(
-        secure.interop_get_swr::<String>("poisoned-stale").await,
-        Ok(cachekit::SwrRead::Miss)
-    ));
-}
-
 #[tokio::test]
 async fn secure_with_namespace() {
     let (shared, backend) = MockBackend::new_with_handle();
@@ -429,6 +388,53 @@ async fn secure_with_namespace() {
     // Round-trip should work
     let val: String = secure.get("namespaced").await.unwrap().unwrap();
     assert_eq!(val, "value");
+}
+
+/// The AAD binds the key the client passes to its backend, namespace
+/// included: same master key and tenant, but ciphertext copied from `app1:k1`
+/// to `app2:k1` must not decrypt.
+#[tokio::test]
+async fn secure_namespace_is_bound_in_aad() {
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client_in = |ns: &str| {
+        CacheKit::builder()
+            .backend(shared.clone())
+            .namespace(ns)
+            .no_l1()
+            .encryption_from_bytes(TEST_MASTER_KEY, "one-tenant")
+            .unwrap()
+            .build()
+            .unwrap()
+    };
+    let (app1, app2) = (client_in("app1"), client_in("app2"));
+
+    app1.secure_cache()
+        .unwrap()
+        .set("k1", &"v-from-app1")
+        .await
+        .unwrap();
+    let stored = backend.store.lock().await["app1:k1"].clone();
+
+    // The ciphertext authenticates under the namespaced key, not the bare one.
+    let layer = cachekit::EncryptionLayer::new(TEST_MASTER_KEY, "one-tenant").unwrap();
+    assert!(layer.decrypt(&stored, "app1:k1").is_ok());
+    assert!(layer.decrypt(&stored, "k1").is_err());
+
+    backend
+        .store
+        .lock()
+        .await
+        .insert("app2:k1".to_owned(), stored);
+    let err = app2
+        .secure_cache()
+        .unwrap()
+        .get::<String>("k1")
+        .await
+        .expect_err("ciphertext moved across namespaces must fail authentication");
+    assert!(
+        matches!(err, CachekitError::Encryption(_)),
+        "expected Encryption, got: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -588,4 +594,647 @@ async fn rotation_drain_signal_is_visible_on_secure_cache() {
         vec![1],
         "previous-key hit is counted"
     );
+}
+
+/// The hex rotation path: an entry written under a 48-byte key for a
+/// non-default tenant stays readable after a fresh 32-byte key is promoted,
+/// with the 48-byte key listed as previous. The raw-bytes path cannot do this
+/// (its keys are exactly 32 bytes), nor can the env path (tenant "default").
+#[tokio::test]
+async fn hex_rotation_reads_a_48_byte_key_entry_for_a_custom_tenant() {
+    const TENANT: &str = "tenant-a";
+    let old_hex = "11".repeat(48);
+    let new_hex = "22".repeat(32);
+    let backend = MockBackend::shared();
+    let client = |configure: &dyn Fn(
+        cachekit::CacheKitBuilder,
+    ) -> Result<cachekit::CacheKitBuilder, CachekitError>| {
+        let builder = CacheKit::builder()
+            .backend(backend.clone())
+            .default_ttl(Duration::from_secs(60))
+            .no_l1();
+        configure(builder)
+            .expect("encryption setup")
+            .build()
+            .expect("client builds")
+    };
+    let secret = plain_secret();
+
+    let writer = client(&|b| b.encryption(&old_hex, TENANT));
+    writer.set("rotate:old", &secret).await.unwrap();
+
+    let rotated = client(&|b| b.encryption_with_previous(&new_hex, &[&old_hex], TENANT));
+    assert_eq!(
+        rotated.get::<Secret>("rotate:old").await.unwrap(),
+        Some(secret.clone()),
+        "the 48-byte-key entry must stay readable after rotation"
+    );
+    assert_eq!(
+        rotated.secure_cache().unwrap().previous_key_hits(),
+        vec![1],
+        "the read was served by the previous key"
+    );
+
+    // Writes use the new key alone: a client holding only it reads them,
+    // and a client holding only the old key does not.
+    rotated.set("rotate:new", &secret).await.unwrap();
+    let new_only = client(&|b| b.encryption(&new_hex, TENANT));
+    assert_eq!(
+        new_only.get::<Secret>("rotate:new").await.unwrap(),
+        Some(secret.clone()),
+        "a write after rotation must decrypt under the new key alone"
+    );
+    let old_only = client(&|b| b.encryption(&old_hex, TENANT));
+    let result = old_only.get::<Secret>("rotate:new").await;
+    assert!(
+        matches!(result, Err(CachekitError::Encryption(_))),
+        "a write after rotation must not be under the old key, got {result:?}"
+    );
+}
+
+#[track_caller]
+fn assert_builder_config_err_naming(
+    result: Result<cachekit::CacheKitBuilder, CachekitError>,
+    names: &str,
+    what: &str,
+) {
+    match result {
+        Err(CachekitError::Config(msg)) => {
+            assert!(
+                msg.contains(names),
+                "{what}: Config error must name {names:?}, got: {msg}"
+            )
+        }
+        Err(e) => panic!("{what}: expected Config error, got {e:?}"),
+        Ok(_) => panic!("{what}: expected Config error, got Ok"),
+    }
+}
+
+/// `encryption_with_previous` keeps the keyring rules of the hex env path,
+/// each a Config error at construction.
+#[test]
+fn encryption_with_previous_enforces_the_keyring_rules() {
+    let current = "22".repeat(32);
+    let (k1, k2, k3, k4) = (
+        "11".repeat(32),
+        "33".repeat(32),
+        "44".repeat(48),
+        "55".repeat(32),
+    );
+    let ok = |prev: &[&str], tenant: &str| {
+        CacheKit::builder().encryption_with_previous(&current, prev, tenant)
+    };
+
+    assert!(
+        ok(&[&k1, &k2, &k3], "t").is_ok(),
+        "3 previous keys are allowed"
+    );
+    assert!(ok(&[], "t").is_ok(), "no previous keys is allowed");
+    assert!(
+        ok(&[&k1], &"t".repeat(255)).is_ok(),
+        "a 255-byte tenant is allowed"
+    );
+
+    assert_builder_config_err_naming(ok(&[&k1, &k2, &k3, &k4], "t"), "keyring", "4 previous keys");
+    assert_builder_config_err_naming(
+        ok(&[&k1, &current], "t"),
+        "keyring",
+        "current key among previous",
+    );
+    assert_builder_config_err_naming(ok(&[&k1], ""), "tenant_id", "empty tenant");
+    assert_builder_config_err_naming(ok(&[&k1], &"t".repeat(256)), "tenant_id", "256-byte tenant");
+
+    for (bad, why) in [
+        ("11".repeat(31), "31-byte previous key"),
+        ("zz".repeat(32), "non-hex previous key"),
+        ("1".repeat(65), "odd-length previous key"),
+        (String::new(), "empty previous key"),
+    ] {
+        assert_builder_config_err_naming(ok(&[&k1, &bad], "t"), "previous master key 1", why);
+    }
+    for (bad, why) in [
+        ("11".repeat(31), "31-byte current key"),
+        ("zz".repeat(32), "non-hex current key"),
+    ] {
+        assert_builder_config_err_naming(
+            CacheKit::builder().encryption_with_previous(&bad, &[&k1], "t"),
+            "master key",
+            why,
+        );
+    }
+}
+
+// ── Plain methods on an encrypted client ──────────────────────────────────────
+//
+// protocol spec/intent-presets.md § Encryption Activation, rule 1: an explicit
+// encryption option encrypts every operation on the client, not only the
+// `secure_cache()` handle.
+
+type Configure = fn(cachekit::CacheKitBuilder) -> Result<cachekit::CacheKitBuilder, CachekitError>;
+
+/// Every builder encryption spelling, each with the same key and tenant, so
+/// one independently built layer decrypts whatever any of them stores.
+const SPELLINGS: [(&str, Configure); 4] = [
+    ("encryption", |b| {
+        b.encryption(&test_master_key_hex(), "test-tenant")
+    }),
+    ("encryption_from_bytes", |b| {
+        b.encryption_from_bytes(TEST_MASTER_KEY, "test-tenant")
+    }),
+    ("encryption_from_bytes_with_previous", |b| {
+        b.encryption_from_bytes_with_previous(TEST_MASTER_KEY, &[&[0x11; 32]], "test-tenant")
+    }),
+    ("encryption_with_previous", |b| {
+        b.encryption_with_previous(&test_master_key_hex(), &[&"11".repeat(32)], "test-tenant")
+    }),
+];
+
+fn plain_client(configure: Configure, backend: SharedBackend, l1: bool) -> CacheKit {
+    let builder = CacheKit::builder()
+        .backend(backend)
+        .default_ttl(Duration::from_secs(60));
+    let builder = if l1 {
+        builder.l1_capacity(100)
+    } else {
+        builder.no_l1()
+    };
+    configure(builder)
+        .expect("encryption setup")
+        .build()
+        .expect("client builds")
+}
+
+fn plain_secret() -> Secret {
+    Secret {
+        api_key: "sk-live-PLAINPATH".to_owned(), // pragma: allowlist secret
+        user_id: 7,
+    }
+}
+
+/// The bytes the backend holds for `key` are the AES-GCM ciphertext of
+/// `value`'s MessagePack: never the MessagePack itself, and decryptable by a
+/// layer built apart from the client.
+async fn assert_backend_holds_ciphertext_of<T: Serialize>(
+    backend: &MockBackend,
+    key: &str,
+    value: &T,
+    how: &str,
+) {
+    let stored = backend
+        .store
+        .lock()
+        .await
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| panic!("{how}: {key} never reached the backend"));
+    let plaintext = cachekit::serializer::serialize(value).unwrap();
+    assert_ne!(stored, plaintext, "{how}: {key} stored as plaintext");
+    let decrypted = cachekit::EncryptionLayer::new(TEST_MASTER_KEY, "test-tenant")
+        .unwrap()
+        .decrypt(&stored, key)
+        .unwrap_or_else(|e| panic!("{how}: {key} is not ciphertext under the key: {e}"));
+    assert_eq!(decrypted, plaintext, "{how}: {key}");
+}
+
+#[tokio::test]
+async fn plain_set_and_set_with_ttl_store_ciphertext() {
+    let secret = plain_secret();
+    for (how, configure) in SPELLINGS {
+        let (shared, backend) = MockBackend::new_with_handle();
+        let client = plain_client(configure, shared, false);
+        client.set("plain:set", &secret).await.unwrap();
+        client
+            .set_with_ttl("plain:ttl", &secret, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_backend_holds_ciphertext_of(&backend, "plain:set", &secret, how).await;
+        assert_backend_holds_ciphertext_of(&backend, "plain:ttl", &secret, how).await;
+    }
+}
+
+#[tokio::test]
+async fn plain_reads_decrypt_what_plain_writes_store() {
+    let secret = plain_secret();
+    for (how, configure) in SPELLINGS {
+        let client = plain_client(configure, MockBackend::shared(), false);
+        client.set("plain:rt", &secret).await.unwrap();
+        assert_eq!(
+            client.get::<Secret>("plain:rt").await.unwrap(),
+            Some(secret.clone()),
+            "{how}: get"
+        );
+        assert_eq!(
+            client.interop_get::<Secret>("plain:rt").await.unwrap(),
+            Some(secret.clone()),
+            "{how}: interop_get"
+        );
+        assert_eq!(
+            client.interop_get_swr::<Secret>("plain:rt").await.unwrap(),
+            cachekit::SwrRead::Fresh(secret.clone()),
+            "{how}: interop_get_swr"
+        );
+
+        // One format: the secure_cache() handle and the plain methods read
+        // each other's entries.
+        let secure = client.secure_cache().unwrap();
+        assert_eq!(
+            secure.get::<Secret>("plain:rt").await.unwrap(),
+            Some(secret.clone()),
+            "{how}: handle reads a plain write"
+        );
+        secure.set("secure:rt", &secret).await.unwrap();
+        assert_eq!(
+            client.get::<Secret>("secure:rt").await.unwrap(),
+            Some(secret.clone()),
+            "{how}: plain get reads a handle write"
+        );
+    }
+}
+
+/// L1 is not visible from here, so read it through the handle, which always
+/// decrypts: with the backend entry gone, an L1 hit that decrypts proves L1
+/// holds ciphertext (the crate-internal `secure_tests` compare the bytes).
+#[tokio::test]
+async fn plain_writes_keep_ciphertext_in_l1() {
+    let secret = plain_secret();
+    for (how, configure) in SPELLINGS {
+        let (shared, backend) = MockBackend::new_with_handle();
+        let client = plain_client(configure, shared, true);
+        client.set("plain:l1", &secret).await.unwrap();
+        backend.store.lock().await.clear();
+
+        let secure = client.secure_cache().unwrap();
+        assert_eq!(
+            secure.get::<Secret>("plain:l1").await.unwrap(),
+            Some(secret.clone()),
+            "{how}"
+        );
+        assert_eq!(client.stats().l1_hits, 1, "{how}: served from L1");
+    }
+}
+
+/// An entry written in the clear (by an unencrypted client, or by plain
+/// `set` on an encrypted client before plain writes encrypted) fails closed
+/// on an encrypted client's plain reads, until it is overwritten or expires.
+#[tokio::test]
+async fn plain_reads_reject_a_plaintext_entry() {
+    let (shared, _backend) = MockBackend::new_with_handle();
+    CacheKit::builder()
+        .backend(shared.clone())
+        .no_l1()
+        .build()
+        .unwrap()
+        .set("legacy", &"in the clear")
+        .await
+        .unwrap();
+
+    let client = make_encrypted_client(shared);
+    let err = client.get::<String>("legacy").await.unwrap_err();
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+    let err = client.interop_get::<String>("legacy").await.unwrap_err();
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+    let err = client
+        .interop_get_swr::<String>("legacy")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CachekitError::Encryption(_)), "got: {err:?}");
+
+    client.set("legacy", &"sealed").await.unwrap();
+    assert_eq!(
+        client.get::<String>("legacy").await.unwrap().as_deref(),
+        Some("sealed")
+    );
+}
+
+/// A decode failure after a successful decrypt names only the target type:
+/// serde's own message quotes the decrypted value (CWE-532) — here
+/// `invalid type: string "sk-live-…", expected struct Secret`. The error stays
+/// `Serialization`, which `#[cachekit]` reads as a miss.
+#[tokio::test]
+async fn decode_error_after_decrypt_does_not_quote_the_value() {
+    let client = make_encrypted_client(MockBackend::shared());
+    client.set("typed", &"sk-live-REDACTME").await.unwrap(); // pragma: allowlist secret
+    let secure = client.secure_cache().unwrap();
+    for (how, result) in [
+        ("get", client.get::<Secret>("typed").await.map(drop)),
+        (
+            "interop_get",
+            client.interop_get::<Secret>("typed").await.map(drop),
+        ),
+        (
+            "interop_get_swr",
+            client.interop_get_swr::<Secret>("typed").await.map(drop),
+        ),
+        ("handle get", secure.get::<Secret>("typed").await.map(drop)),
+    ] {
+        match result {
+            Err(CachekitError::Serialization(msg)) => {
+                assert!(!msg.contains("REDACTME"), "{how} quotes the value: {msg}");
+                assert!(
+                    msg.contains("Secret"),
+                    "{how} must name the target type: {msg}"
+                );
+            }
+            other => panic!("{how}: expected a Serialization error, got {other:?}"),
+        }
+    }
+}
+
+/// After a decrypt the reader's container is exactly one MessagePack document
+/// (spec/encryption.md): a plaintext sealed under the reader's own AAD with one
+/// trailing byte is a parse mismatch, never the value before it. Only the
+/// variant is asserted, because `redact_decode` rewrites the message.
+#[tokio::test]
+async fn secure_get_rejects_a_decrypted_plaintext_with_trailing_bytes() {
+    let (backend, handle) = MockBackend::new_with_handle();
+    let client = make_encrypted_client(backend);
+    let mut plaintext = cachekit::serializer::serialize(&7u8).unwrap();
+    plaintext.push(0x00);
+    let sealed = cachekit::EncryptionLayer::new(TEST_MASTER_KEY, "test-tenant")
+        .unwrap()
+        .encrypt(&plaintext, "trailing")
+        .unwrap();
+    handle
+        .store
+        .lock()
+        .await
+        .insert("trailing".to_owned(), sealed);
+
+    let secure = client.secure_cache().unwrap();
+    let err = secure.get::<u8>("trailing").await.unwrap_err();
+    assert!(
+        matches!(err, CachekitError::Serialization(_)),
+        "got: {err:?}"
+    );
+}
+
+// ── Master-key length (spec/intent-presets.md § Master Key Input) ─────────────
+
+#[track_caller]
+fn assert_builder_config_err(result: Result<cachekit::CacheKitBuilder, CachekitError>, what: &str) {
+    assert_builder_config_err_naming(result, "", what);
+}
+
+/// Rule 4: a raw-bytes entry point takes exactly 32 bytes.
+#[test]
+fn encryption_from_bytes_requires_exactly_32_bytes() {
+    for len in [31, 33] {
+        assert_builder_config_err(
+            CacheKit::builder().encryption_from_bytes(&vec![7u8; len], "t"),
+            &format!("{len}-byte key"),
+        );
+    }
+    assert!(CacheKit::builder()
+        .encryption_from_bytes(&[7u8; 32], "t")
+        .is_ok());
+}
+
+/// The ASCII bytes of a 64-char hex string pass a `>= 32` check and derive a
+/// silently different key — they must be rejected, not accepted.
+#[test]
+fn encryption_from_bytes_rejects_ascii_hex() {
+    let hex = "ab".repeat(32);
+    assert_builder_config_err(
+        CacheKit::builder().encryption_from_bytes(hex.as_bytes(), "t"),
+        "ASCII hex as raw bytes",
+    );
+}
+
+#[test]
+fn encryption_from_bytes_with_previous_requires_exactly_32_bytes() {
+    const K1: &[u8] = &[0x11; 32];
+    const K2: &[u8] = &[0x22; 32];
+    for len in [31, 33] {
+        let bad = vec![7u8; len];
+        assert_builder_config_err(
+            CacheKit::builder().encryption_from_bytes_with_previous(&bad, &[K1], "t"),
+            &format!("{len}-byte current key"),
+        );
+        assert_builder_config_err(
+            CacheKit::builder().encryption_from_bytes_with_previous(K2, &[&bad], "t"),
+            &format!("{len}-byte previous key"),
+        );
+    }
+    assert!(CacheKit::builder()
+        .encryption_from_bytes_with_previous(K2, &[K1], "t")
+        .is_ok());
+}
+
+/// Rule 3: the hex path accepts any key decoding to >= 32 bytes.
+#[test]
+fn encryption_hex_accepts_32_and_48_byte_keys() {
+    for bytes in [32, 48] {
+        assert!(
+            CacheKit::builder()
+                .encryption(&"ab".repeat(bytes), "t")
+                .is_ok(),
+            "{bytes}-byte hex key must be accepted"
+        );
+    }
+}
+
+// ── Env-sourced keys (protocol intent-presets.md § Encryption Activation) ────
+
+/// The `from_env()` environment with the given key variables.
+#[cfg(feature = "cachekitio")]
+fn key_env(master: Option<&str>, previous: Option<&str>) -> common::EnvGuard {
+    common::EnvGuard::set(&[
+        ("CACHEKIT_API_KEY", Some("test-key")),
+        ("CACHEKIT_API_URL", None),
+        ("CACHEKIT_MASTER_KEY", master),
+        ("CACHEKIT_PREVIOUS_MASTER_KEYS", previous),
+    ])
+}
+
+#[cfg(feature = "cachekitio")]
+#[test]
+#[serial_test::serial]
+fn encryption_from_env_accepts_32_and_48_byte_hex_keys() {
+    for bytes in [32, 48] {
+        let (current, previous) = ("22".repeat(bytes), "11".repeat(bytes));
+        let _env = key_env(Some(&current), Some(&previous));
+        let builder = CacheKit::from_env()
+            .and_then(|b| b.encryption_from_env())
+            .unwrap_or_else(|e| panic!("{bytes}-byte hex keys must be accepted: {e}"));
+        assert!(builder.build().unwrap().secure_cache().is_ok());
+    }
+}
+
+/// Write `"plain value"` under `k` through `builder` on a fresh store and
+/// return the bytes the backend holds.
+#[cfg(feature = "cachekitio")]
+fn stored_bytes(builder: cachekit::CacheKitBuilder) -> Option<Vec<u8>> {
+    let (backend, handle) = MockBackend::new_with_handle();
+    let cache = builder
+        .backend(backend)
+        .no_l1()
+        .build()
+        .expect("client builds");
+    assert!(
+        cache.secure_cache().is_err(),
+        "no encryption layer expected"
+    );
+    common::runtime()
+        .block_on(cache.set("k", &"plain value"))
+        .expect("set");
+    let stored = handle.store.try_lock().unwrap().get("k").cloned();
+    stored
+}
+
+/// Rule 2: a set `CACHEKIT_MASTER_KEY` is a key source, never a switch —
+/// with the opt-out stated, the backend holds the value's plain MessagePack
+/// bytes.
+#[cfg(feature = "cachekitio")]
+#[test]
+#[serial_test::serial]
+fn from_env_with_a_master_key_and_no_encryption_stores_plaintext() {
+    let (current, previous) = ("22".repeat(32), "11".repeat(32));
+    let _env = key_env(Some(&current), Some(&previous));
+    let builder = CacheKit::from_env().expect("a valid key must not stop from_env");
+    assert_eq!(
+        stored_bytes(builder.no_encryption()),
+        Some(cachekit::serializer::serialize(&"plain value").unwrap()),
+        "from_env() must not encrypt because CACHEKIT_MASTER_KEY is set"
+    );
+}
+
+/// The transitional gate: a `from_env()` builder that saw the key and
+/// states no intent refuses to build, naming both spellings, so a deployment
+/// that relied on the old activation cannot silently start writing
+/// plaintext. Without the key there is nothing to state.
+#[cfg(feature = "cachekitio")]
+#[test]
+#[serial_test::serial]
+fn from_env_with_a_master_key_and_no_stated_intent_does_not_build() {
+    let current = "22".repeat(32);
+    let _env = key_env(Some(&current), None);
+    match CacheKit::from_env().and_then(|b| b.build()) {
+        Err(CachekitError::Config(msg)) => assert!(
+            msg.contains(".encryption_from_env()") && msg.contains(".no_encryption()"),
+            "the error must name both spellings: {msg}"
+        ),
+        Err(e) => panic!("expected a Config error, got {e:?}"),
+        Ok(_) => panic!("from_env() with a key built without a stated intent"),
+    }
+
+    let _no_key = key_env(None, None);
+    assert_eq!(
+        stored_bytes(CacheKit::from_env().expect("from_env")),
+        Some(cachekit::serializer::serialize(&"plain value").unwrap()),
+    );
+}
+
+/// An opt-out never quietly undoes an encryption call, in either order.
+#[test]
+fn no_encryption_with_an_encryption_call_is_a_config_error() {
+    let key = test_master_key_hex();
+    for builder in [
+        CacheKit::builder()
+            .encryption(&key, "t")
+            .unwrap()
+            .no_encryption(),
+        CacheKit::builder()
+            .no_encryption()
+            .encryption(&key, "t")
+            .unwrap(),
+    ] {
+        let result = builder.backend(MockBackend::shared()).build();
+        assert!(
+            matches!(&result, Err(CachekitError::Config(msg)) if msg.contains(".no_encryption()")),
+            "expected a Config error naming .no_encryption(), got {:?}",
+            result.err()
+        );
+    }
+}
+
+/// A set, non-UTF-8 key is reported as such, never as unset.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn encryption_from_env_rejects_a_non_utf8_key_naming_it() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let _env = common::EnvGuard::set(&[
+        ("CACHEKIT_MASTER_KEY", None),
+        ("CACHEKIT_PREVIOUS_MASTER_KEYS", None),
+    ]);
+    std::env::set_var(
+        "CACHEKIT_MASTER_KEY",
+        std::ffi::OsStr::from_bytes(&[0xff; 32]),
+    );
+    match CacheKit::builder().encryption_from_env() {
+        Err(CachekitError::Config(msg)) => assert!(msg.contains("not valid UTF-8"), "{msg}"),
+        Err(e) => panic!("expected a Config error, got {e:?}"),
+        Ok(_) => panic!("a non-UTF-8 key was accepted"),
+    }
+}
+
+/// `.encryption_from_env()` encrypts under `CACHEKIT_MASTER_KEY` for tenant
+/// `"default"` and decrypts with `CACHEKIT_PREVIOUS_MASTER_KEYS` — checked
+/// against clients given the same keys explicitly.
+#[cfg(feature = "cachekitio")]
+#[test]
+#[serial_test::serial]
+fn encryption_from_env_uses_the_env_keys() {
+    let (current, previous) = ("22".repeat(32), "11".repeat(32));
+    let _env = key_env(Some(&current), Some(&previous));
+    let (backend, handle) = MockBackend::new_with_handle();
+    let explicit = |hex: &str| {
+        CacheKit::builder()
+            .backend(backend.clone())
+            .no_l1()
+            .encryption(hex, "default")
+            .and_then(|b| b.build())
+            .expect("explicit client builds")
+    };
+    let cache = CacheKit::from_env()
+        .and_then(|b| b.encryption_from_env())
+        .expect("env keys are valid")
+        .backend(backend.clone())
+        .no_l1()
+        .build()
+        .expect("client builds");
+    let rt = common::runtime();
+
+    rt.block_on(cache.set("k", &"secret")).expect("set");
+    let stored = handle.store.try_lock().unwrap().get("k").cloned().unwrap();
+    assert_ne!(stored, cachekit::serializer::serialize(&"secret").unwrap());
+    let read: Option<String> = rt.block_on(explicit(&current).get("k")).expect("get");
+    assert_eq!(
+        read.as_deref(),
+        Some("secret"),
+        "written under the current key"
+    );
+
+    rt.block_on(explicit(&previous).set("old", &"rotated"))
+        .expect("set");
+    let read: Option<String> = rt.block_on(cache.get("old")).expect("get");
+    assert_eq!(read.as_deref(), Some("rotated"), "previous key decrypts");
+}
+
+/// Asked to encrypt with no key anywhere, the builder errors — never a
+/// plaintext client.
+#[cfg(feature = "cachekitio")]
+#[test]
+#[serial_test::serial]
+fn encryption_from_env_without_a_key_is_a_config_error() {
+    for (master, says) in [(None, "unset"), (Some(""), "empty")] {
+        let _env = key_env(master, None);
+        for (entry, result) in [
+            ("builder", CacheKit::builder().encryption_from_env()),
+            (
+                "from_env",
+                CacheKit::from_env().and_then(|b| b.encryption_from_env()),
+            ),
+        ] {
+            match result {
+                Err(CachekitError::Config(msg)) => assert!(
+                    msg.contains("CACHEKIT_MASTER_KEY") && msg.contains(says),
+                    "{entry} {master:?}: {msg}"
+                ),
+                Err(e) => panic!("{entry} {master:?}: expected a Config error, got {e:?}"),
+                Ok(_) => panic!("{entry} {master:?}: encryption accepted with no key"),
+            }
+        }
+    }
 }

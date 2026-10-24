@@ -119,4 +119,87 @@ mod redis_tests {
             .await
             .expect("cleanup release should not error");
     }
+
+    /// A server that completes fred's connection handshake, then never answers
+    /// again: no reply, no RST. This is the black-hole case, where an unbounded
+    /// client waits until TCP gives up (minutes).
+    fn spawn_silent_redis() -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    // fred's handshake is sequential request/response (PING,
+                    // CLIENT ID, INFO), so each read holds one command.
+                    while let Ok(n) = stream.read(&mut buf) {
+                        if n == 0 {
+                            return;
+                        }
+                        let cmd = String::from_utf8_lossy(&buf[..n]).to_ascii_uppercase();
+                        let reply: &[u8] = if cmd.contains("PING") {
+                            b"+PONG\r\n"
+                        } else if cmd.contains("CLIENT") || cmd.contains("INFO") {
+                            b"-ERR stub\r\n"
+                        } else {
+                            continue; // every data command: read, never reply
+                        };
+                        if stream.write_all(reply).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Without a command timeout these ops hang; the outer 30 s timeout makes
+    /// that a fast failure instead of a stuck test run.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // test-only: failures should panic loudly
+    async fn redis_ops_time_out_against_unresponsive_server() {
+        use cachekit::error::BackendErrorKind;
+        use std::time::{Duration, Instant};
+
+        let addr = spawn_silent_redis();
+        let backend = RedisBackendBuilder::default()
+            .url(format!("redis://{addr}"))
+            .build()
+            .expect("builder should succeed");
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let _handle = backend
+                .connect()
+                .await
+                .expect("stub handshake should succeed");
+
+            let start = Instant::now();
+            let (get, set, lock) = tokio::join!(
+                backend.get("k"),
+                backend.set("k", b"v".to_vec(), None),
+                backend.acquire_lock("k", 1_000),
+            );
+            let elapsed = start.elapsed();
+
+            assert_eq!(
+                get.expect_err("get must time out").kind,
+                BackendErrorKind::Timeout
+            );
+            assert_eq!(
+                set.expect_err("set must time out").kind,
+                BackendErrorKind::Timeout
+            );
+            assert_eq!(
+                lock.expect_err("acquire_lock must time out").kind,
+                BackendErrorKind::Timeout
+            );
+            assert!(elapsed < Duration::from_secs(6), "ops took {elapsed:?}");
+        })
+        .await
+        .expect("ops hung: no command timeout on the fred client");
+    }
 }

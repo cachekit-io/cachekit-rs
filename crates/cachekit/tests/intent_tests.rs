@@ -158,8 +158,50 @@ mod secure_intent {
     #[serial]
     async fn secure_from_env_valid_hex_passes_validation() {
         let key = valid_key();
-        let _env = EnvGuard::set(&[("CACHEKIT_MASTER_KEY", Some(&key))]);
+        let _env = EnvGuard::set(&[
+            ("CACHEKIT_MASTER_KEY", Some(&key)),
+            ("CACHEKIT_PREVIOUS_MASTER_KEYS", None),
+        ]);
         assert_past_key_validation(CacheKit::secure_from_env(UNREACHABLE).await);
+    }
+
+    // ── CACHEKIT_PREVIOUS_MASTER_KEYS (protocol intent-presets.md § Explicit
+    // Configuration rule 4): read with from_env()'s validation, never ignored.
+
+    #[tokio::test]
+    #[serial]
+    async fn secure_from_env_rejects_malformed_previous_keys_before_connecting() {
+        let key = valid_key();
+        let four = ["11", "33", "44", "55"].map(|b| b.repeat(32)).join(",");
+        for previous in ["not-hex", &*format!("{},", "11".repeat(32)), &*four, &*key] {
+            let _env = EnvGuard::set(&[
+                ("CACHEKIT_MASTER_KEY", Some(&key)),
+                ("CACHEKIT_PREVIOUS_MASTER_KEYS", Some(previous)),
+            ]);
+            let msg = expect_config_err(CacheKit::secure_from_env(UNREACHABLE).await);
+            assert!(!msg.contains(&key), "error quotes key material: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn secure_from_env_valid_previous_keys_pass_validation() {
+        let key = valid_key();
+        let previous = format!("{}, {}", "11".repeat(32), "33".repeat(32));
+        for value in [previous.as_str(), " "] {
+            let _env = EnvGuard::set(&[
+                ("CACHEKIT_MASTER_KEY", Some(&key)),
+                ("CACHEKIT_PREVIOUS_MASTER_KEYS", Some(value)),
+            ]);
+            assert_past_key_validation(CacheKit::secure_from_env(UNREACHABLE).await);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_key_never_reads_previous_keys_env() {
+        let _env = EnvGuard::set(&[("CACHEKIT_PREVIOUS_MASTER_KEYS", Some("not-hex"))]);
+        assert_past_key_validation(CacheKit::secure(UNREACHABLE, &valid_key()).await);
     }
 
     #[tokio::test]

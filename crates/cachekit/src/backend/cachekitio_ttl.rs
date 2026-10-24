@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::cachekitio::{reqwest_err_sanitized, CachekitIO};
-use super::TtlInspectable;
+use super::{ttl_wire_secs, TtlInspectable};
 use crate::error::BackendError;
 
 #[derive(Deserialize)]
@@ -27,8 +27,7 @@ impl TtlInspectable for CachekitIO {
     async fn ttl(&self, key: &str) -> Result<Option<Duration>, BackendError> {
         let url = self.ttl_url(key)?;
 
-        let req =
-            self.with_standard_headers(self.client().get(&url).bearer_auth(self.api_key_str()));
+        let req = self.with_standard_headers(self.client().get(&url));
 
         let resp = req
             .send()
@@ -48,10 +47,11 @@ impl TtlInspectable for CachekitIO {
     }
 
     async fn refresh_ttl(&self, key: &str, ttl: Duration) -> Result<bool, BackendError> {
-        let secs = ttl.as_secs();
+        // PATCH /ttl takes the X-CacheKit-TTL rules (spec/saas-api.md).
+        let secs = ttl_wire_secs(ttl);
         if secs == 0 {
             return Err(BackendError::permanent(
-                "refresh_ttl requires at least 1 second".to_string(),
+                "refresh_ttl requires a non-zero TTL".to_string(),
             ));
         }
 
@@ -64,7 +64,6 @@ impl TtlInspectable for CachekitIO {
         let req = self.with_standard_headers(
             self.client()
                 .patch(&url)
-                .bearer_auth(self.api_key_str())
                 .header("Content-Type", "application/json")
                 .body(body),
         );

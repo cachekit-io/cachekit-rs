@@ -48,9 +48,31 @@ impl L1Stats {
 /// Thread-safe closure that produces an optional [`L1Stats`] snapshot.
 pub type MetricsProvider = Arc<dyn Fn() -> Option<L1Stats> + Send + Sync>;
 
+/// Names of the `X-CacheKit-*` telemetry headers, in the order
+/// [`metrics_headers`] emits them: L1 status, L1 hits, L2 hits, misses, L1 hit
+/// rate.
+pub(crate) const METRICS_HEADER_NAMES: [&str; 5] = [
+    "X-CacheKit-L1-Status",
+    "X-CacheKit-L1-Hits",
+    "X-CacheKit-L2-Hits",
+    "X-CacheKit-Misses",
+    "X-CacheKit-L1-Hit-Rate",
+];
+
 /// Build `X-CacheKit-*` HTTP headers from the current L1 stats provider.
 pub fn metrics_headers(provider: Option<&MetricsProvider>) -> Vec<(&'static str, String)> {
-    let disabled = vec![("X-CacheKit-L1-Status", "disabled".to_string())];
+    metrics_headers_named(provider, &METRICS_HEADER_NAMES)
+}
+
+/// [`metrics_headers`] with the names supplied in [`METRICS_HEADER_NAMES`]
+/// order, so the native CachekitIO backend can pass prebuilt `HeaderName`s
+/// instead of having reqwest parse each name on every request.
+pub(crate) fn metrics_headers_named<N: Clone>(
+    provider: Option<&MetricsProvider>,
+    names: &[N; 5],
+) -> Vec<(N, String)> {
+    let [status, l1_hits, l2_hits, misses, hit_rate] = names.clone();
+    let disabled = vec![(status.clone(), "disabled".to_string())];
 
     let provider = match provider {
         Some(p) => p,
@@ -72,14 +94,11 @@ pub fn metrics_headers(provider: Option<&MetricsProvider>) -> Vec<(&'static str,
         // Metrics Headers"). Like the Python and TypeScript SDKs we report the
         // aggregate `miss` whenever L1 is on — per-request classification is
         // not something an L2 request can know about itself.
-        ("X-CacheKit-L1-Status", "miss".to_string()),
-        ("X-CacheKit-L1-Hits", stats.l1_hits.to_string()),
-        ("X-CacheKit-L2-Hits", stats.l2_hits.to_string()),
-        ("X-CacheKit-Misses", stats.misses.to_string()),
-        (
-            "X-CacheKit-L1-Hit-Rate",
-            format!("{:.3}", stats.l1_hit_rate()),
-        ),
+        (status, "miss".to_string()),
+        (l1_hits, stats.l1_hits.to_string()),
+        (l2_hits, stats.l2_hits.to_string()),
+        (misses, stats.misses.to_string()),
+        (hit_rate, format!("{:.3}", stats.l1_hit_rate())),
     ]
 }
 
@@ -121,7 +140,8 @@ pub(crate) enum ReadOutcome {
     /// Served from L1 past the SWR freshness threshold: still an L1 hit for
     /// the counters, but the caller is about to refresh it in the background.
     L1Stale,
-    /// Served from the L2 backend (and backfilled into L1 when enabled).
+    /// Served from the L2 backend (and backfilled into L1 when enabled, unless
+    /// the server marked the read stale or its freshness exhausted).
     L2Hit,
     /// Neither layer had the key.
     Miss,
@@ -201,8 +221,10 @@ impl CacheCounters {
 // ── tracing events ───────────────────────────────────────────────────────────
 //
 // One `debug` event per completed cache operation on the `cachekit` target
-// (`RUST_LOG=cachekit=debug`). Fields: `op` (`get` | `set` | `delete`),
-// `key_hash` (see `key_hash`), and per op `outcome` / `ttl_secs` / `existed`.
+// (`RUST_LOG=cachekit=debug`), one per failed fill-lock call, and one per
+// `#[cachekit]` result the macro could not store. Fields: `op`
+// (`get` | `set` | `delete` | `lock` | `unlock`), `key_hash` (see `key_hash`),
+// and per op `outcome` / `ttl_secs` / `existed` / `error_kind`.
 // Field expressions only run when a subscriber is enabled for the callsite,
 // so the hash is never computed for an uninterested process. Without the
 // feature these are empty functions the optimizer removes.
@@ -230,7 +252,7 @@ pub(crate) fn trace_write(full_key: &str, ttl: Duration) {
         target: TARGET,
         op = "set",
         key_hash = %key_hash(full_key),
-        ttl_secs = ttl.as_secs(),
+        ttl_secs = crate::backend::ttl_wire_secs(ttl),
     );
     #[cfg(not(feature = "tracing"))]
     let _ = (full_key, ttl);
@@ -247,6 +269,59 @@ pub(crate) fn trace_delete(full_key: &str, existed: bool) {
     );
     #[cfg(not(feature = "tracing"))]
     let _ = (full_key, existed);
+}
+
+/// Emit the event for a failed fill-lock call (`op` is `lock` or `unlock`).
+/// The call bypasses the circuit breaker, so this is the only signal of a
+/// failing lock endpoint: refreshes stand down, cold misses fill without the
+/// lease, and an unreleased lease is left to expire. It carries the error's
+/// kind, never its message: a transport error names the request URL, and the
+/// URL holds the key (CWE-532).
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+pub(crate) fn trace_lock_error(full_key: &str, op: &'static str, err: &crate::BackendError) {
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+        target: TARGET,
+        op,
+        key_hash = %key_hash(full_key),
+        error_kind = %err.kind,
+    );
+    #[cfg(not(feature = "tracing"))]
+    let _ = (full_key, op, err);
+}
+
+/// Emit the event for a `#[cachekit]` result the macro computed but could not
+/// store: a cold-miss fill, or an SWR refresh whose commit failed. Macro
+/// plumbing. A cold-miss call still returns its result; a failed refresh
+/// commit is dropped and the stale value keeps being served. Either way this
+/// is the only signal of a failing store — otherwise it shows only as repeat
+/// misses or refreshes.
+/// The macro stores only on an un-namespaced client, so `key` is the storage
+/// key. Like the lock-error event, it carries the error's kind, never
+/// its message: a transport error names the request URL, and an invalid-key
+/// error the key (CWE-532).
+#[doc(hidden)]
+pub fn __trace_store_error(key: &str, err: &crate::CachekitError) {
+    #[cfg(feature = "tracing")]
+    {
+        use crate::CachekitError as E;
+        let error_kind: &dyn std::fmt::Display = match err {
+            E::Backend(be) => &be.kind,
+            E::Serialization(_) => &"serialization",
+            E::Encryption(_) => &"encryption",
+            E::Config(_) => &"config",
+            E::PayloadTooLarge { .. } => &"payload-too-large",
+            E::InvalidKey(_) => &"invalid-key",
+        };
+        tracing::debug!(
+            target: TARGET,
+            op = "set",
+            key_hash = %key_hash(key),
+            error_kind = %error_kind,
+        );
+    }
+    #[cfg(not(feature = "tracing"))]
+    let _ = (key, err);
 }
 
 #[cfg(test)]

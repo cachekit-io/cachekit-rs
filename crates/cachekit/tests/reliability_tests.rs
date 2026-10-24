@@ -1061,3 +1061,115 @@ async fn circuit_state_is_none_without_a_breaker() {
     let disabled = client_with(shared, ReliabilityConfig::disabled());
     assert_eq!(disabled.circuit_state(), None);
 }
+
+// ── No retry deadline outside CacheKit::io ───────────────────────────────────
+
+/// Every data op sleeps `latency` on the tokio clock, then fails with `kind`;
+/// `None` never completes. Counts calls.
+#[derive(Debug, Clone)]
+struct SlowBackend {
+    latency: Option<Duration>,
+    kind: BackendErrorKind,
+    calls: Arc<AtomicU32>,
+}
+
+impl SlowBackend {
+    fn new_with_handle(latency: Option<Duration>, kind: BackendErrorKind) -> (SharedBackend, Self) {
+        let backend = Self {
+            latency,
+            kind,
+            calls: Arc::new(AtomicU32::new(0)),
+        };
+        let handle = backend.clone();
+        #[cfg(not(feature = "unsync"))]
+        let shared: SharedBackend = Arc::new(backend);
+        #[cfg(feature = "unsync")]
+        let shared: SharedBackend = std::rc::Rc::new(backend);
+        (shared, handle)
+    }
+
+    fn calls(&self) -> u32 {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    async fn op<T>(&self) -> Result<T, BackendError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.latency {
+            Some(latency) => tokio::time::sleep(latency).await,
+            None => std::future::pending().await,
+        }
+        Err(BackendError {
+            kind: self.kind.clone(),
+            message: "scripted failure".to_owned(),
+            source: None,
+        })
+    }
+}
+
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
+impl Backend for SlowBackend {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        self.op().await
+    }
+
+    async fn set(
+        &self,
+        _key: &str,
+        _value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        self.op().await
+    }
+
+    async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+        self.op().await
+    }
+
+    async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+        self.op().await
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Ok(HealthStatus {
+            is_healthy: true,
+            latency_ms: 0.0,
+            backend_type: "slow".to_owned(),
+            details: HashMap::new(),
+        })
+    }
+}
+
+/// The default layers with jitter off, so virtual time is exact.
+fn jitter_off_stack(backend: SharedBackend) -> CacheKit {
+    client_with(
+        backend,
+        ReliabilityConfig {
+            retry: Some(RetryConfig {
+                jitter: false,
+                ..RetryConfig::default()
+            }),
+            ..ReliabilityConfig::default()
+        },
+    )
+}
+
+/// A custom backend keeps every attempt: the 5 s / 10 s retry deadline is
+/// scoped to `CacheKit::io`, so a slow but working backend is never cut short
+/// (or counted as an outage) by budgets sized for cachekit.io.
+#[tokio::test(start_paused = true)]
+async fn a_custom_backend_gets_no_retry_deadline() {
+    let (backend, handle) =
+        SlowBackend::new_with_handle(Some(Duration::from_secs(30)), BackendErrorKind::Timeout);
+    let client = jitter_off_stack(backend);
+
+    let start = tokio::time::Instant::now();
+    client.get::<u32>("k").await.expect_err("times out");
+
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_millis(90_300),
+        "3 x 30 s + 100 + 200 ms"
+    );
+    assert_eq!(handle.calls(), 3);
+}

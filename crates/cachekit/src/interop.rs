@@ -371,18 +371,18 @@ pub fn serialize_value(value: &InteropValue) -> Result<Vec<u8>, CachekitError> {
 /// Deserialize an interop-mode MessagePack document, consuming **exactly one**
 /// document and rejecting trailing bytes (spec MUST).
 ///
-/// Decode bounds: the header walk in `crate::serializer::check_structure` runs
-/// first and rejects, with a `decode bound:` error, any document nested deeper
-/// than [`crate::serializer::MAX_DECODE_DEPTH`] or declaring more than the input
-/// can back.
+/// Decode bounds: cachekit-core's header walk (`check_msgpack_structure`, run
+/// from `crate::serializer::bounded_deserializer`) runs first and rejects, with
+/// a `decode bound:` error, any document nested deeper than
+/// [`crate::serializer::MAX_DECODE_DEPTH`] or declaring more than the input can
+/// back.
 ///
-/// `rmp_serde::from_slice` silently ignores trailing bytes. That leniency is
-/// dangerous here: a Python-SDK-internal CK frame begins `0x43` (`'C'`), which
-/// is a *complete* one-byte MessagePack document (positive fixint 67) — a
-/// lenient reader would silently decode an entire CK frame as the integer 67.
-///
-/// A payload with the `0x43 0x4B` (`"CK"`) prefix gets a specific diagnostic
-/// naming the Python auto-mode frame instead of a generic trailing-bytes error.
+/// The single-document rule is shared with auto-mode
+/// [`crate::serializer::deserialize`]: both refuse a Python-SDK-internal CK
+/// frame, whose first byte `0x43` (`'C'`) is a *complete* one-byte MessagePack
+/// document (positive fixint 67). This reader's only difference is the
+/// diagnostic: a payload with the `0x43 0x4B` (`"CK"`) prefix is named as the
+/// Python auto-mode frame instead of getting a generic trailing-bytes error.
 ///
 /// # Errors
 ///
@@ -398,21 +398,8 @@ pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError
     }
 
     let mut de = crate::serializer::bounded_deserializer(bytes)?;
-    let value = T::deserialize(&mut de)
-        .map_err(|e| CachekitError::Serialization(format!("interop decode: {e}")))?;
-
-    // `Read for &[u8]` advances the slice, so the reader now holds exactly the
-    // bytes the decoder did not consume.
-    let remaining: &[u8] = de.into_inner();
-    if !remaining.is_empty() {
-        return Err(CachekitError::Serialization(format!(
-            "interop payload has {} trailing byte(s) after the MessagePack document — \
-             interop readers must consume exactly one document",
-            remaining.len()
-        )));
-    }
-
-    Ok(value)
+    T::deserialize(&mut de)
+        .map_err(|e| CachekitError::Serialization(format!("interop decode: {e}")))
 }
 
 // ── Canonical encoder ────────────────────────────────────────────────────────
@@ -680,6 +667,21 @@ mod tests {
             err.to_string().contains("trailing byte"),
             "expected trailing-bytes error, got: {err}"
         );
+    }
+
+    /// The one decode the trailing-byte check cannot see: a target that reads
+    /// only an ext's type byte leaves the body unread, and the borrowed-slice
+    /// reader cannot report what it left. Pinned so the gap documented on
+    /// `crate::serializer::bounded_deserializer` stays a known one; interop
+    /// values never contain ext.
+    #[test]
+    fn deserialize_accepts_ext_target_that_reads_only_the_type_byte() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename = "_ExtStruct")]
+        struct TagOnly((i8,));
+        // fixext1: type 5, one data byte the target never reads.
+        let TagOnly((tag,)) = deserialize(&[0xd4, 0x05, 0xaa]).unwrap();
+        assert_eq!(tag, 5);
     }
 
     #[test]

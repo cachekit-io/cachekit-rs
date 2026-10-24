@@ -5,22 +5,95 @@
 //! single-threaded and `worker::Fetch` futures are `!Send`.
 
 use std::collections::HashMap;
+use std::future::{poll_fn, Future};
+use std::pin::pin;
 use std::sync::OnceLock;
+use std::task::Poll;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use js_sys::{Function, Promise, Reflect};
+use worker::wasm_bindgen::{JsCast, JsValue};
+use worker::wasm_bindgen_futures::JsFuture;
 use zeroize::Zeroizing;
 
 use crate::backend::saas_wire::{
     LockAcquireRequest, LockAcquireResponse, RefreshTtlRequest, TtlResponse,
 };
-use crate::backend::{encode_key, Backend, HealthStatus, LockableBackend, TtlInspectable};
+use crate::backend::{
+    delete_succeeded, encode_key, ttl_header, ttl_wire_secs, Backend, HealthStatus,
+    LockableBackend, TtlInspectable, READ_TIMEOUT, WRITE_TIMEOUT,
+};
 use crate::error::BackendError;
 use crate::metrics::{metrics_headers, MetricsProvider};
 use crate::session::session_headers;
-use crate::url_validator::validate_cachekitio_url;
+use crate::url_validator::cachekitio_base_url;
 
 // ── WorkersCachekitIO ────────────────────────────────────────────────────────
+
+/// A response read in full within its attempt's budget.
+struct Fetched {
+    status: u16,
+    body: Vec<u8>,
+}
+
+/// A timer on the global `setTimeout`, cleared when dropped. `worker::Delay`
+/// is not used because it panics unless `setTimeout` returns a number, which
+/// holds on workerd but not on Node.
+struct Timer {
+    handle: JsValue,
+    /// Settles the timer's promise. `JsFuture` frees its callbacks only when
+    /// the promise settles, so a cleared timer must still resolve it, or every
+    /// request that beats its deadline leaks them.
+    resolve: Function,
+}
+
+impl Timer {
+    /// Arm a timer for `after`; the returned future resolves when it fires.
+    fn arm(after: Duration) -> Result<(Self, JsFuture), BackendError> {
+        let global = js_sys::global();
+        let set_timeout: Function = Reflect::get(&global, &"setTimeout".into())
+            .ok()
+            .and_then(|f| f.dyn_into().ok())
+            .ok_or_else(|| BackendError::permanent("no global setTimeout"))?;
+        let mut armed = Err(JsValue::UNDEFINED);
+        let mut settle = None;
+        let fired = Promise::new(&mut |resolve, _reject| {
+            armed = set_timeout.call2(&global, &resolve, &(after.as_millis() as f64).into());
+            settle = Some(resolve);
+        });
+        let handle = armed.map_err(|e| {
+            BackendError::permanent(format!("failed to arm the request timeout: {e:?}"))
+        })?;
+        let resolve = settle
+            .ok_or_else(|| BackendError::permanent("Promise::new did not run its executor"))?;
+        Ok((Self { handle, resolve }, JsFuture::from(fired)))
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        let global = js_sys::global();
+        if let Ok(clear) = Reflect::get(&global, &"clearTimeout".into()) {
+            if let Ok(clear) = clear.dyn_into::<Function>() {
+                let _ = clear.call1(&global, &self.handle);
+            }
+        }
+        let _ = self.resolve.call0(&JsValue::UNDEFINED);
+    }
+}
+
+/// Aborts its request when dropped unless disarmed, so a request is cancelled
+/// both when its budget runs out and when the caller drops the call mid-flight.
+struct AbortOnDrop(Option<worker::AbortController>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(controller) = self.0.take() {
+            controller.abort();
+        }
+    }
+}
 
 /// HTTP backend for cachekit.io that uses `worker::Fetch` instead of `reqwest`.
 ///
@@ -58,14 +131,10 @@ impl WorkersCachekitIO {
 
     /// Build the full URL for a cache key path segment.
     ///
-    /// Keys are percent-encoded via [`encode_key`](crate::backend::encode_key); a
-    /// key whose encoded form is a reserved segment (`.`, `..`, `health`, `ttl`,
-    /// `lock`) is **rejected** (fallible return) rather than sent — the Workers
-    /// runtime `fetch` (WHATWG URL) strips the dot segments and the route tokens
-    /// collide with the health/sub-resource routes, both escaping
-    /// `/v1/cache/{key}` (CWE-22, spec rule 2) — see
-    /// [`encode_key`](crate::backend::encode_key). `ttl_url`/`lock_url` build on
-    /// this, so all three wasm paths inherit the guard.
+    /// Keys are percent-encoded via [`encode_key`](crate::backend::encode_key).
+    /// Fallible: it rejects exactly the keys `encode_key` rejects (CWE-22, spec
+    /// rule 2). `ttl_url`/`lock_url` build on this, so all three wasm paths
+    /// inherit the guard.
     fn url(&self, key: &str) -> Result<String, BackendError> {
         Ok(format!("{}/v1/cache/{}", self.api_url, encode_key(key)?))
     }
@@ -87,24 +156,30 @@ impl WorkersCachekitIO {
     }
 
     /// Convert a non-success response into a classified, sanitized error.
-    async fn error_from_response(&self, mut resp: worker::Response) -> BackendError {
-        let status = resp.status_code();
-        let body = resp.bytes().await.unwrap_or_default();
+    fn error_from(&self, resp: &Fetched) -> BackendError {
         let sanitized = BackendError::sanitize_message(
-            std::str::from_utf8(&body).unwrap_or(""),
+            std::str::from_utf8(&resp.body).unwrap_or(""),
             self.api_key.as_str(),
         );
-        BackendError::from_http_status(status, sanitized.as_bytes())
+        BackendError::from_http_status(resp.status, sanitized.as_bytes())
     }
 
-    /// Execute a fetch request with the given method, URL, optional body, and extra headers.
+    /// Send a request and read its whole response within `budget`, the same
+    /// per-attempt budget the native backend gives reqwest. The Workers
+    /// runtime's `fetch` has no timeout of its own and can hold a request for
+    /// tens of seconds, so past the budget the request is aborted and the
+    /// call fails with [`BackendErrorKind::Timeout`](crate::BackendErrorKind::Timeout).
+    ///
+    /// A success body is read in full and a failure to read it is an error.
+    /// An error body is read best-effort: its status alone classifies it.
     async fn fetch(
         &self,
         method: &str,
         url: &str,
         body: Option<Vec<u8>>,
         extra_headers: Vec<(&str, String)>,
-    ) -> Result<worker::Response, BackendError> {
+        budget: Duration,
+    ) -> Result<Fetched, BackendError> {
         let mut headers = worker::Headers::new();
         headers
             .set(
@@ -156,6 +231,11 @@ impl WorkersCachekitIO {
             }
         });
         init.with_headers(headers);
+        // The API never redirects, and this request carries credentials, so it
+        // goes only to the configured URL: `Manual` returns a 3xx as the
+        // response, which every caller treats as an error. Same policy as the
+        // native client's `Policy::none()`.
+        init.with_redirect(worker::RequestRedirect::Manual);
 
         if let Some(bytes) = body {
             let js_array = js_sys::Uint8Array::from(bytes.as_slice());
@@ -169,12 +249,54 @@ impl WorkersCachekitIO {
             ))
         })?;
 
-        worker::Fetch::Request(request).send().await.map_err(|e| {
-            BackendError::transient(BackendError::sanitize_message(
-                &format!("fetch failed: {e}"),
-                self.api_key.as_str(),
-            ))
+        let controller = worker::AbortController::default();
+        let signal = controller.signal();
+        let mut abort = AbortOnDrop(Some(controller));
+        let attempt = async {
+            let mut resp = worker::Fetch::Request(request)
+                .send_with_signal(&signal)
+                .await
+                .map_err(|e| {
+                    BackendError::transient(BackendError::sanitize_message(
+                        &format!("fetch failed: {e}"),
+                        self.api_key.as_str(),
+                    ))
+                })?;
+            let status = resp.status_code();
+            let body = if (200..300).contains(&status) {
+                resp.bytes().await.map_err(|e| {
+                    BackendError::transient(BackendError::sanitize_message(
+                        &format!("failed to read body: {e}"),
+                        self.api_key.as_str(),
+                    ))
+                })?
+            } else {
+                resp.bytes().await.unwrap_or_default()
+            };
+            Ok(Fetched { status, body })
+        };
+
+        let (_timer, deadline) = Timer::arm(budget)?;
+        let mut attempt = pin!(attempt);
+        let mut deadline = pin!(deadline);
+        let finished = poll_fn(|cx| match attempt.as_mut().poll(cx) {
+            Poll::Ready(result) => Poll::Ready(Some(result)),
+            Poll::Pending => deadline.as_mut().poll(cx).map(|_| None),
         })
+        .await;
+
+        match finished {
+            Some(result) => {
+                abort.0 = None;
+                result
+            }
+            // `abort` drops on return, cancelling the request and any body
+            // still streaming in.
+            None => Err(BackendError::timeout(format!(
+                "{method} request timed out after {} s",
+                budget.as_secs()
+            ))),
+        }
     }
 }
 
@@ -188,20 +310,14 @@ impl Backend for WorkersCachekitIO {
     }
 
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
-        let mut resp = self.fetch("GET", &self.url(key)?, None, vec![]).await?;
+        let resp = self
+            .fetch("GET", &self.url(key)?, None, vec![], READ_TIMEOUT)
+            .await?;
 
-        match resp.status_code() {
-            200 => {
-                let bytes = resp.bytes().await.map_err(|e| {
-                    BackendError::transient(BackendError::sanitize_message(
-                        &format!("failed to read body: {e}"),
-                        self.api_key.as_str(),
-                    ))
-                })?;
-                Ok(Some(bytes))
-            }
+        match resp.status {
+            200 => Ok(Some(resp.body)),
             404 => Ok(None),
-            _ => Err(self.error_from_response(resp).await),
+            _ => Err(self.error_from(&resp)),
         }
     }
 
@@ -213,35 +329,40 @@ impl Backend for WorkersCachekitIO {
     ) -> Result<(), BackendError> {
         let mut headers = vec![("Content-Type", "application/octet-stream".to_owned())];
         if let Some(ttl) = ttl {
-            headers.push(("X-TTL", ttl.as_secs().to_string()));
+            headers.push(ttl_header(ttl));
         }
 
-        let mut resp = self
-            .fetch("PUT", &self.url(key)?, Some(value), headers)
+        let resp = self
+            .fetch("PUT", &self.url(key)?, Some(value), headers, WRITE_TIMEOUT)
             .await?;
-        let status = resp.status_code();
 
-        if (200..300).contains(&status) {
+        if (200..300).contains(&resp.status) {
             Ok(())
         } else {
-            Err(self.error_from_response(resp).await)
+            Err(self.error_from(&resp))
         }
     }
 
+    /// `true` on every successful delete, whether or not the key existed: the
+    /// server does not report existence on `DELETE`.
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
-        let mut resp = self.fetch("DELETE", &self.url(key)?, None, vec![]).await?;
+        let resp = self
+            .fetch("DELETE", &self.url(key)?, None, vec![], WRITE_TIMEOUT)
+            .await?;
 
-        match resp.status_code() {
-            200 | 204 => Ok(true),
-            404 => Ok(false),
-            _ => Err(self.error_from_response(resp).await),
+        if delete_succeeded(resp.status) {
+            Ok(true)
+        } else {
+            Err(self.error_from(&resp))
         }
     }
 
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
-        let resp = self.fetch("HEAD", &self.url(key)?, None, vec![]).await?;
+        let resp = self
+            .fetch("HEAD", &self.url(key)?, None, vec![], READ_TIMEOUT)
+            .await?;
 
-        match resp.status_code() {
+        match resp.status {
             200 => Ok(true),
             404 => Ok(false),
             status => Err(BackendError::from_http_status(status, &[])),
@@ -249,8 +370,10 @@ impl Backend for WorkersCachekitIO {
     }
 
     async fn health(&self) -> Result<HealthStatus, BackendError> {
-        let mut resp = self.fetch("GET", &self.health_url(), None, vec![]).await?;
-        let status = resp.status_code();
+        let resp = self
+            .fetch("GET", &self.health_url(), None, vec![], READ_TIMEOUT)
+            .await?;
+        let status = resp.status;
 
         if (200..300).contains(&status) {
             let mut details = HashMap::new();
@@ -262,7 +385,7 @@ impl Backend for WorkersCachekitIO {
                 details,
             })
         } else {
-            Err(self.error_from_response(resp).await)
+            Err(self.error_from(&resp))
         }
     }
 }
@@ -286,28 +409,23 @@ impl LockableBackend for WorkersCachekitIO {
             BackendError::permanent(format!("failed to serialize lock request: {e}"))
         })?;
 
-        let mut resp = self
+        let resp = self
             .fetch(
                 "POST",
                 &self.lock_url(key)?,
                 Some(body),
                 vec![("Content-Type", "application/json".to_owned())],
+                READ_TIMEOUT,
             )
             .await?;
 
-        if !(200..300).contains(&resp.status_code()) {
-            return Err(self.error_from_response(resp).await);
+        if !(200..300).contains(&resp.status) {
+            return Err(self.error_from(&resp));
         }
 
         // Contested acquire is `200 {"lock_id": null}` — branch on the body,
         // never on a 409 status (protocol#22).
-        let bytes = resp.bytes().await.map_err(|e| {
-            BackendError::transient(BackendError::sanitize_message(
-                &format!("failed to read lock response: {e}"),
-                self.api_key.as_str(),
-            ))
-        })?;
-        let response: LockAcquireResponse = serde_json::from_slice(&bytes)
+        let response: LockAcquireResponse = serde_json::from_slice(&resp.body)
             .map_err(|e| BackendError::transient(format!("failed to parse lock response: {e}")))?;
 
         Ok(response.lock_id)
@@ -322,13 +440,14 @@ impl LockableBackend for WorkersCachekitIO {
                 &self.lock_url(key)?,
                 None,
                 vec![(LOCK_ID_HEADER, lock_id.to_owned())],
+                READ_TIMEOUT,
             )
             .await?;
 
-        match resp.status_code() {
+        match resp.status {
             200 | 204 => Ok(true),
             404 => Ok(false),
-            _ => Err(self.error_from_response(resp).await),
+            _ => Err(self.error_from(&resp)),
         }
     }
 }
@@ -338,31 +457,28 @@ impl LockableBackend for WorkersCachekitIO {
 #[async_trait(?Send)]
 impl TtlInspectable for WorkersCachekitIO {
     async fn ttl(&self, key: &str) -> Result<Option<Duration>, BackendError> {
-        let mut resp = self.fetch("GET", &self.ttl_url(key)?, None, vec![]).await?;
+        let resp = self
+            .fetch("GET", &self.ttl_url(key)?, None, vec![], READ_TIMEOUT)
+            .await?;
 
-        match resp.status_code() {
+        match resp.status {
             200 => {
-                let bytes = resp.bytes().await.map_err(|e| {
-                    BackendError::transient(BackendError::sanitize_message(
-                        &format!("failed to read TTL response: {e}"),
-                        self.api_key.as_str(),
-                    ))
-                })?;
-                let body: TtlResponse = serde_json::from_slice(&bytes).map_err(|e| {
+                let body: TtlResponse = serde_json::from_slice(&resp.body).map_err(|e| {
                     BackendError::transient(format!("failed to parse TTL response: {e}"))
                 })?;
                 Ok(body.ttl.map(Duration::from_secs))
             }
             404 => Ok(None),
-            _ => Err(self.error_from_response(resp).await),
+            _ => Err(self.error_from(&resp)),
         }
     }
 
     async fn refresh_ttl(&self, key: &str, ttl: Duration) -> Result<bool, BackendError> {
-        let secs = ttl.as_secs();
+        // PATCH /ttl takes the X-CacheKit-TTL rules (spec/saas-api.md).
+        let secs = ttl_wire_secs(ttl);
         if secs == 0 {
             return Err(BackendError::permanent(
-                "refresh_ttl requires at least 1 second".to_string(),
+                "refresh_ttl requires a non-zero TTL".to_string(),
             ));
         }
 
@@ -376,13 +492,14 @@ impl TtlInspectable for WorkersCachekitIO {
                 &self.ttl_url(key)?,
                 Some(body),
                 vec![("Content-Type", "application/json".to_owned())],
+                READ_TIMEOUT,
             )
             .await?;
 
-        match resp.status_code() {
+        match resp.status {
             200 | 204 => Ok(true),
             404 => Ok(false),
-            _ => Err(self.error_from_response(resp).await),
+            _ => Err(self.error_from(&resp)),
         }
     }
 }
@@ -434,8 +551,10 @@ impl WorkersCachekitIOBuilder {
     ///
     /// Returns an error if:
     /// - `api_key` was not set or is empty.
-    /// - the resolved URL scheme is not `https`.
-    /// - the URL hostname is not permitted (see [`validate_cachekitio_url`]).
+    /// - the resolved URL scheme is not `https`, or the URL carries a query or
+    ///   a fragment.
+    /// - the URL carries credentials, or its hostname is not permitted (see
+    ///   [`validate_cachekitio_url`](crate::url_validator::validate_cachekitio_url)).
     pub fn build(self) -> Result<WorkersCachekitIO, crate::error::CachekitError> {
         use crate::error::CachekitError;
 
@@ -448,11 +567,7 @@ impl WorkersCachekitIOBuilder {
             .api_url
             .unwrap_or_else(|| "https://api.cachekit.io".to_string());
 
-        // Validate URL: HTTPS, allowed host, no private IPs.
-        validate_cachekitio_url(&api_url, self.allow_custom_host)?;
-
-        // Trim trailing slash once so url()/health_url() don't repeat it per-request.
-        let api_url = api_url.trim_end_matches('/').to_string();
+        let api_url = cachekitio_base_url(&api_url, self.allow_custom_host)?;
 
         Ok(WorkersCachekitIO {
             api_key,

@@ -5,7 +5,7 @@ on:
     branches:
       - main
   # Break-glass republish: dispatch when a release got tagged but the crates.io
-  # publish never ran (the v0.4.0 run died before the publish job — LAB-742).
+  # publish never ran (the v0.4.0 run died before the publish job).
   # The required tag input pins WHAT gets published: main can drift past an
   # unpublished tag within hours (it did for v0.4.0), and publishing main HEAD
   # would package that drift under the tagged version. cargo publish fails
@@ -70,26 +70,61 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
 
-  publish:
+  # The untrusted-code half of a release. Tests, the MSRV check and the
+  # verifying package build run dependency build scripts and proc-macros, so
+  # they run here, with no id-token and no crates.io token. `publish` below
+  # runs no dependency code.
+  verify:
     needs: release-please
-    # Run on an automated release, OR on a manual dispatch. The dispatch must
-    # target main (workflow_dispatch can fire from any ref; requiring main
-    # stops a feature branch from driving a publish) — the required tag input
-    # alone decides what content ships.
+    # Same gate as `publish`: an automated release, or a manual dispatch from
+    # main (workflow_dispatch can fire from any ref; requiring main stops a
+    # feature branch from driving a publish) — the required tag input alone
+    # decides what content ships.
     if: ${{ needs.release-please.outputs.release_created == 'true' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
     steps:
-      # Deliberately no Swatinem/rust-cache here, unlike ci.yml — this job
-      # holds CARGO_REGISTRY_TOKEN and only runs on a release (a handful of
-      # times a year), so a third-party action buys negligible build-time
-      # savings against a real increase in that secret's trust surface.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           # On dispatch, build and publish the tag's content — never main HEAD.
           # inputs.tag is empty on push events, so github.sha keeps the default
           # checkout behaviour there.
-          ref: ${{ inputs.tag || github.sha }}
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          # Full history, so the dispatch check below can see main.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The `release` environment admits main only, but inputs.tag can name
+      # any ref. On dispatch, require a cachekit-rs release tag whose commit
+      # is on main, so no other tree reaches `publish`. Runs before any
+      # dependency code.
+      - name: Check the dispatched tag is a release on main
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          case "$TAG" in
+            cachekit-rs-v*) ;;
+            *) echo "::error::tag must be a cachekit-rs-v* release tag, got '$TAG'"; exit 1 ;;
+          esac
+          tag_commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}") || {
+            echo "::error::'$TAG' is not a tag"; exit 1; }
+          if [ "$tag_commit" != "$(git rev-parse HEAD)" ]; then
+            echo "::error::checked out $(git rev-parse HEAD), but tag '$TAG' is $tag_commit"
+            exit 1
+          fi
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main || {
+            echo "::error::tag '$TAG' is not on main"; exit 1; }
+
+      # `sbom` and `publish` check out the same ref and fail unless they get
+      # this commit, so a tag moved mid-run cannot change what ships.
+      - name: Record the tested commit
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
         run: |
@@ -97,7 +132,7 @@ jobs:
           rustup default stable
 
       - name: Run tests before publish
-        run: cargo test --features "cachekitio,redis,encryption,l1,macros"
+        run: cargo test --locked --features "cachekitio,redis,encryption,l1,macros"
 
       - name: Verify MSRV (1.85) before publish
         # Gate: never ship a release that breaks the declared MSRV floor.
@@ -106,20 +141,215 @@ jobs:
         # of a newer-than-1.85 API across lib + tests without a heavy build.
         run: |
           rustup toolchain install 1.85 --profile minimal
-          cargo +1.85 check --all-targets --features "cachekitio,redis,encryption,l1,macros"
+          cargo +1.85 check --locked --all-targets --features "cachekitio,redis,encryption,l1,macros"
+
+      - name: Package and verify both crates
+        # Multi-package mode resolves cachekit-rs's dependency on the not yet
+        # published cachekit-macros version through a local overlay, then
+        # builds each packaged crate — the build `publish` skips with
+        # --no-verify.
+        run: cargo package --locked -p cachekit-macros -p cachekit-rs
+
+  # cargo-sbom only reads `cargo metadata`, so this job builds nothing from the
+  # project: no dependency build script can rewrite an SBOM before upload.
+  sbom:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    # `publish` downloads this exact upload and checks these digests, so an
+    # artifact replaced later in the run is refused rather than attested.
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      macros-sha256: ${{ steps.sboms.outputs.macros-sha256 }}
+      rs-sha256: ${{ steps.sboms.outputs.rs-sha256 }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          persist-credentials: false
+
+      # `verify` ran dependency code, so its output is a claim, not a source:
+      # check out the ref `verify` did and require the commit it reports. A
+      # moved tag or a forged output fails here instead of shipping.
+      - name: Check this is the commit verify tested
+        env:
+          VERIFIED_SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$VERIFIED_SHA" ]; then
+            echo "::error::checked out $head, but verify tested '$VERIFIED_SHA'. Either the tag moved after verify (start a new dispatch) or verify's output was altered."
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install cargo-sbom
+        run: cargo install cargo-sbom --version 0.10.0 --locked
+
+      - name: Generate SBOMs
+        id: sboms
+        # One CycloneDX SBOM per crate, so each .crate's SBOM attestation
+        # lists that crate's own dependency graph. An empty SBOM fails the
+        # release: attesting it would claim a dependency-free crate.
+        run: |
+          for crate in cachekit-macros cachekit-rs; do
+            cargo sbom --cargo-package "$crate" --output-format cyclone_dx_json_1_6 > "sbom-$crate.cdx.json"
+            count=$(jq -e '.components | length' "sbom-$crate.cdx.json") || {
+              echo "::error::$crate SBOM is empty or not JSON"; exit 1; }
+            echo "$crate SBOM components: $count"
+            if [ "${count:-0}" -lt 1 ]; then
+              echo "::error::$crate SBOM lists no components"
+              exit 1
+            fi
+          done
+          echo "macros-sha256=$(sha256sum sbom-cachekit-macros.cdx.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "rs-sha256=$(sha256sum sbom-cachekit-rs.cdx.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: sbom
+          path: sbom-*.cdx.json
+          if-no-files-found: error
+
+  publish:
+    # With no status function in `if:`, GitHub adds an implicit success(), so
+    # a failed or skipped verify or sbom skips the publish.
+    needs: [release-please, verify, sbom]
+    if: ${{ needs.release-please.outputs.release_created == 'true' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # crates.io trusted publishing matches owner, repository, workflow file
+    # and this environment, never the branch; the environment's deployment
+    # branch policy admits main alone.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      # This job can mint a crates.io publish token, so nothing runs here that
+      # doesn't need it: no dependency code (verification happened in
+      # `verify`), no Swatinem/rust-cache, and no third-party action besides
+      # rust-lang/crates-io-auth-action, which mints the token. The rest are
+      # first-party actions/*.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          persist-credentials: false
+
+      # `verify` ran dependency code, so its output is a claim, not a source:
+      # check out the ref `verify` did and require the commit it reports. A
+      # moved tag or a forged output fails here instead of shipping.
+      - name: Check this is the commit verify tested
+        env:
+          VERIFIED_SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$VERIFIED_SHA" ]; then
+            echo "::error::checked out $head, but verify tested '$VERIFIED_SHA'. Either the tag moved after verify (start a new dispatch) or verify's output was altered."
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Package both crates
+        # --no-verify: packaging alone runs no dependency code. cargo packages
+        # deterministically, so these are the bytes `cargo publish` uploads
+        # below — the check after publishing proves it against crates.io.
+        run: |
+          cargo package --locked --no-verify -p cachekit-macros -p cachekit-rs
+          (cd target/package && sha256sum -- *.crate) > "$RUNNER_TEMP/attested.sha256"
+          cat "$RUNNER_TEMP/attested.sha256"
+
+      # Into runner.temp, never the checkout: cargo refuses to package or
+      # publish a tree with untracked files.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.sbom.outputs.artifact-id }}
+          path: ${{ runner.temp }}/sbom
+
+      - name: Check the SBOMs are the ones `sbom` generated
+        env:
+          MACROS_SHA256: ${{ needs.sbom.outputs.macros-sha256 }}
+          RS_SHA256: ${{ needs.sbom.outputs.rs-sha256 }}
+        run: |
+          cd "$RUNNER_TEMP/sbom"
+          printf '%s  %s\n' \
+            "$MACROS_SHA256" sbom-cachekit-macros.cdx.json \
+            "$RS_SHA256" sbom-cachekit-rs.cdx.json | sha256sum --strict -c
+
+      # Attest before publishing: a crates.io upload is irreversible, so a
+      # Sigstore outage blocks the release instead of shipping it unattested.
+      # On a dispatch of an older tag, this provenance names the workflow's
+      # commit on main, not the tag's. The packaged commit is still bound to
+      # the attested digest: cargo records it in each crate's
+      # .cargo_vcs_info.json, and verify checked that it is a release tag on
+      # main.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: target/package/*.crate
+
+      - name: Attest cachekit-macros SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: target/package/cachekit-macros-*.crate
+          sbom-path: ${{ runner.temp }}/sbom/sbom-cachekit-macros.cdx.json
+
+      - name: Attest cachekit-rs SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: target/package/cachekit-rs-*.crate
+          sbom-path: ${{ runner.temp }}/sbom/sbom-cachekit-rs.cdx.json
+
+      - name: Get crates.io token
+        # Exchanges this job's OIDC token for a 30-minute crates.io token; the
+        # action's post step revokes it when the job ends.
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        id: auth
 
       - name: Publish cachekit-macros to crates.io
         # Known gap: after a PARTIAL failure (macros uploaded, cachekit-rs not),
         # a redundant dispatch still dies here on the macros duplicate — publish
         # the missing crate manually in that case.
-        run: cargo publish -p cachekit-macros
+        run: cargo publish --locked --no-verify -p cachekit-macros
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Wait for crates.io index update
         run: sleep 30
 
       - name: Publish cachekit-rs to crates.io
-        run: cargo publish -p cachekit-rs
+        run: cargo publish --locked --no-verify -p cachekit-rs
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Check the uploaded crates are the attested files
+        # Downloads what crates.io now serves and compares it with the digests
+        # the attestations name. A mismatch means the attestations cover a
+        # file nobody can download. The crates are already live and a version
+        # cannot be re-uploaded, so a re-run cannot repair it: yank the
+        # version and release a patch. This step makes the mismatch loud.
+        run: |
+          mkdir "$RUNNER_TEMP/uploaded"
+          for crate in cachekit-macros cachekit-rs; do
+            for path in target/package/"$crate"-[0-9]*.crate; do
+              file=${path##*/}
+              curl -sSf --connect-timeout 10 --max-time 60 --retry 5 --retry-all-errors --retry-delay 10 \
+                -o "$RUNNER_TEMP/uploaded/$file" "https://static.crates.io/crates/$crate/$file"
+            done
+          done
+          cd "$RUNNER_TEMP/uploaded"
+          if ! sha256sum --strict -c ../attested.sha256; then
+            echo "::error::crates.io serves a .crate that differs from the attested file. The version is live and cannot be re-uploaded: do not re-run. Yank the version, then release a patch."
+            exit 1
+          fi
