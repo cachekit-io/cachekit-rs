@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.13.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.12.0...cachekit-rs-v0.13.0) (2026-10-24)
+
+
+### Features
+
+* **backend:** public reconnect and per-operation timeout setters (LAB-10848) ([#180](https://github.com/cachekit-io/cachekit-rs/issues/180)) ([a4b39b1](https://github.com/cachekit-io/cachekit-rs/commit/a4b39b1d069f9bbc199de11054fb2a2a3ede6212))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.12.0 to 0.13.0
+
 ## [0.12.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.11.1...cachekit-rs-v0.12.0) (2026-10-24)
 
 
