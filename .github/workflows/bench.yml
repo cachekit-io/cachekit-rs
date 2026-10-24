@@ -1,0 +1,57 @@
+name: Bench
+
+# Prints the README's Performance table into the job summary, measured on a
+# GitHub-hosted runner. Run it from the Actions tab to refresh the README. A PR
+# that changes the bench example runs it as well, so the figures a PR quotes
+# come from the code it ships. Informational only: nothing here gates a merge.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - crates/cachekit/examples/bench_hot_path.rs
+      - .github/workflows/bench.yml
+
+permissions:
+  contents: read
+
+# No concurrency group: GitHub keeps at most one run of a group pending and
+# cancels it when the next one queues, and several manual runs are how the
+# spread between runs is measured.
+
+# bash -eo pipefail, so a failing benchmark is not hidden by the tee after it.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  readme-table:
+    name: README table
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build
+        run: cargo build --release --example bench_hot_path
+
+      - name: Record the machine
+        run: |
+          {
+            echo '```text'
+            rustc --version
+            lscpu | grep -E '^(Model name|CPU\(s\)):'
+            echo '```'
+            echo
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run the README benchmark
+        run: target/release/examples/bench_hot_path readme | tee -a "$GITHUB_STEP_SUMMARY"

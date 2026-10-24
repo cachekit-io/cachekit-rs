@@ -195,9 +195,10 @@ fn config_builder_rejects_every_hex_reject_row() {
     }
 }
 
-/// Both env readers, `CachekitConfig::from_env` and the client constructor
-/// `CacheKit::from_env` built on it, under the given key variables. A valid
-/// API key is set so the client constructor can only fail on a key.
+/// Every env reader — `CachekitConfig::from_env`, the client constructor
+/// `CacheKit::from_env` built on it, and the builder's
+/// `.encryption_from_env()` — under the given key variables. A valid API key
+/// is set so the client constructor can only fail on a key.
 fn env_entry_points(
     master: &str,
     previous: Option<&str>,
@@ -207,7 +208,6 @@ fn env_entry_points(
         ("CACHEKIT_PREVIOUS_MASTER_KEYS", previous),
         ("CACHEKIT_API_KEY", Some("ck_test_key")),
         ("CACHEKIT_API_URL", None),
-        ("CACHEKIT_DEFAULT_TTL", None),
     ]);
     vec![
         (
@@ -216,6 +216,10 @@ fn env_entry_points(
         ),
         #[cfg(feature = "cachekitio")]
         ("CacheKit::from_env", CacheKit::from_env().map(drop)),
+        (
+            "CacheKitBuilder::encryption_from_env",
+            CacheKit::builder().encryption_from_env().map(drop),
+        ),
     ]
 }
 
@@ -293,7 +297,7 @@ fn keyring_rows() -> Vec<KeyringRow> {
 
 /// Each row loads, or is refused with a `Config` error, as its verdict says,
 /// through the hex builders and through `CACHEKIT_PREVIOUS_MASTER_KEYS`
-/// (comma-separated) on both env readers.
+/// (comma-separated) on every env reader.
 #[test]
 #[serial]
 fn keyring_configuration_rows_load_as_their_verdict_says() {

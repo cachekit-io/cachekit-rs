@@ -679,7 +679,7 @@ mod tests {
             layer.hardware_acceleration_enabled(),
             core.hardware_acceleration_enabled()
         );
-        // ...and on x86_64 with the CPU itself. This pins core 0.6's runtime
+        // ...and on x86_64 with the CPU itself. This pins core's runtime
         // probe — the only executed evidence in any repo that the bool is live
         // detection, not a constant.
         #[cfg(target_arch = "x86_64")]

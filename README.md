@@ -41,7 +41,7 @@
 | Feature | Default | Description |
 |:--------|:-------:|:------------|
 | `cachekitio` | ✅ | HTTP backend for [api.cachekit.io](https://api.cachekit.io) via [reqwest](https://crates.io/crates/reqwest) + rustls |
-| `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core). Without it, every builder encryption call (`.encryption()`, `.encryption_with_previous()`, `.encryption_from_bytes()`, `.encryption_from_bytes_with_previous()`) returns a config error, and so does `from_env()` with `CACHEKIT_MASTER_KEY` set |
+| `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core). Without it, every builder encryption call (`.encryption()`, `.encryption_with_previous()`, `.encryption_from_env()`, `.encryption_from_bytes()`, `.encryption_from_bytes_with_previous()`) returns a config error |
 | `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka), with stale-while-revalidate (native). Not supported on `wasm32-unknown-unknown` (compile error: no clock there) |
 | `reliability` | ✅ | Retry with backoff + jitter, circuit breaker, backpressure, distributed fill locks (native only) |
 | `redis` | ❌ | Redis backend via [fred](https://crates.io/crates/fred) (native only) |
@@ -55,15 +55,15 @@
 ```toml
 # Defaults: SaaS + encryption + L1
 [dependencies]
-cachekit-rs = "0.10.0"
+cachekit-rs = "0.12.0"
 
 # With Redis backend
 [dependencies]
-cachekit-rs = { version = "0.10.0", features = ["redis"] }
+cachekit-rs = { version = "0.12.0", features = ["redis"] }
 
 # For Cloudflare Workers (no L1, no Redis)
 [dependencies]
-cachekit-rs = { version = "0.10.0", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.12.0", default-features = false, features = ["workers", "encryption"] }
 ```
 <!-- x-release-please-end -->
 
@@ -142,6 +142,10 @@ async fn main() -> Result<(), CachekitError> {
 }
 ```
 
+`from_env()` reads the [Environment Variables](#environment-variables) below. Its default TTL is 300 s, and no variable changes it: chain `.default_ttl(…)` before `.build()`, or pass a TTL per call with `set_with_ttl`.
+
+With `CACHEKIT_MASTER_KEY` set, chain `.encryption_from_env()?` or `.no_encryption()` before `.build()`; see [Zero-Knowledge Encryption](#zero-knowledge-encryption).
+
 ### Builder API
 
 ```rust
@@ -165,10 +169,11 @@ let cache = CacheKit::builder()
 > [!IMPORTANT]
 > Never hardcode API keys or master keys. Use environment variables or a secrets manager.
 
-On native targets each cachekit.io request attempt times out after 5 s, the
-protocol's `CACHEKIT_TIMEOUT` default and the same as cachekit-py and
-cachekit-ts; a write (`set`, `delete`) gets 10 s. The timeout covers connect,
-TLS and the response, and surfaces as `BackendErrorKind::Timeout`.
+Each cachekit.io request attempt times out after 5 s, the protocol's
+`CACHEKIT_TIMEOUT` default; a write (`set`, `delete`) gets 10 s. The timeout
+covers connect, TLS and the whole response body, and surfaces as
+`BackendErrorKind::Timeout`. The same budgets apply on native targets and on
+the [Workers backend](#cloudflare-workers).
 
 On native targets every request carries the User-Agent `cachekit-rs/<version>`,
 and an idle pooled connection is kept for 390 s (reqwest's default is 90 s).
@@ -187,7 +192,7 @@ permanent error. On wasm32, use the [Workers backend](#cloudflare-workers).
 
 ## Zero-Knowledge Encryption
 
-Configure a master key — the `secure` preset, or `.encryption()` / `.encryption_with_previous()` / `.encryption_from_bytes()` / `.encryption_from_bytes_with_previous()` on any builder — and every value the client reads or writes is encrypted client-side with AES-256-GCM before it reaches any cache layer. `get`, `set`, `set_with_ttl`, `interop_get`, `interop_get_swr` and `#[cachekit]` functions all encrypt; the backend and L1 only ever see ciphertext. `delete` and `exists` carry no value.
+Configure a master key — the `secure` preset, or `.encryption()` / `.encryption_with_previous()` / `.encryption_from_env()` / `.encryption_from_bytes()` / `.encryption_from_bytes_with_previous()` on any builder — and every value the client reads or writes is encrypted client-side with AES-256-GCM before it reaches any cache layer. `get`, `set`, `set_with_ttl`, `interop_get`, `interop_get_swr` and `#[cachekit]` functions all encrypt; the backend and L1 only ever see ciphertext. `delete` and `exists` carry no value.
 
 ```rust
 // Env: CACHEKIT_MASTER_KEY=<64 hex chars>
@@ -214,6 +219,11 @@ let secure = cache.secure_cache()?;
                       L1 stores ciphertext
                       (zero-knowledge preserved)
 ```
+
+`CACHEKIT_MASTER_KEY` is a key source, never a switch: no constructor encrypts because it is set. Chain `.encryption_from_env()?` to encrypt with it (and with `CACHEKIT_PREVIOUS_MASTER_KEYS`), for tenant `"default"`, or `.no_encryption()` to state a plaintext client.
+
+> [!WARNING]
+> Earlier releases encrypted on `CacheKit::from_env()` whenever `CACHEKIT_MASTER_KEY` was set. A `from_env()` builder that sees the key now fails at `build()` until you state the intent, so the upgrade cannot silently start writing plaintext. To keep encrypting, change `CacheKit::from_env()?` to `CacheKit::from_env()?.encryption_from_env()?`: the keys and tenant are unchanged, so existing entries stay readable. To stop encrypting, use `.no_encryption()`, and delete the old entries first: a client that does not encrypt cannot read them. `get` returns an error, a `#[cachekit]` function recomputes the value and overwrites the entry in plaintext, and a rare entry decodes into a wrong value. This check is transitional and goes away in a later release, after which a `from_env()` builder that states neither builds a plaintext client.
 
 > [!WARNING]
 > Earlier releases encrypted only through `secure_cache()`: plain `get` / `set` on a client with a key configured read and wrote plaintext. Reading such an entry now returns an `Encryption` error until it is overwritten, deleted or expires, so delete (or let expire) whatever those calls wrote before you upgrade.
@@ -246,7 +256,7 @@ Cross-SDK compatible — ciphertext produced by the Python SDK decrypts with the
 
 </details>
 
-**Is AES hardware-accelerated on this host?** `cache.secure_cache()?.hardware_acceleration_enabled()` (also on `EncryptionLayer`) forwards cachekit-core's detection. Informational only: `ring`/`aes-gcm` pick their implementation independently, so use it to explain secure-cache latency, not to change behaviour. The per-architecture semantics are core's — as of cachekit-core 0.6.0 a runtime AES-NI probe on x86/x86_64, `true` on every aarch64 build (it tests NEON, which all aarch64 targets enable, not the Crypto Extension — a Raspberry Pi 4, a Cortex-A72 without the Crypto Extension, reports `true` while running software AES), and `false` on wasm32.
+**Is AES hardware-accelerated on this host?** `cache.secure_cache()?.hardware_acceleration_enabled()` (also on `EncryptionLayer`) forwards cachekit-core's detection. Informational only: `ring`/`aes-gcm` pick their implementation independently, so use it to explain secure-cache latency, not to change behaviour. The per-architecture semantics are core's — as of cachekit-core 0.7.0 a runtime AES-NI probe on x86/x86_64, a runtime probe for the Armv8 Crypto Extension's AES instructions on aarch64 (a Raspberry Pi 4, a Cortex-A72 without the Crypto Extension, reports `false`), and `false` on wasm32.
 
 ### Key Rotation
 
@@ -254,7 +264,7 @@ Rotate the master key without invalidating existing entries: promote the new key
 
 ```rust
 // Env: CACHEKIT_MASTER_KEY=<k2-hex> CACHEKIT_PREVIOUS_MASTER_KEYS=<k1-hex>
-let cache = CacheKit::from_env()?.build()?;
+let cache = CacheKit::from_env()?.encryption_from_env()?.build()?;
 
 // The Redis `secure` preset reads the same two variables:
 let cache = CacheKit::secure_from_env("redis://localhost:6379").await?.build()?;
@@ -335,7 +345,7 @@ Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.10.0", features = ["redis"] }
+cachekit-rs = { version = "0.12.0", features = ["redis"] }
 ```
 <!-- x-release-please-end -->
 
@@ -358,7 +368,7 @@ TTLs above memcached's 30-day ceiling are clamped (larger values would be misrea
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.10.0", features = ["memcached"] }
+cachekit-rs = { version = "0.12.0", features = ["memcached"] }
 ```
 <!-- x-release-please-end -->
 
@@ -377,7 +387,7 @@ Local disk cache, **byte-compatible with cachekit-py's File backend** — a py a
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.10.0", features = ["file"] }
+cachekit-rs = { version = "0.12.0", features = ["file"] }
 ```
 <!-- x-release-please-end -->
 
@@ -393,9 +403,11 @@ let backend = FileBackend::builder()
 
 `wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. It is the CachekitIO backend on wasm32. Requires the `workers` feature with default features disabled.
 
+The Workers runtime's `fetch` has no timeout of its own and can hold a request for tens of seconds, so the backend bounds each request itself: 5 s for a read and 10 s for a write (`set`, `delete`), from send through the last byte of the response body. Past that the request is aborted and the call fails with `BackendErrorKind::Timeout`. The `reliability` feature is native-only, so a Workers call makes one attempt and does not retry.
+
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.10.0", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.12.0", default-features = false, features = ["workers", "encryption"] }
 ```
 <!-- x-release-please-end -->
 
@@ -438,7 +450,7 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
 │  GET path:                                              │
-│  L1 fresh hit (~50ns) ──► return immediately            │
+│  L1 fresh hit ──► return immediately                    │
 │  L1 stale hit ──► return + background refresh (SWR)     │
 │  L1 miss ──► L2 backend ──► backfill L1 if fresh (≤30s) │
 │                                                         │
@@ -449,8 +461,8 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 │  invalidate L1 first ──► delete from L2 backend         │
 │                                                         │
 ├─────────────┬───────────────────────────────────────────┤
-│  L1 (moka)  │  L2 (cachekit.io / Redis / Workers)      │
-│  ~50ns      │  ~2–50ms                                  │
+│  L1 (moka)  │  L2 (cachekit.io / Redis / Workers)       │
+│  in-process │  one backend round trip                   │
 └─────────────┴───────────────────────────────────────────┘
 ```
 
@@ -529,6 +541,28 @@ fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
   there is no SWR; the builder knobs don't exist there, so misuse is a
   compile error rather than a silent no-op. A sync function under
   `#[cachekit]` is likewise a clear compile-time error.
+
+---
+
+## Performance
+
+What one call costs in the client: the public `CacheKit` API over an in-memory backend, so no figure includes network time. The client comes from `CacheKit::builder()` with no reliability stack, like `minimal`. The `production`, `secure` and `io` presets send every backend call through the [reliability stack](#reliability), so their L2 hits and sets cost more than the table shows; L1 hits never reach it. Each cell is the median wall time per call of five runs, each in its own process, on a single-threaded tokio runtime. Measured on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with Rust 1.99.1.
+
+| Operation | 64 B | 1 KiB |
+|:----------|-----:|------:|
+| `get`, L1 hit | 285 ns | 334 ns |
+| `get`, L2 hit | 2.3 µs | 3.0 µs |
+| `set_with_ttl` | 1.6 µs | 1.7 µs |
+| `secure_cache()` `get`, L1 hit | 1.2 µs | 1.4 µs |
+| `secure_cache()` `get`, L2 hit | 3.4 µs | 4.3 µs |
+| `secure_cache()` `set_with_ttl` | 2.2 µs | 2.6 µs |
+
+- **L1 hit**: the value comes from the in-process cache; the backend is not asked.
+- **L2 hit**: L1 does not hold the key, so `get` reads the backend, decodes the MessagePack and backfills L1. A real backend adds its round trip, which for Redis or cachekit.io is a network call.
+- **Encrypted** (`secure_cache()`): L1 holds the same ciphertext as the backend, so every hit decrypts (AES-256-GCM) and checks the AAD.
+- **Larger values**: at 64 KiB most of the time is copying and allocating. It ran to tens of microseconds for L2 hits and encrypted calls, but repeat runs disagreed by up to 3.5x, so the table stops at 1 KiB.
+
+The table comes from one of five **Bench** workflow runs of the same build on this CPU model, the one closest to their per-cell medians. Across the five, L1 hits varied by up to 9% and L2 hits by up to 22%. Hosted runners also come with other CPU models (an EPYC 9V45 run took 65-78% as long), and other machines give other figures. To print this table for your own machine, run `cargo run --release --example bench_hot_path -- readme`, or run the **Bench** workflow from the Actions tab. To compare two builds, use the instruction counts in [Measuring performance](#measuring-performance).
 
 ---
 
@@ -616,9 +650,8 @@ Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rus
 |:---------|:--------:|:------------|
 | `CACHEKIT_API_KEY` | ✅ | API key for cachekit.io (`from_env()` and `CacheKit::io_from_env()`) |
 | `CACHEKIT_API_URL` | ❌ | Override API endpoint (default: `https://api.cachekit.io`) |
-| `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and `from_env()`); use exactly 32 bytes (64 hex chars) — shorter, non-hex or non-UTF-8 values are rejected, never treated as unset |
-| `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (`CacheKit::secure_from_env()` and `from_env()`; max 3; a blank value is treated as unset) |
-| `CACHEKIT_DEFAULT_TTL` | ❌ | Default TTL in seconds (min 1, default: 300) |
+| `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and the builder's `.encryption_from_env()`); use exactly 32 bytes (64 hex chars) — shorter, non-hex or non-UTF-8 values are rejected, never treated as unset. A key source, never a switch: `from_env()` validates it but does not encrypt, and while it is set a `from_env()` builder needs `.encryption_from_env()` or `.no_encryption()` |
+| `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (`CacheKit::secure_from_env()` and `.encryption_from_env()`; max 3; a blank value is treated as unset). `from_env()` validates it and fails on a malformed value, even for a `.no_encryption()` client |
 
 > [!CAUTION]
 > `CACHEKIT_API_URL` must use HTTPS, must not carry credentials, a query or a
@@ -721,6 +754,8 @@ make bench                                  # wall ns/op: indicative only
 make bench-instr                            # instructions/op + run-to-run spread (needs valgrind)
 make bench-instr BASE=../bench-base FILTER=l2_hit   # A/B against another build
 ```
+
+`bench_hot_path readme` prints the table in [Performance](#performance).
 
 Wall time on a shared machine moves by tens of percent between runs, so
 `bench-instr` is the number a change is judged on. It counts only the timed

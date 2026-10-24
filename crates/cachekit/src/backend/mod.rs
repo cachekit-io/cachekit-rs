@@ -387,6 +387,27 @@ pub(crate) fn ttl_header(ttl: Duration) -> (&'static str, String) {
     ("X-CacheKit-TTL", ttl_wire_secs(ttl).to_string())
 }
 
+/// Per-attempt budget for every cachekit.io request but a write, from connect
+/// through the last body byte: the protocol's `CACHEKIT_TIMEOUT` default
+/// (`spec/saas-api.md`). It was 30 s, so under the retrying presets a request
+/// the service accepted and never answered held a call for ~90 s before it
+/// failed open. Shared by the native and Workers backends so their budgets
+/// cannot drift.
+#[cfg(any(
+    all(feature = "cachekitio", not(target_arch = "wasm32")),
+    feature = "workers"
+))]
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-attempt budget for a write (`set`, `delete`): twice the read budget,
+/// because a write carries the payload and the service commits it before it
+/// answers, so a slow but healthy write must not time out and be re-sent.
+#[cfg(any(
+    all(feature = "cachekitio", not(target_arch = "wasm32")),
+    feature = "workers"
+))]
+pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 // ── Feature-gated backend modules ─────────────────────────────────────────────
 
 /// JSON wire bodies for the SaaS lock/TTL endpoints. Compiled under `test`

@@ -371,10 +371,11 @@ pub fn serialize_value(value: &InteropValue) -> Result<Vec<u8>, CachekitError> {
 /// Deserialize an interop-mode MessagePack document, consuming **exactly one**
 /// document and rejecting trailing bytes (spec MUST).
 ///
-/// Decode bounds: the header walk in `crate::serializer::check_structure` runs
-/// first and rejects, with a `decode bound:` error, any document nested deeper
-/// than [`crate::serializer::MAX_DECODE_DEPTH`] or declaring more than the input
-/// can back.
+/// Decode bounds: cachekit-core's header walk (`check_msgpack_structure`, run
+/// from `crate::serializer::bounded_deserializer`) runs first and rejects, with
+/// a `decode bound:` error, any document nested deeper than
+/// [`crate::serializer::MAX_DECODE_DEPTH`] or declaring more than the input can
+/// back.
 ///
 /// The single-document rule is shared with auto-mode
 /// [`crate::serializer::deserialize`]: both refuse a Python-SDK-internal CK
