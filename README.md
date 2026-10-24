@@ -55,15 +55,15 @@
 ```toml
 # Defaults: SaaS + encryption + L1
 [dependencies]
-cachekit-rs = "0.11.1"
+cachekit-rs = "0.12.0"
 
 # With Redis backend
 [dependencies]
-cachekit-rs = { version = "0.11.1", features = ["redis"] }
+cachekit-rs = { version = "0.12.0", features = ["redis"] }
 
 # For Cloudflare Workers (no L1, no Redis)
 [dependencies]
-cachekit-rs = { version = "0.11.1", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.12.0", default-features = false, features = ["workers", "encryption"] }
 ```
 <!-- x-release-please-end -->
 
@@ -345,7 +345,7 @@ Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.11.1", features = ["redis"] }
+cachekit-rs = { version = "0.12.0", features = ["redis"] }
 ```
 <!-- x-release-please-end -->
 
@@ -368,7 +368,7 @@ TTLs above memcached's 30-day ceiling are clamped (larger values would be misrea
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.11.1", features = ["memcached"] }
+cachekit-rs = { version = "0.12.0", features = ["memcached"] }
 ```
 <!-- x-release-please-end -->
 
@@ -387,7 +387,7 @@ Local disk cache, **byte-compatible with cachekit-py's File backend** — a py a
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.11.1", features = ["file"] }
+cachekit-rs = { version = "0.12.0", features = ["file"] }
 ```
 <!-- x-release-please-end -->
 
@@ -407,7 +407,7 @@ The Workers runtime's `fetch` has no timeout of its own and can hold a request f
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.11.1", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.12.0", default-features = false, features = ["workers", "encryption"] }
 ```
 <!-- x-release-please-end -->
 
@@ -550,11 +550,11 @@ What one call costs in the client: the public `CacheKit` API over an in-memory b
 
 | Operation | 64 B | 1 KiB |
 |:----------|-----:|------:|
-| `get`, L1 hit | 304 ns | 346 ns |
-| `get`, L2 hit | 2.2 µs | 2.9 µs |
+| `get`, L1 hit | 285 ns | 334 ns |
+| `get`, L2 hit | 2.3 µs | 3.0 µs |
 | `set_with_ttl` | 1.6 µs | 1.7 µs |
-| `secure_cache()` `get`, L1 hit | 1.3 µs | 1.5 µs |
-| `secure_cache()` `get`, L2 hit | 3.3 µs | 4.2 µs |
+| `secure_cache()` `get`, L1 hit | 1.2 µs | 1.4 µs |
+| `secure_cache()` `get`, L2 hit | 3.4 µs | 4.3 µs |
 | `secure_cache()` `set_with_ttl` | 2.2 µs | 2.6 µs |
 
 - **L1 hit**: the value comes from the in-process cache; the backend is not asked.
@@ -562,7 +562,7 @@ What one call costs in the client: the public `CacheKit` API over an in-memory b
 - **Encrypted** (`secure_cache()`): L1 holds the same ciphertext as the backend, so every hit decrypts (AES-256-GCM) and checks the AAD.
 - **Larger values**: at 64 KiB most of the time is copying and allocating. It ran to tens of microseconds for L2 hits and encrypted calls, but repeat runs disagreed by up to 3.5x, so the table stops at 1 KiB.
 
-Two earlier runs on this CPU model, which timed every cell in one process, agreed with this one within about 20% at these sizes. Hosted runners also come with other CPU models (an EPYC 9V45 run took 65-78% as long), and other machines give other figures. To print this table for your own machine, run `cargo run --release --example bench_hot_path -- readme`, or run the **Bench** workflow from the Actions tab. To compare two builds, use the instruction counts in [Measuring performance](#measuring-performance).
+The table comes from one of five **Bench** workflow runs of the same build on this CPU model, the one closest to their per-cell medians. Across the five, L1 hits varied by up to 9% and L2 hits by up to 22%. Hosted runners also come with other CPU models (an EPYC 9V45 run took 65-78% as long), and other machines give other figures. To print this table for your own machine, run `cargo run --release --example bench_hot_path -- readme`, or run the **Bench** workflow from the Actions tab. To compare two builds, use the instruction counts in [Measuring performance](#measuring-performance).
 
 ---
 
