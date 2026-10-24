@@ -548,23 +548,23 @@ fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
 
 ## Performance
 
-What one call costs in the client: the public `CacheKit` API over an in-memory backend, so no figure includes network time. The client comes from `CacheKit::builder()` with no reliability stack, like `minimal`. The `production`, `secure` and `io` presets send every backend call through the [reliability stack](#reliability), so their L2 hits and sets cost more than the table shows; L1 hits never reach it. Each cell is the median wall time per call of five runs, each in its own process, on a single-threaded tokio runtime. Measured on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with Rust 1.99.1.
+What one call costs in the client: the public `CacheKit` API over an in-memory backend, so no figure includes network time. The client comes from `CacheKit::builder()` with no reliability stack, like `minimal`. The `production`, `secure` and `io` presets send every backend call through the [reliability stack](#reliability), so their L2 hits and sets cost more than the table shows; L1 hits never reach it. One **Bench** workflow run times each cell in five processes of its own, each on a single-threaded tokio runtime, and reports their median wall time per call. Measured on GitHub-hosted `ubuntu-latest` runners (AMD EPYC 7763, 4 vCPUs) with Rust 1.99.1.
 
 | Operation | 64 B | 1 KiB |
 |:----------|-----:|------:|
-| `get`, L1 hit | 285 ns | 334 ns |
-| `get`, L2 hit | 2.3 µs | 3.0 µs |
-| `set_with_ttl` | 1.6 µs | 1.7 µs |
-| `secure_cache()` `get`, L1 hit | 1.2 µs | 1.4 µs |
-| `secure_cache()` `get`, L2 hit | 3.4 µs | 4.3 µs |
-| `secure_cache()` `set_with_ttl` | 2.2 µs | 2.6 µs |
+| `get`, L1 hit | 195 ns | 242 ns |
+| `get`, L2 hit | 1.4 µs | 2.2 µs |
+| `set_with_ttl` | 764 ns | 807 ns |
+| `secure_cache()` `get`, L1 hit | 1.1 µs | 1.3 µs |
+| `secure_cache()` `get`, L2 hit | 2.4 µs | 3.4 µs |
+| `secure_cache()` `set_with_ttl` | 1.3 µs | 1.6 µs |
 
 - **L1 hit**: the value comes from the in-process cache; the backend is not asked.
 - **L2 hit**: L1 does not hold the key, so `get` reads the backend, decodes the MessagePack and backfills L1. A real backend adds its round trip, which for Redis or cachekit.io is a network call.
 - **Encrypted** (`secure_cache()`): L1 holds the same ciphertext as the backend, so every hit decrypts (AES-256-GCM) and checks the AAD.
 - **Larger values**: at 64 KiB most of the time is copying and allocating. It ran to tens of microseconds for L2 hits and encrypted calls, but repeat runs disagreed by up to 3.5x, so the table stops at 1 KiB.
 
-The table comes from one of five **Bench** workflow runs of the same build on this CPU model, the one closest to their per-cell medians. Across the five, L1 hits varied by up to 9% and L2 hits by up to 22%. Hosted runners also come with other CPU models (an EPYC 9V45 run took 65-78% as long), and other machines give other figures. To print this table for your own machine, run `cargo run --release --example bench_hot_path -- readme`, or run the **Bench** workflow from the Actions tab. To compare two builds, use the instruction counts in [Measuring performance](#measuring-performance).
+Each cell in the table is the median of nine such runs of one build on this CPU model. Across the nine, L1 hits varied by up to 13% and L2 hits by up to 21%. Hosted runners also come with other CPU models: on an AMD EPYC 9V45, four runs of the same build took 59-73% as long, cell for cell. Other machines give other figures. To print this table for your own machine, run `cargo run --release --example bench_hot_path -- readme`, or run the **Bench** workflow from the Actions tab. To compare two builds, use the instruction counts in [Measuring performance](#measuring-performance).
 
 ---
 
@@ -767,8 +767,9 @@ the base commit, copy `target/release/examples/bench_hot_path` outside
 `target/`, and pass it as `BASE`; the runs interleave ABBA, a delta counts only
 when it beats `max(3 × spread, 0.5%)`, and the target exits 1 when a case got
 slower by more than that, or 2 when it measured nothing (an unknown flag, a
-filter that matches no case, a valgrind failure). Most cases repeat within 0.4%; the `delete` cases
-spread more (up to about 2.5%), so their floor is wider.
+filter that matches no case, a valgrind failure). Most cases repeat within 0.8%; the `delete` cases
+spread more (up to about 10%, from the per-key mutation lock map, a hash table seeded afresh in
+each process), so their floor is wider.
 
 **Client wall time** — `examples/wall_time_probe.rs` times `CacheKit` calls
 against the cachekit.io dev endpoint and writes one JSON object per request. It runs
