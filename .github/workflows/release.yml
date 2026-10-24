@@ -8,9 +8,9 @@ on:
   # publish never ran (the v0.4.0 run died before the publish job).
   # The required tag input pins WHAT gets published: main can drift past an
   # unpublished tag within hours (it did for v0.4.0), and publishing main HEAD
-  # would package that drift under the tagged version. cargo publish fails
-  # loudly on already-uploaded versions, so a redundant dispatch cannot
-  # double-publish.
+  # would package that drift under the tagged version. `verify` accepts only
+  # the release commit of a version newer than any on crates.io, so a
+  # dispatch of an already-published version fails there, before publish.
   workflow_dispatch:
     inputs:
       tag:
@@ -99,26 +99,60 @@ jobs:
           persist-credentials: false
 
       # The `release` environment admits main only, but inputs.tag can name
-      # any ref. On dispatch, require a cachekit-rs release tag whose commit
-      # is on main, so no other tree reaches `publish`. Runs before any
-      # dependency code.
-      - name: Check the dispatched tag is a release on main
+      # any tag. On dispatch, accept only the release commit of an unpublished
+      # version: tag cachekit-rs-v<version> is on main, its commit sets both
+      # crates to <version> and its parent does not, and <version> is newer
+      # than every cachekit-rs version on crates.io, yanked ones included.
+      # Runs before any dependency code. The checkout above already resolved
+      # refs/tags/<tag>, so HEAD is the tag's commit.
+      - name: Check the dispatched tag is the release commit of an unpublished version
         if: github.event_name == 'workflow_dispatch'
         env:
           TAG: ${{ inputs.tag }}
         run: |
-          case "$TAG" in
-            cachekit-rs-v*) ;;
-            *) echo "::error::tag must be a cachekit-rs-v* release tag, got '$TAG'"; exit 1 ;;
-          esac
-          tag_commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}") || {
-            echo "::error::'$TAG' is not a tag"; exit 1; }
-          if [ "$tag_commit" != "$(git rev-parse HEAD)" ]; then
-            echo "::error::checked out $(git rev-parse HEAD), but tag '$TAG' is $tag_commit"
-            exit 1
+          version=${TAG#cachekit-rs-v}
+          if [ "$version" = "$TAG" ] || ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag must be cachekit-rs-v<major>.<minor>.<patch>, got '$TAG'"; exit 1
           fi
           git merge-base --is-ancestor HEAD refs/remotes/origin/main || {
             echo "::error::tag '$TAG' is not on main"; exit 1; }
+
+          # The [package] version of crates/<dir>/Cargo.toml at <commit>.
+          manifest_version() {
+            local toml
+            toml=$(git show "$1:crates/$2/Cargo.toml") || return 1
+            python3 -c 'import sys, tomllib; v = tomllib.loads(sys.stdin.read())["package"]["version"]; print(v) if isinstance(v, str) else sys.exit("not a literal version")' <<<"$toml"
+          }
+          for crate in cachekit cachekit-macros; do
+            at_tag=$(manifest_version HEAD "$crate") || {
+              echo "::error::cannot read the crates/$crate version at '$TAG'"; exit 1; }
+            if [ "$at_tag" != "$version" ]; then
+              echo "::error::tag '$TAG' names $version, but crates/$crate is $at_tag at that commit"; exit 1
+            fi
+            at_parent=$(manifest_version HEAD^ "$crate") || {
+              echo "::error::cannot read the crates/$crate version at the parent of '$TAG'"; exit 1; }
+            if [ "$at_parent" = "$version" ]; then
+              echo "::error::'$TAG' is not the commit that set crates/$crate to $version"; exit 1
+            fi
+          done
+
+          # The sparse index lists every published version, yanked ones too.
+          # sort -V orders plain X.Y.Z correctly; a prerelease on the index can
+          # only make this check stricter.
+          index=$(curl -sSf --connect-timeout 10 --max-time 60 --retry 5 --retry-all-errors --retry-delay 10 \
+            https://index.crates.io/ca/ch/cachekit-rs) || {
+            echo "::error::cannot read the cachekit-rs crates.io index"; exit 1; }
+          published=$(jq -er .vers <<<"$index") || {
+            echo "::error::the cachekit-rs crates.io index is not valid"; exit 1; }
+          newest=$(sort -V <<<"$published" | tail -n 1)
+          if [ -z "$newest" ]; then
+            echo "::error::the cachekit-rs crates.io index lists no versions"; exit 1
+          fi
+          # The lower of the two is $version when it is older or equal.
+          if [ "$(printf '%s\n' "$version" "$newest" | sort -V | head -n 1)" = "$version" ]; then
+            echo "::error::$version is not newer than $newest, the newest cachekit-rs on crates.io"; exit 1
+          fi
+          echo "$TAG is the release commit of $version; crates.io's newest is $newest"
 
       # `sbom` and `publish` check out the same ref and fail unless they get
       # this commit, so a tag moved mid-run cannot change what ships.
@@ -179,7 +213,7 @@ jobs:
         run: |
           head=$(git rev-parse HEAD)
           if [ "$head" != "$VERIFIED_SHA" ]; then
-            echo "::error::checked out $head, but verify tested '$VERIFIED_SHA'. Either the tag moved after verify (start a new dispatch) or verify's output was altered."
+            echo "::error::checked out $head, but verify tested '$VERIFIED_SHA'. Either the tag moved after verify or verify's output was altered: find out which before dispatching again."
             exit 1
           fi
 
@@ -252,7 +286,7 @@ jobs:
         run: |
           head=$(git rev-parse HEAD)
           if [ "$head" != "$VERIFIED_SHA" ]; then
-            echo "::error::checked out $head, but verify tested '$VERIFIED_SHA'. Either the tag moved after verify (start a new dispatch) or verify's output was altered."
+            echo "::error::checked out $head, but verify tested '$VERIFIED_SHA'. Either the tag moved after verify or verify's output was altered: find out which before dispatching again."
             exit 1
           fi
 
@@ -292,8 +326,8 @@ jobs:
       # On a dispatch of an older tag, this provenance names the workflow's
       # commit on main, not the tag's. The packaged commit is still bound to
       # the attested digest: cargo records it in each crate's
-      # .cargo_vcs_info.json, and verify checked that it is a release tag on
-      # main.
+      # .cargo_vcs_info.json, and verify checked that it is the release commit
+      # of an unpublished version on main.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -337,8 +371,8 @@ jobs:
         # Downloads what crates.io now serves and compares it with the digests
         # the attestations name. A mismatch means the attestations cover a
         # file nobody can download. The crates are already live and a version
-        # cannot be re-uploaded, so a re-run cannot repair it: yank the
-        # version and release a patch. This step makes the mismatch loud.
+        # cannot be re-uploaded, so a re-run cannot repair it: release a
+        # patch, then yank the version. This step makes the mismatch loud.
         run: |
           mkdir "$RUNNER_TEMP/uploaded"
           for crate in cachekit-macros cachekit-rs; do
@@ -350,6 +384,6 @@ jobs:
           done
           cd "$RUNNER_TEMP/uploaded"
           if ! sha256sum --strict -c ../attested.sha256; then
-            echo "::error::crates.io serves a .crate that differs from the attested file. The version is live and cannot be re-uploaded: do not re-run. Yank the version, then release a patch."
+            echo "::error::crates.io serves a .crate that differs from the attested file. The version is live and cannot be re-uploaded: do not re-run. Release a patch, then yank the version."
             exit 1
           fi
