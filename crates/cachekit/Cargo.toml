@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Caching for Rust (beta). Supports cachekit.io SaaS, Redis, Memcached, local File, and Cloudflare Workers."
 readme = "../../README.md"
 homepage = "https://cachekit.io"
-keywords = ["cache", "redis", "encryption", "moka", "cloudflare-workers"]
+keywords = ["cache", "redis", "encryption", "ttl", "cloudflare-workers"]
 categories = ["caching", "web-programming", "cryptography"]
 # Reads the workspace READMEs from outside this directory, so it cannot build
 # from the published package.
@@ -46,7 +46,7 @@ encryption = ["cachekit-core/encryption"]
 # tokio/rt provides Handle::try_current + spawn for the L1 stale-while-
 # revalidate background refresh (native only; the spawn is cfg'd off wasm32).
 # L1 is a compile error on wasm32-unknown-unknown; see the target guard in lib.rs.
-l1 = ["dep:moka", "tokio/rt"]
+l1 = ["dep:quick_cache", "tokio/rt"]
 macros = ["dep:cachekit-macros"]
 # Retry with backoff + circuit breaker around backend ops, and cross-process
 # cold-miss suppression via LockableBackend. Native only (needs tokio timers).
@@ -97,8 +97,11 @@ fred = { version = "9", optional = true, features = ["i-scripts"] }
 # uses `is_multiple_of`/let-chains and breaks this workspace's 1.85 MSRV.
 memcache = { version = "0.19", optional = true, default-features = false }
 
-# Optional: L1 in-process cache
-moka = { version = "0.12", optional = true, features = ["sync"] }
+# Optional: L1 in-process cache. No default features: src/l1 pins SipHash in
+# the cache's type, so `custom-hasher` (foldhash) would only add a crate; and
+# `parking_lot` and `sharded-lock` are mutually exclusive in quick_cache, so
+# enabling either could break a build where another crate enables the other.
+quick_cache = { version = "0.7", optional = true, default-features = false }
 
 # Optional: Cloudflare Workers
 worker = { version = "0.4", optional = true }

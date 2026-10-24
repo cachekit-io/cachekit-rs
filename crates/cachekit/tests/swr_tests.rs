@@ -4,7 +4,7 @@
 //!   cargo test --test swr_tests --features macros,l1
 //!
 //! SWR is native-only (no `unsync`, no wasm32): the background refresh needs
-//! a spawnable `Send` future. These tests use real time — moka's clock is not
+//! a spawnable `Send` future. These tests use real time — L1's clock is not
 //! tokio-mockable — so windows are generous: threshold ~1 s (±10% jitter),
 //! hard expiry 4 s, origin delay 400 ms, and every latency assertion leaves
 //! two orders of magnitude of slack over an L1 read.
@@ -348,7 +348,7 @@ async fn swr_expiry_renewal(cache: &CacheKit, id: u64) -> Result<String, Cacheki
     Ok(format!("r{id}-c{n}"))
 }
 
-/// A successful refresh renews moka's hard-expiry deadline from the commit,
+/// A successful refresh renews L1's hard-expiry deadline from the commit,
 /// rather than retaining the original entry's create deadline.
 #[tokio::test]
 async fn refresh_renews_the_full_l1_ttl() {

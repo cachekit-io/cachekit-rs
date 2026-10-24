@@ -86,7 +86,7 @@ const L1_BACKFILL_TTL_SECS: u64 = 30;
 /// L1 lifetime for a backfill from an L2 hit, or `None` when the read must not
 /// be backfilled (`spec/saas-api.md` § Remaining Freshness). A stale label or a
 /// zero `Fresh-For` forbids it; a present `Fresh-For` is a hard bound under the
-/// 30 s cap, which SWR cannot outlive because moka drops the entry at its TTL.
+/// 30 s cap, which SWR cannot outlive because L1 never serves an entry past its TTL.
 /// With no header the cap applies unchanged.
 #[cfg(feature = "l1")]
 fn l1_backfill_ttl(default_ttl: Duration, freshness: Freshness) -> Option<Duration> {
@@ -109,15 +109,17 @@ fn validate_key(key: &str) -> Result<(), CachekitError> {
             key.len()
         )));
     }
-    if has_control_byte(key.as_bytes()) {
-        // Rejection only: find the first offending byte to name it.
-        if let Some(b) = key.bytes().find(|&b| is_control_byte(b)) {
-            return Err(CachekitError::InvalidKey(format!(
-                "key contains illegal control character 0x{b:02X}"
-            )));
-        }
+    if !has_control_byte(key.as_bytes()) {
+        return Ok(());
     }
-    Ok(())
+    // Rejection only: find the first offending byte to name it.
+    key.bytes()
+        .find(|&b| is_control_byte(b))
+        .map_or(Ok(()), |b| {
+            Err(CachekitError::InvalidKey(format!(
+                "key contains illegal control character 0x{b:02X}"
+            )))
+        })
 }
 
 /// A byte no key may hold: a control character below 0x20, or DEL.
@@ -127,11 +129,11 @@ const fn is_control_byte(b: u8) -> bool {
 
 /// Whether any byte of `bytes` is a control byte.
 ///
-/// Every key on every operation passes through here, so it reads 16 bytes at
-/// a time: a block's compares are folded with no early exit, which the
-/// compiler turns into a few SIMD instructions where a byte loop spends a
-/// branch per byte. When the length is not a multiple of 16, the last block
-/// overlaps the one before it instead of leaving a byte-at-a-time tail.
+/// Every validated key passes through here, so it reads 16 bytes at a time:
+/// a block's compares are folded with no early exit, which lets the compiler
+/// vectorise them where a byte loop spends a branch per byte. When the length
+/// is not a multiple of 16, the last block overlaps the one before it instead
+/// of leaving a byte-at-a-time tail.
 fn has_control_byte(bytes: &[u8]) -> bool {
     fn any_control(block: &[u8]) -> bool {
         block
@@ -408,7 +410,7 @@ impl CacheKit {
         };
 
         // Check before touching L2. The mutation state lives independently of
-        // the moka entry, so hard expiry or capacity eviction does not look
+        // the L1 entry, so hard expiry or capacity eviction does not look
         // like an explicit set/delete and waste a valid origin result.
         if !mutation.is_current(&token.state, token.version) {
             return Ok(false);
@@ -559,8 +561,9 @@ impl CacheKit {
     ///   so a newer set/delete always wins.
     /// - [`SwrRead::Miss`] — nothing usable anywhere: normal blocking miss.
     ///
-    /// A hard-expired L1 entry is a [`SwrRead::Miss`], never `Stale` — moka
-    /// drops entries at their TTL, so SWR cannot serve past hard expiry.
+    /// A hard-expired L1 entry is a [`SwrRead::Miss`], never `Stale` — L1
+    /// never serves an entry past its TTL, so SWR cannot serve past hard
+    /// expiry.
     ///
     /// With SWR disabled ([`CacheKitBuilder::swr_enabled`]`(false)`), without
     /// the `l1` feature, on wasm32, or under `unsync`, this behaves exactly
@@ -871,9 +874,9 @@ impl CacheKit {
     /// Number of entries currently held in L1, or `None` when L1 is disabled
     /// (or the `l1` feature is off).
     ///
-    /// Exact at the time of the call: moka's pending expirations and
-    /// evictions are applied first, which makes this a housekeeping call, not
-    /// a free counter read — poll it, don't put it on a hot path.
+    /// Exact at the time of the call: expired entries are swept out first,
+    /// a pass over every entry that makes this a housekeeping call, not a
+    /// free counter read — poll it, don't put it on a hot path.
     pub fn l1_entry_count(&self) -> Option<u64> {
         #[cfg(feature = "l1")]
         let count = self.l1.as_ref().map(crate::l1::L1Cache::entry_count);
