@@ -375,7 +375,7 @@ let backend = RedisBackend::builder()
 backend.connect().await?;  // explicit connect required
 ```
 
-`connect` returns fred's `ConnectHandle`, the task driving the connection. Discarding it, as above and in the presets, leaves the connection and any auto-reconnect running; keep it only to await the error that finally closed the connection.
+`connect` returns fred's `ConnectHandle`, the task driving the connection. Discarding it, as above and in the presets, leaves the connection and any auto-reconnect running; keep it only to await the error, if any, that finally closed the connection.
 
 ### Memcached
 

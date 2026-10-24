@@ -74,7 +74,7 @@ impl RedisBackend {
     /// drop it for that reason. Keep it only to observe how the connection
     /// ended: the task resolves when the connection closes for good (on a
     /// fail-fast backend, the first dropped connection), with the error that
-    /// closed it. Do not `abort` it while the backend is still in use.
+    /// closed it, if any. Do not `abort` it while the backend is still in use.
     pub async fn connect(&self) -> Result<ConnectHandle, BackendError> {
         self.client.init().await.map_err(redis_err)
     }
