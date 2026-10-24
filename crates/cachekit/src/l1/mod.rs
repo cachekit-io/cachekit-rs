@@ -96,32 +96,23 @@ impl L1Cache {
         // Floor per shard, where quick_cache would round up, so the shards
         // never hold more than `capacity` between them.
         let weight = u64::try_from(capacity / shards * shards).unwrap_or(u64::MAX);
+        // `build` fails only when a capacity is unset, and both are set here.
+        // No fallback: quick_cache's own constructors pick shards by core
+        // count and round per-shard capacity up, which would break the bound.
+        #[allow(clippy::expect_used)]
         let options = OptionsBuilder::new()
             .shards(shards)
             .estimated_items_capacity(capacity)
             .weight_capacity(weight)
-            .build();
-        let store = match options {
-            Ok(options) => Store::with_options(
+            .build()
+            .expect("L1 options set both capacities");
+        Self {
+            store: Arc::new(Store::with_options(
                 options,
                 UnitWeighter,
                 RandomState::new(),
                 DefaultLifecycle::default(),
-            ),
-            // `build` fails only when a capacity is unset, and both are set
-            // above. Should a later quick_cache also refuse the shard count,
-            // `with` leaves shards at its own default, so the client still
-            // builds instead of panicking.
-            Err(_) => Store::with(
-                capacity,
-                weight,
-                UnitWeighter,
-                RandomState::new(),
-                DefaultLifecycle::default(),
-            ),
-        };
-        Self {
-            store: Arc::new(store),
+            )),
         }
     }
 
@@ -407,22 +398,36 @@ mod tests {
         assert_eq!(cache.store.len(), 3);
     }
 
+    /// Entries written in the past, so no sleep decides the outcome. TTL 10 s
+    /// at ratio 0.5 with no jitter: stale after 5 s, a miss from 10 s on.
     #[test]
     fn swr_goes_fresh_then_stale_then_miss() {
+        let ttl = Duration::from_secs(10);
+        let written = |ago: Duration| {
+            let created_at = Instant::now()
+                .checked_sub(ago)
+                .expect("the monotonic clock has run for more than 11 s");
+            L1Entry {
+                data: Bytes::from_static(b"v"),
+                ttl,
+                created_at,
+                expires_at: created_at.checked_add(ttl),
+                freshness_jitter: 1.0,
+            }
+        };
         let cache = L1Cache::new(16);
-        // Ratio 0.5 with ±10% jitter: stale from 180-220 ms, a miss from 400 ms.
-        cache.set("k", b"v", Duration::from_millis(400));
+        for (key, ago) in [("fresh", 1), ("stale", 7), ("expired", 11)] {
+            cache
+                .store
+                .insert(key.to_owned(), written(Duration::from_secs(ago)));
+        }
+        let v = b"v".to_vec();
         assert_eq!(
-            cache.get_with_swr("k", 0.5),
-            L1SwrRead::Fresh(b"v".to_vec())
+            cache.get_with_swr("fresh", 0.5),
+            L1SwrRead::Fresh(v.clone())
         );
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            cache.get_with_swr("k", 0.5),
-            L1SwrRead::Stale(b"v".to_vec())
-        );
-        std::thread::sleep(Duration::from_millis(150));
-        assert_eq!(cache.get_with_swr("k", 0.5), L1SwrRead::Miss);
+        assert_eq!(cache.get_with_swr("stale", 0.5), L1SwrRead::Stale(v));
+        assert_eq!(cache.get_with_swr("expired", 0.5), L1SwrRead::Miss);
     }
 
     /// `exists` must not protect an entry from eviction the way a read does.
@@ -449,25 +454,34 @@ mod tests {
     }
 
     /// One pass over keys that are never read again must not evict entries
-    /// that were read, which an LRU would do.
+    /// that were read, which an LRU would do. L1 is first filled with keys
+    /// nobody reads, so the later keys cannot go straight into quick_cache's
+    /// main queue the way they would in an empty cache; the same run without
+    /// the reads is the control, and it keeps none of them.
     #[test]
     fn a_scan_does_not_flush_entries_that_were_read() {
-        let cache = L1Cache::new(100);
-        for i in 0..50 {
-            cache.set(&format!("hot-{i}"), b"v", LONG);
-        }
-        for _ in 0..2 {
-            for i in 0..50 {
-                assert!(cache.get(&format!("hot-{i}")).is_some());
+        fn kept_after_scan(read: bool) -> usize {
+            let cache = L1Cache::new(100);
+            for i in 0..100 {
+                cache.set(&format!("filler-{i}"), b"v", LONG);
             }
+            for i in 0..50 {
+                let key = format!("hot-{i}");
+                cache.set(&key, b"v", LONG);
+                if read {
+                    assert!(cache.get(&key).is_some());
+                    assert!(cache.get(&key).is_some());
+                }
+            }
+            for i in 0..1000 {
+                cache.set(&format!("scan-{i}"), b"v", LONG);
+            }
+            (0..50)
+                .filter(|i| cache.store.peek(&format!("hot-{i}")).is_some())
+                .count()
         }
-        for i in 0..1000 {
-            cache.set(&format!("scan-{i}"), b"v", LONG);
-        }
-        let kept = (0..50)
-            .filter(|i| cache.store.peek(&format!("hot-{i}")).is_some())
-            .count();
-        assert_eq!(kept, 50);
+        assert_eq!(kept_after_scan(true), 50);
+        assert_eq!(kept_after_scan(false), 0);
     }
 
     /// Many threads mixing every operation on shared keys, with TTLs short

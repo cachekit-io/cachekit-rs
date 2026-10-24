@@ -24,7 +24,6 @@ mod tests {
         cache.set("del_key", b"value", Duration::from_secs(60));
         assert!(cache.get("del_key").is_some());
         cache.delete("del_key");
-        cache.run_pending_tasks();
         assert_eq!(cache.get("del_key"), None);
     }
 
@@ -33,7 +32,6 @@ mod tests {
         let cache = L1Cache::new(16);
         cache.set("exp_key", b"data", Duration::from_millis(1));
         std::thread::sleep(Duration::from_millis(50));
-        cache.run_pending_tasks();
         assert_eq!(cache.get("exp_key"), None);
     }
 
@@ -47,11 +45,9 @@ mod tests {
         // gets its full TTL from the moment it is written.
         cache.set("refresh", b"new", Duration::from_millis(300));
         std::thread::sleep(Duration::from_millis(100));
-        cache.run_pending_tasks();
         assert_eq!(cache.get("refresh"), Some(b"new".to_vec()));
 
         std::thread::sleep(Duration::from_millis(250));
-        cache.run_pending_tasks();
         assert_eq!(cache.get("refresh"), None);
     }
 
@@ -61,7 +57,6 @@ mod tests {
         cache.set("a", b"1", Duration::from_secs(60));
         cache.set("b", b"2", Duration::from_secs(60));
         cache.set("c", b"3", Duration::from_secs(60));
-        cache.run_pending_tasks();
         let count = ["a", "b", "c"]
             .iter()
             .filter(|k| cache.get(k).is_some())
