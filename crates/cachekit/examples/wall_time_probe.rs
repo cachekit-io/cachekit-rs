@@ -43,6 +43,18 @@
 //!   fill's unlock is sent after the call returns, so the probe waits for it
 //!   off the clock and judges it with that call.
 //!
+//! `--versions A,B --override-worker NAME` compares two server versions instead
+//! of two clients. It needs `--arms transport,transport`: each slot's requests
+//! carry a `Cloudflare-Workers-Version-Overrides` header naming that slot's
+//! Worker version, so the arms differ only by the version that serves them. A
+//! row records the version its slot asked for (`version_override`) and the
+//! version the server reports serving it (`served_version`, from the
+//! `x-cachekit-worker-version` response header, `null` when absent). Cloudflare
+//! routes a request whose override it cannot apply by the deployment's
+//! percentages, silently, so the analysis must void a run in which any row
+//! that reached the Worker (all but the edge-answered `trace` rows) names no
+//! served version or another than its slot asked for.
+//!
 //! `--hold-lock` tests those stop rules against a live refusal: before the
 //! run's first cold miss, a second client takes that key's fill lock (held
 //! 10 s at most), so the call's LOCK is refused by the server and the run must
@@ -136,6 +148,9 @@ struct Args {
     ops: Vec<Op>,
     macro_cold_miss: bool,
     hold_lock: bool,
+    /// Slot A's and slot B's Worker version ids, with `override_worker`.
+    versions: Option<[String; 2]>,
+    override_worker: Option<String>,
     size: usize,
     ttl: Duration,
     max_per_min: u32,
@@ -146,10 +161,10 @@ const USAGE: &str = "usage: wall_time_probe --run ID --phase NAME --out FILE --l
 [--env dev] [--key-prefix P] [--arms sdk,sdk|sdk,transport|transport,transport] \
 [--samples N per arm] [--block N] [--gap-ms MS] [--fresh-conn] [--concurrency C] \
 [--ops put,get,head,delete | --macro-cold-miss [--hold-lock]] [--size BYTES] [--ttl-s S] \
-[--max-per-min N] [--max-ops N]
+[--max-per-min N] [--max-ops N] [--versions A_ID,B_ID --override-worker NAME]
 env: CACHEKIT_API_KEY, CACHEKIT_API_URL";
 
-const VALUE_FLAGS: [&str; 16] = [
+const VALUE_FLAGS: [&str; 18] = [
     "run",
     "env",
     "phase",
@@ -166,6 +181,8 @@ const VALUE_FLAGS: [&str; 16] = [
     "ttl-s",
     "max-per-min",
     "max-ops",
+    "versions",
+    "override-worker",
 ];
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -226,6 +243,13 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             _ => Err(format!("unknown op {s:?}")),
         })
         .collect::<Result<_, _>>()?;
+    let versions = match kv.get("versions") {
+        None => None,
+        Some(v) => match v.split(',').collect::<Vec<_>>()[..] {
+            [a, b] => Some([a.to_owned(), b.to_owned()]),
+            _ => return Err("--versions takes exactly two version ids, A,B".into()),
+        },
+    };
     let epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -248,6 +272,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         ops,
         macro_cold_miss: flags.contains("macro-cold-miss"),
         hold_lock: flags.contains("hold-lock"),
+        versions,
+        override_worker: kv.get("override-worker").map(|v| (*v).to_owned()),
         size: num("size", 1024)?,
         ttl: Duration::from_secs(num("ttl-s", 900)? as u64),
         max_per_min: u32::try_from(num("max-per-min", 60)?)
@@ -294,6 +320,7 @@ fn validate(a: &Args) -> Result<(), String> {
     if a.hold_lock && !a.macro_cold_miss {
         return Err("--hold-lock contends a cold miss's fill lock; add --macro-cold-miss".into());
     }
+    validate_versions(a)?;
     let per_sample = if a.macro_cold_miss {
         MACRO_REQUESTS
     } else {
@@ -316,6 +343,48 @@ fn validate(a: &Args) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The version-override flags: both or neither, transport arms only, and
+/// values that keep the header a well-formed structured-field dictionary.
+fn validate_versions(a: &Args) -> Result<(), String> {
+    match (&a.versions, &a.override_worker) {
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => {
+            Err("--versions and --override-worker go together".into())
+        }
+        (Some(ids), Some(worker)) => {
+            if a.arms != [Kind::Transport, Kind::Transport] {
+                // The sdk arm's backend exposes no request headers to set.
+                return Err("--versions needs --arms transport,transport".into());
+            }
+            if !is_worker_name(worker) {
+                return Err(format!(
+                    "--override-worker: not a Worker name (1-63 of a-z, 0-9, -): {worker:?}"
+                ));
+            }
+            for id in ids {
+                if uuid::Uuid::try_parse(id).map_or(true, |u| u.hyphenated().to_string() != *id) {
+                    return Err(format!(
+                        "--versions: not a lowercase hyphenated version id: {id:?}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn is_worker_name(s: &str) -> bool {
+    (1..=63).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The `Cloudflare-Workers-Version-Overrides` value for one version: a
+/// dictionary with one member, the Worker's name, whose value is a string.
+fn override_header(worker: &str, version: &str) -> String {
+    format!("{worker}=\"{version}\"")
 }
 
 // ── Transport arm: a reqwest copy of the CachekitIO backend ──────────────────
@@ -348,8 +417,12 @@ impl reqwest::dns::Resolve for CountingResolver {
     }
 }
 
-const KEEP_HEADERS: [&str; 6] = [
+/// The response header naming the Worker version that served the request.
+const SERVED_VERSION: &str = "x-cachekit-worker-version";
+
+const KEEP_HEADERS: [&str; 7] = [
     "cf-ray",
+    SERVED_VERSION,
     "x-cachekit-store-source",
     "x-cachekit-l0-status",
     "x-cachekit-freshness",
@@ -363,12 +436,18 @@ struct Transport {
     api_url: String,
     provider: OnceLock<MetricsProvider>,
     resolves: Arc<AtomicU64>,
+    /// The version-override header value every request carries, if any.
+    version_override: Option<String>,
     /// Last exchange per (method, key); ops on one key never overlap.
     seen: Mutex<HashMap<(&'static str, String), Exchange>>,
 }
 
 impl Transport {
-    fn new(api_key: &str, api_url: &str) -> Result<Self, CachekitError> {
+    fn new(
+        api_key: &str,
+        api_url: &str,
+        version_override: Option<String>,
+    ) -> Result<Self, CachekitError> {
         let resolves = Arc::new(AtomicU64::new(0));
         // Mirrors CachekitIOBuilder::build; the only addition is the resolver.
         let client = reqwest::Client::builder()
@@ -389,6 +468,7 @@ impl Transport {
             api_url: api_url.trim_end_matches('/').to_owned(),
             provider: OnceLock::new(),
             resolves,
+            version_override,
             seen: Mutex::new(HashMap::new()),
         })
     }
@@ -414,6 +494,9 @@ impl Transport {
         }
         for (name, value) in metrics_headers(self.provider.get()) {
             req = req.header(name, value);
+        }
+        if let Some(value) = &self.version_override {
+            req = req.header("Cloudflare-Workers-Version-Overrides", value);
         }
         let start = Instant::now();
         let resp = req.send().await.map_err(|e| wire_err(&e, &self.api_key))?;
@@ -668,19 +751,23 @@ impl LockableBackend for Recorded {
 struct Arm {
     kind: Kind,
     slot: &'static str,
+    /// The Worker version this arm's requests ask for, if any.
+    version: Option<String>,
     cache: CacheKit,
     wire: Option<Arc<Transport>>,
     recorded: Option<Arc<Recorded>>,
 }
 
 /// `record` wraps the sdk arm's backend in [`Recorded`]; only the macro
-/// regime needs it, so the plain sdk arm stays the bare SDK.
+/// regime needs it, so the plain sdk arm stays the bare SDK. `version` is
+/// (Worker name, version id) for a version-override arm.
 fn build_arm(
     kind: Kind,
     slot: &'static str,
     api_key: &str,
     api_url: &str,
     record: bool,
+    version: Option<(&str, &str)>,
 ) -> Result<Arm, CachekitError> {
     let (mut wire, mut recorded) = (None, None);
     let backend: cachekit::SharedBackend = match kind {
@@ -702,7 +789,8 @@ fn build_arm(
             }
         }
         Kind::Transport => {
-            let t = Arc::new(Transport::new(api_key, api_url)?);
+            let header = version.map(|(worker, id)| override_header(worker, id));
+            let t = Arc::new(Transport::new(api_key, api_url, header)?);
             wire = Some(t.clone());
             t
         }
@@ -712,6 +800,7 @@ fn build_arm(
     Ok(Arm {
         kind,
         slot,
+        version: version.map(|(_, id)| id.to_owned()),
         cache,
         wire,
         recorded,
@@ -944,7 +1033,7 @@ impl Sink {
         let status = ex.map(|e| e.status).or(inferred);
         let ray = ex.and_then(|e| e.headers.get("cf-ray").cloned());
         let reused = t.new_conn == Some(false);
-        let row = json!({
+        let mut row = json!({
             "session_started": t.started,
             "session_ended": t.ended,
             "host": self.host,
@@ -989,6 +1078,9 @@ impl Sink {
             "invocation": self.invocation,
             "loadavg": self.loadavg,
         });
+        // Set apart from the literal above, which is at json!'s recursion limit.
+        row["version_override"] = json!(arm.version);
+        row["served_version"] = json!(ex.and_then(|e| e.headers.get(SERVED_VERSION)));
         writeln!(self.out, "{row}").map_err(|e| Stop::Fault(format!("out: {e}")))?;
         println!(
             "  {:10} {} {:9} {:16} {:6} {:>4} new={:5} total={:7.1} ttfb={:>7} ray={}",
@@ -1134,8 +1226,13 @@ async fn schedule(sink: &mut Sink, api_key: &str, api_url: &str) -> Result<(), S
         every: Duration::from_secs(60) / a.max_per_min,
     };
     let slots = ["A", "B"];
+    let versions = a.versions.clone();
+    let worker = a.override_worker.clone();
     let build = |i: usize| {
-        build_arm(arms[i], slots[i], api_key, api_url, macro_mode)
+        let version = worker
+            .as_deref()
+            .zip(versions.as_ref().map(|v| v[i].as_str()));
+        build_arm(arms[i], slots[i], api_key, api_url, macro_mode, version)
             .map(Arc::new)
             .map_err(|e| Stop::Fault(e.to_string()))
     };
@@ -1390,6 +1487,99 @@ fn main() -> ExitCode {
         Err(Stop::Fault(why)) => {
             eprintln!("wall_time_probe: {why}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: &str = "0f6b8e3a-1c2d-4e5f-8a9b-0c1d2e3f4a5b";
+    const B: &str = "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d";
+
+    fn args(extra: &[&str]) -> Result<Args, String> {
+        let base = ["--run", "R", "--phase", "p", "--out", "o", "--ledger", "l"];
+        let argv: Vec<String> = base.iter().chain(extra).map(|s| (*s).to_owned()).collect();
+        parse_args(&argv)
+    }
+
+    #[test]
+    fn versions_set_one_override_per_slot_on_transport_arms() {
+        let a = args(&[
+            "--arms",
+            "transport,transport",
+            "--versions",
+            &format!("{A},{B}"),
+            "--override-worker",
+            "my-worker",
+        ])
+        .expect("valid");
+        assert_eq!(a.versions, Some([A.to_owned(), B.to_owned()]));
+        assert_eq!(
+            override_header("my-worker", A),
+            format!("my-worker=\"{A}\"")
+        );
+    }
+
+    #[test]
+    fn versions_refuse_an_sdk_arm_a_lone_flag_and_malformed_values() {
+        let pair = format!("{A},{B}");
+        let t = "transport,transport";
+        for (extra, why) in [
+            (
+                vec![
+                    "--arms",
+                    "sdk,transport",
+                    "--versions",
+                    &pair,
+                    "--override-worker",
+                    "w",
+                ],
+                "transport,transport",
+            ),
+            (vec!["--arms", t, "--versions", &pair], "go together"),
+            (vec!["--arms", t, "--override-worker", "w"], "go together"),
+            (
+                vec!["--arms", t, "--versions", A, "--override-worker", "w"],
+                "exactly two",
+            ),
+            (
+                vec![
+                    "--arms",
+                    t,
+                    "--versions",
+                    &format!("{A},x\""),
+                    "--override-worker",
+                    "w",
+                ],
+                "version id",
+            ),
+            (
+                vec![
+                    "--arms",
+                    t,
+                    "--versions",
+                    &pair.to_uppercase(),
+                    "--override-worker",
+                    "w",
+                ],
+                "version id",
+            ),
+            (
+                vec![
+                    "--arms",
+                    t,
+                    "--versions",
+                    &pair,
+                    "--override-worker",
+                    "W=\"x\"",
+                ],
+                "Worker name",
+            ),
+        ] {
+            let err = args(&extra).expect_err(why);
+            assert!(err.contains(why), "{extra:?}: {err}");
         }
     }
 }
