@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.12.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.11.1...cachekit-rs-v0.12.0) (2026-10-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* **encryption:** `CacheKit::from_env()` no longer encrypts because `CACHEKIT_MASTER_KEY` is set. While the variable is set, a `from_env()` builder fails at `build()` with `CachekitError::Config` until you chain `.encryption_from_env()` (encrypt with the same keys and tenant as before, so existing entries stay readable) or `.no_encryption()` (a plaintext client: delete the old encrypted entries first, because a client that does not encrypt cannot read them and a `#[cachekit]` function overwrites them in plaintext). A build without the `encryption` feature now raises that error at `build()`, not at `from_env()`, and accepts `.no_encryption()`.
+* **config:** from_env ignores CACHEKIT_DEFAULT_TTL; pass a TTL per call or chain .default_ttl() (LAB-4664) ([#172](https://github.com/cachekit-io/cachekit-rs/issues/172))
+
+### Features
+
+* **encryption:** from_env() no longer encrypts because CACHEKIT_MASTER_KEY is set (LAB-4669) ([#173](https://github.com/cachekit-io/cachekit-rs/issues/173)) ([63a5399](https://github.com/cachekit-io/cachekit-rs/commit/63a5399d450eb0c5d79be6a410347f04ec32ff97))
+
+
+### Bug Fixes
+
+* **config:** from_env ignores CACHEKIT_DEFAULT_TTL; pass a TTL per call or chain .default_ttl() (LAB-4664) ([#172](https://github.com/cachekit-io/cachekit-rs/issues/172)) ([dcae57c](https://github.com/cachekit-io/cachekit-rs/commit/dcae57c3823a4d0b3e44b6b1e5949a003e710eb0))
+* **readme:** replace the unmeasured latency figures with measured ones (LAB-10638) ([#171](https://github.com/cachekit-io/cachekit-rs/issues/171)) ([d9d6394](https://github.com/cachekit-io/cachekit-rs/commit/d9d6394baf60ee6af803b516757f4710b6438988))
+
+
+### Performance Improvements
+
+* **client:** borrow the key and check it 16 bytes at a time (LAB-10665) ([#178](https://github.com/cachekit-io/cachekit-rs/issues/178)) ([af59b91](https://github.com/cachekit-io/cachekit-rs/commit/af59b91ad0d68da2b2cbb233c802e585860b29fc))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.11.1 to 0.12.0
+
 ## [0.11.1](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.11.0...cachekit-rs-v0.11.1) (2026-10-22)
 
 
