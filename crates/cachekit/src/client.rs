@@ -109,15 +109,17 @@ fn validate_key(key: &str) -> Result<(), CachekitError> {
             key.len()
         )));
     }
-    if has_control_byte(key.as_bytes()) {
-        // Rejection only: find the first offending byte to name it.
-        if let Some(b) = key.bytes().find(|&b| is_control_byte(b)) {
-            return Err(CachekitError::InvalidKey(format!(
-                "key contains illegal control character 0x{b:02X}"
-            )));
-        }
+    if !has_control_byte(key.as_bytes()) {
+        return Ok(());
     }
-    Ok(())
+    // Rejection only: find the first offending byte to name it.
+    key.bytes()
+        .find(|&b| is_control_byte(b))
+        .map_or(Ok(()), |b| {
+            Err(CachekitError::InvalidKey(format!(
+                "key contains illegal control character 0x{b:02X}"
+            )))
+        })
 }
 
 /// A byte no key may hold: a control character below 0x20, or DEL.
@@ -127,11 +129,11 @@ const fn is_control_byte(b: u8) -> bool {
 
 /// Whether any byte of `bytes` is a control byte.
 ///
-/// Every key on every operation passes through here, so it reads 16 bytes at
-/// a time: a block's compares are folded with no early exit, which the
-/// compiler turns into a few SIMD instructions where a byte loop spends a
-/// branch per byte. When the length is not a multiple of 16, the last block
-/// overlaps the one before it instead of leaving a byte-at-a-time tail.
+/// Every validated key passes through here, so it reads 16 bytes at a time:
+/// a block's compares are folded with no early exit, which lets the compiler
+/// vectorise them where a byte loop spends a branch per byte. When the length
+/// is not a multiple of 16, the last block overlaps the one before it instead
+/// of leaving a byte-at-a-time tail.
 fn has_control_byte(bytes: &[u8]) -> bool {
     fn any_control(block: &[u8]) -> bool {
         block
