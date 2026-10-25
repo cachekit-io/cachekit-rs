@@ -164,20 +164,23 @@ impl EncryptionLayer {
         // `derive_tenant_keys` would also run the authentication and
         // cache-key HKDFs. This repeats the keyring's entry 0, which
         // `TenantKeyring` neither exposes nor encrypts with, so construction
-        // derives the current key twice.
-        let derived_key = derive_domain_key(
-            master_key_bytes,
-            KeyDomain::Encryption.as_str(),
-            tenant_id.as_bytes(),
-        )
-        .map_err(|e| CachekitError::Config(format!("key derivation failed: {e}")))?;
+        // derives the current key twice. Wrapped at once, so the error
+        // returns below wipe it too.
+        let derived_key = Zeroizing::new(
+            derive_domain_key(
+                master_key_bytes,
+                KeyDomain::Encryption.as_str(),
+                tenant_id.as_bytes(),
+            )
+            .map_err(|e| CachekitError::Config(format!("key derivation failed: {e}")))?,
+        );
 
         let encryptor = ZeroKnowledgeEncryptor::new()
             .map_err(|e| CachekitError::Encryption(format!("encryptor init failed: {e}")))?;
 
         Ok(Self {
             encryptor,
-            derived_key: Zeroizing::new(derived_key),
+            derived_key,
             keyring: tenant_keyring(master_key_bytes, previous_keys, tenant_id)?,
             tenant_id: tenant_id.to_owned(),
             previous_key_hits: previous_keys.iter().map(|_| AtomicU64::new(0)).collect(),

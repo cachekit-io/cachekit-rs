@@ -190,7 +190,7 @@ impl Bench {
         let bench = Self {
             op,
             mode,
-            enc: mode != "plain" && mode != "rel",
+            enc: matches!(mode, "enc" | "prev"),
             reader,
             backend,
             keys,
