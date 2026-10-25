@@ -118,12 +118,22 @@ async fn connect_secure(
     redis_url: &str,
     builder: CacheKitBuilder,
 ) -> Result<CacheKitBuilder, CachekitError> {
-    let backend = crate::backend::redis::RedisBackend::builder()
-        .url(redis_url)
-        .auto_reconnect()
-        .build()?;
+    let backend = reconnecting_redis(redis_url)?;
     drop(backend.connect().await?);
     Ok(builder.backend(wrap(backend)))
+}
+
+/// The unconnected Redis backend of `production` and `secure`: the public
+/// [`auto_reconnect`](crate::backend::redis::RedisBackendBuilder::auto_reconnect)
+/// policy, so a caller building their own backend gets the same one.
+#[cfg(feature = "redis")]
+fn reconnecting_redis(
+    redis_url: &str,
+) -> Result<crate::backend::redis::RedisBackend, CachekitError> {
+    crate::backend::redis::RedisBackend::builder()
+        .url(redis_url)
+        .auto_reconnect()
+        .build()
 }
 
 impl CacheKit {
@@ -197,10 +207,7 @@ impl CacheKit {
     /// ```
     #[cfg(feature = "redis")]
     pub async fn production(redis_url: &str) -> Result<CacheKitBuilder, CachekitError> {
-        let backend = crate::backend::redis::RedisBackend::builder()
-            .url(redis_url)
-            .auto_reconnect()
-            .build()?;
+        let backend = reconnecting_redis(redis_url)?;
         drop(backend.connect().await?);
 
         let builder = CacheKitBuilder::default()
@@ -542,28 +549,41 @@ mod secure_tests {
         assert!(secure_env_defaults_with(Some(&"22".repeat(32)), None).is_ok());
     }
 
-    /// Run `secure_env_defaults` under the given env, restoring both
-    /// variables before anything can panic.
+    /// Run `f` with each variable set (`Some`) or removed (`None`),
+    /// restoring every one before anything can panic.
+    fn with_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
+        let saved: Vec<_> = vars
+            .iter()
+            .map(|(var, _)| (*var, std::env::var_os(var)))
+            .collect();
+        for (var, val) in vars {
+            match val {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        let out = f();
+        for (var, val) in saved {
+            match val {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+        out
+    }
+
+    /// Run `secure_env_defaults` under the given env.
     fn secure_env_defaults_with(
         master: Option<&str>,
         previous: Option<&str>,
     ) -> Result<crate::CacheKitBuilder, crate::CachekitError> {
-        const VARS: [&str; 2] = ["CACHEKIT_MASTER_KEY", "CACHEKIT_PREVIOUS_MASTER_KEYS"];
-        let saved = VARS.map(std::env::var_os);
-        for (var, val) in VARS.iter().zip([master, previous]) {
-            match val {
-                Some(v) => std::env::set_var(var, v),
-                None => std::env::remove_var(var),
-            }
-        }
-        let resolved = super::secure_env_defaults();
-        for (var, val) in VARS.iter().zip(saved) {
-            match val {
-                Some(v) => std::env::set_var(var, v),
-                None => std::env::remove_var(var),
-            }
-        }
-        resolved
+        with_env(
+            &[
+                ("CACHEKIT_MASTER_KEY", master),
+                ("CACHEKIT_PREVIOUS_MASTER_KEYS", previous),
+            ],
+            super::secure_env_defaults,
+        )
     }
 
     #[test]
@@ -572,6 +592,31 @@ mod secure_tests {
         assert_decrypts_default_tenant_vector(
             secure_env_defaults_with(Some(MASTER_KEY_HEX), None).expect("valid key"),
         );
+    }
+
+    /// The env constructor with no tenant: `.encryption_from_env()` on the
+    /// builder `from_env()` returns resolves "default", and a namespace on
+    /// that builder never becomes the tenant.
+    #[cfg(feature = "cachekitio")]
+    #[test]
+    #[serial_test::serial]
+    fn from_env_encryption_from_env_decrypts_default_tenant_vector(
+    ) -> Result<(), crate::CachekitError> {
+        let builder = with_env(
+            &[
+                ("CACHEKIT_MASTER_KEY", Some(MASTER_KEY_HEX)),
+                ("CACHEKIT_PREVIOUS_MASTER_KEYS", None),
+                ("CACHEKIT_API_KEY", Some("test-key")),
+                ("CACHEKIT_API_URL", None),
+            ],
+            || {
+                crate::CacheKit::from_env()?
+                    .namespace("my-app")
+                    .encryption_from_env()
+            },
+        )?;
+        assert_decrypts_default_tenant_vector(builder);
+        Ok(())
     }
 
     /// An entry written under k1 must still decrypt after the
@@ -774,5 +819,38 @@ mod io_deadline_tests {
             .expect("io builds")
             .backend(super::wrap(other));
         assert_eq!(builder.retry_deadlines, None);
+    }
+}
+
+#[cfg(all(test, feature = "redis"))]
+#[allow(clippy::expect_used)] // test-only
+mod redis_reconnect_tests {
+    use fred::prelude::ClientLike;
+
+    use crate::backend::redis::RedisBackend;
+
+    /// `production` and `secure` build their backend with the same reconnect
+    /// policy and unresponsive check a caller gets from the public builder.
+    #[test]
+    fn presets_and_the_public_builder_share_one_reconnect_policy() {
+        let url = "redis://localhost:6379";
+        let preset = super::reconnecting_redis(url).expect("builds");
+        let public = RedisBackend::builder()
+            .url(url)
+            .auto_reconnect()
+            .build()
+            .expect("builds");
+
+        let policy = preset.client().client_reconnect_policy();
+        assert!(policy.is_some(), "presets reconnect");
+        assert_eq!(policy, public.client().client_reconnect_policy());
+        assert_eq!(
+            preset.client().connection_config().unresponsive.max_timeout,
+            public.client().connection_config().unresponsive.max_timeout
+        );
+        assert_eq!(
+            preset.client().perf_config().default_command_timeout,
+            public.client().perf_config().default_command_timeout
+        );
     }
 }

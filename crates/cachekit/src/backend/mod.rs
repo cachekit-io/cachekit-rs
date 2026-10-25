@@ -408,6 +408,27 @@ pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(5);
 ))]
 pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A builder's configured timeout, or `default` when unset. Zero is a config
+/// error naming `setter`: fred reads a zero command timeout as "none", and a
+/// zero HTTP budget fails every request.
+#[cfg(any(
+    feature = "redis",
+    all(feature = "cachekitio", not(target_arch = "wasm32"))
+))]
+pub(crate) fn nonzero_timeout(
+    setter: &str,
+    value: Option<Duration>,
+    default: Duration,
+) -> Result<Duration, crate::error::CachekitError> {
+    let timeout = value.unwrap_or(default);
+    if timeout.is_zero() {
+        return Err(crate::error::CachekitError::Config(format!(
+            "{setter} must be greater than zero"
+        )));
+    }
+    Ok(timeout)
+}
+
 // ── Feature-gated backend modules ─────────────────────────────────────────────
 
 /// JSON wire bodies for the SaaS lock/TTL endpoints. Compiled under `test`

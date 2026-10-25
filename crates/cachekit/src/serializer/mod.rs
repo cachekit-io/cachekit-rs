@@ -1,4 +1,4 @@
-use cachekit_core::check_msgpack_structure;
+use cachekit_core::msgpack_document_len;
 use rmp_serde::decode::ReadRefReader;
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -17,7 +17,7 @@ use crate::error::CachekitError;
 /// every profile and target (wasm32 included), and sits inside the protocol's
 /// required `32..=1024` window (`spec/interop-mode.md` → Decode bounds).
 ///
-/// Enforced by cachekit-core's `check_msgpack_structure`, which runs before
+/// Enforced by cachekit-core's `msgpack_document_len`, which runs before
 /// every decode in [`deserialize`] and [`crate::interop::deserialize`]. Depth
 /// counts every array and map header on the deepest path, empty ones included;
 /// scalars, str, bin and ext are leaves.
@@ -34,7 +34,7 @@ pub(crate) type SliceDeserializer<'a> = rmp_serde::Deserializer<ReadRefReader<'a
 /// Every decode of backend-supplied bytes (auto-mode [`deserialize`] and
 /// [`crate::interop::deserialize`]) MUST go through here so the bounds cannot
 /// drift between paths. It runs cachekit-core's header-only
-/// `check_msgpack_structure` walk first. The walk proves that a complete
+/// `msgpack_document_len` walk first. The walk proves that a complete
 /// document lies within `bytes`, that it nests no deeper than
 /// [`MAX_DECODE_DEPTH`], and that no header declares more elements or bytes
 /// than the remaining input can back. Its rejection becomes a
@@ -56,9 +56,8 @@ pub(crate) type SliceDeserializer<'a> = rmp_serde::Deserializer<ReadRefReader<'a
 /// read would decode a foreign container by its first byte (a cachekit-py CK
 /// frame begins with `0x43`, the complete document 67), and after a decrypt the
 /// spec requires a parse mismatch to fail. The walk leaves trailing bytes to
-/// its caller and reports no length, so the check walks `bytes` again without
-/// its last byte. A MessagePack document's own bytes fix where it ends, so it is
-/// still complete without that byte exactly when at least one byte follows it.
+/// its caller and returns where the document ends, so the same walk settles
+/// this: any length short of `bytes.len()` means bytes follow the document.
 /// Finally it sets `rmp-serde`'s own depth limit as a backstop just above
 /// [`MAX_DECODE_DEPTH`]: its default (1024) is deep enough to overflow a
 /// debug-build thread stack.
@@ -73,19 +72,16 @@ pub(crate) type SliceDeserializer<'a> = rmp_serde::Deserializer<ReadRefReader<'a
 /// only an ext's type byte leaves the body unread and is accepted. No value
 /// this SDK writes contains ext.
 pub(crate) fn bounded_deserializer(bytes: &[u8]) -> Result<SliceDeserializer<'_>, CachekitError> {
-    check_msgpack_structure(bytes, MAX_DECODE_DEPTH)
+    let len = msgpack_document_len(bytes, MAX_DECODE_DEPTH)
         .map_err(|e| CachekitError::Serialization(format!("decode bound: {e}")))?;
-    let trailing = bytes
-        .split_last()
-        .is_some_and(|(_, head)| check_msgpack_structure(head, MAX_DECODE_DEPTH).is_ok());
     // The error names no byte: on the secure path these bytes are decrypted
-    // plaintext (CWE-532).
-    if trailing {
-        return Err(CachekitError::Serialization(
-            "payload has trailing byte(s) after the MessagePack document — \
-             readers must consume exactly one document"
-                .to_owned(),
-        ));
+    // plaintext (CWE-532). Their count is not.
+    if len < bytes.len() {
+        return Err(CachekitError::Serialization(format!(
+            "payload has {} trailing byte(s) after the MessagePack document — \
+             readers must consume exactly one document",
+            bytes.len() - len
+        )));
     }
     let mut de = rmp_serde::Deserializer::from_read_ref(bytes);
     // rmp-serde decrements its counter on entry and errors when it reaches 0, so

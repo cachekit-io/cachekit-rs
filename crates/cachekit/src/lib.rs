@@ -99,7 +99,7 @@ compile_error!(
 );
 
 #[cfg(all(feature = "workers", feature = "l1"))]
-compile_error!("features `workers` and `l1` are mutually exclusive — moka requires std threads unavailable in wasm32");
+compile_error!("features `workers` and `l1` are mutually exclusive — L1 reads `std::time::Instant`, which has no clock on wasm32-unknown-unknown, the Workers target");
 
 #[cfg(all(feature = "workers", feature = "reliability"))]
 compile_error!("features `workers` and `reliability` are mutually exclusive — retry/breaker timers need tokio `time`, unavailable in wasm32");
@@ -112,9 +112,9 @@ compile_error!(
     "features `workers` and `file` are mutually exclusive — Workers runtime has no filesystem"
 );
 
-// Target guard: moka reads `Instant::now()` for its clock origin when the cache is constructed.
+// Target guard: L1 reads `Instant::now()` on every insert and read.
 #[cfg(all(feature = "l1", target_arch = "wasm32", target_os = "unknown"))]
-compile_error!("feature `l1` is not supported on wasm32-unknown-unknown — std::time::Instant has no clock there, so building the client (and its L1 cache) would panic; set `default-features = false, features = [\"encryption\"]` plus your backend feature, leaving out `l1`");
+compile_error!("feature `l1` is not supported on wasm32-unknown-unknown — std::time::Instant has no clock there, so the client's first L1 read or write would panic; set `default-features = false, features = [\"encryption\"]` plus your backend feature, leaving out `l1`");
 
 /// Pluggable cache backend trait and implementations (CachekitIO, Redis,
 /// Memcached, File, Workers).
@@ -146,7 +146,7 @@ mod intents;
 #[cfg(feature = "encryption")]
 pub mod encryption;
 
-/// In-process L1 cache backed by [`moka`] with per-entry TTL.
+/// In-process L1 cache with per-entry TTL, backed by [`quick_cache`].
 #[cfg(feature = "l1")]
 pub mod l1;
 

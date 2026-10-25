@@ -140,8 +140,10 @@ impl Bench {
             )));
         }
         let backend = Arc::new(MemBackend::default());
-        // Room for every key, so no op pays a moka eviction.
-        let reader = client(&backend, mode, iters + WARM + 8)?;
+        // Room for every key twice over, so no op pays an eviction: L1 splits
+        // its capacity into shards, and a shard sized exactly to its keys
+        // evicts a few of them when the hash spreads them unevenly.
+        let reader = client(&backend, mode, 2 * (iters + WARM) + 8)?;
         let keys: Vec<String> = (0..iters + WARM)
             .map(|i| format!("bench:{op}:{i:08}"))
             .collect();
