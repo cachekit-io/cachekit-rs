@@ -371,7 +371,7 @@ pub fn serialize_value(value: &InteropValue) -> Result<Vec<u8>, CachekitError> {
 /// Deserialize an interop-mode MessagePack document, consuming **exactly one**
 /// document and rejecting trailing bytes (spec MUST).
 ///
-/// Decode bounds: cachekit-core's header walk (`check_msgpack_structure`, run
+/// Decode bounds: cachekit-core's header walk (`msgpack_document_len`, run
 /// from `crate::serializer::bounded_deserializer`) runs first and rejects, with
 /// a `decode bound:` error, any document nested deeper than
 /// [`crate::serializer::MAX_DECODE_DEPTH`] or declaring more than the input can

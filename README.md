@@ -28,7 +28,7 @@
 | **CacheKit** | `get` / `set` / `delete` / `exists` with automatic L1 → L2 layering; with a master key configured, every value is AES-256-GCM encrypted before storage (zero-knowledge) |
 | **SecureCache** | The same encryption as a handle (`cache.secure_cache()`) that refuses a client without a key |
 | **Backend** | Pluggable trait — cachekit.io SaaS, Redis, Memcached, local File, Cloudflare Workers |
-| **L1 Cache** | In-process [moka](https://crates.io/crates/moka) cache with write-through + backfill |
+| **L1 Cache** | In-process cache ([quick_cache](https://crates.io/crates/quick_cache)) with per-entry TTL, write-through + backfill |
 
 > [!TIP]
 > For the Python SDK with decorators, see [`cachekit`](https://github.com/cachekit-io/cachekit).
@@ -42,7 +42,7 @@
 |:--------|:-------:|:------------|
 | `cachekitio` | ✅ | HTTP backend for [api.cachekit.io](https://api.cachekit.io) via [reqwest](https://crates.io/crates/reqwest) + rustls |
 | `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core). Without it, every builder encryption call (`.encryption()`, `.encryption_with_previous()`, `.encryption_from_env()`, `.encryption_from_bytes()`, `.encryption_from_bytes_with_previous()`) returns a config error |
-| `l1` | ✅ | In-process L1 cache via [moka](https://crates.io/crates/moka), with stale-while-revalidate (native). Not supported on `wasm32-unknown-unknown` (compile error: no clock there) |
+| `l1` | ✅ | In-process L1 cache via [quick_cache](https://crates.io/crates/quick_cache), with per-entry TTL and stale-while-revalidate (native). Not supported on `wasm32-unknown-unknown` (compile error: no clock there) |
 | `reliability` | ✅ | Retry with backoff + jitter, circuit breaker, backpressure, distributed fill locks (native only) |
 | `redis` | ❌ | Redis backend via [fred](https://crates.io/crates/fred) (native only) |
 | `memcached` | ❌ | Memcached backend via [rust-memcache](https://crates.io/crates/memcache) (native only) |
@@ -55,27 +55,27 @@
 ```toml
 # Defaults: SaaS + encryption + L1
 [dependencies]
-cachekit-rs = "0.12.0"
+cachekit-rs = "0.13.0"
 
 # With Redis backend
 [dependencies]
-cachekit-rs = { version = "0.12.0", features = ["redis"] }
+cachekit-rs = { version = "0.13.0", features = ["redis"] }
 
 # For Cloudflare Workers (no L1, no Redis)
 [dependencies]
-cachekit-rs = { version = "0.12.0", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.13.0", default-features = false, features = ["workers", "encryption"] }
 ```
 <!-- x-release-please-end -->
 
 > [!WARNING]
 > **Mutually exclusive features:**
 > - `workers` + `redis` — Workers runtime cannot use fred
-> - `workers` + `l1` — moka requires std threads unavailable in wasm32
+> - `workers` + `l1` — L1 reads `std::time::Instant`, which has no clock on wasm32-unknown-unknown, the Workers target
 > - `workers` + `reliability` — retry/breaker timers need tokio `time`, unavailable in wasm32
 > - `workers` + `memcached` — Workers runtime has no TCP sockets
 > - `workers` + `file` — Workers runtime has no filesystem
 >
-> `l1` is also a compile error on `wasm32-unknown-unknown` with any feature set: `std::time::Instant` has no clock there, so building the client would panic. Build for that target with `default-features = false, features = ["encryption"]` plus your backend feature (`workers` for cachekit.io); `wasm32-wasip1` keeps L1.
+> `l1` is also a compile error on `wasm32-unknown-unknown` with any feature set: `std::time::Instant` has no clock there, so the client's first L1 read or write would panic. Build for that target with `default-features = false, features = ["encryption"]` plus your backend feature (`workers` for cachekit.io); `wasm32-wasip1` keeps L1.
 
 ---
 
@@ -118,12 +118,12 @@ async fn main() -> Result<(), CachekitError> {
 
 **Resilience contract** — connection failures, at construction and mid-run:
 
-- `production` / `secure` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely.
+- `production` / `secure` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely. To get the same policy on a backend you build yourself, for example one `RedisBackend` shared by several clients through `CacheKitBuilder::backend`, call `RedisBackendBuilder::auto_reconnect()` (see [Redis](#redis)). A backend built without it is fail-fast like `minimal`.
 - `minimal` is **fail-fast**: a dropped connection is not re-established — every subsequent operation that reaches Redis errors until you rebuild the client. Reads served from a warm L1 entry still return without contacting Redis.
 - **Initial** connections fail fast for every Redis preset: a bad URL or unreachable Redis errors immediately at construction, never enters a retry loop. `io` opens no connection at construction: an empty API key fails at construction, while an invalid key or unreachable endpoint surfaces at the first request.
 - `secure` / `secure_from_env` validate the master key (and `secure_from_env` any previous keys) **before** any Redis connection is attempted — a missing, non-hex or short key, or a malformed `CACHEKIT_PREVIOUS_MASTER_KEYS`, is a deterministic local error, never masked by (or paying for) network I/O, and never a fallback to plaintext.
 - Auto-reconnect is connection-level repair, distinct from the per-operation [reliability stack](#reliability) (retry, circuit breaker, backpressure) that `production` / `secure` / `io` also enable. `minimal` has neither — every failure is yours to handle.
-- Every Redis command has a **5 s timeout** (matching cachekit-py and cachekit-ts), so a stalled or unreachable server returns `BackendErrorKind::Timeout` instead of hanging. `minimal` fails after ~5 s. `production` / `secure` retry a timeout up to 3 attempts, so one op can take ~15 s before it errors, and those timeouts count toward opening the circuit breaker. Under `production` / `secure`, a connection that stops answering is also closed and re-established, typically 6-8 s after the stalled command was sent (fred checks every 2 s for a pending reply older than 5 s).
+- Every Redis command has a **5 s timeout** (matching cachekit-py and cachekit-ts), so a stalled or unreachable server returns `BackendErrorKind::Timeout` instead of hanging. `minimal` fails after ~5 s. `production` / `secure` retry a timeout up to 3 attempts, so one op can take ~15 s before it errors, and those timeouts count toward opening the circuit breaker. Under `production` / `secure`, a connection that stops answering is also closed and re-established, typically 6-8 s after the stalled command was sent (fred checks every 2 s for a pending reply older than 5 s). On a backend you build yourself, `RedisBackendBuilder::command_timeout` sets a different budget; it is per attempt, and it is also the stalled-reply threshold when `auto_reconnect()` is on.
 
 ### From Environment Variables
 
@@ -173,7 +173,10 @@ Each cachekit.io request attempt times out after 5 s, the protocol's
 `CACHEKIT_TIMEOUT` default; a write (`set`, `delete`) gets 10 s. The timeout
 covers connect, TLS and the whole response body, and surfaces as
 `BackendErrorKind::Timeout`. The same budgets apply on native targets and on
-the [Workers backend](#cloudflare-workers).
+the [Workers backend](#cloudflare-workers). On native targets,
+`CachekitIO::builder().read_timeout(..)` and `.write_timeout(..)` change them
+(zero is rejected at `build()`); connecting still gives up after 5 s. Under the
+[reliability stack](#reliability) the budget is per attempt.
 
 On native targets every request carries the User-Agent `cachekit-rs/<version>`,
 and an idle pooled connection is kept for 390 s (reqwest's default is 90 s).
@@ -187,6 +190,23 @@ probe count, so detection there takes about 165 s. On wasm32 the platform's
 
 Neither CachekitIO client follows a redirect: a 3xx from the API is a
 permanent error. On wasm32, use the [Workers backend](#cloudflare-workers).
+
+### Values and binary payloads
+
+`get` and `set` take any serde type and store it as MessagePack. serde treats a plain `Vec<u8>` as a sequence, so it is stored as a MessagePack array of integers: up to twice the size, with a per-byte encode and decode. For bodies, blobs and other large byte payloads, mark the field with [`serde_bytes`](https://crates.io/crates/serde_bytes) (a crate you add yourself) so it is stored as one MessagePack `bin` value:
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Response {
+    status: u16,
+    #[serde(with = "serde_bytes")]
+    body: Vec<u8>,
+}
+```
+
+For a bare byte value, store a `serde_bytes::ByteBuf`. Either form decodes into either type, so switching a field to `serde_bytes` still reads entries written before the switch.
+
+`SecureCache` borrows the `CacheKit` it came from, so keep the client and call `secure_cache()` where you need the handle; it is cheap enough to call per operation.
 
 ---
 
@@ -341,22 +361,29 @@ How fresh a cachekit.io read is, and how long a deleted project's data stays rea
 
 ### Redis
 
-Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Each command times out after 5 s with `BackendErrorKind::Timeout`. A timed-out command may still run on the server: harmless for `get`/`set`/`delete`, and a timed-out lock acquire leaves the lock to expire on its own TTL. Requires the `redis` feature flag.
+Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL inspection, and distributed locking (`SET NX PX` acquire, atomic Lua compare-and-delete release, `<key>:lock` namespace shared with cachekit-py). Each command times out after 5 s with `BackendErrorKind::Timeout`; `.command_timeout(Duration)` changes that (zero is rejected at `build()`). A timed-out command may still run on the server: harmless for `get`/`set`/`delete`, and a timed-out lock acquire leaves the lock to expire on its own TTL. Requires the `redis` feature flag.
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.12.0", features = ["redis"] }
+cachekit-rs = { version = "0.13.0", features = ["redis"] }
 ```
 <!-- x-release-please-end -->
 
 ```rust
+use std::time::Duration;
 use cachekit::backend::redis::RedisBackend;
 
 let backend = RedisBackend::builder()
     .url("redis://localhost:6379")
+    .auto_reconnect()                            // optional: the production/secure policy
+    .command_timeout(Duration::from_millis(500)) // optional: default 5 s
     .build()?;
 backend.connect().await?;  // explicit connect required
 ```
+
+Without `.auto_reconnect()` the backend is fail-fast: after Redis restarts, every operation errors until you rebuild it.
+
+`connect` returns fred's `ConnectHandle`, the task driving the connection. Discarding it, as above and in the presets, leaves the connection and any auto-reconnect running; keep it only to await the error, if any, that finally closed the connection.
 
 ### Memcached
 
@@ -368,7 +395,7 @@ TTLs above memcached's 30-day ceiling are clamped (larger values would be misrea
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.12.0", features = ["memcached"] }
+cachekit-rs = { version = "0.13.0", features = ["memcached"] }
 ```
 <!-- x-release-please-end -->
 
@@ -387,7 +414,7 @@ Local disk cache, **byte-compatible with cachekit-py's File backend** — a py a
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.12.0", features = ["file"] }
+cachekit-rs = { version = "0.13.0", features = ["file"] }
 ```
 <!-- x-release-please-end -->
 
@@ -407,7 +434,7 @@ The Workers runtime's `fetch` has no timeout of its own and can hold a request f
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.12.0", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.13.0", default-features = false, features = ["workers", "encryption"] }
 ```
 <!-- x-release-please-end -->
 
@@ -442,7 +469,7 @@ Optional extension traits: `TtlInspectable` (TTL queries), `LockableBackend` (di
 
 ## Dual-Layer Caching
 
-When the `l1` feature is enabled (default), CacheKit maintains an in-process [moka](https://crates.io/crates/moka) cache in front of the backend:
+When the `l1` feature is enabled (default), CacheKit keeps an in-process cache in front of the backend. [quick_cache](https://crates.io/crates/quick_cache) stores the entries and chooses what to evict; CacheKit adds per-entry TTL and stale-while-revalidate on top:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -461,7 +488,7 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 │  invalidate L1 first ──► delete from L2 backend         │
 │                                                         │
 ├─────────────┬───────────────────────────────────────────┤
-│  L1 (moka)  │  L2 (cachekit.io / Redis / Workers)       │
+│  L1         │  L2 (cachekit.io / Redis / Workers)       │
 │  in-process │  one backend round trip                   │
 └─────────────┴───────────────────────────────────────────┘
 ```
@@ -473,7 +500,9 @@ When the `l1` feature is enabled (default), CacheKit maintains an in-process [mo
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
 | **Encrypted L1** | A client with encryption configured stores ciphertext in L1 (never plaintext) |
 | **Evict on decrypt failure** | A read on an encrypted client that fails decryption drops the key's L1 copy and returns the error; the backend entry is kept, so the next read reaches the backend: a hit once the entry is replaced with ciphertext the client can decrypt, a miss once it expires or is deleted |
-| **Default capacity** | 1,000 entries (configurable via `.l1_capacity()`) |
+| **Capacity** | 1,000 entries by default (`.l1_capacity()` sets it); L1 never holds more. It is split into shards: capacity ÷ 128 rounded down to a power of two, from 1 to 64 (4 at the default). A full shard evicts even while others have room |
+| **Eviction** | Scan-resistant (quick_cache's CLOCK-Pro variant, close to S3-FIFO): a run of keys written once and never read does not flush the entries being read, as it would under LRU. `exists()` does not count as a read |
+| **Expiry** | An entry is never served past its TTL. An expired entry leaves memory when a read finds it, when eviction reaches it, or when `l1_entry_count()` sweeps; until then it holds its place, so an idle L1 can keep up to its capacity in expired entries |
 | **Live counters** | `cache.stats()` reports L1 hits / L2 hits / misses; `cache.l1_entry_count()` the current occupancy — see [Observability](#observability) |
 | **Stale-while-revalidate** | On by default (native; `minimal` turns it off): `#[cachekit]` serves an L1 hit past `swr_threshold_ratio` × entry TTL (default 0.5, ±10% jitter) immediately and refreshes it in the background — see below |
 
@@ -546,23 +575,23 @@ fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
 
 ## Performance
 
-What one call costs in the client: the public `CacheKit` API over an in-memory backend, so no figure includes network time. The client comes from `CacheKit::builder()` with no reliability stack, like `minimal`. The `production`, `secure` and `io` presets send every backend call through the [reliability stack](#reliability), so their L2 hits and sets cost more than the table shows; L1 hits never reach it. Each cell is the median wall time per call of five runs, each in its own process, on a single-threaded tokio runtime. Measured on a GitHub-hosted `ubuntu-latest` runner (AMD EPYC 7763, 4 vCPUs) with Rust 1.99.1.
+What one call costs in the client: the public `CacheKit` API over an in-memory backend, so no figure includes network time. The client comes from `CacheKit::builder()` with no reliability stack, like `minimal`. The `production`, `secure` and `io` presets send every backend call through the [reliability stack](#reliability), so their L2 hits and sets cost more than the table shows; L1 hits never reach it. One **Bench** workflow run times each cell in five processes of its own, each on a single-threaded tokio runtime, and reports their median wall time per call. Measured on GitHub-hosted `ubuntu-latest` runners (AMD EPYC 7763, 4 vCPUs) with Rust 1.99.1.
 
 | Operation | 64 B | 1 KiB |
 |:----------|-----:|------:|
-| `get`, L1 hit | 285 ns | 334 ns |
-| `get`, L2 hit | 2.3 µs | 3.0 µs |
-| `set_with_ttl` | 1.6 µs | 1.7 µs |
-| `secure_cache()` `get`, L1 hit | 1.2 µs | 1.4 µs |
-| `secure_cache()` `get`, L2 hit | 3.4 µs | 4.3 µs |
-| `secure_cache()` `set_with_ttl` | 2.2 µs | 2.6 µs |
+| `get`, L1 hit | 195 ns | 242 ns |
+| `get`, L2 hit | 1.4 µs | 2.2 µs |
+| `set_with_ttl` | 764 ns | 807 ns |
+| `secure_cache()` `get`, L1 hit | 1.1 µs | 1.3 µs |
+| `secure_cache()` `get`, L2 hit | 2.4 µs | 3.4 µs |
+| `secure_cache()` `set_with_ttl` | 1.3 µs | 1.6 µs |
 
 - **L1 hit**: the value comes from the in-process cache; the backend is not asked.
 - **L2 hit**: L1 does not hold the key, so `get` reads the backend, decodes the MessagePack and backfills L1. A real backend adds its round trip, which for Redis or cachekit.io is a network call.
 - **Encrypted** (`secure_cache()`): L1 holds the same ciphertext as the backend, so every hit decrypts (AES-256-GCM) and checks the AAD.
 - **Larger values**: at 64 KiB most of the time is copying and allocating. It ran to tens of microseconds for L2 hits and encrypted calls, but repeat runs disagreed by up to 3.5x, so the table stops at 1 KiB.
 
-The table comes from one of five **Bench** workflow runs of the same build on this CPU model, the one closest to their per-cell medians. Across the five, L1 hits varied by up to 9% and L2 hits by up to 22%. Hosted runners also come with other CPU models (an EPYC 9V45 run took 65-78% as long), and other machines give other figures. To print this table for your own machine, run `cargo run --release --example bench_hot_path -- readme`, or run the **Bench** workflow from the Actions tab. To compare two builds, use the instruction counts in [Measuring performance](#measuring-performance).
+Each cell in the table is the median of nine such runs of one build on this CPU model. Across the nine, L1 hits varied by up to 13% and L2 hits by up to 21%. Hosted runners also come with other CPU models: on an AMD EPYC 9V45, four runs of the same build took 59-73% as long, cell for cell. Other machines give other figures. To print this table for your own machine, run `cargo run --release --example bench_hot_path -- readme`, or run the **Bench** workflow from the Actions tab. To compare two builds, use the instruction counts in [Measuring performance](#measuring-performance).
 
 ---
 
@@ -580,6 +609,8 @@ With the `reliability` feature (default, native only), the `production`, `secure
 | **Stale-while-revalidate** | Stale-but-unexpired L1 hits are served immediately while one single-flight-deduplicated background task re-executes the function ([details](#stale-while-revalidate-swr)) | on by default with `l1` (native); threshold 0.5 × entry TTL ±10% jitter |
 
 Retry sits *inside* the breaker (one exhausted retry sequence = one breaker failure) and backpressure sits *outside* both — one permit per logical operation, held across the whole retry sequence, so retry amplification is bounded and shed calls never skew breaker state. Degradation, single-flight, and SWR sit in the `#[cachekit]` macro around the read path — the same composition as the TypeScript SDK's `ReliabilityExecutor` and the Python decorator.
+
+To give operations a tighter budget than the 5 s default, set it on the backend builder (`RedisBackendBuilder::command_timeout`, `CachekitIOBuilder::read_timeout` / `write_timeout`), not with `tokio::time::timeout` around each call. The backend's timeout is an error the stack sees: it is retried, each attempt gets the full budget (one op can take about three budgets plus backoff), and an op that ends in a timeout counts as one breaker failure. A call cancelled from outside records nothing, so a backend slower than your budget would never open the breaker and every op would wait out your full timeout.
 
 ```rust,ignore
 use std::time::Duration;
@@ -620,7 +651,7 @@ let breaker = cache.circuit_state();       // Option<CircuitState>: Closed / Ope
 | Surface | What you get |
 |:--------|:-------------|
 | `CacheKit::stats()` | `L1Stats { l1_hits, l2_hits, misses, l1_enabled }` for every value read (`get`, `interop_get`, SWR and `SecureCache` variants). `exists` and reads that fail with a backend error are not counted. |
-| `CacheKit::l1_entry_count()` | Exact L1 occupancy (runs moka's pending housekeeping first — poll it, don't put it on a hot path). |
+| `CacheKit::l1_entry_count()` | Exact L1 occupancy. Sweeps expired entries out first, a pass over every entry, so poll it; don't put it on a hot path. |
 | `CacheKit::circuit_state()` | Live breaker state (`reliability` feature); `None` when the client has no breaker. |
 | SaaS telemetry headers | The cachekit.io backends send `X-CacheKit-L1-Hits` / `L2-Hits` / `Misses` / `L1-Hit-Rate` from the **same counters**, wired automatically by `CacheKitBuilder::build()`. A `.metrics_provider(..)` set on the backend builder still takes precedence. One backend instance reports one client — the first built over it; once that client is gone the headers fall back to `disabled`. |
 | `tracing` feature | One `debug` event per completed operation, per failed fill-lock call, and per `#[cachekit]` result the macro could not store, on the `cachekit` target, and breaker transitions on `cachekit::reliability` (`warn` on open, `info` for half-open / closed). |
@@ -677,7 +708,7 @@ cachekit-rs/
 │   │       ├── session.rs     # SDK session tracking
 │   │       ├── url_validator.rs # SSRF-safe URL validation
 │   │       ├── serializer/    # MessagePack serialization
-│   │       ├── l1/            # moka-based L1 cache (feature = "l1")
+│   │       ├── l1/            # L1 cache: quick_cache plus TTL and SWR (feature = "l1")
 │   │       └── backend/
 │   │           ├── mod.rs     # Backend + TtlInspectable + LockableBackend traits
 │   │           ├── cachekitio.rs      # cachekit.io HTTP backend
@@ -765,8 +796,9 @@ the base commit, copy `target/release/examples/bench_hot_path` outside
 `target/`, and pass it as `BASE`; the runs interleave ABBA, a delta counts only
 when it beats `max(3 × spread, 0.5%)`, and the target exits 1 when a case got
 slower by more than that, or 2 when it measured nothing (an unknown flag, a
-filter that matches no case, a valgrind failure). Most cases repeat within 0.4%; the `delete` cases
-spread more (up to about 2.5%), so their floor is wider.
+filter that matches no case, a valgrind failure). Most cases repeat within 0.8%; the `delete` cases
+spread more (up to about 10%, from the per-key mutation lock map, a hash table seeded afresh in
+each process), so their floor is wider.
 
 **Client wall time** — `examples/wall_time_probe.rs` times `CacheKit` calls
 against the cachekit.io dev endpoint and writes one JSON object per request. It runs

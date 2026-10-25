@@ -86,7 +86,7 @@ const L1_BACKFILL_TTL_SECS: u64 = 30;
 /// L1 lifetime for a backfill from an L2 hit, or `None` when the read must not
 /// be backfilled (`spec/saas-api.md` § Remaining Freshness). A stale label or a
 /// zero `Fresh-For` forbids it; a present `Fresh-For` is a hard bound under the
-/// 30 s cap, which SWR cannot outlive because moka drops the entry at its TTL.
+/// 30 s cap, which SWR cannot outlive because L1 never serves an entry past its TTL.
 /// With no header the cap applies unchanged.
 #[cfg(feature = "l1")]
 fn l1_backfill_ttl(default_ttl: Duration, freshness: Freshness) -> Option<Duration> {
@@ -109,15 +109,17 @@ fn validate_key(key: &str) -> Result<(), CachekitError> {
             key.len()
         )));
     }
-    if has_control_byte(key.as_bytes()) {
-        // Rejection only: find the first offending byte to name it.
-        if let Some(b) = key.bytes().find(|&b| is_control_byte(b)) {
-            return Err(CachekitError::InvalidKey(format!(
-                "key contains illegal control character 0x{b:02X}"
-            )));
-        }
+    if !has_control_byte(key.as_bytes()) {
+        return Ok(());
     }
-    Ok(())
+    // Rejection only: find the first offending byte to name it.
+    key.bytes()
+        .find(|&b| is_control_byte(b))
+        .map_or(Ok(()), |b| {
+            Err(CachekitError::InvalidKey(format!(
+                "key contains illegal control character 0x{b:02X}"
+            )))
+        })
 }
 
 /// A byte no key may hold: a control character below 0x20, or DEL.
@@ -127,11 +129,11 @@ const fn is_control_byte(b: u8) -> bool {
 
 /// Whether any byte of `bytes` is a control byte.
 ///
-/// Every key on every operation passes through here, so it reads 16 bytes at
-/// a time: a block's compares are folded with no early exit, which the
-/// compiler turns into a few SIMD instructions where a byte loop spends a
-/// branch per byte. When the length is not a multiple of 16, the last block
-/// overlaps the one before it instead of leaving a byte-at-a-time tail.
+/// Every validated key passes through here, so it reads 16 bytes at a time:
+/// a block's compares are folded with no early exit, which lets the compiler
+/// vectorise them where a byte loop spends a branch per byte. When the length
+/// is not a multiple of 16, the last block overlaps the one before it instead
+/// of leaving a byte-at-a-time tail.
 fn has_control_byte(bytes: &[u8]) -> bool {
     fn any_control(block: &[u8]) -> bool {
         block
@@ -408,7 +410,7 @@ impl CacheKit {
         };
 
         // Check before touching L2. The mutation state lives independently of
-        // the moka entry, so hard expiry or capacity eviction does not look
+        // the L1 entry, so hard expiry or capacity eviction does not look
         // like an explicit set/delete and waste a valid origin result.
         if !mutation.is_current(&token.state, token.version) {
             return Ok(false);
@@ -450,6 +452,10 @@ impl CacheKit {
     ///
     /// Returns `None` if the key does not exist.
     /// Checks L1 cache before hitting the backend.
+    ///
+    /// Values are MessagePack. A `Vec<u8>` field written by [`Self::set`]
+    /// as a plain `Vec<u8>` decodes back here unchanged, but it is stored as
+    /// an array of integers; see [`Self::set`] for the compact form.
     ///
     /// # Errors
     ///
@@ -555,8 +561,9 @@ impl CacheKit {
     ///   so a newer set/delete always wins.
     /// - [`SwrRead::Miss`] — nothing usable anywhere: normal blocking miss.
     ///
-    /// A hard-expired L1 entry is a [`SwrRead::Miss`], never `Stale` — moka
-    /// drops entries at their TTL, so SWR cannot serve past hard expiry.
+    /// A hard-expired L1 entry is a [`SwrRead::Miss`], never `Stale` — L1
+    /// never serves an entry past its TTL, so SWR cannot serve past hard
+    /// expiry.
     ///
     /// With SWR disabled ([`CacheKitBuilder::swr_enabled`]`(false)`), without
     /// the `l1` feature, on wasm32, or under `unsync`, this behaves exactly
@@ -691,6 +698,30 @@ impl CacheKit {
     ///
     /// Encrypts first on a client with encryption configured — see
     /// [`Self::set_with_ttl`].
+    ///
+    /// # Binary payloads
+    ///
+    /// Values are serialized as MessagePack through serde. serde treats a
+    /// plain `Vec<u8>` (or `&[u8]`) as a sequence, so it is stored as a
+    /// MessagePack array of integers: up to 2 bytes per byte, and a per-element
+    /// encode and decode. Mark the field with `serde_bytes` to store it as a
+    /// single MessagePack `bin` value instead. `serde_bytes` is a crate you add
+    /// to your own `Cargo.toml`:
+    ///
+    /// ```ignore
+    /// #[derive(serde::Serialize, serde::Deserialize)]
+    /// struct Response {
+    ///     status: u16,
+    ///     #[serde(with = "serde_bytes")]
+    ///     body: Vec<u8>,
+    /// }
+    ///
+    /// cache.set("resp", &Response { status: 200, body }).await?;
+    /// ```
+    ///
+    /// For a bare byte value, store a `serde_bytes::ByteBuf`. Either form
+    /// decodes into either type on [`Self::get`], so switching a field to
+    /// `serde_bytes` still reads entries written before the switch.
     pub async fn set<T: Serialize>(&self, key: &str, value: &T) -> Result<(), CachekitError> {
         self.set_with_ttl(key, value, self.default_ttl).await
     }
@@ -843,9 +874,9 @@ impl CacheKit {
     /// Number of entries currently held in L1, or `None` when L1 is disabled
     /// (or the `l1` feature is off).
     ///
-    /// Exact at the time of the call: moka's pending expirations and
-    /// evictions are applied first, which makes this a housekeeping call, not
-    /// a free counter read — poll it, don't put it on a hot path.
+    /// Exact at the time of the call: expired entries are swept out first,
+    /// a pass over every entry that makes this a housekeeping call, not a
+    /// free counter read — poll it, don't put it on a hot path.
     pub fn l1_entry_count(&self) -> Option<u64> {
         #[cfg(feature = "l1")]
         let count = self.l1.as_ref().map(crate::l1::L1Cache::entry_count);
@@ -964,6 +995,12 @@ impl CacheKit {
 /// L1 stores ciphertext to maintain zero-knowledge guarantees. The client's
 /// own value methods route through these same methods once encryption is
 /// configured, so the handle and the client read each other's entries.
+///
+/// The handle borrows its [`CacheKit`] (`SecureCache<'a>` holds `&'a CacheKit`),
+/// so it cannot be stored in the same struct as the client it came from.
+/// Store the `CacheKit` and call [`CacheKit::secure_cache()`] where you need
+/// the handle: it only checks that encryption is configured and copies two
+/// references, so calling it per operation is cheap.
 #[cfg(feature = "encryption")]
 pub struct SecureCache<'a> {
     client: &'a CacheKit,
@@ -999,6 +1036,10 @@ impl SecureCache<'_> {
     }
 
     /// Encrypt and store `value` under `key` with an explicit `ttl`.
+    ///
+    /// A positive sub-second `ttl` is sent to the backend as 1 second.
+    ///
+    /// Returns [`CachekitError::Config`] if `ttl` is zero.
     ///
     /// The client namespace is not checked here: an interop key written on a
     /// namespaced client lands under `{namespace}:{interop_key}`, which no
