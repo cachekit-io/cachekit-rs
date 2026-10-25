@@ -55,15 +55,15 @@
 ```toml
 # Defaults: SaaS + encryption + L1
 [dependencies]
-cachekit-rs = "0.12.0"
+cachekit-rs = "0.13.0"
 
 # With Redis backend
 [dependencies]
-cachekit-rs = { version = "0.12.0", features = ["redis"] }
+cachekit-rs = { version = "0.13.0", features = ["redis"] }
 
 # For Cloudflare Workers (no L1, no Redis)
 [dependencies]
-cachekit-rs = { version = "0.12.0", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.13.0", default-features = false, features = ["workers", "encryption"] }
 ```
 <!-- x-release-please-end -->
 
@@ -365,7 +365,7 @@ Native Redis via [fred](https://crates.io/crates/fred) with cluster support, TTL
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.12.0", features = ["redis"] }
+cachekit-rs = { version = "0.13.0", features = ["redis"] }
 ```
 <!-- x-release-please-end -->
 
@@ -395,7 +395,7 @@ TTLs above memcached's 30-day ceiling are clamped (larger values would be misrea
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.12.0", features = ["memcached"] }
+cachekit-rs = { version = "0.13.0", features = ["memcached"] }
 ```
 <!-- x-release-please-end -->
 
@@ -414,7 +414,7 @@ Local disk cache, **byte-compatible with cachekit-py's File backend** — a py a
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.12.0", features = ["file"] }
+cachekit-rs = { version = "0.13.0", features = ["file"] }
 ```
 <!-- x-release-please-end -->
 
@@ -434,7 +434,7 @@ The Workers runtime's `fetch` has no timeout of its own and can hold a request f
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.12.0", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.13.0", default-features = false, features = ["workers", "encryption"] }
 ```
 <!-- x-release-please-end -->
 
