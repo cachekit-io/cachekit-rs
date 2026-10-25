@@ -41,12 +41,16 @@ use cachekit::{BackendError, CacheKit, CachekitError};
 
 const OPS: [&str; 6] = ["l1_hit", "l2_hit", "set", "delete", "exists", "oneshot"];
 const MODES: [&str; 4] = ["plain", "rel", "enc", "prev"];
-/// The master key every encrypting client writes under.
+/// The current master key of every encrypting reader and every writer but
+/// `prev`'s.
 const KEY: [u8; 32] = [0x42; 32];
 /// A retired master key. A `prev` reader holds it as its one previous key and
 /// reads only entries written under it, so every read fails the current key
 /// before the previous key decrypts it: the rotation read path.
 const PREV_KEY: [u8; 32] = [0x41; 32];
+/// Every encrypting client's tenant: a `prev` reader decrypts only what a
+/// writer of the same tenant wrote.
+const TENANT: &str = "bench";
 const SIZES: [usize; 3] = [64, 1024, 65536];
 const TTL: Duration = Duration::from_secs(300);
 const WARM: usize = 16;
@@ -126,8 +130,8 @@ fn client(
         .l1_capacity(l1_capacity);
     match mode {
         "rel" => b.reliability(ReliabilityConfig::default()),
-        "enc" => b.encryption_from_bytes(&KEY, "bench")?,
-        "prev" => b.encryption_from_bytes_with_previous(&KEY, &[&PREV_KEY], "bench")?,
+        "enc" => b.encryption_from_bytes(&KEY, TENANT)?,
+        "prev" => b.encryption_from_bytes_with_previous(&KEY, &[&PREV_KEY], TENANT)?,
         _ => b,
     }
     .build()
@@ -142,7 +146,7 @@ fn writer(backend: &Arc<MemBackend>, mode: &str) -> Result<CacheKit, CachekitErr
     CacheKit::builder()
         .backend(backend.clone())
         .l1_capacity(8)
-        .encryption_from_bytes(&PREV_KEY, "bench")?
+        .encryption_from_bytes(&PREV_KEY, TENANT)?
         .build()
 }
 
@@ -206,8 +210,9 @@ impl Bench {
                     write(&bench.reader, bench.enc, k, &bench.value).await?;
                 }
             }
-            // The reader's first read, in the warm-up, is an L2 hit that
-            // fills its L1 with the previous key's ciphertext.
+            // Seeds keys[0] under PREV_KEY. `l1_hit/prev`'s first read, in the
+            // warm-up, is an L2 hit that fills its L1 with that ciphertext;
+            // `oneshot/prev` reads it from the backend on every op.
             _ if mode == "prev" => {
                 let writer = writer(&bench.backend, mode)?;
                 write(&writer, true, &bench.keys[0], &bench.value).await?;
@@ -237,8 +242,9 @@ impl Bench {
                     CachekitError::Config(format!("{key}: expected exists, got absent"))
                 })
             }
-            // A process that does one cached read: build the client, whose
-            // empty L1 sends the read to the backend.
+            // One client build plus one read, which its empty L1 sends to the
+            // backend: what a one-read process pays past start-up (the warm-up
+            // has already paid first-use costs, and L1 holds 8 entries).
             "oneshot" => read(&client(&self.backend, self.mode, 8)?, true, key).await,
             _ => read(&self.reader, self.enc, key).await,
         }

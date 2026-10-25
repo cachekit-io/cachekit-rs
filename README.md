@@ -781,7 +781,7 @@ key), each `plain`, with reliability (`rel`) or with encryption (`enc`), at
 64 B, 1 KiB and 64 KiB. Two more price key rotation and short-lived processes:
 `prev` reads, L1 and L2 hits, on a client holding one previous key, of entries
 written under that key; `oneshot` builds an encrypting client (`enc` or `prev`)
-and reads one L2 hit, which is what a process that does one cached read pays.
+and reads one L2 hit, the cost a one-read process pays beyond its start-up.
 
 ```bash
 make bench                                  # wall ns/op: indicative only

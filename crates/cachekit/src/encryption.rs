@@ -31,7 +31,7 @@ const RAW_KEY_LEN: usize = 32;
 /// Zero-knowledge encryption layer with per-tenant key derivation.
 ///
 /// Holds the derived encryption key that writes use, a [`TenantKeyring`] of
-/// the derived per-tenant keys that reads try during rotation (current first,
+/// the derived per-tenant keys that every read tries in order (current first,
 /// then each previous key), and the `ZeroKnowledgeEncryptor` from
 /// cachekit-core for AES-256-GCM operations. Every key is derived at
 /// construction, so no read runs HKDF; derived keys zeroize on drop, and the
@@ -162,8 +162,9 @@ impl EncryptionLayer {
 
         // The encryption-domain key alone: writes use nothing else, and
         // `derive_tenant_keys` would also run the authentication and
-        // cache-key HKDFs. The checks above leave derivation nothing to
-        // reject; were it to fail, that is configuration, like the keyring's.
+        // cache-key HKDFs. This repeats the keyring's entry 0, which
+        // `TenantKeyring` neither exposes nor encrypts with, so construction
+        // derives the current key twice.
         let derived_key = derive_domain_key(
             master_key_bytes,
             KeyDomain::Encryption.as_str(),
