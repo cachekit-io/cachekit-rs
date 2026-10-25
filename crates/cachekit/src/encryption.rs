@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use zeroize::Zeroizing;
 
-use cachekit_core::{Keyring, ZeroKnowledgeEncryptor};
+use cachekit_core::{derive_domain_key, KeyDomain, Keyring, TenantKeyring, ZeroKnowledgeEncryptor};
 
 use crate::error::CachekitError;
 
@@ -30,9 +30,12 @@ const RAW_KEY_LEN: usize = 32;
 
 /// Zero-knowledge encryption layer with per-tenant key derivation.
 ///
-/// Holds a derived encryption key (zeroized on drop), a [`Keyring`] of master
-/// keys for multi-key decrypt during rotation, and the
-/// `ZeroKnowledgeEncryptor` from cachekit-core for AES-256-GCM operations.
+/// Holds the derived encryption key that writes use, a [`TenantKeyring`] of
+/// the derived per-tenant keys that every read tries in order (current first,
+/// then each previous key), and the `ZeroKnowledgeEncryptor` from
+/// cachekit-core for AES-256-GCM operations. Every key is derived at
+/// construction, so no read runs HKDF; derived keys zeroize on drop, and the
+/// layer keeps no master key.
 ///
 /// L1 stores **ciphertext**, not plaintext — the zero-knowledge property
 /// is preserved across all cache layers.
@@ -49,7 +52,7 @@ const RAW_KEY_LEN: usize = 32;
 pub struct EncryptionLayer {
     encryptor: ZeroKnowledgeEncryptor,
     derived_key: Zeroizing<[u8; 32]>,
-    keyring: Keyring,
+    keyring: TenantKeyring,
     tenant_id: String,
     /// `hits[i]` ↔ `previous_keys[i]`; see [`Self::previous_key_hits`].
     previous_key_hits: Vec<AtomicU64>,
@@ -66,8 +69,8 @@ impl EncryptionLayer {
     ///
     /// # Errors
     /// - Master key not exactly 32 bytes ([`CachekitError::Config`])
-    /// - HKDF derivation failure
-    /// - Encryptor initialization failure
+    /// - HKDF derivation failure ([`CachekitError::Config`])
+    /// - Encryptor initialization failure ([`CachekitError::Encryption`])
     pub fn new(master_key_bytes: &[u8], tenant_id: &str) -> Result<Self, CachekitError> {
         Self::with_previous_keys(master_key_bytes, &[], tenant_id)
     }
@@ -91,8 +94,8 @@ impl EncryptionLayer {
     ///   never truncated)
     /// - The current master key also present in `previous_keys`
     ///   ([`CachekitError::Config`] — rotation is forward-only)
-    /// - HKDF derivation failure
-    /// - Encryptor initialization failure
+    /// - HKDF derivation failure ([`CachekitError::Config`])
+    /// - Encryptor initialization failure ([`CachekitError::Encryption`])
     pub fn with_previous_keys(
         master_key_bytes: &[u8],
         previous_keys: &[&[u8]],
@@ -157,26 +160,28 @@ impl EncryptionLayer {
             )));
         }
 
-        let tenant_keys = cachekit_core::encryption::key_derivation::derive_tenant_keys(
-            master_key_bytes,
-            tenant_id,
-        )
-        .map_err(|e| CachekitError::Encryption(format!("key derivation failed: {e}")))?;
+        // The encryption-domain key alone: writes use nothing else, and
+        // `derive_tenant_keys` would also run the authentication and
+        // cache-key HKDFs. This repeats the keyring's entry 0, which
+        // `TenantKeyring` neither exposes nor encrypts with, so construction
+        // derives the current key twice. Wrapped at once, so the error
+        // returns below wipe it too.
+        let derived_key = Zeroizing::new(
+            derive_domain_key(
+                master_key_bytes,
+                KeyDomain::Encryption.as_str(),
+                tenant_id.as_bytes(),
+            )
+            .map_err(|e| CachekitError::Config(format!("key derivation failed: {e}")))?,
+        );
 
         let encryptor = ZeroKnowledgeEncryptor::new()
             .map_err(|e| CachekitError::Encryption(format!("encryptor init failed: {e}")))?;
 
-        // The shared multi-key decrypt helper (cachekit-core) owns
-        // the keyring invariants: cap of 3, forward-only self-collision,
-        // sequential current-first attempts. Its construction failures are
-        // configuration errors, not crypto failures.
-        let keyring = Keyring::new(master_key_bytes, previous_keys)
-            .map_err(|e| CachekitError::Config(format!("keyring: {e}")))?;
-
         Ok(Self {
             encryptor,
-            derived_key: Zeroizing::new(tenant_keys.encryption_key),
-            keyring,
+            derived_key,
+            keyring: tenant_keyring(master_key_bytes, previous_keys, tenant_id)?,
             tenant_id: tenant_id.to_owned(),
             previous_key_hits: previous_keys.iter().map(|_| AtomicU64::new(0)).collect(),
         })
@@ -210,11 +215,13 @@ impl EncryptionLayer {
         let aad = self.build_aad(cache_key, false);
         let (plaintext, index) = self
             .keyring
-            .decrypt_indexed(&self.encryptor, ciphertext, &self.tenant_id, &aad)
+            .decrypt_indexed(&self.encryptor, ciphertext, &aad)
             .map_err(|e| match e {
                 // Config-class errors stay config-class:
                 // a derivation failure or caller bug must never masquerade as
                 // a decrypt failure that fail-open callers read as a miss.
+                // The bound keyring derives nothing here, so neither arm fires
+                // today; both keep the class if core's decrypt ever reports one.
                 cachekit_core::EncryptionError::KeyDerivation(_)
                 | cachekit_core::EncryptionError::KeyringIndexOutOfRange { .. } => {
                     CachekitError::Config(format!("keyring decrypt misconfiguration: {e}"))
@@ -378,6 +385,22 @@ impl EncryptionLayer {
 
         aad
     }
+}
+
+/// The keyring bound to `tenant_id`: cachekit-core derives every entry's
+/// per-tenant key here, once, and zeroizes the master keys before returning.
+///
+/// Core owns the keyring invariants (cap of 3, forward-only self-collision,
+/// sequential current-first attempts). Its construction and derivation
+/// failures are configuration errors, not crypto failures.
+fn tenant_keyring(
+    master_key_bytes: &[u8],
+    previous_keys: &[&[u8]],
+    tenant_id: &str,
+) -> Result<TenantKeyring, CachekitError> {
+    Keyring::new(master_key_bytes, previous_keys)
+        .and_then(|keyring| keyring.for_tenant(tenant_id))
+        .map_err(|e| CachekitError::Config(format!("keyring: {e}")))
 }
 
 /// Convert a usize length to u32 for AAD encoding, saturating on overflow.
@@ -614,6 +637,87 @@ mod tests {
         let short = [0x01u8; 16]; // core would accept 16; raw keys must be exactly 32
         let result = EncryptionLayer::with_previous_keys(K2, &[&short], TEST_TENANT);
         assert!(matches!(result, Err(CachekitError::Config(_))));
+    }
+
+    #[test]
+    fn keyring_derivation_failure_is_config_error() {
+        // The layer's own tenant checks run first, so only the helper reaches
+        // core's derivation with a tenant it rejects. A config error must not
+        // read as a crypto failure.
+        let err = tenant_keyring(K2, &[K1], "").err();
+        assert!(
+            matches!(&err, Some(CachekitError::Config(msg)) if msg.contains("Key derivation failed")),
+            "expected a Config error carrying core's KeyDerivation, got {err:?}"
+        );
+    }
+
+    // ── Derived keys ─────────────────────────────────────────────────────────
+
+    /// Every key the layer derives is the protocol's. Each keyring entry,
+    /// current and previous, and the write key fingerprint to
+    /// `tests/vectors/encryption.json`, and the write key is byte-identical to
+    /// core's `derive_tenant_keys` encryption key.
+    #[test]
+    fn derived_keys_match_the_protocol_vectors() {
+        use cachekit_core::encryption::key_derivation::{derive_tenant_keys, key_fingerprint};
+
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/vectors/encryption.json")).unwrap();
+        let text = |v: &serde_json::Value| v.as_str().unwrap().to_owned();
+        let key = |v: &serde_json::Value| hex::decode(v.as_str().unwrap()).unwrap();
+        let (main, ring) = (key(&doc["master_key_hex"]), &doc["keyring"]);
+        let (k1, k2) = (&ring["entries"][0], &ring["entries"][1]);
+        let fp = |entry: &serde_json::Value| text(&entry["derived_key_fingerprint_hex"]);
+        // (current, previous, tenant, fingerprints in attempt order)
+        let cases = [
+            (
+                main.clone(),
+                vec![],
+                text(&doc["tenant_id"]),
+                vec![fp(&doc)],
+            ),
+            (
+                main,
+                vec![],
+                text(&doc["default_tenant"]["tenant_id"]),
+                vec![fp(&doc["default_tenant"])],
+            ),
+            (
+                key(&k1["master_key_hex"]),
+                vec![key(&k2["master_key_hex"])],
+                text(&ring["tenant_id"]),
+                vec![fp(k1), fp(k2)],
+            ),
+            (
+                key(&k2["master_key_hex"]),
+                vec![key(&k1["master_key_hex"])],
+                text(&ring["tenant_id"]),
+                vec![fp(k2), fp(k1)],
+            ),
+        ];
+        for (current, previous, tenant, expected) in cases {
+            let previous: Vec<&[u8]> = previous.iter().map(Vec::as_slice).collect();
+            let layer = EncryptionLayer::with_previous_keys(&current, &previous, &tenant).unwrap();
+            let entries: Vec<String> = layer
+                .keyring
+                .encryption_fingerprints()
+                .iter()
+                .map(hex::encode)
+                .collect();
+            assert_eq!(entries, expected, "keyring entries, tenant {tenant}");
+            assert_eq!(
+                hex::encode(key_fingerprint(&*layer.derived_key)),
+                expected[0],
+                "write key, tenant {tenant}"
+            );
+            assert_eq!(
+                *layer.derived_key,
+                derive_tenant_keys(&current, &tenant)
+                    .unwrap()
+                    .encryption_key,
+                "write key against core, tenant {tenant}"
+            );
+        }
     }
 
     // ── Rotation drain signal ────────────────────────────────────────────────

@@ -39,8 +39,18 @@ use cachekit::backend::{Backend, HealthStatus};
 use cachekit::reliability::ReliabilityConfig;
 use cachekit::{BackendError, CacheKit, CachekitError};
 
-const OPS: [&str; 5] = ["l1_hit", "l2_hit", "set", "delete", "exists"];
-const MODES: [&str; 3] = ["plain", "rel", "enc"];
+const OPS: [&str; 6] = ["l1_hit", "l2_hit", "set", "delete", "exists", "oneshot"];
+const MODES: [&str; 4] = ["plain", "rel", "enc", "prev"];
+/// The current master key of every encrypting reader and every writer but
+/// `prev`'s.
+const KEY: [u8; 32] = [0x42; 32];
+/// A retired master key. A `prev` reader holds it as its one previous key and
+/// reads only entries written under it, so every read fails the current key
+/// before the previous key decrypts it: the rotation read path.
+const PREV_KEY: [u8; 32] = [0x41; 32];
+/// Every encrypting client's tenant: a `prev` reader decrypts only what a
+/// writer of the same tenant wrote.
+const TENANT: &str = "bench";
 const SIZES: [usize; 3] = [64, 1024, 65536];
 const TTL: Duration = Duration::from_secs(300);
 const WARM: usize = 16;
@@ -102,8 +112,10 @@ impl Backend for MemBackend {
 /// One bench case: `<op>/<mode>`, e.g. `l2_hit/enc`.
 struct Bench {
     op: &'static str,
+    mode: &'static str,
     enc: bool,
     reader: CacheKit,
+    backend: Arc<MemBackend>,
     keys: Vec<String>,
     value: String,
 }
@@ -113,16 +125,40 @@ fn client(
     mode: &str,
     l1_capacity: usize,
 ) -> Result<CacheKit, CachekitError> {
-    let mut b = CacheKit::builder()
+    let b = CacheKit::builder()
         .backend(backend.clone())
         .l1_capacity(l1_capacity);
-    if mode == "rel" {
-        b = b.reliability(ReliabilityConfig::default());
+    match mode {
+        "rel" => b.reliability(ReliabilityConfig::default()),
+        "enc" => b.encryption_from_bytes(&KEY, TENANT)?,
+        "prev" => b.encryption_from_bytes_with_previous(&KEY, &[&PREV_KEY], TENANT)?,
+        _ => b,
     }
-    if mode == "enc" {
-        b = b.encryption_from_bytes(&[0x42; 32], "bench")?;
+    .build()
+}
+
+/// A client that writes what a `mode` reader reads: under [`PREV_KEY`] for
+/// `prev`, otherwise as the reader would. Its L1 is small: it only writes.
+fn writer(backend: &Arc<MemBackend>, mode: &str) -> Result<CacheKit, CachekitError> {
+    if mode != "prev" {
+        return client(backend, mode, 8);
     }
-    b.build()
+    CacheKit::builder()
+        .backend(backend.clone())
+        .l1_capacity(8)
+        .encryption_from_bytes(&PREV_KEY, TENANT)?
+        .build()
+}
+
+/// Whether `<op>/<mode>` is a case. `prev` is the rotation read path, so it
+/// pairs only with reads; `oneshot` prices building an encrypting client, so
+/// it pairs only with the encrypted modes.
+fn is_case(op: &str, mode: &str) -> bool {
+    match op {
+        "oneshot" => matches!(mode, "enc" | "prev"),
+        "l1_hit" | "l2_hit" => true,
+        _ => mode != "prev",
+    }
 }
 
 impl Bench {
@@ -134,9 +170,13 @@ impl Bench {
             .into_iter()
             .find(|o| *o == op)
             .ok_or_else(|| CachekitError::Config(format!("unknown op in case {case:?}")))?;
-        if !MODES.contains(&mode) {
+        let mode = MODES
+            .into_iter()
+            .find(|m| *m == mode)
+            .ok_or_else(|| CachekitError::Config(format!("unknown mode in case {case:?}")))?;
+        if !is_case(op, mode) {
             return Err(CachekitError::Config(format!(
-                "unknown mode in case {case:?}"
+                "{case:?} is not a case; `bench_hot_path list` names them"
             )));
         }
         let backend = Arc::new(MemBackend::default());
@@ -149,8 +189,10 @@ impl Bench {
             .collect();
         let bench = Self {
             op,
-            enc: mode == "enc",
+            mode,
+            enc: matches!(mode, "enc" | "prev"),
             reader,
+            backend,
             keys,
             value: "x".repeat(size),
         };
@@ -158,15 +200,22 @@ impl Bench {
             // L2 hits need the value in the backend but not in the reader's
             // L1: write through a second client sharing the backend.
             "l2_hit" => {
-                let writer = client(&backend, mode, 8)?;
+                let writer = writer(&bench.backend, mode)?;
                 for k in &bench.keys {
-                    write(&writer, mode == "enc", k, &bench.value).await?;
+                    write(&writer, bench.enc, k, &bench.value).await?;
                 }
             }
             "delete" => {
                 for k in &bench.keys {
                     write(&bench.reader, bench.enc, k, &bench.value).await?;
                 }
+            }
+            // Seeds keys[0] under PREV_KEY. `l1_hit/prev`'s first read, in the
+            // warm-up, is an L2 hit that fills its L1 with that ciphertext;
+            // `oneshot/prev` reads it from the backend on every op.
+            _ if mode == "prev" => {
+                let writer = writer(&bench.backend, mode)?;
+                write(&writer, true, &bench.keys[0], &bench.value).await?;
             }
             _ => write(&bench.reader, bench.enc, &bench.keys[0], &bench.value).await?,
         }
@@ -193,19 +242,24 @@ impl Bench {
                     CachekitError::Config(format!("{key}: expected exists, got absent"))
                 })
             }
-            _ => {
-                let got: Option<String> = if self.enc {
-                    self.reader.secure_cache()?.get(key).await?
-                } else {
-                    self.reader.get(key).await?
-                };
-                // A miss would measure the wrong path; fail the run instead.
-                got.map(|v| drop(black_box(v))).ok_or_else(|| {
-                    CachekitError::Config(format!("{key}: expected a hit, got a miss"))
-                })
-            }
+            // One client build plus one read, which its empty L1 sends to the
+            // backend: what a one-read process pays past start-up (the warm-up
+            // has already paid first-use costs, and L1 holds 8 entries).
+            "oneshot" => read(&client(&self.backend, self.mode, 8)?, true, key).await,
+            _ => read(&self.reader, self.enc, key).await,
         }
     }
+}
+
+async fn read(cache: &CacheKit, enc: bool, key: &str) -> Result<(), CachekitError> {
+    let got: Option<String> = if enc {
+        cache.secure_cache()?.get(key).await?
+    } else {
+        cache.get(key).await?
+    };
+    // A miss would measure the wrong path; fail the run instead.
+    got.map(|v| drop(black_box(v)))
+        .ok_or_else(|| CachekitError::Config(format!("{key}: expected a hit, got a miss")))
 }
 
 async fn write(
@@ -273,7 +327,7 @@ fn measured_warm(
 fn cases(filter: Option<&str>) -> Result<Vec<(String, usize)>, String> {
     let mut out = Vec::new();
     for op in OPS {
-        for mode in MODES {
+        for mode in MODES.into_iter().filter(|m| is_case(op, m)) {
             for size in SIZES {
                 let case = format!("{op}/{mode}");
                 if filter.is_none_or(|f| format!("{case}/{size}").contains(f)) {

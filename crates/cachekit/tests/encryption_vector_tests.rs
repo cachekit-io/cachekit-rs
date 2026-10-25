@@ -1,7 +1,8 @@
 //! `aad_reject_vectors` and `decrypted_container` rows from the shared
 //! protocol vectors (`spec/encryption.md` § AAD v0x03 Format, ENC-2 and
 //! ENC-3), driven through an encrypting client over a backend that holds each
-//! row's ciphertext.
+//! row's ciphertext. The `keyring` rows (§ Key Rotation (Keyring)) are
+//! decrypted through an [`EncryptionLayer`] holding both keyring keys.
 //!
 //! Vectors: `tests/vectors/encryption.json`, the copy
 //! `tests/master_key_input_tests.rs` pins by sha256. Do not edit the JSON
@@ -92,6 +93,51 @@ fn client_holding(namespace: Option<&str>, stored_key: &str, ciphertext: Vec<u8>
         stored_key,
         ciphertext,
     )
+}
+
+// ── keyring ──────────────────────────────────────────────────────────────────
+
+/// Each `keyring.vectors` row decrypts to its plaintext with its key as the
+/// layer's current key and as its previous key (`spec/encryption.md` § Key
+/// Rotation (Keyring)), and the read served by the previous key is counted.
+#[test]
+fn keyring_rows_decrypt_under_their_key_as_current_and_as_previous() {
+    let doc = vectors();
+    let ring = &doc["keyring"];
+    let entries = ring["entries"].as_array().expect("keyring.entries");
+    let master = |id: &str| {
+        let entry = entries
+            .iter()
+            .find(|e| e["id"] == id)
+            .unwrap_or_else(|| panic!("no keyring entry {id}"));
+        hex_field(entry, "master_key_hex")
+    };
+    let (k1, k2) = (master("k1"), master("k2"));
+    let rows = ring["vectors"].as_array().expect("keyring.vectors");
+    assert_eq!(names(rows), ["encrypted_with_k1", "encrypted_with_k2"]);
+
+    for (current, previous) in [(&k1, &k2), (&k2, &k1)] {
+        let layer =
+            EncryptionLayer::with_previous_keys(current, &[previous], field(ring, "tenant_id"))
+                .expect("keyring layer");
+        for row in rows {
+            let (name, cache_key) = (field(row, "name"), field(row, "cache_key"));
+            assert_eq!(
+                layer.build_aad(cache_key, false),
+                hex_field(row, "aad_hex"),
+                "{name}: AAD"
+            );
+            let plaintext = layer
+                .decrypt(&hex_field(row, "ciphertext_hex"), cache_key)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(plaintext, hex_field(row, "plaintext_hex"), "{name}");
+        }
+        assert_eq!(
+            layer.previous_key_hits(),
+            vec![1],
+            "one row is sealed under the previous key"
+        );
+    }
 }
 
 // ── aad_reject_vectors ───────────────────────────────────────────────────────
