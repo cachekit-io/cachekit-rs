@@ -18,10 +18,12 @@
       "dependencyDashboardApproval": true
     },
     {
-      "description": "Keep uuid below 1.27. uuid 1.27.0 raised its rust-version to 1.89, above this workspace's MSRV of 1.85 (rust-version in Cargo.toml), so the 1.85 CI job cannot build it and the whole non-major group fails. 1.26.x patches still arrive in that group. Raise or drop this cap when the MSRV reaches 1.89.",
+      "description": "Hold uuid minor and major updates. uuid 1.27.0 raised its rust-version to 1.89, above this workspace's MSRV of 1.85 (rust-version in Cargo.toml), so the 1.85 CI job cannot build it and the whole non-major group fails. Such an update waits under Pending Approval on the Dependency Dashboard instead; patches within the locked minor still arrive in that group. Vulnerability updates are not held: Renovate forces dependencyDashboardApproval off for them, so a security fix gets its own PR even above the MSRV. That is why this is a hold and not an allowedVersions cap, which would also filter out a GitHub-advisory fix. Drop this rule when the MSRV reaches 1.89.",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["uuid"],
-      "allowedVersions": "<1.27.0"
+      "matchUpdateTypes": ["minor", "major"],
+      "groupName": null,
+      "dependencyDashboardApproval": true
     }
   ]
 }
