@@ -4,7 +4,7 @@ members = ["crates/cachekit", "crates/cachekit-macros"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.91"
 license = "MIT"
 repository = "https://github.com/cachekit-io/cachekit-rs"
 
