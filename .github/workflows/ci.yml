@@ -28,18 +28,24 @@ jobs:
           [ -z "$bad" ] || { echo "$bad"; exit 1; }
 
   test:
-    name: ${{ matrix.rust }}
+    name: ${{ matrix.label || matrix.rust }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     continue-on-error: ${{ matrix.rust == 'beta' }}
     strategy:
       fail-fast: false
       matrix:
-        # "1.91" is the rust-version floor from Cargo.toml. New releases
-        # support stable Rust: when a dependency needs a newer toolchain,
-        # raise rust-version, this entry, the clippy.toml msrv values and
-        # release.yml's MSRV gate together instead of holding it back.
-        rust: ["1.91", stable, beta]
+        include:
+          # "1.91" is the rust-version floor from Cargo.toml. New releases
+          # support stable Rust: when a dependency needs a newer toolchain,
+          # raise rust-version, this entry, the clippy.toml msrv values and
+          # release.yml's MSRV gate together instead of holding it back.
+          # The label keeps the job name ("msrv", a required check) free of
+          # the version, so a raise changes no branch rule.
+          - rust: "1.91"
+            label: msrv
+          - rust: stable
+          - rust: beta
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -51,11 +57,11 @@ jobs:
       - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
 
       - name: Check formatting
-        if: matrix.rust != '1.91'
+        if: matrix.label != 'msrv'
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        if: matrix.rust != '1.91'
+        if: matrix.label != 'msrv'
         run: cargo clippy --all-targets --features "cachekitio,redis,encryption,l1,macros,memcached,file,tracing" -- -D warnings
 
       - name: Run tests
