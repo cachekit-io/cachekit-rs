@@ -285,13 +285,13 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
 }
 
 fn validate(a: &Args) -> Result<(), String> {
-    if a.block == 0 || a.samples == 0 || a.samples % a.block != 0 {
+    if a.block == 0 || a.samples == 0 || !a.samples.is_multiple_of(a.block) {
         return Err("--samples must be a positive multiple of --block".into());
     }
     if a.concurrency == 0 || a.concurrency > MAX_CONCURRENCY {
         return Err(format!("--concurrency must be 1..={MAX_CONCURRENCY}"));
     }
-    if a.concurrency > 1 && a.block % a.concurrency != 0 {
+    if a.concurrency > 1 && !a.block.is_multiple_of(a.concurrency) {
         return Err("--block must be a multiple of --concurrency".into());
     }
     if a.ttl.is_zero() || a.ttl.as_secs() > MAX_TTL_S {

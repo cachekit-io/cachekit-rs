@@ -143,7 +143,8 @@ fn has_control_byte(bytes: &[u8]) -> bool {
     if bytes.len() < 16 {
         return any_control(bytes);
     }
-    bytes.chunks_exact(16).any(any_control) || any_control(&bytes[bytes.len() - 16..])
+    let (blocks, _) = bytes.as_chunks::<16>();
+    blocks.iter().any(|block| any_control(block)) || any_control(&bytes[bytes.len() - 16..])
 }
 
 // ── Stale-while-revalidate ───────────────────────────────────────────────────

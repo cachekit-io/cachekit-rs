@@ -7,7 +7,7 @@
 [![Crates.io](https://img.shields.io/crates/v/cachekit-rs.svg)](https://crates.io/crates/cachekit-rs)
 [![docs.rs](https://docs.rs/cachekit-rs/badge.svg)](https://docs.rs/cachekit-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
+[![MSRV](https://img.shields.io/badge/MSRV-1.91-blue.svg)](https://blog.rust-lang.org/2025/10/30/Rust-1.91.0/)
 
 [Features](#features) · [Quick Start](#quick-start) · [Encryption](#zero-knowledge-encryption) · [Backends](#backends) · [Architecture](#architecture)
 
@@ -859,7 +859,7 @@ keeping the job name green. Two properties make that visible:
 
 ## Minimum Supported Rust Version
 
-**Rust 1.85** or later (Edition 2021).
+New releases support the latest stable Rust. This release requires **Rust 1.91** or later: `rust-version` in `Cargo.toml` is the oldest toolchain CI tests, and any release may raise it when a dependency needs a newer one.
 
 ## Contributing
 

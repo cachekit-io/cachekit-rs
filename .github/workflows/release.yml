@@ -178,14 +178,14 @@ jobs:
       - name: Run tests before publish
         run: cargo test --locked --features "cachekitio,redis,encryption,l1,macros"
 
-      - name: Verify MSRV (1.85) before publish
+      - name: Verify MSRV (1.91) before publish
         # Gate: never ship a release that breaks the declared MSRV floor.
         # release.yml previously built `stable` only, so a red MSRV job could
         # publish silently (issue #25). `check --all-targets` catches any use
-        # of a newer-than-1.85 API across lib + tests without a heavy build.
+        # of a newer-than-1.91 API across lib + tests without a heavy build.
         run: |
-          rustup toolchain install 1.85 --profile minimal
-          cargo +1.85 check --locked --all-targets --features "cachekitio,redis,encryption,l1,macros"
+          rustup toolchain install 1.91 --profile minimal
+          cargo +1.91 check --locked --all-targets --features "cachekitio,redis,encryption,l1,macros"
 
       - name: Package and verify both crates
         # Multi-package mode resolves cachekit-rs's dependency on the not yet

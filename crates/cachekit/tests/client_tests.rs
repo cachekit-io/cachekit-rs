@@ -114,6 +114,37 @@ async fn client_payload_too_large() {
     );
 }
 
+/// Keys of 16 bytes or more are scanned 16 bytes at a time, with the last
+/// block overlapping the one before it, so a control byte must be caught at
+/// every position: inside a full block and inside the overlapping tail.
+#[tokio::test]
+async fn client_key_validation_finds_control_byte_at_every_position() {
+    let client = mock_client();
+    for len in [16, 17, 31, 32, 33, 47, 64] {
+        let clean = "a".repeat(len);
+        let result = client.get::<String>(&clean).await;
+        assert!(
+            !matches!(result, Err(CachekitError::InvalidKey(_))),
+            "clean key of {len} bytes rejected: {result:?}"
+        );
+        for pos in 0..len {
+            for bad in ['\x1F', '\x7F'] {
+                let mut key = clean.clone();
+                key.replace_range(pos..=pos, &bad.to_string());
+                let err = client
+                    .get::<String>(&key)
+                    .await
+                    .expect_err("control byte key should be rejected");
+                assert!(
+                    matches!(err, CachekitError::InvalidKey(_)),
+                    "0x{:02X} at {pos} of {len}: {err:?}",
+                    bad as u32
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn client_key_validation() {
     let client = mock_client();
