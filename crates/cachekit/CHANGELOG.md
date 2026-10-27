@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.13.1](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.13.0...cachekit-rs-v0.13.1) (2026-10-27)
+
+
+### Bug Fixes
+
+* **metrics:** count one outcome per #[cachekit] call (LAB-11384) ([#196](https://github.com/cachekit-io/cachekit-rs/issues/196)) ([2ee734b](https://github.com/cachekit-io/cachekit-rs/commit/2ee734bd0a463c29d6c7df52966f485fba6021b0))
+
+
+### Performance Improvements
+
+* **deps:** bump cachekit-core to 0.7.2 (LAB-11012) ([#193](https://github.com/cachekit-io/cachekit-rs/issues/193)) ([a07cf55](https://github.com/cachekit-io/cachekit-rs/commit/a07cf55414e06b63e8ea3b67a805dfc7702e239c))
+* **encryption:** decrypt through a tenant-bound keyring, so reads run no HKDF (LAB-7137) ([#185](https://github.com/cachekit-io/cachekit-rs/issues/185)) ([cd785c1](https://github.com/cachekit-io/cachekit-rs/commit/cd785c10e3c10effd78897746faa545998ebb1d2))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * cachekit-macros bumped from 0.13.0 to 0.13.1
+
 ## [0.13.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.12.0...cachekit-rs-v0.13.0) (2026-10-25)
 
 
