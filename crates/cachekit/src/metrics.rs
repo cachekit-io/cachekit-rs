@@ -127,14 +127,12 @@ pub fn key_hash(key: &str) -> String {
 /// How a value read was served. Counted by [`CacheCounters`] and, with the
 /// `tracing` feature, emitted as the `outcome` field of the read event.
 ///
-/// The L1 variants are only constructed by the L1 read paths (`L1Stale` by
-/// the native SWR path), so builds without them would flag dead variants.
-#[cfg_attr(
-    not(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32"))),
-    allow(dead_code)
-)]
+/// Public only so `#[cachekit]` can carry a call's outcome from its reads to
+/// [`CacheKit::__count`](crate::CacheKit::__count) — not public API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReadOutcome {
+#[doc(hidden)]
+#[non_exhaustive]
+pub enum ReadOutcome {
     /// Served from the in-process L1 cache, within its freshness window.
     L1Hit,
     /// Served from L1 past the SWR freshness threshold: still an L1 hit for

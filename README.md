@@ -650,11 +650,11 @@ let breaker = cache.circuit_state();       // Option<CircuitState>: Closed / Ope
 
 | Surface | What you get |
 |:--------|:-------------|
-| `CacheKit::stats()` | `L1Stats { l1_hits, l2_hits, misses, l1_enabled }` for every value read (`get`, `interop_get`, SWR and `SecureCache` variants). `exists` and reads that fail with a backend error are not counted. |
+| `CacheKit::stats()` | `L1Stats { l1_hits, l2_hits, misses, l1_enabled }`. Each value read (`get`, `interop_get`, SWR and `SecureCache` variants) counts one outcome: a hit by the layer that served it, or a miss. Each `#[cachekit]` call counts one outcome too: a hit by the layer that served its value, or one miss when it runs the function; its own reads, single-flight re-polls included, count nothing. `exists`, and reads that fail at the backend or on an oversized payload, are not counted; a plain read whose served entry then fails to decode or decrypt counts the layer that served it. |
 | `CacheKit::l1_entry_count()` | Exact L1 occupancy. Sweeps expired entries out first, a pass over every entry, so poll it; don't put it on a hot path. |
 | `CacheKit::circuit_state()` | Live breaker state (`reliability` feature); `None` when the client has no breaker. |
 | SaaS telemetry headers | The cachekit.io backends send `X-CacheKit-L1-Hits` / `L2-Hits` / `Misses` / `L1-Hit-Rate` from the **same counters**, wired automatically by `CacheKitBuilder::build()`. A `.metrics_provider(..)` set on the backend builder still takes precedence. One backend instance reports one client — the first built over it; once that client is gone the headers fall back to `disabled`. |
-| `tracing` feature | One `debug` event per completed operation, per failed fill-lock call, and per `#[cachekit]` result the macro could not store, on the `cachekit` target, and breaker transitions on `cachekit::reliability` (`warn` on open, `info` for half-open / closed). |
+| `tracing` feature | One `debug` event per completed operation (a `#[cachekit]` call's reads emit one `get` event, with the call's outcome), per failed fill-lock call, and per `#[cachekit]` result the macro could not store, on the `cachekit` target, and breaker transitions on `cachekit::reliability` (`warn` on open, `info` for half-open / closed). |
 
 With the `tracing` feature, point your subscriber at the crate:
 

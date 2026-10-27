@@ -384,16 +384,18 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     // Generate cache get/set calls depending on `secure` flag.
     let (get_expr, get_swr_expr, set_expr, complete_refresh_expr) = if args.secure {
         (
+            // `secure_cache()?` fails a client without encryption; on one with
+            // it, the client's reads already decrypt.
             quote! {
                 {
-                    let __ck_sec = #client_ident.secure_cache()?;
-                    __ck_sec.interop_get::<#ok_type>(&__ck_key).await
+                    #client_ident.secure_cache()?;
+                    #client_ident.__interop_read::<#ok_type>(&__ck_key).await
                 }
             },
             quote! {
                 {
-                    let __ck_sec = #client_ident.secure_cache()?;
-                    __ck_sec.interop_get_swr::<#ok_type>(&__ck_key).await
+                    #client_ident.secure_cache()?;
+                    #client_ident.__interop_read_swr::<#ok_type>(&__ck_key).await
                 }
             },
             quote! {
@@ -412,8 +414,8 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
         )
     } else {
         (
-            quote! { #client_ident.interop_get::<#ok_type>(&__ck_key).await },
-            quote! { #client_ident.interop_get_swr::<#ok_type>(&__ck_key).await },
+            quote! { #client_ident.__interop_read::<#ok_type>(&__ck_key).await },
+            quote! { #client_ident.__interop_read_swr::<#ok_type>(&__ck_key).await },
             quote! {
                 #client_ident.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await
             },
@@ -540,8 +542,16 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             // TTL expiry. Backend errors fail open on the plain path (run
             // the function uncached) and fail closed on the secure path.
             // Other errors (namespaced-client Config, decryption) propagate.
+            //
+            // The call counts ONE outcome in the client's stats and telemetry
+            // headers: a hit by the layer that served its value, or a miss
+            // when it runs the function. Its reads (this one, the
+            // single-flight re-polls below) count nothing themselves.
             match #get_swr_expr {
-                Ok(cachekit::SwrRead::Fresh(__ck_cached)) => return Ok(__ck_cached),
+                Ok(cachekit::SwrRead::Fresh((__ck_cached, __ck_by))) => {
+                    #client_ident.__count(&__ck_key, __ck_by);
+                    return Ok(__ck_cached);
+                }
                 // Stale (past the freshness threshold, before hard expiry):
                 // serve the cached value immediately and schedule ONE
                 // background refresh. Dedup takes the same locks as the
@@ -557,7 +567,8 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                 // falls through to the blocking path where errors surface.
                 // Completion is version-checked, so a newer explicit set or
                 // delete always wins over this older origin computation.
-                Ok(cachekit::SwrRead::Stale(__ck_cached, __ck_swr_token)) => {
+                Ok(cachekit::SwrRead::Stale((__ck_cached, __ck_by), __ck_swr_token)) => {
+                    #client_ident.__count(&__ck_key, __ck_by);
                     let __ck_swr_client = ::std::clone::Clone::clone(#client_ident);
                     let __ck_swr_key = __ck_key.clone();
                     #swr_captures
@@ -610,7 +621,8 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                     continue;
                 };
                 match __ck_read {
-                    Ok(Some(__ck_cached)) => {
+                    Ok(Some((__ck_cached, __ck_by))) => {
+                        #client_ident.__count(&__ck_key, __ck_by);
                         __ck_flight.release().await;
                         return Ok(__ck_cached);
                     }
@@ -623,6 +635,10 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                     }
                 }
             }
+
+            // The call runs the function: its one miss, counted before the
+            // write-after-miss so that write's telemetry headers carry it.
+            #client_ident.__count(&__ck_key, cachekit::metrics::ReadOutcome::Miss);
 
             // Execute original function body
             let __ck_result: #ret_ty = (async #original_body).await;
