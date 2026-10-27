@@ -131,6 +131,7 @@ pub fn key_hash(key: &str) -> String {
 /// [`CacheKit::__count`](crate::CacheKit::__count) — not public API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
+#[non_exhaustive]
 pub enum ReadOutcome {
     /// Served from the in-process L1 cache, within its freshness window.
     L1Hit,

@@ -884,8 +884,9 @@ impl CacheKit {
     /// also counts one outcome: a hit by the layer that served its value, or
     /// one miss when it runs the function. The reads inside that call (its
     /// first read, single-flight re-polls) count nothing themselves.
-    /// `exists`, and reads that fail with an error (backend, oversized
-    /// payload), are not counted. The
+    /// `exists`, and reads that fail at the backend or on an oversized
+    /// payload, are not counted. A plain read whose served entry then fails to
+    /// decode or decrypt counts the layer that served it. The
     /// same counters feed the cachekit.io backends' `X-CacheKit-*` telemetry
     /// headers, so for a backend used by this client alone, what you see here
     /// is what the SaaS sees (a backend shared by several clients reports the
@@ -1280,10 +1281,9 @@ impl SecureCache<'_> {
         }
     }
 
-    /// The secure twin of [`CacheKit::__interop_read`]. Macro plumbing for
-    /// `#[cachekit]` — not public API.
-    #[doc(hidden)]
-    pub async fn __interop_read<T: DeserializeOwned>(
+    /// The secure twin of [`CacheKit::__interop_read`], which hands an
+    /// encrypting client's reads here.
+    async fn __interop_read<T: DeserializeOwned>(
         &self,
         key: &str,
     ) -> Result<Option<(T, ReadOutcome)>, CachekitError> {
@@ -1300,10 +1300,9 @@ impl SecureCache<'_> {
         }
     }
 
-    /// The secure twin of [`CacheKit::__interop_read_swr`]. Macro plumbing
-    /// for `#[cachekit]` — not public API.
-    #[doc(hidden)]
-    pub async fn __interop_read_swr<T: DeserializeOwned>(
+    /// The secure twin of [`CacheKit::__interop_read_swr`], which hands an
+    /// encrypting client's reads here.
+    async fn __interop_read_swr<T: DeserializeOwned>(
         &self,
         key: &str,
     ) -> Result<SwrRead<(T, ReadOutcome)>, CachekitError> {

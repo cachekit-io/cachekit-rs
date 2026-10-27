@@ -422,6 +422,79 @@ async fn macro_secure_fails_closed_when_backend_down() {
     );
 }
 
+// ── Counters: a warm call counts one hit by the layer that served it ────────
+
+#[cachekit(client = cache, ttl = 60, interop = "warm_plain", namespace = "counts")]
+async fn warm_plain(cache: &CacheKit, id: u64) -> Result<u64, CachekitError> {
+    Ok(id)
+}
+
+#[cfg(feature = "encryption")]
+#[cachekit(client = cache, ttl = 60, interop = "warm_secure", namespace = "counts", secure)]
+async fn warm_secure(cache: &CacheKit, id: u64) -> Result<u64, CachekitError> {
+    Ok(id)
+}
+
+/// `(l1_hits, l2_hits, misses)` of the client's read counters.
+fn outcomes(cache: &CacheKit) -> (u64, u64, u64) {
+    let s = cache.stats();
+    (s.l1_hits, s.l2_hits, s.misses)
+}
+
+fn counting_client(l1: bool, encrypted: bool) -> CacheKit {
+    let (shared, _) = CountingBackend::new_with_handle();
+    let builder = CacheKit::builder().backend(shared);
+    let builder = if l1 { builder } else { builder.no_l1() };
+    #[cfg(feature = "encryption")]
+    let builder = if encrypted {
+        builder
+            .encryption_from_bytes(&[7u8; 32], "default")
+            .expect("encryption configures")
+    } else {
+        builder
+    };
+    #[cfg(not(feature = "encryption"))]
+    assert!(!encrypted, "encryption needs the `encryption` feature");
+    builder.build().expect("client builds")
+}
+
+#[tokio::test]
+async fn warm_call_served_by_l2_counts_one_l2_hit() {
+    let cache = counting_client(false, false);
+    assert_eq!(warm_plain(&cache, 1).await.unwrap(), 1);
+    assert_eq!(outcomes(&cache), (0, 0, 1), "cold call: one miss");
+    assert_eq!(warm_plain(&cache, 1).await.unwrap(), 1);
+    assert_eq!(outcomes(&cache), (0, 1, 1), "warm call: one L2 hit");
+}
+
+#[cfg(feature = "l1")]
+#[tokio::test]
+async fn warm_call_served_by_l1_counts_one_l1_hit() {
+    let cache = counting_client(true, false);
+    warm_plain(&cache, 2).await.unwrap();
+    assert_eq!(warm_plain(&cache, 2).await.unwrap(), 2);
+    assert_eq!(outcomes(&cache), (1, 0, 1));
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn secure_warm_call_served_by_l2_counts_one_l2_hit() {
+    let cache = counting_client(false, true);
+    warm_secure(&cache, 3).await.unwrap();
+    assert_eq!(outcomes(&cache), (0, 0, 1), "cold call: one miss");
+    assert_eq!(warm_secure(&cache, 3).await.unwrap(), 3);
+    assert_eq!(outcomes(&cache), (0, 1, 1), "warm call: one L2 hit");
+}
+
+#[cfg(all(feature = "encryption", feature = "l1"))]
+#[tokio::test]
+async fn secure_warm_call_served_by_l1_counts_one_l1_hit() {
+    let cache = counting_client(true, true);
+    warm_secure(&cache, 4).await.unwrap();
+    assert_eq!(warm_secure(&cache, 4).await.unwrap(), 4);
+    assert_eq!(outcomes(&cache), (1, 0, 1));
+}
+
 #[cfg(feature = "encryption")]
 static POISONED_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 

@@ -384,16 +384,18 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     // Generate cache get/set calls depending on `secure` flag.
     let (get_expr, get_swr_expr, set_expr, complete_refresh_expr) = if args.secure {
         (
+            // `secure_cache()?` fails a client without encryption; on one with
+            // it, the client's reads already decrypt.
             quote! {
                 {
-                    let __ck_sec = #client_ident.secure_cache()?;
-                    __ck_sec.__interop_read::<#ok_type>(&__ck_key).await
+                    #client_ident.secure_cache()?;
+                    #client_ident.__interop_read::<#ok_type>(&__ck_key).await
                 }
             },
             quote! {
                 {
-                    let __ck_sec = #client_ident.secure_cache()?;
-                    __ck_sec.__interop_read_swr::<#ok_type>(&__ck_key).await
+                    #client_ident.secure_cache()?;
+                    #client_ident.__interop_read_swr::<#ok_type>(&__ck_key).await
                 }
             },
             quote! {
