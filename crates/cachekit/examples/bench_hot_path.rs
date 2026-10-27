@@ -53,7 +53,7 @@ const PREV_KEY: [u8; 32] = [0x41; 32];
 const TENANT: &str = "bench";
 /// Value length in characters. The value is a `String` of `x`, so its stored
 /// MessagePack is 2 bytes longer from 32 to 255 characters: 40 stores 42 B,
-/// the one case below 64 B, where per-call fixed costs dominate; 64 stores 66 B.
+/// the smallest case, where per-call fixed costs dominate; 64 stores 66 B.
 const SIZES: [usize; 4] = [40, 64, 1024, 65536];
 const TTL: Duration = Duration::from_secs(300);
 const WARM: usize = 16;
