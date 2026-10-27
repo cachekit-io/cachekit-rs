@@ -270,6 +270,14 @@ async fn macro_self_heals_undecodable_entry() {
         1,
         "fresh result must overwrite the poisoned entry"
     );
+    // The backend served bytes, but the call ran the function: one miss,
+    // not an L2 hit.
+    let stats = cache.stats();
+    assert_eq!(
+        (stats.l1_hits, stats.l2_hits, stats.misses),
+        (0, 0, 1),
+        "{stats:?}"
+    );
 
     let healed = get_user_namespaced(&cache, 42).await.unwrap();
     assert_eq!(healed, user);

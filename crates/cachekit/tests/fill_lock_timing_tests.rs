@@ -506,6 +506,68 @@ async fn a_remote_fill_is_still_picked_up_within_one_poll() {
     assert_eq!(picked_up, polling_from + POLL_INTERVAL + GET);
 }
 
+// ── Counters: one outcome per call, however often it re-polls ───────────────
+
+/// `(l1_hits, l2_hits, misses)` of the client's read counters.
+fn outcomes(cache: &CacheKit) -> (u64, u64, u64) {
+    let s = cache.stats();
+    (s.l1_hits, s.l2_hits, s.misses)
+}
+
+#[tokio::test(start_paused = true)]
+async fn contested_call_that_finds_the_remote_fill_counts_one_l2_hit() {
+    let backend = Timed::new();
+    backend.st().remote_holds = true;
+    let cache = backend.client();
+
+    // Lands after several empty polls.
+    let remote_fill = async {
+        tokio::time::sleep(ms(GET + LOCK + 1_000)).await;
+        let bytes = serialize_value(&InteropValue::from(120_u64)).unwrap();
+        backend.st().store.insert(fill_key(12), bytes);
+    };
+    let (value, ()) = tokio::join!(fill(&cache, 12), remote_fill);
+    assert_eq!(value.unwrap(), 120);
+    assert!(
+        ORIGIN_STARTED.get().is_none(),
+        "the follower never computes"
+    );
+    // The first read and at least two polls missed before one found it.
+    assert!(backend.gets() >= 4, "{} GETs", backend.gets());
+    assert_eq!(outcomes(&cache), (0, 1, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn contested_call_that_times_out_and_computes_counts_one_miss() {
+    let backend = Timed::new();
+    backend.st().remote_holds = true; // another process leads and never fills
+    let cache = backend.client();
+
+    assert_eq!(fill(&cache, 13).await.unwrap(), 130);
+    assert_eq!(backend.gets(), 17, "the first read and 16 polls all missed");
+    assert_eq!(outcomes(&cache), (0, 0, 1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_follower_counts_one_hit_and_its_leader_one_miss() {
+    let backend = Timed::new();
+    let cache = backend.client();
+
+    let follower = async {
+        tokio::task::yield_now().await;
+        fill(&cache, 14).await.unwrap()
+    };
+    let (leader, follower) = tokio::join!(fill(&cache, 14), follower);
+    assert_eq!((leader.unwrap(), follower), (140, 140));
+    // The follower's re-check is served by L1 when it is on, else by a GET.
+    let want = if cfg!(feature = "l1") {
+        (1, 0, 1)
+    } else {
+        (0, 1, 1)
+    };
+    assert_eq!(outcomes(&cache), want);
+}
+
 // ── The leader's runtime idles or goes away before the unlock is sent ───────
 
 fn current_thread() -> tokio::runtime::Runtime {
