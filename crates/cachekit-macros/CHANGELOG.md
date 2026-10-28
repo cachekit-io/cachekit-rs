@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.13.0...cachekit-macros-v0.13.1) (2026-10-27)
+
+
+### Bug Fixes
+
+* **metrics:** count one outcome per #[cachekit] call (LAB-11384) ([#196](https://github.com/cachekit-io/cachekit-rs/issues/196)) ([2ee734b](https://github.com/cachekit-io/cachekit-rs/commit/2ee734bd0a463c29d6c7df52966f485fba6021b0))
+
 ## [0.13.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.12.0...cachekit-macros-v0.13.0) (2026-10-25)
 
 
