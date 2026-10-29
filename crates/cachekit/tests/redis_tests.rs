@@ -221,26 +221,35 @@ mod redis_tests {
         struct KillableProxy {
             addr: SocketAddr,
             up: Arc<AtomicBool>,
-            /// While set, bytes from the client are dropped: commands are
-            /// written but never reach Redis, and no reply comes back.
-            stalled: Arc<AtomicBool>,
+            stall: Arc<Stall>,
             /// Connections accepted while cut, each closed at once: the client's
             /// reconnect attempts.
             refused: Arc<AtomicUsize>,
             live: Arc<Mutex<Vec<TcpStream>>>,
         }
 
+        /// While `on` is set, bytes from the client are dropped: commands are
+        /// written but never reach Redis, and no reply comes back. `dropped`
+        /// keeps them, so a test can see that a command was written.
+        #[derive(Default)]
+        struct Stall {
+            on: AtomicBool,
+            dropped: Mutex<Vec<u8>>,
+        }
+
         /// Copy `from` to `to` until either closes, dropping what `from` sends
-        /// while `drop_while` is set.
-        fn pipe(mut from: TcpStream, mut to: TcpStream, drop_while: Option<&AtomicBool>) {
+        /// while `stall` is on.
+        fn pipe(mut from: TcpStream, mut to: TcpStream, stall: Option<&Stall>) {
             use std::io::{Read, Write};
 
             let mut buf = [0u8; 16 * 1024];
             while let Ok(n @ 1..) = from.read(&mut buf) {
-                if drop_while
-                    .as_ref()
-                    .is_some_and(|d| d.load(Ordering::SeqCst))
-                {
+                if let Some(stall) = stall.filter(|s| s.on.load(Ordering::SeqCst)) {
+                    stall
+                        .dropped
+                        .lock()
+                        .expect("lock")
+                        .extend_from_slice(&buf[..n]);
                     continue;
                 }
                 if to.write_all(&buf[..n]).is_err() {
@@ -255,11 +264,11 @@ mod redis_tests {
                 let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
                 let addr = listener.local_addr().expect("proxy addr");
                 let up = Arc::new(AtomicBool::new(true));
-                let stalled = Arc::new(AtomicBool::new(false));
+                let stall = Arc::new(Stall::default());
                 let refused = Arc::new(AtomicUsize::new(0));
                 let live = Arc::new(Mutex::new(Vec::new()));
-                let (is_up, is_stalled, refusals, conns) =
-                    (up.clone(), stalled.clone(), refused.clone(), live.clone());
+                let (is_up, stalls, refusals, conns) =
+                    (up.clone(), stall.clone(), refused.clone(), live.clone());
                 std::thread::spawn(move || {
                     for client in listener.incoming() {
                         let Ok(client) = client else { return };
@@ -272,7 +281,7 @@ mod redis_tests {
                             client.try_clone().expect("clone"),
                             server.try_clone().expect("clone"),
                         );
-                        let to_redis = is_stalled.clone();
+                        let to_redis = stalls.clone();
                         std::thread::spawn(move || pipe(c, s, Some(&to_redis)));
                         let (s, c) = (
                             server.try_clone().expect("clone"),
@@ -285,14 +294,38 @@ mod redis_tests {
                 Self {
                     addr,
                     up,
-                    stalled,
+                    stall,
                     refused,
                     live,
                 }
             }
 
             fn stall(&self) {
-                self.stalled.store(true, Ordering::SeqCst);
+                self.stall.on.store(true, Ordering::SeqCst);
+            }
+
+            /// Wait until the stalled connection has swallowed `count` commands
+            /// named `command`: the client has written them to the connection.
+            async fn wait_for_stalled(&self, command: &str, count: usize) {
+                let needle = format!("\r\n{command}\r\n").into_bytes();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let seen = self
+                            .stall
+                            .dropped
+                            .lock()
+                            .expect("lock")
+                            .windows(needle.len())
+                            .filter(|w| *w == needle.as_slice())
+                            .count();
+                        if seen >= count {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{count} {command} never reached the connection"));
             }
 
             fn cut(&self) {
@@ -303,7 +336,7 @@ mod redis_tests {
             }
 
             fn restore(&self) {
-                self.stalled.store(false, Ordering::SeqCst);
+                self.stall.on.store(false, Ordering::SeqCst);
                 self.up.store(true, Ordering::SeqCst);
             }
 
@@ -526,6 +559,8 @@ mod redis_tests {
                     .expect("task")
                     .expect_err("a stalled set cannot complete");
             }
+            // The caller timing out does not show the SETs were written.
+            proxy.wait_for_stalled("SET", in_flight.len()).await;
 
             proxy.cut();
             tokio::time::sleep(SEE_THE_DROP).await;
@@ -545,9 +580,10 @@ mod redis_tests {
 
         /// Lock release is the documented exception: fred's EVAL takes no
         /// per-command options, so a release already on the connection when
-        /// it drops is sent again after the reconnect, and frees the lock. A
-        /// release called while the connection is down is refused (the
-        /// `release_lock` case in `assert_every_op_refused`).
+        /// it drops, whose caller gave up first, is sent again after the
+        /// reconnect and frees the lock. A release called while the
+        /// connection is down is refused (the `release_lock` case in
+        /// `assert_every_op_refused`).
         #[tokio::test]
         #[allow(clippy::expect_used)] // test-only: failures should panic loudly
         async fn redis_disable_offline_queue_resends_a_lock_release_in_flight_at_the_drop() {
@@ -584,6 +620,8 @@ mod redis_tests {
             )
             .await
             .expect_err("a stalled release cannot complete");
+            // The caller timing out does not show the EVAL was written.
+            proxy.wait_for_stalled("EVAL", 1).await;
             proxy.cut();
             tokio::time::sleep(SEE_THE_DROP).await;
             proxy.restore();
