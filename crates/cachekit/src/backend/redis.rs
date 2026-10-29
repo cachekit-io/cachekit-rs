@@ -188,7 +188,12 @@ enum ConnectionEvent {
     Reconnected,
     /// The watcher fell behind and the channel dropped events.
     Missed,
+    /// The last probe got no answer and no event has come since.
+    Unsettled,
 }
+
+/// The pause between probes while the last one got no answer.
+const REPROBE_DELAY: Duration = Duration::from_secs(1);
 
 /// The watcher's state machine, apart from fred so it can be tested.
 ///
@@ -197,10 +202,13 @@ enum ConnectionEvent {
 /// the connection down, and nothing marks it up on an event's word alone.
 /// With a reconnect policy, `probe` (a PING through the bare client, which
 /// waits for a reconnect in progress instead of failing at once) decides after
-/// each reconnect and after missed events; a probe that gets no answer leaves
-/// `down` as it is, and fred's next drop or reconnect brings another event.
-/// Without a policy (`probe` is `None`) the only reconnect event is the first
-/// connect and a drop is final, so reconnect events are ignored.
+/// each reconnect and after missed events. A probe that gets no answer is
+/// repeated every [`REPROBE_DELAY`], one at a time, until one is answered or a
+/// drop arrives: a server that stalled past the command timeout and then
+/// recovered sends no further event. A drop stops the repeats, so a probe of an
+/// earlier connection cannot clear `down` for a newer drop. Without a policy
+/// (`probe` is `None`) the only reconnect event is the first connect and a drop
+/// is final, so reconnect events are ignored and nothing is probed.
 async fn follow_connection<P, F>(
     mut errors: broadcast::Receiver<RedisError>,
     mut reconnects: broadcast::Receiver<Server>,
@@ -211,6 +219,7 @@ async fn follow_connection<P, F>(
     F: std::future::Future<Output = bool>,
 {
     let (mut errors_open, mut reconnects_open) = (true, true);
+    let mut unsettled = false;
     loop {
         let event = tokio::select! {
             biased;
@@ -230,7 +239,10 @@ async fn follow_connection<P, F>(
                     None
                 }
             },
-            // Both closed: the client is gone, so there is nothing to guard.
+            () = tokio::time::sleep(REPROBE_DELAY), if unsettled && errors_open && reconnects_open => {
+                Some(ConnectionEvent::Unsettled)
+            }
+            // The client is gone, so there is nothing to guard.
             else => return,
         };
         let Some(event) = event else { continue };
@@ -240,22 +252,20 @@ async fn follow_connection<P, F>(
             }
             continue;
         };
-        match event {
-            ConnectionEvent::Dropped => down.store(true, Ordering::Release),
-            ConnectionEvent::Reconnected => {
-                if probe().await {
-                    down.store(false, Ordering::Release);
-                }
-            }
-            ConnectionEvent::Missed => {
-                // What is still buffered has lost its order: start afresh.
-                errors = errors.resubscribe();
-                reconnects = reconnects.resubscribe();
-                down.store(true, Ordering::Release);
-                if probe().await {
-                    down.store(false, Ordering::Release);
-                }
-            }
+        if event == ConnectionEvent::Dropped {
+            down.store(true, Ordering::Release);
+            unsettled = false;
+            continue;
+        }
+        if event == ConnectionEvent::Missed {
+            // What is still buffered has lost its order: start afresh.
+            errors = errors.resubscribe();
+            reconnects = reconnects.resubscribe();
+            down.store(true, Ordering::Release);
+        }
+        unsettled = !probe().await;
+        if !unsettled {
+            down.store(false, Ordering::Release);
         }
     }
 }
@@ -513,7 +523,8 @@ impl RedisBackendBuilder {
     /// connection is back, and, without `auto_reconnect`, none after it.
     /// "Back" means the server answered a PING after fred reported the
     /// reconnect; while it waits for that answer, the backend holds that one
-    /// PING of its own in fred's queue.
+    /// PING of its own in fred's queue, and repeats it each second until one
+    /// is answered or fred reports another drop.
     /// A command already written to the connection when fred notices the drop
     /// fails then, instead of being sent again after the reconnect; it may
     /// have run on the server. (Lock release is the exception: it is sent
@@ -864,6 +875,78 @@ mod tests {
         assert_eq!(follow(&overflow, 2, Some(true)).await, (false, 1));
         assert_eq!(follow(&overflow, 2, Some(false)).await, (true, 1));
         assert_eq!(follow(&overflow, 2, None).await, (true, 0));
+    }
+
+    /// A watcher on open channels, probing with `answers` in turn (then `false`).
+    /// Returns the senders that keep it alive, `down`, the probe count and the task.
+    #[allow(clippy::type_complexity)]
+    fn live_watcher(
+        answers: Vec<bool>,
+    ) -> (
+        (broadcast::Sender<RedisError>, broadcast::Sender<Server>),
+        Arc<AtomicBool>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (errors, errors_rx) = broadcast::channel(32);
+        let (reconnects, reconnects_rx) = broadcast::channel(32);
+        let down = Arc::new(AtomicBool::new(false));
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = {
+            let probes = Arc::clone(&probes);
+            move || {
+                let n = probes.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(answers.get(n).copied().unwrap_or(false))
+            }
+        };
+        let task = tokio::spawn({
+            let down = Arc::clone(&down);
+            async move { follow_connection(errors_rx, reconnects_rx, &down, Some(probe)).await }
+        });
+        ((errors, reconnects), down, probes, task)
+    }
+
+    fn drop_event() -> RedisError {
+        RedisError::new(RedisErrorKind::IO, "closed")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_probe_is_repeated_until_one_is_answered() {
+        // A server that stalled past the command timeout after a reconnect, then
+        // recovered: no further event comes, so only a repeat can clear `down`.
+        let ((errors, reconnects), down, probes, task) = live_watcher(vec![false, false, true]);
+        errors.send(drop_event()).expect("watcher listening");
+        reconnects
+            .send(Server::new("localhost", 6379))
+            .expect("watcher listening");
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while probes.load(Ordering::Relaxed) < 3 || down.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("down never cleared");
+        assert_eq!(probes.load(Ordering::Relaxed), 3);
+        drop((errors, reconnects));
+        task.await.expect("watcher ends with the channels");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drop_stops_the_repeats() {
+        let ((errors, reconnects), down, probes, task) = live_watcher(vec![]);
+        errors.send(drop_event()).expect("watcher listening");
+        reconnects
+            .send(Server::new("localhost", 6379))
+            .expect("watcher listening");
+        while probes.load(Ordering::Relaxed) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        errors.send(drop_event()).expect("watcher listening");
+        tokio::time::sleep(REPROBE_DELAY * 10).await;
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
+        assert!(down.load(Ordering::Acquire));
+        drop((errors, reconnects));
+        task.await.expect("watcher ends with the channels");
     }
 
     #[test]
