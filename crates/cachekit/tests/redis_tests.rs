@@ -596,8 +596,8 @@ mod redis_tests {
             );
         }
 
-        /// A failed connect can be retried; a backend that connected cannot
-        /// connect again.
+        /// `connect` runs once per backend, whatever the first call's outcome:
+        /// failed, cancelled or connected.
         #[tokio::test]
         #[allow(clippy::expect_used)] // test-only: failures should panic loudly
         async fn redis_disable_offline_queue_connects_once() {
@@ -605,29 +605,47 @@ mod redis_tests {
                 eprintln!("skipping redis_disable_offline_queue_connects_once: CACHEKIT_TEST_REDIS_URL not set");
                 return;
             };
+            let build = |url: String| {
+                RedisBackendBuilder::default()
+                    .url(url)
+                    .auto_reconnect()
+                    .disable_offline_queue()
+                    .build()
+                    .expect("builder should succeed")
+            };
+            let assert_second_call_refused = |err: BackendError| {
+                assert_eq!(err.kind, BackendErrorKind::Permanent, "{err}");
+            };
             let proxy = KillableProxy::start(upstream(&url));
-            let backend = RedisBackendBuilder::default()
-                .url(proxy.url(&url))
-                .auto_reconnect()
-                .disable_offline_queue()
-                .build()
-                .expect("builder should succeed");
 
+            // Failed.
+            let failed = build(proxy.url(&url));
             proxy.cut();
-            backend.connect().await.expect_err("redis is unreachable");
+            failed.connect().await.expect_err("redis is unreachable");
             proxy.restore();
-            let _handle = backend
+            assert_second_call_refused(failed.connect().await.expect_err("second call"));
+
+            // Cancelled: the handshake gets no answer, so the caller gives up.
+            let cancelled = build(proxy.url(&url));
+            proxy.stall();
+            tokio::time::timeout(Duration::from_millis(100), cancelled.connect())
+                .await
+                .expect_err("a stalled handshake cannot finish");
+            proxy.restore();
+            assert_second_call_refused(cancelled.connect().await.expect_err("second call"));
+
+            // Connected.
+            let connected = build(url.clone());
+            let _handle = connected
                 .connect()
                 .await
-                .expect("a failed connect can be retried");
-            backend.health().await.expect("connected");
-            let err = backend
-                .connect()
+                .expect("redis should be reachable");
+            assert_second_call_refused(connected.connect().await.expect_err("second call"));
+            connected
+                .health()
                 .await
-                .expect_err("second connect is refused");
-            assert_eq!(err.kind, BackendErrorKind::Permanent, "{err}");
-            backend.health().await.expect("still connected");
-            eprintln!("redis_disable_offline_queue_connects_once: retried after a failure, refused a second connect");
+                .expect("the first connection is still up");
+            eprintln!("redis_disable_offline_queue_connects_once: second call refused after a failed, a cancelled and a successful first call");
         }
 
         /// The option refuses only while the connection is down: a burst far

@@ -66,8 +66,8 @@ pub struct RedisBackend {
 struct OfflineGuard {
     /// Set by fred's error events, cleared by its reconnect events.
     down: Arc<AtomicBool>,
-    /// Set once `connect` has started; cleared again if it fails.
-    connecting: AtomicBool,
+    /// Set by the first call to `connect`.
+    connect_called: AtomicBool,
 }
 
 impl std::fmt::Debug for RedisBackend {
@@ -98,32 +98,28 @@ impl RedisBackend {
     /// none may reach it, so the task may never resolve and failed commands
     /// are the signal. Do not `abort` it while the backend is still in use.
     ///
-    /// With `disable_offline_queue`, a backend connects once: a call after one
-    /// that succeeded returns `BackendErrorKind::Permanent`. Connecting again
-    /// would close the old connection, whose close fred reports after the new
-    /// one may already be up. To reconnect, build a new backend.
+    /// With `disable_offline_queue`, call it once per backend: a second call
+    /// returns `BackendErrorKind::Permanent`, even after a first call that
+    /// failed or was cancelled. Another attempt would replace the connection
+    /// fred is still making or holding, and fred can report that one's close
+    /// after the new one is up. To try again, build a new backend.
     pub async fn connect(&self) -> Result<ConnectHandle, BackendError> {
         let Some(guard) = &self.offline else {
             return self.client.init().await.map_err(redis_err);
         };
-        if guard.connecting.swap(true, Ordering::AcqRel) {
+        if guard.connect_called.swap(true, Ordering::AcqRel) {
             return Err(BackendError::permanent(
-                "connect was already called on this backend; build a new one to reconnect",
+                "connect was already called on this backend; build a new one to connect again",
             ));
         }
-        // Subscribe first, so no event of this connection is missed.
-        let errors = self.client.error_rx();
-        let reconnects = self.client.reconnect_rx();
-        match self.client.init().await {
-            Ok(handle) => {
-                watch_connection(errors, reconnects, Arc::clone(&guard.down));
-                Ok(handle)
-            }
-            Err(e) => {
-                guard.connecting.store(false, Ordering::Release);
-                Err(redis_err(e))
-            }
-        }
+        // Before `init`, so no event is missed, and so the watcher runs even if
+        // this future is dropped while fred's connection task carries on.
+        watch_connection(
+            self.client.error_rx(),
+            self.client.reconnect_rx(),
+            Arc::clone(&guard.down),
+        );
+        self.client.init().await.map_err(redis_err)
     }
 
     /// The client to send a command through, or the error a command returns
