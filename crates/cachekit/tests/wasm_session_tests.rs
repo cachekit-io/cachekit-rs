@@ -1,5 +1,6 @@
-//! wasm32 runtime regression tests for the session clock and the Workers
-//! backend's request path.
+//! wasm32 runtime regression tests for the session clock, the Workers
+//! backend's request path and, in `tests/wasm/encryption.rs`, the
+//! `EncryptionLayer` seal, open and rejects.
 //!
 //! `SystemTime::now()` / `Instant::now()` panic on `wasm32-unknown-unknown`,
 //! and the compile-only wasm CI check shipped that trap in five releases —
@@ -14,6 +15,11 @@
 
 use cachekit::session::session_headers;
 use wasm_bindgen_test::wasm_bindgen_test;
+
+// In this binary, not a second one: `make test-wasm` runs one test binary.
+#[cfg(feature = "encryption")]
+#[path = "wasm/encryption.rs"]
+mod encryption;
 
 /// The exact panic site: building session headers on wasm32.
 /// Reaching the asserts at all proves the clock (and uuid's js entropy) did

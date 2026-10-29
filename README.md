@@ -742,6 +742,7 @@ make security      # cargo deny + cargo audit (the CI supply-chain gate)
 make test          # cargo test --features $(NATIVE_FEATURES) (CI's list; see Makefile)
 make build         # cargo build --release
 make build-wasm    # wasm32-unknown-unknown (workers feature)
+make test-wasm     # wasm32 runtime tests under Node: session clock, Workers fetch, encryption (see Makefile)
 ```
 
 `make security` runs the same two enforcement commands as the `supply-chain`
