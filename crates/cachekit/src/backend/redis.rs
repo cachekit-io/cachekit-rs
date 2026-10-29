@@ -561,9 +561,11 @@ impl RedisBackendBuilder {
     /// once and leaves that PING queued until the next reconnect.
     /// A command already written to the connection when fred notices the drop
     /// fails then, instead of being sent again after the reconnect; it may
-    /// have run on the server. (Lock release is the exception: it is sent
-    /// again, which is harmless, because it deletes the lock only while it
-    /// still holds the caller's token.)
+    /// have run on the server. (Lock release is the exception: a release
+    /// already written when the connection drops is sent again after the
+    /// reconnect, which is harmless because it deletes the lock only while
+    /// the lock still holds the caller's token. A release called while the
+    /// connection is down is refused like any other command.)
     ///
     /// A refused command returns `BackendErrorKind::Transient`. Under the
     /// reliability stack it is retried with backoff and counts toward

@@ -543,6 +543,62 @@ mod redis_tests {
             );
         }
 
+        /// Lock release is the documented exception: fred's EVAL takes no
+        /// per-command options, so a release already on the connection when
+        /// it drops is sent again after the reconnect, and frees the lock. A
+        /// release called while the connection is down is refused (the
+        /// `release_lock` case in `assert_every_op_refused`).
+        #[tokio::test]
+        #[allow(clippy::expect_used)] // test-only: failures should panic loudly
+        async fn redis_disable_offline_queue_resends_a_lock_release_in_flight_at_the_drop() {
+            let Ok(url) = std::env::var("CACHEKIT_TEST_REDIS_URL") else {
+                eprintln!("skipping redis_disable_offline_queue_resends_a_lock_release_in_flight_at_the_drop: CACHEKIT_TEST_REDIS_URL not set");
+                return;
+            };
+            let proxy = KillableProxy::start(upstream(&url));
+            let backend = RedisBackendBuilder::default()
+                .url(proxy.url(&url))
+                .auto_reconnect()
+                .disable_offline_queue()
+                .build()
+                .expect("builder should succeed");
+            let _handle = backend.connect().await.expect("redis should be reachable");
+            let prefix = unique_prefix("offline-release");
+            let probe = format!("{prefix}probe");
+            backend
+                .set(&probe, b"v".to_vec(), TTL)
+                .await
+                .expect("set on a healthy connection");
+            let key = format!("{prefix}locked");
+            let token = backend
+                .acquire_lock(&key, 60_000)
+                .await
+                .expect("acquire should not error")
+                .expect("the lock is free");
+
+            // Written to the connection, never answered; the caller gives up.
+            proxy.stall();
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                backend.release_lock(&key, &token),
+            )
+            .await
+            .expect_err("a stalled release cannot complete");
+            proxy.cut();
+            tokio::time::sleep(SEE_THE_DROP).await;
+            proxy.restore();
+            wait_until_served(&backend, &probe).await;
+
+            assert!(
+                !backend
+                    .exists(&format!("{key}:lock"))
+                    .await
+                    .expect("exists after reconnect"),
+                "the release in flight was not sent after the reconnect"
+            );
+            eprintln!("redis_disable_offline_queue_resends_a_lock_release_in_flight_at_the_drop: lock freed by the resent release");
+        }
+
         /// Without `auto_reconnect`, fred reports the client connected after the
         /// connection closes for good; commands sent after that still fail at
         /// once instead of waiting in a queue nothing reads.
