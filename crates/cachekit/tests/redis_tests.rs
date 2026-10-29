@@ -671,13 +671,15 @@ mod redis_tests {
 
             drop(backend);
             tokio::time::timeout(Duration::from_secs(5), async {
-                while metrics.num_alive_tasks() != with_backend - 1 {
+                while metrics.num_alive_tasks() >= with_backend {
                     tokio::task::yield_now().await;
                 }
             })
             .await
             .expect("the watcher outlived the backend");
-            eprintln!("redis_disable_offline_queue_watcher_stops_with_the_backend: {with_backend} tasks -> {}", with_backend - 1);
+            let after = metrics.num_alive_tasks();
+            assert_eq!(after, with_backend - 1, "only the watcher should stop");
+            eprintln!("redis_disable_offline_queue_watcher_stops_with_the_backend: {with_backend} tasks -> {after}");
         }
 
         /// The option refuses only while the connection is down: a burst far
