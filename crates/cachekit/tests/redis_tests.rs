@@ -208,8 +208,9 @@ mod redis_tests {
     #[cfg(not(feature = "unsync"))]
     mod offline_queue {
         use cachekit::backend::redis::{RedisBackend, RedisBackendBuilder};
-        use cachekit::backend::Backend;
-        use cachekit::error::BackendErrorKind;
+        use cachekit::backend::{Backend, LockableBackend, TtlInspectable};
+        use cachekit::error::{BackendError, BackendErrorKind};
+        use std::future::Future;
         use std::net::{SocketAddr, TcpListener, TcpStream};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
@@ -220,10 +221,33 @@ mod redis_tests {
         struct KillableProxy {
             addr: SocketAddr,
             up: Arc<AtomicBool>,
+            /// While set, bytes from the client are dropped: commands are
+            /// written but never reach Redis, and no reply comes back.
+            stalled: Arc<AtomicBool>,
             /// Connections accepted while cut, each closed at once: the client's
             /// reconnect attempts.
             refused: Arc<AtomicUsize>,
             live: Arc<Mutex<Vec<TcpStream>>>,
+        }
+
+        /// Copy `from` to `to` until either closes, dropping what `from` sends
+        /// while `drop_while` is set.
+        fn pipe(mut from: TcpStream, mut to: TcpStream, drop_while: Option<&AtomicBool>) {
+            use std::io::{Read, Write};
+
+            let mut buf = [0u8; 16 * 1024];
+            while let Ok(n @ 1..) = from.read(&mut buf) {
+                if drop_while
+                    .as_ref()
+                    .is_some_and(|d| d.load(Ordering::SeqCst))
+                {
+                    continue;
+                }
+                if to.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            let _ = to.shutdown(std::net::Shutdown::Both);
         }
 
         impl KillableProxy {
@@ -231,9 +255,11 @@ mod redis_tests {
                 let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
                 let addr = listener.local_addr().expect("proxy addr");
                 let up = Arc::new(AtomicBool::new(true));
+                let stalled = Arc::new(AtomicBool::new(false));
                 let refused = Arc::new(AtomicUsize::new(0));
                 let live = Arc::new(Mutex::new(Vec::new()));
-                let (is_up, refusals, conns) = (up.clone(), refused.clone(), live.clone());
+                let (is_up, is_stalled, refusals, conns) =
+                    (up.clone(), stalled.clone(), refused.clone(), live.clone());
                 std::thread::spawn(move || {
                     for client in listener.incoming() {
                         let Ok(client) = client else { return };
@@ -242,31 +268,31 @@ mod redis_tests {
                             continue; // dropping `client` closes it
                         }
                         let server = TcpStream::connect(upstream.as_str()).expect("reach redis");
-                        let pipes = [
-                            (
-                                client.try_clone().expect("clone"),
-                                server.try_clone().expect("clone"),
-                            ),
-                            (
-                                server.try_clone().expect("clone"),
-                                client.try_clone().expect("clone"),
-                            ),
-                        ];
+                        let (c, s) = (
+                            client.try_clone().expect("clone"),
+                            server.try_clone().expect("clone"),
+                        );
+                        let to_redis = is_stalled.clone();
+                        std::thread::spawn(move || pipe(c, s, Some(&to_redis)));
+                        let (s, c) = (
+                            server.try_clone().expect("clone"),
+                            client.try_clone().expect("clone"),
+                        );
+                        std::thread::spawn(move || pipe(s, c, None));
                         conns.lock().expect("lock").extend([client, server]);
-                        for (mut from, mut to) in pipes {
-                            std::thread::spawn(move || {
-                                let _ = std::io::copy(&mut from, &mut to);
-                                let _ = to.shutdown(std::net::Shutdown::Both);
-                            });
-                        }
                     }
                 });
                 Self {
                     addr,
                     up,
+                    stalled,
                     refused,
                     live,
                 }
+            }
+
+            fn stall(&self) {
+                self.stalled.store(true, Ordering::SeqCst);
             }
 
             fn cut(&self) {
@@ -277,6 +303,7 @@ mod redis_tests {
             }
 
             fn restore(&self) {
+                self.stalled.store(false, Ordering::SeqCst);
                 self.up.store(true, Ordering::SeqCst);
             }
 
@@ -308,29 +335,74 @@ mod redis_tests {
         /// fred queued would show up here as a caller timeout.
         const CALLER_BUDGET: Duration = Duration::from_millis(500);
 
-        /// Send one `set` per key concurrently, each under `CALLER_BUDGET`, and
-        /// require every one to fail with `Transient` before the caller gives up.
-        async fn assert_all_refused(backend: &Arc<RedisBackend>, keys: &[String]) {
+        /// Keys these tests write expire, so a run leaves nothing behind.
+        const TTL: Option<Duration> = Some(Duration::from_secs(60));
+
+        /// Require `op` to fail with `Transient` before the caller gives up.
+        async fn assert_refused<T: std::fmt::Debug>(
+            what: &str,
+            op: impl Future<Output = Result<T, BackendError>>,
+        ) {
+            let err = tokio::time::timeout(CALLER_BUDGET, op)
+                .await
+                .unwrap_or_else(|_| panic!("{what} queued: the caller timed out first"))
+                .expect_err("must fail while the connection is down");
+            assert_eq!(err.kind, BackendErrorKind::Transient, "{what}: {err}");
+        }
+
+        /// Send one `set` per key concurrently and require every one refused.
+        async fn assert_sets_refused(backend: &Arc<RedisBackend>, keys: &[String]) {
             let mut sets = tokio::task::JoinSet::new();
             for key in keys {
                 let (backend, key) = (Arc::clone(backend), key.clone());
                 sets.spawn(async move {
-                    tokio::time::timeout(CALLER_BUDGET, backend.set(&key, vec![7; 1024], None))
-                        .await
+                    assert_refused(&key, backend.set(&key, vec![7; 1024], TTL)).await;
                 });
             }
-            while let Some(outcome) = sets.join_next().await {
-                let err = outcome
-                    .expect("task")
-                    .expect("queued: the caller timed out instead of the command failing at once")
-                    .expect_err("set must fail while the connection is down");
-                assert_eq!(err.kind, BackendErrorKind::Transient, "{err}");
+            while let Some(done) = sets.join_next().await {
+                done.expect("a set was not refused");
             }
         }
 
-        /// With `auto_reconnect`, commands sent while fred reconnects fail at once
-        /// and are never sent after the reconnect, and the backend still
-        /// reconnects although commands were in flight when the connection closed.
+        /// Every backend operation is refused, not only `set`.
+        async fn assert_every_op_refused(backend: &RedisBackend, key: &str) {
+            assert_refused("get", backend.get(key)).await;
+            assert_refused("delete", backend.delete(key)).await;
+            assert_refused("exists", backend.exists(key)).await;
+            assert_refused("ttl", backend.ttl(key)).await;
+            assert_refused("health", backend.health()).await;
+            assert_refused("acquire_lock", backend.acquire_lock(key, 1_000)).await;
+            assert_refused("release_lock", backend.release_lock(key, "token")).await;
+        }
+
+        /// Poll until `get` succeeds again: the backend has reconnected.
+        async fn wait_until_served(backend: &RedisBackend, key: &str) {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !matches!(
+                    tokio::time::timeout(CALLER_BUDGET, backend.get(key)).await,
+                    Ok(Ok(Some(_)))
+                ) {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("backend never reconnected");
+        }
+
+        fn keys(prefix: &str, name: &str) -> Vec<String> {
+            (0..20).map(|i| format!("{prefix}{name}:{i}")).collect()
+        }
+
+        /// fred notices a closed connection at once, but its client state
+        /// stays `Connected` until its first reconnect attempt, 100 to 150 ms
+        /// later. Long enough for the backend to see the drop, well inside
+        /// that window.
+        const SEE_THE_DROP: Duration = Duration::from_millis(20);
+
+        /// With `auto_reconnect`, commands fail at once from the drop until the
+        /// reconnect, both inside fred's first reconnect backoff and while it
+        /// retries, and none is sent after the reconnect. The backend still
+        /// reconnects although writes were in flight when the connection closed.
         #[tokio::test]
         #[allow(clippy::expect_used)] // test-only: failures should panic loudly
         async fn redis_disable_offline_queue_refuses_while_reconnecting() {
@@ -351,11 +423,11 @@ mod redis_tests {
             let prefix = unique_prefix("offline-reconnect");
             let probe = format!("{prefix}probe");
             backend
-                .set(&probe, b"v".to_vec(), None)
+                .set(&probe, b"v".to_vec(), TTL)
                 .await
                 .expect("set on a healthy connection");
 
-            // Keep commands in flight and queued across the cut.
+            // Keep writes in flight across the cut.
             let writing = Arc::new(AtomicBool::new(true));
             let writer = tokio::spawn({
                 let (backend, writing, prefix) =
@@ -363,11 +435,14 @@ mod redis_tests {
                 async move {
                     let mut i = 0u32;
                     while writing.load(Ordering::SeqCst) {
+                        let key = format!("{prefix}burst:{i}");
                         let _ = tokio::time::timeout(
                             CALLER_BUDGET,
-                            backend.set(&format!("{prefix}burst:{i}"), vec![1; 1024], None),
+                            backend.set(&key, vec![1; 1024], TTL),
                         )
                         .await;
+                        // A refused set returns without yielding.
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                         i += 1;
                     }
                 }
@@ -375,7 +450,14 @@ mod redis_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             proxy.cut();
 
-            // Send only once fred has seen the drop: it is trying to reconnect.
+            // Inside fred's first reconnect backoff.
+            tokio::time::sleep(SEE_THE_DROP).await;
+            let attempts_before_backoff_burst = proxy.refused.load(Ordering::SeqCst);
+            let in_backoff = keys(&prefix, "backoff");
+            assert_sets_refused(&backend, &in_backoff).await;
+            assert_every_op_refused(&backend, &probe).await;
+
+            // While fred retries.
             tokio::time::timeout(Duration::from_secs(10), async {
                 while proxy.refused.load(Ordering::SeqCst) == 0 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -385,33 +467,79 @@ mod redis_tests {
             .expect("fred never tried to reconnect");
             writing.store(false, Ordering::SeqCst);
             writer.await.expect("writer task");
-
-            let keys: Vec<String> = (0..20).map(|i| format!("{prefix}outage:{i}")).collect();
-            assert_all_refused(&backend, &keys).await;
+            let while_retrying = keys(&prefix, "retrying");
+            assert_sets_refused(&backend, &while_retrying).await;
 
             proxy.restore();
-            tokio::time::timeout(Duration::from_secs(30), async {
-                loop {
-                    if let Ok(Ok(Some(_))) =
-                        tokio::time::timeout(CALLER_BUDGET, backend.get(&probe)).await
-                    {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            })
-            .await
-            .expect("backend never reconnected");
-
-            for key in &keys {
+            wait_until_served(&backend, &probe).await;
+            for key in in_backoff.iter().chain(&while_retrying) {
                 assert!(
                     !backend.exists(key).await.expect("exists after reconnect"),
                     "{key} was sent after the reconnect"
                 );
             }
             eprintln!(
-                "redis_disable_offline_queue_refuses_while_reconnecting: {} refused at once, 0 sent after the reconnect",
-                keys.len()
+                "redis_disable_offline_queue_refuses_while_reconnecting: {} refused at once (first burst after {attempts_before_backoff_burst} reconnect attempts), 0 sent after the reconnect",
+                in_backoff.len() + while_retrying.len()
+            );
+        }
+
+        /// Writes already on the connection when it drops, whose callers gave
+        /// up, fail with it instead of being sent after the reconnect.
+        #[tokio::test]
+        #[allow(clippy::expect_used)] // test-only: failures should panic loudly
+        async fn redis_disable_offline_queue_drops_writes_in_flight_at_the_drop() {
+            let Ok(url) = std::env::var("CACHEKIT_TEST_REDIS_URL") else {
+                eprintln!("skipping redis_disable_offline_queue_drops_writes_in_flight_at_the_drop: CACHEKIT_TEST_REDIS_URL not set");
+                return;
+            };
+            let proxy = KillableProxy::start(upstream(&url));
+            let backend = Arc::new(
+                RedisBackendBuilder::default()
+                    .url(proxy.url(&url))
+                    .auto_reconnect()
+                    .disable_offline_queue()
+                    .build()
+                    .expect("builder should succeed"),
+            );
+            let _handle = backend.connect().await.expect("redis should be reachable");
+            let prefix = unique_prefix("offline-in-flight");
+            let probe = format!("{prefix}probe");
+            backend
+                .set(&probe, b"v".to_vec(), TTL)
+                .await
+                .expect("set on a healthy connection");
+
+            // Written to the connection, never answered; each caller gives up.
+            proxy.stall();
+            let in_flight = keys(&prefix, "in-flight");
+            let mut sets = tokio::task::JoinSet::new();
+            for key in &in_flight {
+                let (backend, key) = (Arc::clone(&backend), key.clone());
+                sets.spawn(async move {
+                    let budget = Duration::from_millis(200);
+                    tokio::time::timeout(budget, backend.set(&key, vec![3; 1024], TTL)).await
+                });
+            }
+            while let Some(outcome) = sets.join_next().await {
+                outcome
+                    .expect("task")
+                    .expect_err("a stalled set cannot complete");
+            }
+
+            proxy.cut();
+            tokio::time::sleep(SEE_THE_DROP).await;
+            proxy.restore();
+            wait_until_served(&backend, &probe).await;
+            for key in &in_flight {
+                assert!(
+                    !backend.exists(key).await.expect("exists after reconnect"),
+                    "{key} was sent after the reconnect"
+                );
+            }
+            eprintln!(
+                "redis_disable_offline_queue_drops_writes_in_flight_at_the_drop: {} abandoned in flight, 0 sent after the reconnect",
+                in_flight.len()
             );
         }
 
@@ -435,34 +563,28 @@ mod redis_tests {
             );
             let _handle = backend.connect().await.expect("redis should be reachable");
             let prefix = unique_prefix("offline-closed");
+            let probe = format!("{prefix}probe");
             backend
-                .set(&format!("{prefix}probe"), b"v".to_vec(), None)
+                .set(&probe, b"v".to_vec(), TTL)
                 .await
                 .expect("set on a healthy connection");
 
             proxy.cut();
-            // Send only once the backend has seen the drop.
-            tokio::time::timeout(Duration::from_secs(10), async {
-                while let Ok(Ok(_)) = tokio::time::timeout(CALLER_BUDGET, backend.health()).await {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("backend never saw the drop");
-
-            let keys: Vec<String> = (0..20).map(|i| format!("{prefix}outage:{i}")).collect();
-            assert_all_refused(&backend, &keys).await;
+            tokio::time::sleep(SEE_THE_DROP).await;
+            let outage = keys(&prefix, "outage");
+            assert_sets_refused(&backend, &outage).await;
+            assert_every_op_refused(&backend, &probe).await;
             // Nothing reads a queue later: the connection stays down, and
             // commands keep failing at once after Redis is reachable again.
             proxy.restore();
-            assert_all_refused(&backend, &keys).await;
+            assert_sets_refused(&backend, &outage).await;
 
             let direct = RedisBackendBuilder::default()
                 .url(&url)
                 .build()
                 .expect("builder should succeed");
             let _direct = direct.connect().await.expect("redis should be reachable");
-            for key in &keys {
+            for key in &outage {
                 assert!(
                     !direct.exists(key).await.expect("exists"),
                     "{key} reached Redis"
@@ -470,8 +592,42 @@ mod redis_tests {
             }
             eprintln!(
                 "redis_disable_offline_queue_refuses_after_close_without_reconnect: {} refused at once, twice",
-                keys.len()
+                outage.len()
             );
+        }
+
+        /// A failed connect can be retried; a backend that connected cannot
+        /// connect again.
+        #[tokio::test]
+        #[allow(clippy::expect_used)] // test-only: failures should panic loudly
+        async fn redis_disable_offline_queue_connects_once() {
+            let Ok(url) = std::env::var("CACHEKIT_TEST_REDIS_URL") else {
+                eprintln!("skipping redis_disable_offline_queue_connects_once: CACHEKIT_TEST_REDIS_URL not set");
+                return;
+            };
+            let proxy = KillableProxy::start(upstream(&url));
+            let backend = RedisBackendBuilder::default()
+                .url(proxy.url(&url))
+                .auto_reconnect()
+                .disable_offline_queue()
+                .build()
+                .expect("builder should succeed");
+
+            proxy.cut();
+            backend.connect().await.expect_err("redis is unreachable");
+            proxy.restore();
+            let _handle = backend
+                .connect()
+                .await
+                .expect("a failed connect can be retried");
+            backend.health().await.expect("connected");
+            let err = backend
+                .connect()
+                .await
+                .expect_err("second connect is refused");
+            assert_eq!(err.kind, BackendErrorKind::Permanent, "{err}");
+            backend.health().await.expect("still connected");
+            eprintln!("redis_disable_offline_queue_connects_once: retried after a failure, refused a second connect");
         }
 
         /// The option refuses only while the connection is down: a burst far
@@ -501,7 +657,7 @@ mod redis_tests {
                 for i in 0..BURST {
                     let (backend, key) = (Arc::clone(&backend), format!("{prefix}{i}"));
                     ops.spawn(async move {
-                        backend.set(&key, vec![2; 1024], None).await?;
+                        backend.set(&key, vec![2; 1024], TTL).await?;
                         backend.get(&key).await
                     });
                 }
