@@ -785,8 +785,8 @@ adds a dependency.
 (key handling, MessagePack, L1, the reliability stack, AES-256-GCM) and no
 network. Cases are `l1_hit`, `l2_hit`, `set`, `delete` and `exists` (a warm
 key), each `plain`, with reliability (`rel`) or with encryption (`enc`), at
-40 B, 64 B, 1 KiB and 64 KiB of `String` value (40 B is the one value stored
-below 64 B: 42 B of MessagePack). Two more price key rotation and short-lived processes:
+40 B, 64 B, 1 KiB and 64 KiB of `String` value (40 B, stored as 42 B of
+MessagePack, is the smallest case, where per-call fixed costs dominate). Two more price key rotation and short-lived processes:
 `prev` reads, L1 and L2 hits, on a client holding one previous key, of entries
 written under that key; `oneshot` builds an encrypting client (`enc` or `prev`)
 and reads one L2 hit, the cost a one-read process pays beyond its start-up.
