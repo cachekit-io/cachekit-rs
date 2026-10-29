@@ -1,10 +1,14 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use fred::interfaces::LuaInterface;
+use fred::clients::WithOptions;
+use fred::interfaces::{EventInterface, LuaInterface};
 use fred::prelude::*;
-use fred::types::ConnectHandle;
+use fred::types::{ConnectHandle, Options};
+use tokio::sync::broadcast::error::RecvError;
 
 use crate::backend::{nonzero_timeout, Backend, HealthStatus, LockableBackend, TtlInspectable};
 use crate::error::{BackendError, BackendErrorKind};
@@ -48,7 +52,13 @@ fn redis_err(e: RedisError) -> BackendError {
 ///
 /// Call [`connect`](RedisBackend::connect) before issuing any cache operations.
 pub struct RedisBackend {
-    client: RedisClient,
+    /// Every command goes through these options; they carry fred's
+    /// `fail_fast` when the offline queue is disabled.
+    client: WithOptions<RedisClient>,
+    /// Set once the connection has closed on a backend built with
+    /// [`disable_offline_queue`](RedisBackendBuilder::disable_offline_queue)
+    /// and no reconnect policy; `None` on every other backend.
+    closed: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for RedisBackend {
@@ -72,18 +82,56 @@ impl RedisBackend {
     /// task without stopping it: the connection, and any auto-reconnect,
     /// keeps running for as long as the backend is alive. The intent presets
     /// drop it for that reason. Keep it only to observe how the connection
-    /// ended: the task resolves when the connection closes for good (on a
-    /// fail-fast backend, the first dropped connection), with the error that
-    /// closed it, if any. Do not `abort` it while the backend is still in use.
+    /// ended: the task resolves when the connection closes for good, with the
+    /// error that closed it, if any. Without a reconnect policy that is the
+    /// first command to reach the dropped connection; with
+    /// [`disable_offline_queue`](RedisBackendBuilder::disable_offline_queue)
+    /// none may reach it, so the task may never resolve and failed commands
+    /// are the signal. Do not `abort` it while the backend is still in use.
     pub async fn connect(&self) -> Result<ConnectHandle, BackendError> {
-        self.client.init().await.map_err(redis_err)
+        let handle = self.client.init().await.map_err(redis_err)?;
+        if let Some(closed) = &self.closed {
+            closed.store(false, Ordering::Release);
+            watch_for_close(&self.client, Arc::clone(closed));
+        }
+        Ok(handle)
+    }
+
+    /// The client to send a command through, or, once the connection of a
+    /// backend without a reconnect policy has closed, the error every command
+    /// returns at once.
+    fn redis(&self) -> Result<&WithOptions<RedisClient>, BackendError> {
+        match &self.closed {
+            Some(closed) if closed.load(Ordering::Acquire) => Err(BackendError::transient(
+                "Redis connection closed; without auto_reconnect it is not re-established",
+            )),
+            _ => Ok(&self.client),
+        }
     }
 
     /// The fred client, so tests can read the options `build` gave it.
     #[cfg(test)]
-    pub(crate) fn client(&self) -> &RedisClient {
+    pub(crate) fn client(&self) -> &WithOptions<RedisClient> {
         &self.client
     }
+}
+
+/// Mark `closed` once fred reports the connection gone.
+///
+/// Without a reconnect policy, fred still reports the client as connected
+/// after the connection drops for good, so its `fail_fast` check never fires:
+/// every later command would wait in a queue that nothing reads again. fred
+/// broadcasts an error when a connection ends, and on a backend without a
+/// policy that is the only error it broadcasts after `init` succeeds.
+fn watch_for_close(client: &RedisClient, closed: Arc<AtomicBool>) {
+    let mut errors = client.error_rx();
+    tokio::spawn(async move {
+        // `Lagged` also means an error was broadcast; `Closed` means the
+        // client itself is gone, so there is nothing left to guard.
+        if !matches!(errors.recv().await, Err(RecvError::Closed)) {
+            closed.store(true, Ordering::Release);
+        }
+    });
 }
 
 // ── Backend impl ──────────────────────────────────────────────────────────────
@@ -93,7 +141,7 @@ impl RedisBackend {
 #[cfg_attr(feature = "unsync", async_trait(?Send))]
 impl Backend for RedisBackend {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
-        let result: Option<bytes::Bytes> = self.client.get(key).await.map_err(redis_err)?;
+        let result: Option<bytes::Bytes> = self.redis()?.get(key).await.map_err(redis_err)?;
         Ok(result.map(|b| b.to_vec()))
     }
 
@@ -107,25 +155,25 @@ impl Backend for RedisBackend {
             let secs = i64::try_from(d.as_secs().max(1)).unwrap_or(i64::MAX);
             Expiration::EX(secs)
         });
-        self.client
+        self.redis()?
             .set::<(), _, _>(key, value.as_slice(), expiration, None, false)
             .await
             .map_err(redis_err)
     }
 
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
-        let removed: i64 = self.client.del(key).await.map_err(redis_err)?;
+        let removed: i64 = self.redis()?.del(key).await.map_err(redis_err)?;
         Ok(removed > 0)
     }
 
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
-        let count: i64 = self.client.exists(key).await.map_err(redis_err)?;
+        let count: i64 = self.redis()?.exists(key).await.map_err(redis_err)?;
         Ok(count > 0)
     }
 
     async fn health(&self) -> Result<HealthStatus, BackendError> {
         let start = std::time::Instant::now();
-        let _pong: String = self.client.ping().await.map_err(redis_err)?;
+        let _pong: String = self.redis()?.ping().await.map_err(redis_err)?;
         let latency = start.elapsed();
 
         let mut details = HashMap::new();
@@ -154,7 +202,7 @@ impl TtlInspectable for RedisBackend {
         //   -2 → key does not exist
         //   -1 → key exists but has no TTL
         //   N  → remaining seconds
-        let secs: i64 = self.client.ttl(key).await.map_err(redis_err)?;
+        let secs: i64 = self.redis()?.ttl(key).await.map_err(redis_err)?;
         match secs {
             ..0 => Ok(None),
             n => Ok(Some(Duration::from_secs(n.unsigned_abs()))),
@@ -191,7 +239,7 @@ impl LockableBackend for RedisBackend {
 
         // SET NX PX: returns OK when the lock was free, nil when contested.
         let result: Option<String> = self
-            .client
+            .redis()?
             .set(
                 lock_key(key),
                 lock_id.as_str(),
@@ -207,7 +255,7 @@ impl LockableBackend for RedisBackend {
 
     async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError> {
         let deleted: i64 = self
-            .client
+            .redis()?
             .eval(RELEASE_LOCK_SCRIPT, vec![lock_key(key)], vec![lock_id])
             .await
             .map_err(redis_err)?;
@@ -252,6 +300,7 @@ pub struct RedisBackendBuilder {
     url: Option<String>,
     reconnect: Option<ReconnectPolicy>,
     command_timeout: Option<Duration>,
+    disable_offline_queue: bool,
 }
 
 impl RedisBackendBuilder {
@@ -312,10 +361,61 @@ impl RedisBackendBuilder {
     /// call records no outcome. With [`auto_reconnect`](Self::auto_reconnect)
     /// the budget is also the unresponsive-connection threshold.
     ///
+    /// A `tokio::time::timeout` shorter than the budget ends the caller's wait
+    /// but not the command. While the connection is down fred keeps such a
+    /// command queued, value included: with `auto_reconnect` it is sent after
+    /// the reconnect, and without it, it stays queued until the process
+    /// exits. [`disable_offline_queue`](Self::disable_offline_queue) fails
+    /// commands at once instead of queueing them.
+    ///
     /// `build` rejects `Duration::ZERO` with `CachekitError::Config`; fred
     /// reads zero as "no timeout".
     pub fn command_timeout(mut self, timeout: Duration) -> Self {
         self.command_timeout = Some(timeout);
+        self
+    }
+
+    /// Fail each command at once while the connection is down, instead of
+    /// queueing it until a reconnect. Off by default.
+    ///
+    /// By default fred queues every command sent while it has no connection,
+    /// with no limit. With [`auto_reconnect`](Self::auto_reconnect) the queue
+    /// is sent once the connection is back, including commands whose caller
+    /// has given up; without it, nothing reads the queue again, so it grows
+    /// until the process exits. With this option fred queues none of this
+    /// backend's commands while it is reconnecting, and, without
+    /// `auto_reconnect`, none after the connection has closed. A command
+    /// already written to the connection when fred notices the drop fails
+    /// then, instead of being sent again after the reconnect; it may have run
+    /// on the server.
+    ///
+    /// A refused command returns `BackendErrorKind::Transient`. Under the
+    /// reliability stack it is retried with backoff and counts toward
+    /// opening the circuit breaker.
+    ///
+    /// Not covered: commands sent before fred has noticed the drop and stopped
+    /// treating the connection as up. fred notices a closed connection at
+    /// once. It notices one that stays open but stops answering only through
+    /// the unresponsive check of `auto_reconnect`, after the command timeout
+    /// plus up to 2 s; until then commands are written to it. Most commands
+    /// sent in that window fail when fred notices the drop, but some can
+    /// still be sent after the reconnect.
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), cachekit::CachekitError> {
+    /// use cachekit::backend::redis::RedisBackend;
+    ///
+    /// let backend = RedisBackend::builder()
+    ///     .url("redis://localhost:6379")
+    ///     .auto_reconnect()
+    ///     .disable_offline_queue()
+    ///     .build()?;
+    /// let _connection = backend.connect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn disable_offline_queue(mut self) -> Self {
+        self.disable_offline_queue = true;
         self
     }
 
@@ -343,9 +443,19 @@ impl RedisBackendBuilder {
         let command_timeout =
             nonzero_timeout("command_timeout", self.command_timeout, COMMAND_TIMEOUT)?;
 
-        let (perf, connection) = fred_options(self.reconnect.is_some(), command_timeout);
-        let client = RedisClient::new(config, Some(perf), Some(connection), self.reconnect);
-        Ok(RedisBackend { client })
+        let reconnects = self.reconnect.is_some();
+        let (perf, connection) = fred_options(reconnects, command_timeout);
+        // fred's per-command `fail_fast` refuses a command while the client is
+        // not connected. Without a reconnect policy fred never leaves the
+        // connected state, so `closed` covers that case.
+        let options = Options {
+            fail_fast: self.disable_offline_queue,
+            ..Default::default()
+        };
+        let client = RedisClient::new(config, Some(perf), Some(connection), self.reconnect)
+            .with_options(&options);
+        let closed = (self.disable_offline_queue && !reconnects).then(Arc::default);
+        Ok(RedisBackend { client, closed })
     }
 }
 
@@ -489,5 +599,38 @@ mod tests {
             matches!(&err, crate::error::CachekitError::Config(m) if m.contains("command_timeout")),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn offline_queue_is_on_by_default() {
+        for builder in [
+            RedisBackend::builder().url(URL),
+            RedisBackend::builder().url(URL).auto_reconnect(),
+        ] {
+            let backend = builder.build().expect("builds");
+            assert!(!backend.client().options().fail_fast);
+            assert!(backend.closed.is_none());
+        }
+    }
+
+    #[test]
+    fn disable_offline_queue_fails_fast_without_bounding_the_command_channel() {
+        for reconnects in [false, true] {
+            let mut builder = RedisBackend::builder().url(URL).disable_offline_queue();
+            if reconnects {
+                builder = builder.auto_reconnect();
+            }
+            let backend = builder.build().expect("builds");
+            assert!(backend.client().options().fail_fast);
+            // fred sends its own reconnect request through the command
+            // channel; a length bound on that channel could refuse it.
+            assert_eq!(
+                backend.client().connection_config().max_command_buffer_len,
+                0
+            );
+            // Without a policy fred never leaves the connected state, so only
+            // the close watcher can see the connection go.
+            assert_eq!(backend.closed.is_some(), !reconnects);
+        }
     }
 }

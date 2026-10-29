@@ -139,8 +139,8 @@ fn reconnecting_redis(
 impl CacheKit {
     /// **Minimal** — speed-first Redis cache, no extras.
     ///
-    /// * Backend: Redis (connects eagerly; **fails fast** — a dropped
-    ///   connection is not re-established)
+    /// * Backend: Redis (connects eagerly; a dropped connection is **not
+    ///   re-established**)
     /// * L1 cache: **on** (1 000 entries, **no SWR / invalidation**) — an L1
     ///   hit is served as-is until it expires, so a read may return an entry
     ///   up to its TTL (300 s by default) after another process changed it
