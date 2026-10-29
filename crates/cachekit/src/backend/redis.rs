@@ -210,8 +210,8 @@ const REPROBE_DELAY: Duration = Duration::from_secs(1);
 /// each reconnect and after missed events. The probe runs alongside the event
 /// channels, so a drop is handled at once even while a probe waits, and a drop
 /// cancels the probe: an answer from before it proves nothing. A probe that
-/// gets no answer is repeated every [`REPROBE_DELAY`], one at a time, until one
-/// is answered or a drop arrives: a server that stalled past the command
+/// gets no answer is repeated [`REPROBE_DELAY`] after it ends, one at a time,
+/// until one is answered or a drop arrives: a server that stalled past the command
 /// timeout and then recovered sends no further event. Without a policy
 /// (`probe` is `None`) the only reconnect event is the first connect and a drop
 /// is final, so reconnect events are ignored and nothing is probed.
@@ -555,7 +555,8 @@ impl RedisBackendBuilder {
     /// connection is back, and, without `auto_reconnect`, none after it.
     /// "Back" means the server answered a PING after fred reported the
     /// reconnect. While the backend waits for that answer, its PING sits in
-    /// fred's queue, and it repeats the PING each second until one is
+    /// fred's queue. A PING can wait up to the command timeout; one second
+    /// after an unanswered one ends, the backend sends another, until one is
     /// answered. A drop fred reports meanwhile marks the connection down at
     /// once and leaves that PING queued until the next reconnect.
     /// A command already written to the connection when fred notices the drop
