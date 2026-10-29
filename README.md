@@ -118,8 +118,8 @@ async fn main() -> Result<(), CachekitError> {
 
 **Resilience contract** — connection failures, at construction and mid-run:
 
-- `production` / `secure` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely. To get the same policy on a backend you build yourself, for example one `RedisBackend` shared by several clients through `CacheKitBuilder::backend`, call `RedisBackendBuilder::auto_reconnect()` (see [Redis](#redis)). A backend built without it is fail-fast like `minimal`.
-- `minimal` is **fail-fast**: a dropped connection is not re-established — every subsequent operation that reaches Redis errors until you rebuild the client. Reads served from a warm L1 entry still return without contacting Redis.
+- `production` / `secure` **auto-reconnect**: a dropped connection is re-established with exponential backoff (100 ms → 30 s cap), retrying indefinitely. To get the same policy on a backend you build yourself, for example one `RedisBackend` shared by several clients through `CacheKitBuilder::backend`, call `RedisBackendBuilder::auto_reconnect()` (see [Redis](#redis)). A backend built without it does not reconnect, like `minimal`. While a connection is down, operations queue until the reconnect; `RedisBackendBuilder::disable_offline_queue()` fails them at once instead.
+- `minimal` does **not reconnect**: a dropped connection is not re-established, and every later operation that reaches Redis errors until you rebuild the client: the first at once, each later one after the 5 s command timeout (see [Redis](#redis)). Reads served from a warm L1 entry still return without contacting Redis.
 - **Initial** connections fail fast for every Redis preset: a bad URL or unreachable Redis errors immediately at construction, never enters a retry loop. `io` opens no connection at construction: an empty API key fails at construction, while an invalid key or unreachable endpoint surfaces at the first request.
 - `secure` / `secure_from_env` validate the master key (and `secure_from_env` any previous keys) **before** any Redis connection is attempted — a missing, non-hex or short key, or a malformed `CACHEKIT_PREVIOUS_MASTER_KEYS`, is a deterministic local error, never masked by (or paying for) network I/O, and never a fallback to plaintext.
 - Auto-reconnect is connection-level repair, distinct from the per-operation [reliability stack](#reliability) (retry, circuit breaker, backpressure) that `production` / `secure` / `io` also enable. `minimal` has neither — every failure is yours to handle.
@@ -377,13 +377,20 @@ let backend = RedisBackend::builder()
     .url("redis://localhost:6379")
     .auto_reconnect()                            // optional: the production/secure policy
     .command_timeout(Duration::from_millis(500)) // optional: default 5 s
+    .disable_offline_queue()                     // optional: fail at once while disconnected
     .build()?;
 backend.connect().await?;  // explicit connect required
 ```
 
-Without `.auto_reconnect()` the backend is fail-fast: after Redis restarts, every operation errors until you rebuild it.
+Without `.auto_reconnect()` a dropped connection is not re-established: after Redis restarts, every operation errors until you rebuild the backend.
 
-`connect` returns fred's `ConnectHandle`, the task driving the connection. Discarding it, as above and in the presets, leaves the connection and any auto-reconnect running; keep it only to await the error, if any, that finally closed the connection.
+**Commands sent while the connection is down.** By default fred queues them, with no limit and value included, including ones whose caller has given up: a `tokio::time::timeout` shorter than the command timeout ends the wait, not the command. With `.auto_reconnect()` the queue is sent after the reconnect. Without it, only the first operation after the drop errors at once; each later one waits out the command timeout and stays queued until the backend is dropped. `.disable_offline_queue()` fails each command at once instead, with `BackendErrorKind::Transient`, which the reliability stack retries and counts toward the circuit breaker.
+
+With it, the backend queues none of its commands from the moment fred reports the drop until the connection is back, or, without `.auto_reconnect()`, ever after. "Back" means the server answered a PING the backend sent after the last drop fred reported. These PINGs pass the same guard as any command, so while fred is reconnecting they fail at once instead of queueing. While the connection is down, the backend sends one when fred reports a reconnect, and another one second after each unanswered one ends, until one is answered. A drop reported meanwhile marks the connection down at once, and the answer to a PING sent before it no longer counts. A command already written to the connection when fred notices the drop fails instead of being sent again after the reconnect; it may have run on the server. Lock release is the exception: a release already written when the connection drops can be sent again after the reconnect, which is harmless because it deletes the lock only while the lock still holds the caller's token. fred does not promise that resend: it skips a release whose caller waited out the command timeout, and can drop one during a long outage, and the lock then stays until its TTL. A release called while the connection is down is refused like any other command. Not covered: commands sent before fred reports the drop. A closed connection is noticed at once. One that stays open but stops answering is noticed only by `.auto_reconnect()`'s unresponsive check, up to 4 s after the command timeout. Most commands sent in that window fail when fred notices, but some can still be sent after the reconnect.
+
+The backend follows fred's connection events, so with the option `connect` may be called once per backend (a second call returns `BackendErrorKind::Permanent`, even after a first call that failed; build a new backend to try again), and `build()` rejects the option on a Redis Cluster URL. The option is off by default and in every preset.
+
+`connect` returns fred's `ConnectHandle`, the task driving the connection. Discarding it, as above and in the presets, leaves the connection and any auto-reconnect running; keep it only to await the error, if any, that finally closed the connection. On a backend with `.disable_offline_queue()` and no `.auto_reconnect()` it may never resolve, because no command reaches the closed connection; failed commands are the signal there.
 
 ### Memcached
 

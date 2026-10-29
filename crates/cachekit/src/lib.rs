@@ -21,8 +21,8 @@
 //! backend ops — see [`reliability`]. Requires the default-on `reliability`
 //! cargo feature.
 //! ² `production`/`secure` re-establish a dropped Redis connection with
-//! exponential backoff (100 ms → 30 s, retrying indefinitely); `minimal` is
-//! fail-fast (a dropped connection stays dead). **Initial** connections fail
+//! exponential backoff (100 ms → 30 s, retrying indefinitely); `minimal` does
+//! not reconnect (a dropped connection stays dead). **Initial** connections fail
 //! fast for every Redis preset — `io` opens no connection at construction: an
 //! empty API key fails at construction, while an invalid key or unreachable
 //! endpoint surfaces at the first request.

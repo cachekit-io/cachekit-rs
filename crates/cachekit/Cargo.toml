@@ -28,7 +28,10 @@ name = "cachekit"
 [features]
 default = ["cachekitio", "encryption", "l1", "reliability"]
 cachekitio = ["dep:reqwest", "dep:serde_json"]
-redis = ["dep:fred"]
+# tokio/rt, tokio/macros and tokio/time run the task that follows fred's
+# connection events on a backend built with `disable_offline_queue` (spawn,
+# select!, the pause between probes). fred already turns on rt and macros.
+redis = ["dep:fred", "tokio/rt", "tokio/macros", "tokio/time"]
 # Memcached backend (native only). rust-memcache is sync (r2d2-pooled, socket
 # read/write timeouts); ops run on tokio's blocking pool via spawn_blocking,
 # each under a tokio/time budget so a wedged server can't hang callers.
@@ -78,8 +81,8 @@ url = "2"
 uuid = { version = "1", features = ["v4", "js"] }
 # `sync` only: runtime-independent primitives for cold-miss single-flight.
 # Compiles on wasm32. Features stack per consumer: `reliability` adds `time`
-# (native only); the `memcached`/`file` backends add `rt` (spawn_blocking) —
-# see the feature declarations above.
+# (native only); the `memcached`/`file` backends add `rt` (spawn_blocking) and
+# `redis` adds `rt`, `macros` and `time` — see the feature declarations above.
 tokio = { version = "1", default-features = false, features = ["sync"] }
 
 # Optional: HTTP backend (native)
