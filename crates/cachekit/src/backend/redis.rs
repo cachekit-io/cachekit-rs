@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use fred::clients::WithOptions;
 use fred::interfaces::{EventInterface, LuaInterface};
 use fred::prelude::*;
-use fred::types::{ClientState, ConnectHandle, Options};
+use fred::types::{ConnectHandle, Options};
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::task::{AbortHandle, JoinHandle};
 
@@ -161,46 +161,103 @@ impl RedisBackend {
 /// established. (Redis Cluster is excluded at `build`: there an error can come
 /// from one node while the others serve.)
 fn watch_connection(client: &RedisClient, down: Arc<AtomicBool>) -> JoinHandle<()> {
-    let mut errors = client.error_rx();
-    let mut reconnects = client.reconnect_rx();
-    let client = client.clone();
-    tokio::spawn(async move {
-        loop {
-            // Errors come first when both are pending: a drop followed by a
-            // reconnect must end up `false`. (A reconnect followed at once by
-            // a drop then ends up `false` too; fred's `fail_fast` covers that
-            // drop from its first reconnect attempt on.) `Closed` means the
-            // client is gone, so there is nothing left to guard.
-            let is_down = tokio::select! {
-                biased;
-                event = errors.recv() => match event {
-                    Ok(_) => true,
-                    Err(RecvError::Lagged(_)) => resync(&client, &mut errors, &mut reconnects),
-                    Err(RecvError::Closed) => return,
-                },
-                event = reconnects.recv() => match event {
-                    Ok(_) => false,
-                    Err(RecvError::Lagged(_)) => resync(&client, &mut errors, &mut reconnects),
-                    Err(RecvError::Closed) => return,
-                },
-            };
-            down.store(is_down, Ordering::Release);
+    let errors = client.error_rx();
+    let reconnects = client.reconnect_rx();
+    let probe = client.client_reconnect_policy().is_some().then(|| {
+        let client = client.clone();
+        move || {
+            let client = client.clone();
+            async move { answered(client.ping::<()>().await) }
         }
-    })
+    });
+    tokio::spawn(async move { follow_connection(errors, reconnects, &down, probe).await })
 }
 
-/// After the watcher missed events, the order of those still buffered across
-/// the two channels is lost, so drop them and read fred's client state
-/// instead. That state reads `Connected` during the first reconnect backoff;
-/// fred's `fail_fast` covers the drop from its first reconnect attempt on.
-fn resync(
-    client: &RedisClient,
-    errors: &mut broadcast::Receiver<RedisError>,
-    reconnects: &mut broadcast::Receiver<Server>,
-) -> bool {
-    *errors = errors.resubscribe();
-    *reconnects = reconnects.resubscribe();
-    client.state() != ClientState::Connected
+/// Whether the server replied, an error reply included: a user without
+/// `+ping` still answers.
+fn answered(ping: RedisResult<()>) -> bool {
+    !matches!(
+        ping,
+        Err(e) if matches!(e.kind(), RedisErrorKind::IO | RedisErrorKind::Canceled | RedisErrorKind::Timeout)
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionEvent {
+    Dropped,
+    Reconnected,
+    /// The watcher fell behind and the channel dropped events.
+    Missed,
+}
+
+/// The watcher's state machine, apart from fred so it can be tested.
+///
+/// The two channels carry no common order, so a watcher that falls behind
+/// cannot tell an old reconnect from a new one. A drop therefore always marks
+/// the connection down, and nothing marks it up on an event's word alone.
+/// With a reconnect policy, `probe` (a PING through the bare client, which
+/// waits for a reconnect in progress instead of failing at once) decides after
+/// each reconnect and after missed events; a probe that gets no answer leaves
+/// `down` as it is, and fred's next drop or reconnect brings another event.
+/// Without a policy (`probe` is `None`) the only reconnect event is the first
+/// connect and a drop is final, so reconnect events are ignored.
+async fn follow_connection<P, F>(
+    mut errors: broadcast::Receiver<RedisError>,
+    mut reconnects: broadcast::Receiver<Server>,
+    down: &AtomicBool,
+    probe: Option<P>,
+) where
+    P: Fn() -> F,
+    F: std::future::Future<Output = bool>,
+{
+    let (mut errors_open, mut reconnects_open) = (true, true);
+    loop {
+        let event = tokio::select! {
+            biased;
+            event = errors.recv(), if errors_open => match event {
+                Ok(_) => Some(ConnectionEvent::Dropped),
+                Err(RecvError::Lagged(_)) => Some(ConnectionEvent::Missed),
+                Err(RecvError::Closed) => {
+                    errors_open = false;
+                    None
+                }
+            },
+            event = reconnects.recv(), if reconnects_open => match event {
+                Ok(_) => Some(ConnectionEvent::Reconnected),
+                Err(RecvError::Lagged(_)) => Some(ConnectionEvent::Missed),
+                Err(RecvError::Closed) => {
+                    reconnects_open = false;
+                    None
+                }
+            },
+            // Both closed: the client is gone, so there is nothing to guard.
+            else => return,
+        };
+        let Some(event) = event else { continue };
+        let Some(probe) = &probe else {
+            if event != ConnectionEvent::Reconnected {
+                down.store(true, Ordering::Release);
+            }
+            continue;
+        };
+        match event {
+            ConnectionEvent::Dropped => down.store(true, Ordering::Release),
+            ConnectionEvent::Reconnected => {
+                if probe().await {
+                    down.store(false, Ordering::Release);
+                }
+            }
+            ConnectionEvent::Missed => {
+                // What is still buffered has lost its order: start afresh.
+                errors = errors.resubscribe();
+                reconnects = reconnects.resubscribe();
+                down.store(true, Ordering::Release);
+                if probe().await {
+                    down.store(false, Ordering::Release);
+                }
+            }
+        }
+    }
 }
 
 // ── Backend impl ──────────────────────────────────────────────────────────────
@@ -454,6 +511,9 @@ impl RedisBackendBuilder {
     /// until the backend is dropped. With this option the backend queues
     /// none of its commands from the moment fred reports the drop until the
     /// connection is back, and, without `auto_reconnect`, none after it.
+    /// "Back" means the server answered a PING after fred reported the
+    /// reconnect; while it waits for that answer, the backend holds that one
+    /// PING of its own in fred's queue.
     /// A command already written to the connection when fred notices the drop
     /// fails then, instead of being sent again after the reconnect; it may
     /// have run on the server. (Lock release is the exception: it is sent
@@ -730,5 +790,95 @@ mod tests {
             matches!(&err, crate::error::CachekitError::Config(m) if m.contains("Cluster")),
             "{err:?}"
         );
+    }
+
+    // ── follow_connection ────────────────────────────────────────────────────
+
+    use ConnectionEvent::{Dropped, Reconnected};
+
+    /// Run the watcher over `events`, all sent before it runs (the case of a
+    /// watcher that fell behind), then close both channels. Returns the final
+    /// `down` and the number of probes. `probe` is the probe's answer, or
+    /// `None` for a backend without a reconnect policy.
+    async fn follow(
+        events: &[ConnectionEvent],
+        capacity: usize,
+        probe: Option<bool>,
+    ) -> (bool, usize) {
+        let (errors, errors_rx) = broadcast::channel(capacity);
+        let (reconnects, reconnects_rx) = broadcast::channel(capacity);
+        for event in events {
+            // `send` fails only once every receiver is gone.
+            let sent = match event {
+                Dropped => errors
+                    .send(RedisError::new(RedisErrorKind::IO, "closed"))
+                    .is_ok(),
+                _ => reconnects.send(Server::new("localhost", 6379)).is_ok(),
+            };
+            assert!(sent);
+        }
+        drop((errors, reconnects));
+
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let probe = probe.map(|answer| {
+            let probes = &probes;
+            move || {
+                probes.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(answer)
+            }
+        });
+        let down = AtomicBool::new(false);
+        follow_connection(errors_rx, reconnects_rx, &down, probe).await;
+        (down.load(Ordering::Acquire), probes.load(Ordering::Relaxed))
+    }
+
+    #[tokio::test]
+    async fn a_drop_after_the_first_connect_is_final_without_a_policy() {
+        // The first connect's reconnect event and the drop are both pending;
+        // the drop is processed first, and the older reconnect must not undo it.
+        assert_eq!(follow(&[Reconnected, Dropped], 32, None).await, (true, 0));
+        assert_eq!(follow(&[Dropped, Reconnected], 32, None).await, (true, 0));
+        assert_eq!(follow(&[Reconnected], 32, None).await, (false, 0));
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_clears_a_drop_only_once_the_server_answers() {
+        // An older reconnect read after a newer drop: the probe gets no answer.
+        assert_eq!(
+            follow(&[Reconnected, Dropped], 32, Some(false)).await,
+            (true, 1)
+        );
+        // A drop then a reconnect: the probe gets an answer.
+        assert_eq!(
+            follow(&[Dropped, Reconnected], 32, Some(true)).await,
+            (false, 1)
+        );
+        assert_eq!(follow(&[Dropped], 32, Some(true)).await, (true, 0));
+    }
+
+    #[tokio::test]
+    async fn missed_events_are_settled_by_a_probe() {
+        // Five drops overflow a channel of two, so the reconnect after them
+        // is dropped with the backlog: only the probe can clear `down`.
+        let overflow = [Dropped, Dropped, Dropped, Dropped, Dropped, Reconnected];
+        assert_eq!(follow(&overflow, 2, Some(true)).await, (false, 1));
+        assert_eq!(follow(&overflow, 2, Some(false)).await, (true, 1));
+        assert_eq!(follow(&overflow, 2, None).await, (true, 0));
+    }
+
+    #[test]
+    fn any_reply_counts_as_an_answer() {
+        assert!(answered(Ok(())));
+        assert!(answered(Err(RedisError::new(
+            RedisErrorKind::Unknown,
+            "NOPERM this user has no permissions to run the 'ping' command"
+        ))));
+        for kind in [
+            RedisErrorKind::IO,
+            RedisErrorKind::Canceled,
+            RedisErrorKind::Timeout,
+        ] {
+            assert!(!answered(Err(RedisError::new(kind, "no reply"))));
+        }
     }
 }
