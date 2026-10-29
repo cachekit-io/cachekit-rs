@@ -648,6 +648,38 @@ mod redis_tests {
             eprintln!("redis_disable_offline_queue_connects_once: second call refused after a failed, a cancelled and a successful first call");
         }
 
+        /// Dropping the backend stops the task that follows fred's connection
+        /// events. fred's own connection task lives on (nothing quits it on
+        /// drop), so the runtime's task count falls by exactly that one task.
+        #[tokio::test]
+        #[allow(clippy::expect_used)] // test-only: failures should panic loudly
+        async fn redis_disable_offline_queue_watcher_stops_with_the_backend() {
+            let Ok(url) = std::env::var("CACHEKIT_TEST_REDIS_URL") else {
+                eprintln!("skipping redis_disable_offline_queue_watcher_stops_with_the_backend: CACHEKIT_TEST_REDIS_URL not set");
+                return;
+            };
+            let metrics = tokio::runtime::Handle::current().metrics();
+            let backend = RedisBackendBuilder::default()
+                .url(&url)
+                .auto_reconnect()
+                .disable_offline_queue()
+                .build()
+                .expect("builder should succeed");
+            let _handle = backend.connect().await.expect("redis should be reachable");
+            backend.health().await.expect("connected");
+            let with_backend = metrics.num_alive_tasks();
+
+            drop(backend);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while metrics.num_alive_tasks() != with_backend - 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the watcher outlived the backend");
+            eprintln!("redis_disable_offline_queue_watcher_stops_with_the_backend: {with_backend} tasks -> {}", with_backend - 1);
+        }
+
         /// The option refuses only while the connection is down: a burst far
         /// larger than any queue length a caller would pick goes through on a
         /// healthy connection. (A fred `max_command_buffer_len` of N refused most

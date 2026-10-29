@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use fred::clients::WithOptions;
 use fred::interfaces::{EventInterface, LuaInterface};
 use fred::prelude::*;
-use fred::types::{ConnectHandle, Options};
-use tokio::sync::broadcast::error::RecvError;
+use fred::types::{ClientState, ConnectHandle, Options};
+use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::backend::{nonzero_timeout, Backend, HealthStatus, LockableBackend, TtlInspectable};
 use crate::error::{BackendError, BackendErrorKind};
@@ -68,6 +69,18 @@ struct OfflineGuard {
     down: Arc<AtomicBool>,
     /// Set by the first call to `connect`.
     connect_called: AtomicBool,
+    /// The task following fred's connection events. fred's reconnect task
+    /// keeps the event channels open after the backend is dropped, so the
+    /// task is aborted with the backend instead of waiting for them to close.
+    watcher: OnceLock<AbortHandle>,
+}
+
+impl Drop for OfflineGuard {
+    fn drop(&mut self) {
+        if let Some(watcher) = self.watcher.get() {
+            watcher.abort();
+        }
+    }
 }
 
 impl std::fmt::Debug for RedisBackend {
@@ -114,11 +127,9 @@ impl RedisBackend {
         }
         // Before `init`, so no event is missed, and so the watcher runs even if
         // this future is dropped while fred's connection task carries on.
-        watch_connection(
-            self.client.error_rx(),
-            self.client.reconnect_rx(),
-            Arc::clone(&guard.down),
-        );
+        let watcher = watch_connection(&self.client, Arc::clone(&guard.down));
+        // `connect_called` lets only the first call get here.
+        let _ = guard.watcher.set(watcher.abort_handle());
         self.client.init().await.map_err(redis_err)
     }
 
@@ -149,33 +160,47 @@ impl RedisBackend {
 /// ends or a reconnect attempt fails, and a reconnect event each time one is
 /// established. (Redis Cluster is excluded at `build`: there an error can come
 /// from one node while the others serve.)
-fn watch_connection(
-    mut errors: tokio::sync::broadcast::Receiver<RedisError>,
-    mut reconnects: tokio::sync::broadcast::Receiver<Server>,
-    down: Arc<AtomicBool>,
-) {
+fn watch_connection(client: &RedisClient, down: Arc<AtomicBool>) -> JoinHandle<()> {
+    let mut errors = client.error_rx();
+    let mut reconnects = client.reconnect_rx();
+    let client = client.clone();
     tokio::spawn(async move {
         loop {
-            // `Lagged` still means the event happened. `Closed` means the
-            // client is gone, so there is nothing left to guard. Errors come
-            // first when both are pending: a drop followed by a reconnect
-            // must end up `false`. (A reconnect followed at once by a drop
-            // then ends up `false` too; fred's `fail_fast` covers that drop
-            // from its first reconnect attempt on.)
+            // Errors come first when both are pending: a drop followed by a
+            // reconnect must end up `false`. (A reconnect followed at once by
+            // a drop then ends up `false` too; fred's `fail_fast` covers that
+            // drop from its first reconnect attempt on.) `Closed` means the
+            // client is gone, so there is nothing left to guard.
             let is_down = tokio::select! {
                 biased;
                 event = errors.recv() => match event {
+                    Ok(_) => true,
+                    Err(RecvError::Lagged(_)) => resync(&client, &mut errors, &mut reconnects),
                     Err(RecvError::Closed) => return,
-                    _ => true,
                 },
                 event = reconnects.recv() => match event {
+                    Ok(_) => false,
+                    Err(RecvError::Lagged(_)) => resync(&client, &mut errors, &mut reconnects),
                     Err(RecvError::Closed) => return,
-                    _ => false,
                 },
             };
             down.store(is_down, Ordering::Release);
         }
-    });
+    })
+}
+
+/// After the watcher missed events, the order of those still buffered across
+/// the two channels is lost, so drop them and read fred's client state
+/// instead. That state reads `Connected` during the first reconnect backoff;
+/// fred's `fail_fast` covers the drop from its first reconnect attempt on.
+fn resync(
+    client: &RedisClient,
+    errors: &mut broadcast::Receiver<RedisError>,
+    reconnects: &mut broadcast::Receiver<Server>,
+) -> bool {
+    *errors = errors.resubscribe();
+    *reconnects = reconnects.resubscribe();
+    client.state() != ClientState::Connected
 }
 
 // ── Backend impl ──────────────────────────────────────────────────────────────
