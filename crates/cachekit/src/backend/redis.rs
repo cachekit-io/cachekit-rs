@@ -208,10 +208,12 @@ const REPROBE_DELAY: Duration = Duration::from_secs(1);
 /// With a reconnect policy, `probe` (a PING through the bare client, which
 /// waits for a reconnect in progress instead of failing at once) decides after
 /// each reconnect and after missed events. The probe runs alongside the event
-/// channels, so a drop is handled at once even while a probe waits, and a drop
-/// cancels the probe: an answer from before it proves nothing. A probe that
-/// gets no answer is repeated [`REPROBE_DELAY`] after it ends, one at a time,
-/// until one is answered or a drop arrives: a server that stalled past the command
+/// channels, so a drop is handled at once even while a probe waits. A drop
+/// replaces the probe in flight with a fresh one: the drop may be older than
+/// the reconnect that started the probe, and an answer from before the drop
+/// proves nothing. A probe started by a reconnect or missed events that gets
+/// no answer is repeated [`REPROBE_DELAY`] after it ends, one at a time, until
+/// one is answered or a drop arrives: a server that stalled past the command
 /// timeout and then recovered sends no further event. Without a policy
 /// (`probe` is `None`) the only reconnect event is the first connect and a drop
 /// is final, so reconnect events are ignored and nothing is probed.
@@ -226,6 +228,8 @@ async fn follow_connection<P, F>(
 {
     let (mut errors_open, mut reconnects_open) = (true, true);
     let mut probing: Option<Pin<Box<F>>> = None;
+    // Whether the probe in flight is repeated if it gets no answer.
+    let mut repeat = false;
     let mut unsettled = false;
     loop {
         let retry = unsettled && probing.is_none() && errors_open && reconnects_open;
@@ -264,14 +268,22 @@ async fn follow_connection<P, F>(
         match event {
             ConnectionEvent::Dropped => {
                 down.store(true, Ordering::Release);
-                probing = None;
                 unsettled = false;
+                // This drop may be older than the reconnect that started the
+                // probe in flight, whose answer could then predate the drop.
+                // Only a PING sent after the drop tells. If it gets no answer
+                // it is not repeated: a real drop brings a reconnect event.
+                if probing.is_some() {
+                    probing = Some(Box::pin(probe()));
+                    repeat = false;
+                }
             }
-            // A probe already in flight began after the last drop, so its
-            // answer still counts.
-            ConnectionEvent::Reconnected if probing.is_some() => {}
+            // A probe already in flight began after the last drop the watcher
+            // read, so its answer still counts.
+            ConnectionEvent::Reconnected if probing.is_some() => repeat = true,
             ConnectionEvent::Reconnected | ConnectionEvent::Unsettled => {
                 probing = Some(Box::pin(probe()));
+                repeat = true;
             }
             ConnectionEvent::Missed => {
                 // What is still buffered has lost its order, and may hide a
@@ -280,10 +292,11 @@ async fn follow_connection<P, F>(
                 reconnects = reconnects.resubscribe();
                 down.store(true, Ordering::Release);
                 probing = Some(Box::pin(probe()));
+                repeat = true;
             }
             ConnectionEvent::Probed(answered) => {
                 probing = None;
-                unsettled = !answered;
+                unsettled = !answered && repeat;
                 if answered {
                     down.store(false, Ordering::Release);
                 }
@@ -558,7 +571,9 @@ impl RedisBackendBuilder {
     /// fred's queue. A PING can wait up to the command timeout; one second
     /// after an unanswered one ends, the backend sends another, until one is
     /// answered. A drop fred reports meanwhile marks the connection down at
-    /// once and leaves that PING queued until the next reconnect.
+    /// once, and the backend sends one fresh PING, because the drop may
+    /// predate the reconnect; the earlier PING stays queued until the next
+    /// reconnect.
     /// A command already written to the connection when fred notices the drop
     /// fails then, instead of being sent again after the reconnect; it may
     /// have run on the server. (Lock release is the exception: a release
@@ -969,54 +984,112 @@ mod tests {
         drop((errors, reconnects));
         task.await.expect("watcher ends with the channels");
     }
-
-    #[tokio::test]
-    async fn a_drop_is_handled_while_a_probe_waits() {
-        // The first connect's probe still waits for its PING when the
-        // connection closes: the drop must not wait for the probe.
+    /// A watcher on open channels whose probes follow `script` in turn: `None`
+    /// waits forever (a PING with no answer yet), `Some(answer)` answers at
+    /// once. Probes past the script wait forever.
+    #[allow(clippy::type_complexity)]
+    fn scripted_watcher(
+        script: Vec<Option<bool>>,
+    ) -> (
+        (broadcast::Sender<RedisError>, broadcast::Sender<Server>),
+        Arc<AtomicBool>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (errors, errors_rx) = broadcast::channel(32);
         let (reconnects, reconnects_rx) = broadcast::channel(32);
         let down = Arc::new(AtomicBool::new(false));
         let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let probe = {
             let probes = Arc::clone(&probes);
-            move || {
-                probes.fetch_add(1, Ordering::Relaxed);
-                std::future::pending::<bool>()
+            move || -> Pin<Box<dyn Future<Output = bool> + Send>> {
+                let n = probes.fetch_add(1, Ordering::Relaxed);
+                match script.get(n).copied().flatten() {
+                    Some(answer) => Box::pin(std::future::ready(answer)),
+                    None => Box::pin(std::future::pending()),
+                }
             }
         };
         let task = tokio::spawn({
             let down = Arc::clone(&down);
             async move { follow_connection(errors_rx, reconnects_rx, &down, Some(probe)).await }
         });
+        ((errors, reconnects), down, probes, task)
+    }
 
-        reconnects
-            .send(Server::new("localhost", 6379))
-            .expect("watcher listening");
-        while probes.load(Ordering::Relaxed) == 0 {
+    fn reconnect_event() -> Server {
+        Server::new("localhost", 6379)
+    }
+
+    /// Yield to the watcher until `condition` holds. Counted in yields, not
+    /// time, so it also ends under a paused clock.
+    async fn until(condition: impl Fn() -> bool) {
+        for _ in 0..10_000 {
+            if condition() {
+                return;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(condition(), "condition never held");
+    }
+
+    #[tokio::test]
+    async fn a_drop_is_handled_while_a_probe_waits() {
+        // The first connect's probe still waits for its PING when the
+        // connection closes: the drop must not wait for the probe.
+        let ((errors, reconnects), down, probes, task) = scripted_watcher(vec![]);
+        reconnects
+            .send(reconnect_event())
+            .expect("watcher listening");
+        until(|| probes.load(Ordering::Relaxed) == 1).await;
         // A second reconnect leaves the probe in flight alone.
         reconnects
-            .send(Server::new("localhost", 6379))
+            .send(reconnect_event())
             .expect("watcher listening");
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
         assert_eq!(probes.load(Ordering::Relaxed), 1);
-        errors.send(drop_event()).expect("watcher listening");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !down.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the drop waited for the probe");
-        assert_eq!(probes.load(Ordering::Relaxed), 1);
 
-        drop((errors, reconnects));
-        task.await
-            .expect("the drop cancelled the probe, so the watcher ends");
+        errors.send(drop_event()).expect("watcher listening");
+        until(|| down.load(Ordering::Acquire)).await;
+        // The drop replaced the probe in flight with a fresh one.
+        until(|| probes.load(Ordering::Relaxed) == 2).await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_drop_older_than_the_reconnect_is_settled_by_a_fresh_probe() {
+        // The channels share no order: the watcher can read a reconnect, start
+        // its probe, and only then read a drop from before that reconnect. On a
+        // healthy connection no further event comes, so the fresh probe the drop
+        // starts must clear `down`.
+        let ((errors, reconnects), down, probes, task) = scripted_watcher(vec![None, Some(true)]);
+        reconnects
+            .send(reconnect_event())
+            .expect("watcher listening");
+        until(|| probes.load(Ordering::Relaxed) == 1).await;
+        errors.send(drop_event()).expect("watcher listening");
+        until(|| probes.load(Ordering::Relaxed) == 2).await;
+        until(|| !down.load(Ordering::Acquire)).await;
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_probe_after_a_drop_is_not_repeated() {
+        // A real drop brings a reconnect event, so an unanswered probe the drop
+        // started is left at that: no PING piles up in fred during the outage.
+        let ((errors, reconnects), down, probes, task) = scripted_watcher(vec![None, Some(false)]);
+        reconnects
+            .send(reconnect_event())
+            .expect("watcher listening");
+        until(|| probes.load(Ordering::Relaxed) == 1).await;
+        errors.send(drop_event()).expect("watcher listening");
+        until(|| probes.load(Ordering::Relaxed) == 2).await;
+        tokio::time::sleep(REPROBE_DELAY * 10).await;
+        assert_eq!(probes.load(Ordering::Relaxed), 2);
+        assert!(down.load(Ordering::Acquire));
+        task.abort();
     }
 
     #[tokio::test(start_paused = true)]
