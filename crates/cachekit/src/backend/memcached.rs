@@ -217,6 +217,16 @@ fn expiration_secs(ttl: Option<Duration>) -> u32 {
 /// default `idle_timeout`, which the inner pools turn off (see `open`).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// Remove and return the entries idle for at least [`IDLE_TIMEOUT`] at `now`.
+///
+/// Entries are only pushed (stamped `now`) and popped at the end, so the list
+/// is sorted oldest first and the expired entries are a prefix.
+fn split_expired<T>(idle: &mut Vec<(T, Instant)>, now: Instant) -> Vec<(T, Instant)> {
+    let cut =
+        idle.partition_point(|(_, since)| now.saturating_duration_since(*since) >= IDLE_TIMEOUT);
+    idle.drain(..cut).collect()
+}
+
 /// Idle single-connection clients, and the permits that cap how many exist.
 ///
 /// This is the desync guard the module docs describe. Each client wraps a
@@ -264,21 +274,20 @@ impl Connections {
         Client::with_pool(pool)
     }
 
-    /// The most recently idled client, or a new one. When it is past
-    /// [`IDLE_TIMEOUT`], so is every client below it: all are closed.
+    /// The most recently idled client, or a new one. Every checkout first
+    /// closes the clients idle for longer than [`IDLE_TIMEOUT`], so a hot top
+    /// entry cannot keep older idle connections (and their threads) alive.
     fn checkout(&self) -> Result<Client, MemcacheError> {
         let mut idle = self.lock_idle();
-        match idle.pop() {
-            Some((client, since)) if since.elapsed() < IDLE_TIMEOUT => return Ok(client),
-            Some(stale) => {
-                let older = std::mem::take(&mut *idle);
-                drop(idle);
-                // Dropped outside the lock: each drop stops 3 worker threads.
-                drop((stale, older));
-            }
-            None => drop(idle),
+        let expired = split_expired(&mut idle, Instant::now());
+        let fresh = idle.pop();
+        drop(idle);
+        // Dropped outside the lock: each drop stops 3 worker threads.
+        drop(expired);
+        match fresh {
+            Some((client, _)) => Ok(client),
+            None => self.open(),
         }
-        self.open()
     }
 
     /// Run `op` on an idle client, or a new one, on the calling thread.
@@ -757,6 +766,45 @@ mod tests {
         // The canonical cache-key format passes.
         assert!(validate_key("ns:app:func:m.f:args:abc123:v1").is_ok());
         assert!(validate_key(&"k".repeat(250)).is_ok());
+    }
+
+    #[test]
+    fn idle_expiry_splits_the_old_prefix() {
+        let now = Instant::now();
+        let ago = |secs| now.checked_sub(Duration::from_secs(secs)).expect("uptime");
+        let mut idle = vec![(1, ago(900)), (2, ago(601)), (3, ago(600)), (4, ago(5))];
+        let expired = split_expired(&mut idle, now);
+        assert_eq!(expired.iter().map(|e| e.0).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(idle.iter().map(|e| e.0).collect::<Vec<_>>(), [4]);
+        assert!(split_expired(&mut idle, now).is_empty());
+    }
+
+    #[test]
+    fn hot_client_does_not_keep_cold_clients_alive() {
+        // A ten-connection burst, then sequential traffic: the top client is
+        // fresh on every checkout, while the nine below it went idle 601 s
+        // ago. Checkout must close those nine, not only look at the top one.
+        // Building a Pool with min_idle 0 opens no socket, so no server runs.
+        let url = Url::parse("memcache://127.0.0.1:1?protocol=ascii&timeout=1").expect("url");
+        let conns = Connections::new(url, Duration::from_millis(100), 10);
+        let cold = Instant::now()
+            .checked_sub(Duration::from_secs(601))
+            .expect("uptime");
+        for _ in 0..9 {
+            let client = conns.open().expect("client");
+            conns.lock_idle().push((client, cold));
+        }
+        let hot = conns.open().expect("client");
+        conns.lock_idle().push((hot, Instant::now()));
+
+        let client = conns.checkout().expect("checkout");
+        assert!(
+            conns.lock_idle().is_empty(),
+            "the nine cold clients must be closed"
+        );
+        conns.lock_idle().push((client, Instant::now()));
+        drop(conns.checkout().expect("checkout"));
+        assert!(conns.lock_idle().is_empty());
     }
 
     #[test]
