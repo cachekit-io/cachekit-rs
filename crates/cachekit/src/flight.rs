@@ -31,15 +31,19 @@
 //! slow leader.
 //!
 //! The `#[cachekit]` macro wires this in automatically around its miss path.
-//! With `#[cachekit(distributed_lock = false)]` its cold miss keeps only the
-//! in-process half: it sends no lock or unlock request, and a queued miss
-//! never contests the lease. Its stale-while-revalidate refresh takes the same locks but never waits
+//! Its stale-while-revalidate refresh takes the same locks but never waits
 //! for another worker's fill: if another worker holds either one, or the lock
 //! call fails, the refresh stands down without polling or re-reading the
 //! cache, and the stale copy keeps being served. A cold miss queued behind a
 //! holder that found the distributed lock contested and let go without a
 //! fill (a refresh that stood down, a cancelled or failed poll) contests that
 //! lock itself before computing, since another process may be filling.
+//!
+//! With `#[cachekit(distributed_lock = false)]` a function's cold miss keeps
+//! only the in-process lock: it sends no lock or unlock request, and a miss
+//! queued behind another holder never contests the lease. Its
+//! stale-while-revalidate refresh still takes both locks.
+//!
 //! Manual usage follows the same shape:
 //!
 //! ```no_run
@@ -105,9 +109,12 @@ const FILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// refresh stands down; a cold miss polls and may be cancelled or fail), and
 /// a queued cold miss whose re-check misses must contest that lock before
 /// computing. A holder that leads clears the note: on acquire, or when its
-/// own lease contest makes it a leader. A leader that skipped the lock
-/// (`#[cachekit(distributed_lock = false)]`) sets it instead, since it holds
-/// no lease either. A follower leaves it as it found it,
+/// own lease contest makes it a leader. A leader that never asked for the
+/// lease (`#[cachekit(distributed_lock = false)]`) sets it instead: it cannot
+/// vouch that no other process holds the lease. (A leader whose lock call
+/// failed, or whose backend cannot lock, clears it like any leader, so an
+/// outage does not make every queued follower send a lock call.) A follower
+/// leaves it as it found it,
 /// whether it finds a fill, errors out or is dropped, so the next follower
 /// still sees it. A stale `true` costs at most one lock call, by a follower
 /// that was about to compute anyway.
@@ -750,10 +757,13 @@ impl SingleFlight {
             return flight;
         }
         let mut flight = Self::new(map, local, Role::Leader, backend, full_key);
-        // A leader without the lease suppresses nothing across processes, so
-        // it leaves the note set, as a contested holder does: a locking cold
-        // miss queued behind it that misses must contest the lease.
-        flight.local.stand_down |= !distributed;
+        // `new` just cleared the note for this leader. A leader that never
+        // asked for the lease cannot vouch that no other process holds it, so
+        // it sets the note: a locking cold miss queued behind it that misses
+        // must contest the lease before computing.
+        if !distributed {
+            flight.local.stand_down = true;
+        }
         flight
     }
 

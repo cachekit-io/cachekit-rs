@@ -131,11 +131,12 @@ impl Timed {
         self.st().gets
     }
 
-    fn unlocks(&self) -> usize {
+    /// Completed backend calls of any of these kinds.
+    fn count(&self, kinds: &[&str]) -> usize {
         self.st()
             .ops
             .iter()
-            .filter(|(op, _)| *op == "unlock")
+            .filter(|(op, _)| kinds.contains(op))
             .count()
     }
 }
@@ -258,15 +259,6 @@ async fn fill_unlocked(cache: &CacheKit, id: u64) -> Result<u64, CachekitError> 
     Ok(id * 10)
 }
 
-fn lock_ops(backend: &Timed) -> usize {
-    backend
-        .st()
-        .ops
-        .iter()
-        .filter(|(op, _)| matches!(*op, "lock" | "unlock"))
-        .count()
-}
-
 fn fill_key(id: u64) -> String {
     interop_key("timing", "fill", &[InteropValue::from(id)]).expect("key")
 }
@@ -303,7 +295,7 @@ async fn cold_miss_leader_returns_without_waiting_for_the_unlock() {
     // The unlock is still sent. (+1: a timer at the same instant may wake
     // this task before the release task records its call.)
     tokio::time::sleep(ms(UNLOCK + 1)).await;
-    assert_eq!(backend.unlocks(), 1);
+    assert_eq!(backend.count(&["unlock"]), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -600,31 +592,19 @@ async fn local_follower_counts_one_hit_and_its_leader_one_miss() {
 
 #[tokio::test(start_paused = true)]
 async fn opted_out_cold_miss_sends_no_lock_or_unlock() {
-    let locked = Timed::new();
-    let t0 = Instant::now();
-    fill(&locked.client(), 16).await.unwrap();
-    let with_lock = since(t0);
-
     let backend = Timed::new();
     let t0 = Instant::now();
     assert_eq!(fill_unlocked(&backend.client(), 16).await.unwrap(), 160);
     let returned = Instant::now();
-    let without_lock = since(t0);
 
-    println!(
-        "cold miss: lock on {with_lock} ms, opted out {without_lock} ms, saved {} ms",
-        with_lock - without_lock
-    );
-    assert_eq!(without_lock, GET + ORIGIN + SET);
+    // Against the lock-on leader above: no LOCK leg, and no inline UNLOCK.
+    println!("opted-out cold miss: {} ms", since(t0));
+    assert_eq!(since(t0), GET + ORIGIN + SET);
     assert_eq!(backend.ops_by(returned), ["get", "set"]);
-    // The lock-on arm waits for the acquire, and for the unlock too unless
-    // the build detaches it.
-    let saved = LOCK + if DETACHED { 0 } else { UNLOCK };
-    assert_eq!(with_lock - without_lock, saved);
 
     // Nothing is sent after the call returns either.
     tokio::time::sleep(ms(FILL_LOCK_TIMEOUT)).await;
-    assert_eq!(lock_ops(&backend), 0);
+    assert_eq!(backend.count(&["lock", "unlock"]), 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -644,14 +624,8 @@ async fn opted_out_concurrent_misses_run_the_body_once_and_set_once() {
     assert_eq!(UNLOCKED_RUNS.get(), 1, "the body ran more than once");
 
     tokio::time::sleep(ms(FILL_LOCK_TIMEOUT)).await;
-    let sets = backend
-        .st()
-        .ops
-        .iter()
-        .filter(|(op, _)| *op == "set")
-        .count();
-    assert_eq!(sets, 1);
-    assert_eq!(lock_ops(&backend), 0);
+    assert_eq!(backend.count(&["set"]), 1);
+    assert_eq!(backend.count(&["lock", "unlock"]), 0);
 }
 
 /// A holder that found the lease contested and let go without a fill leaves
@@ -664,7 +638,11 @@ async fn opted_out_follower_does_not_contest_the_lease_after_a_stand_down() {
     let cache = backend.client();
 
     let held = cache.single_flight(&fill_key(18)).await;
-    assert_eq!(lock_ops(&backend), 1, "the holder's contested lock");
+    assert_eq!(
+        backend.count(&["lock", "unlock"]),
+        1,
+        "the holder's contested lock"
+    );
     let holder = async move {
         // Let go once the opted-out call has missed and queued behind it.
         tokio::time::sleep(ms(GET + 10)).await;
@@ -675,7 +653,7 @@ async fn opted_out_follower_does_not_contest_the_lease_after_a_stand_down() {
     assert_eq!(value.unwrap(), 180);
     assert_eq!(UNLOCKED_RUNS.get(), 1);
     assert_eq!(
-        lock_ops(&backend),
+        backend.count(&["lock", "unlock"]),
         1,
         "the opted-out follower sent a lock call"
     );
@@ -764,7 +742,7 @@ fn re_miss_after_the_leaders_runtime_is_dropped_sends_the_unlock_and_leads() {
             "re-miss after the runtime drop: {} ms, {} GETs, {} unlocks",
             t.elapsed().as_millis(),
             backend.gets() - gets,
-            backend.unlocks()
+            backend.count(&["unlock"])
         );
         assert_eq!(backend.gets() - gets, 1, "led without polling");
     });

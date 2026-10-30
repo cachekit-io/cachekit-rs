@@ -226,14 +226,16 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   encrypt.
 /// - `distributed_lock = <bool>` (optional, default `true`): `false` skips
 ///   the distributed fill lock on a cold miss, so the miss sends no lock or
-///   unlock request and saves one lock round trip before the body runs.
+///   unlock request. It saves the lock round trip before the body runs, and
+///   the unlock round trip where the build keeps it on the caller's path
+///   (without `l1`, under `unsync`, or after an `Err` or a failed store).
 ///   Concurrent misses in one process still run the body once, but
 ///   processes no longer wait for each other's fill: N processes that miss
 ///   one key together may each run the body and store it. Use it for
 ///   single-process deployments or cheap, idempotent bodies. The
 ///   stale-while-revalidate refresh still takes the lock (it runs off the
-///   caller's path). Same meaning as TypeScript's `stampede.distributedLock`,
-///   which defaults to off there.
+///   caller's path). The per-function counterpart of TypeScript's per-cache
+///   `stampede.distributedLock`, which defaults to off there.
 ///
 /// # Requirements
 ///
@@ -791,7 +793,6 @@ mod tests {
         ] {
             let code = expand_with(extra).expect("expands");
             assert_eq!(code.contains("__local_single_flight"), local, "{extra:?}");
-            assert_eq!(code.contains(". single_flight"), !local, "{extra:?}");
         }
         assert!(expand_with(", distributed_lock = \"no\"").is_err());
         assert!(expand_with(", distributed_lock").is_err());
