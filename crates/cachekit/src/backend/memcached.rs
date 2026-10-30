@@ -14,6 +14,21 @@
 //! [`crate::backend::memcached::MemcachedBackendBuilder::timeout`]) so a wedged server surfaces as a
 //! `Timeout` error instead of hanging callers.
 //!
+//! ## Transports and socket timeouts
+//!
+//! [`url`](crate::backend::memcached::MemcachedBackendBuilder::url) accepts
+//! TCP, UDP (`memcache+udp://`, or `?udp=true`) and Unix-socket
+//! (`memcache:///path`) URLs, plus `memcache+tls://` when rust-memcache's
+//! `tls` feature is enabled in the build (cachekit does not enable it).
+//! rust-memcache applies the URL's `timeout=` to TCP and TLS sockets only,
+//! so the backend sets the configured timeout on every connection itself
+//! before its first operation. Without it a lost UDP reply or a stalled
+//! Unix-socket server would block a connection forever, and with it a
+//! permit, until every operation failed.
+//!
+//! Over UDP every `get` fails with a retryable error: rust-memcache 0.19
+//! never sends an ASCII `get` there. Writes work.
+//!
 //! ## The desync guard: discard on error
 //!
 //! A connection goes back to the idle list only after an operation whose
@@ -227,6 +242,13 @@ fn split_expired<T>(idle: &mut Vec<(T, Instant)>, now: Instant) -> Vec<(T, Insta
     idle.drain(..cut).collect()
 }
 
+/// A single-connection client, and whether its connection carries the socket
+/// timeouts yet.
+struct Conn {
+    client: Client,
+    timed: bool,
+}
+
 /// Idle single-connection clients, and the permits that cap how many exist.
 ///
 /// This is the desync guard the module docs describe. Each client wraps a
@@ -235,19 +257,25 @@ fn split_expired<T>(idle: &mut Vec<(T, Instant)>, now: Instant) -> Vec<(T, Insta
 struct Connections {
     url: Url,
     connect_timeout: Duration,
+    /// Socket read/write timeout for every connection. rust-memcache applies
+    /// the URL's `timeout=` to TCP (and TLS) streams only, so a UDP or
+    /// Unix-socket connection would block forever on a lost reply, holding
+    /// its permit. [`Connections::run`] sets it on each connection itself.
+    io_timeout: Duration,
     /// LIFO, like r2d2: the most recently used connection is reused first,
     /// so the list is ordered by when each client went idle, oldest first.
-    idle: Mutex<Vec<(Client, Instant)>>,
+    idle: Mutex<Vec<(Conn, Instant)>>,
     /// One permit per client in use, held until the blocking call ends, so
     /// idle plus in-use clients never exceed `pool_size`.
     permits: Arc<Semaphore>,
 }
 
 impl Connections {
-    fn new(url: Url, connect_timeout: Duration, pool_size: u32) -> Self {
+    fn new(url: Url, connect_timeout: Duration, io_timeout: Duration, pool_size: u32) -> Self {
         Self {
             url,
             connect_timeout,
+            io_timeout,
             idle: Mutex::new(Vec::new()),
             permits: Arc::new(Semaphore::new(
                 usize::try_from(pool_size)
@@ -256,7 +284,7 @@ impl Connections {
         }
     }
 
-    fn open(&self) -> Result<Client, MemcacheError> {
+    fn open(&self) -> Result<Conn, MemcacheError> {
         let pool = memcache::Pool::builder()
             .max_size(1)
             // build() opens nothing; the op's first checkout connects, bounded
@@ -271,13 +299,31 @@ impl Connections {
             .idle_timeout(None)
             .connection_timeout(self.connect_timeout)
             .build(ConnectionManager::new(self.url.clone()))?;
-        Client::with_pool(pool)
+        Ok(Conn {
+            client: Client::with_pool(pool)?,
+            timed: false,
+        })
+    }
+
+    /// Set the socket timeouts on `conn`'s connection, once. A new client
+    /// connects here, bounded by `connect_timeout`.
+    ///
+    /// They then hold for the client's life: its pool never replaces its one
+    /// connection (no checkout test, no reaper, and rust-memcache's
+    /// `has_broken` is always `false`).
+    fn set_timeouts(&self, conn: &mut Conn) -> Result<(), MemcacheError> {
+        if !conn.timed {
+            conn.client.set_read_timeout(Some(self.io_timeout))?;
+            conn.client.set_write_timeout(Some(self.io_timeout))?;
+            conn.timed = true;
+        }
+        Ok(())
     }
 
     /// The most recently idled client, or a new one. Every checkout first
     /// closes the clients idle for longer than [`IDLE_TIMEOUT`], so a hot top
     /// entry cannot keep older idle connections (and their threads) alive.
-    fn checkout(&self) -> Result<Client, MemcacheError> {
+    fn checkout(&self) -> Result<Conn, MemcacheError> {
         let mut idle = self.lock_idle();
         let expired = split_expired(&mut idle, Instant::now());
         let fresh = idle.pop();
@@ -285,12 +331,13 @@ impl Connections {
         // Dropped outside the lock: each drop stops 3 worker threads.
         drop(expired);
         match fresh {
-            Some((client, _)) => Ok(client),
+            Some((conn, _)) => Ok(conn),
             None => self.open(),
         }
     }
 
-    /// Run `op` on an idle client, or a new one, on the calling thread.
+    /// Run `op` on an idle client, or a new one, on the calling thread, after
+    /// setting the socket timeouts on a connection that lacks them.
     ///
     /// The client goes back to the idle list only if `op` returned `Ok`, so
     /// its whole response was parsed. Any error drops it, and a lost
@@ -302,18 +349,18 @@ impl Connections {
         &self,
         op: impl FnOnce(&Client) -> Result<T, MemcacheError>,
     ) -> Result<T, BackendError> {
-        let client = self.checkout().map_err(memcached_err)?;
-        match op(&client) {
+        let mut conn = self.checkout().map_err(memcached_err)?;
+        match self.set_timeouts(&mut conn).and_then(|()| op(&conn.client)) {
             Ok(value) => {
-                self.lock_idle().push((client, Instant::now()));
+                self.lock_idle().push((conn, Instant::now()));
                 Ok(value)
             }
             Err(e @ MemcacheError::PoolError(_)) => {
-                self.lock_idle().push((client, Instant::now()));
+                self.lock_idle().push((conn, Instant::now()));
                 Err(memcached_err(e))
             }
             Err(e) => {
-                drop(client);
+                drop(conn);
                 if connection_lost(&e) {
                     let stale = std::mem::take(&mut *self.lock_idle());
                     drop(stale);
@@ -325,7 +372,7 @@ impl Connections {
 
     /// The list is only pushed, popped and taken, so a poisoned lock still
     /// guards a consistent `Vec`.
-    fn lock_idle(&self) -> MutexGuard<'_, Vec<(Client, Instant)>> {
+    fn lock_idle(&self) -> MutexGuard<'_, Vec<(Conn, Instant)>> {
         self.idle.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -529,8 +576,19 @@ pub struct MemcachedBackendBuilder {
 impl MemcachedBackendBuilder {
     /// Set the memcached server address (required).
     ///
-    /// Accepts `memcache://host:port`, `tcp://host:port`, or bare
-    /// `host:port`.
+    /// Accepts:
+    ///
+    /// - TCP: `memcache://host:port`, `tcp://host:port`, or bare `host:port`;
+    /// - UDP: `memcache+udp://host:port`, or `memcache://host:port?udp=true`.
+    ///   rust-memcache 0.19 never sends an ASCII `get` over UDP, so every
+    ///   `get` and `exists` fails with a retryable error; writes work;
+    /// - a Unix socket: `memcache:///path/to/socket` (no host, unix only);
+    /// - TLS: `memcache+tls://host:port`, only when rust-memcache's `tls`
+    ///   feature is enabled in the build. cachekit does not enable it, so
+    ///   otherwise the URL fails to connect.
+    ///
+    /// Every connection carries the [`timeout`](Self::timeout), whatever
+    /// the transport.
     pub fn url(mut self, url: impl Into<String>) -> Self {
         self.url = Some(url.into());
         self
@@ -544,8 +602,10 @@ impl MemcachedBackendBuilder {
         self
     }
 
-    /// Socket read/write timeout per operation (default 1s). A hung server
-    /// errors that operation instead of wedging the backend.
+    /// Socket read/write timeout on every connection, for every URL form
+    /// [`url`](Self::url) accepts (default 1s). A hung server, or a lost UDP
+    /// reply, errors that operation and discards its connection instead of
+    /// wedging the backend. A `timeout=<secs>` param in the URL overrides it.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
@@ -582,11 +642,10 @@ impl MemcachedBackendBuilder {
     /// - `protocol=ascii`: see the module docs — the binary parser does not
     ///   correlate responses to requests, so a timed-out op could desync a
     ///   pooled connection into serving wrong values.
-    /// - `timeout=<secs>`: the only spelling that applies socket read/write
-    ///   timeouts to **every** connection at creation.
-    ///   `ClientBuilder::with_read_timeout` reaches exactly one checked-out
-    ///   connection and none of the replacements r2d2 creates later (a hung
-    ///   server wedged the backend despite configured timeouts).
+    /// - `timeout=<secs>`: rust-memcache sets it on each TCP (and TLS) socket
+    ///   as it connects. It ignores it for UDP and Unix sockets, so the
+    ///   backend sets the same value on every connection itself (see
+    ///   [`Connections::run`]).
     ///
     /// Explicit user-supplied `protocol=`/`timeout=` params win.
     fn with_connection_params(url: &str, timeout: Duration) -> String {
@@ -608,6 +667,17 @@ impl MemcachedBackendBuilder {
             url.push_str(&format!("timeout={}", timeout.as_secs_f64()));
         }
         url
+    }
+
+    /// The URL's `timeout=` (pinned by `with_connection_params` unless the
+    /// caller set one), parsed as rust-memcache parses it for TCP, so every
+    /// transport gets the value TCP gets. `default` if it does not parse.
+    fn socket_timeout(url: &Url, default: Duration) -> Duration {
+        url.query_pairs()
+            .find(|(name, _)| name == "timeout")
+            .and_then(|(_, secs)| secs.parse::<f64>().ok())
+            .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
+            .unwrap_or(default)
     }
 
     /// Connect to memcached and construct a [`MemcachedBackend`].
@@ -644,22 +714,29 @@ impl MemcachedBackendBuilder {
             .into());
         }
 
+        let io_timeout = Self::socket_timeout(&url, timeout);
+
         // Budget: a connect plus a few socket timeouts' worth of I/O covers
         // the healthy path with slack while still failing a wedged server
         // fast. It also bounds the wait for a free connection.
         let op_budget = timeout * 3 + connect_timeout;
 
         let backend = MemcachedBackend {
-            conns: Arc::new(Connections::new(url, connect_timeout, pool_size)),
+            conns: Arc::new(Connections::new(
+                url,
+                connect_timeout,
+                io_timeout,
+                pool_size,
+            )),
             max_item_size_bytes: self
                 .max_item_size_bytes
                 .unwrap_or(DEFAULT_MAX_ITEM_SIZE_BYTES),
             op_budget,
         };
         // Eager reachability check — connect() promises a live server. The
-        // socket timeouts (via the URL) and the op budget bound it even
-        // against a wedged-but-accepting server. The connection it opens is
-        // the first idle one.
+        // socket timeouts and the op budget bound it even against a
+        // wedged-but-accepting server. The connection it opens is the first
+        // idle one.
         backend.run_op(|client| client.version()).await?;
         Ok(backend)
     }
@@ -786,7 +863,7 @@ mod tests {
         // ago. Checkout must close those nine, not only look at the top one.
         // Building a Pool with min_idle 0 opens no socket, so no server runs.
         let url = Url::parse("memcache://127.0.0.1:1?protocol=ascii&timeout=1").expect("url");
-        let conns = Connections::new(url, Duration::from_millis(100), 10);
+        let conns = Connections::new(url, Duration::from_millis(100), Duration::from_secs(1), 10);
         let cold = Instant::now()
             .checked_sub(Duration::from_secs(601))
             .expect("uptime");
@@ -815,6 +892,29 @@ mod tests {
         // > 30 days would be read as an absolute unix timestamp — clamp.
         let clamped = expiration_secs(Some(Duration::from_secs(MAX_MEMCACHED_TTL_SECS + 1)));
         assert_eq!(u64::from(clamped), MAX_MEMCACHED_TTL_SECS);
+    }
+
+    #[test]
+    fn socket_timeout_is_the_urls_timeout_param() {
+        let at = |url: &str| {
+            let url = Url::parse(url).expect("url");
+            MemcachedBackendBuilder::socket_timeout(&url, Duration::from_secs(1))
+        };
+        assert_eq!(
+            at("memcache+udp://h:1?protocol=ascii&timeout=0.25"),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            at("memcache:///tmp/m.sock?timeout=5"),
+            Duration::from_secs(5)
+        );
+        // No param, or one that does not parse: the builder's value.
+        assert_eq!(
+            at("memcache://h:1?connect_timeout=5"),
+            Duration::from_secs(1)
+        );
+        assert_eq!(at("memcache://h:1?timeout=soon"), Duration::from_secs(1));
+        assert_eq!(at("memcache://h:1?timeout=-1"), Duration::from_secs(1));
     }
 
     #[test]
