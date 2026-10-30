@@ -234,7 +234,7 @@ impl ReliabilityConfig {
 pub(crate) struct RetryDeadlines {
     /// For `get`, `get_with_freshness` and `exists`.
     pub(crate) read: Duration,
-    /// For `set` and `delete`.
+    /// For `set`, `set_bytes` and `delete`.
     pub(crate) write: Duration,
 }
 
@@ -825,8 +825,8 @@ impl Backend for ReliableBackend {
         self.set_bytes(key, Bytes::from(value), ttl).await
     }
 
-    // Forwarded, not defaulted: the default would copy the payload into a
-    // `Vec` once per attempt. Each attempt clones the handle, not the buffer.
+    // Required, not just faster: `set` forwards here, and the default calls
+    // `set`. Each attempt clones the handle, not the buffer.
     async fn set_bytes(
         &self,
         key: &str,

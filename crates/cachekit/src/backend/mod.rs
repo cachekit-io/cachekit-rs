@@ -85,9 +85,16 @@ pub trait Backend: Send + Sync {
     /// its L1 and to every retry attempt without copying the payload. The
     /// default converts `value` to a `Vec<u8>` and calls [`Self::set`]; the
     /// conversion copies the payload while another handle shares the buffer,
-    /// as the L1 or a retry does. Override it when the backend can store a
-    /// [`Bytes`] without that copy. A backend that wraps another should
-    /// forward it, or the inner backend's override is never reached.
+    /// as the L1 or a retry does.
+    ///
+    /// Override it when the backend can store a [`Bytes`] without that copy.
+    /// An override must store exactly what `set` would. A backend that wraps
+    /// another and overrides it applies the same wrapping as its `set` and
+    /// calls the inner backend's `set_bytes`; one that does not override it
+    /// keeps working through its `set`, but the inner backend's override is
+    /// never reached. Implement `set` by calling `set_bytes` only when you
+    /// also override `set_bytes`: the default calls `set`, and the pair would
+    /// recurse.
     async fn set_bytes(
         &self,
         key: &str,
@@ -176,9 +183,16 @@ pub trait Backend {
     /// its L1 and to every retry attempt without copying the payload. The
     /// default converts `value` to a `Vec<u8>` and calls [`Self::set`]; the
     /// conversion copies the payload while another handle shares the buffer,
-    /// as the L1 or a retry does. Override it when the backend can store a
-    /// [`Bytes`] without that copy. A backend that wraps another should
-    /// forward it, or the inner backend's override is never reached.
+    /// as the L1 or a retry does.
+    ///
+    /// Override it when the backend can store a [`Bytes`] without that copy.
+    /// An override must store exactly what `set` would. A backend that wraps
+    /// another and overrides it applies the same wrapping as its `set` and
+    /// calls the inner backend's `set_bytes`; one that does not override it
+    /// keeps working through its `set`, but the inner backend's override is
+    /// never reached. Implement `set` by calling `set_bytes` only when you
+    /// also override `set_bytes`: the default calls `set`, and the pair would
+    /// recurse.
     async fn set_bytes(
         &self,
         key: &str,

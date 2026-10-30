@@ -128,8 +128,8 @@ impl CachekitIO {
         req
     }
 
-    /// Build the `PUT` for [`Backend::set`] without sending it, so tests can
-    /// pin its headers.
+    /// Build the `PUT` for [`Backend::set_bytes`] without sending it, so tests
+    /// can pin its headers.
     fn put_request(
         &self,
         key: &str,
@@ -281,7 +281,8 @@ impl Backend for CachekitIO {
     }
 
     // The request body takes the buffer as is, so a retry or the client's L1
-    // can share it.
+    // can share it. Required, not just faster: `set` forwards here, and the
+    // default calls `set`.
     async fn set_bytes(
         &self,
         key: &str,

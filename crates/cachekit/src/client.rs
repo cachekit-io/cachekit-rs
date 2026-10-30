@@ -366,7 +366,7 @@ impl CacheKit {
         }
     }
 
-    /// Write-through to L1 after a write the backend accepted. The copy lives
+    /// Write-through to L1 after a write the backend accepted. The entry lives
     /// no longer than the TTL the write sent on the wire ([`ttl_wire_secs`]):
     /// `spec/saas-api.md` forbids serving it past `min(local_ttl, effective_ttl)`,
     /// and the wire truncates a fractional TTL from 1 s up (1.5 s goes as 1).
@@ -384,11 +384,13 @@ impl CacheKit {
     }
 
     /// Wrap a write's payload for the backend, plus a handle to the same
-    /// buffer for [`Self::l1_set`] when the client has an L1. Neither copies
-    /// the payload, and a retry clones only the handle.
+    /// buffer for [`Self::l1_set`] when the client has an L1. Clones no
+    /// payload; outside glibc the shrink below may reallocate.
     ///
     /// A synchronous step, not an async helper around the backend write: the
-    /// nested future measured about 75 more instructions per SET.
+    /// nested future cost `bench_hot_path`'s 40 B `set/plain` about 75 more
+    /// instructions per op. Each caller writes the L1 only after the backend
+    /// accepted the write.
     #[cfg_attr(not(feature = "l1"), allow(clippy::unused_self))]
     fn share_with_l1(&self, bytes: Vec<u8>) -> (Bytes, Option<Bytes>) {
         #[cfg(feature = "l1")]
