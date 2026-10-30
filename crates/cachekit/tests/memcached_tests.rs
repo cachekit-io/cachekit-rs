@@ -611,6 +611,50 @@ mod memcached_tests {
             }
         }
 
+        /// A UDP server with credentials in its URL that answers everything
+        /// but the first `delete` and the second `set auth` (the first is
+        /// `connect()`'s): the reply to each is lost.
+        pub fn lossy_udp_with_auth() -> Silent {
+            let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+            let addr = sock.local_addr().expect("addr");
+            let deletes = Arc::new(AtomicU64::new(0));
+            let counter = Arc::clone(&deletes);
+            std::thread::spawn(move || {
+                let mut auths = 0;
+                let mut buf = [0u8; 1500];
+                while let Ok((n, from)) = sock.recv_from(&mut buf) {
+                    let Some(body) = buf[..n].get(8..) else {
+                        continue;
+                    };
+                    let reply: &[u8] = if body.starts_with(b"version") {
+                        VERSION
+                    } else if body.starts_with(b"set auth ") {
+                        auths += 1;
+                        if auths == 2 {
+                            continue;
+                        }
+                        b"STORED\r\n"
+                    } else if body.starts_with(b"delete ") {
+                        if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                            continue;
+                        }
+                        b"NOT_FOUND\r\n"
+                    } else {
+                        b"ERROR\r\n"
+                    };
+                    let mut datagram = buf[..2].to_vec();
+                    datagram.extend([0, 0, 0, 1, 0, 0]);
+                    datagram.extend(reply);
+                    let _ = sock.send_to(&datagram, from);
+                }
+            });
+            Silent {
+                url: format!("memcache+udp://user:secret@{addr}"), // pragma: allowlist secret
+                deletes,
+                _dir: None,
+            }
+        }
+
         /// Accepts every connection and holds it open.
         #[cfg(unix)]
         pub fn unix() -> Silent {
@@ -733,6 +777,39 @@ mod memcached_tests {
         within(Duration::from_secs(20), || async {
             lost_replies_cost_no_permits(silent::udp(|a| format!("memcache+udp://{a}"))).await;
             lost_replies_cost_no_permits(silent::udp(|a| format!("memcache://{a}?udp=true"))).await;
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn lost_udp_auth_reply_costs_one_operation() {
+        // A replacement connection authenticates before its first operation.
+        // That exchange must run under the socket timeout too: a lost reply
+        // fails one operation, where a connect blocked on it would leave the
+        // pool's only connect pending and fail every later checkout.
+        within(Duration::from_secs(20), || async {
+            let stub = silent::lossy_udp_with_auth();
+            let backend = MemcachedBackend::builder()
+                .url(&stub.url)
+                .timeout(Duration::from_millis(50))
+                .connect_timeout(Duration::from_millis(200))
+                .pool_size(1)
+                .connect()
+                .await
+                .expect("connect: the first auth and version are answered");
+            let mut outcomes = Vec::new();
+            for i in 0..6 {
+                let outcome = backend.delete(&format!("k{i}")).await;
+                if let Err(e) = &outcome {
+                    assert!(e.kind.is_retryable(), "delete #{i}: {e}");
+                }
+                outcomes.push(outcome.is_ok());
+            }
+            assert_eq!(
+                outcomes,
+                [false, false, true, true, true, true],
+                "the lost delete reply and the lost auth reply each cost one operation"
+            );
         });
     }
 

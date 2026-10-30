@@ -242,11 +242,11 @@ fn split_expired<T>(idle: &mut Vec<(T, Instant)>, now: Instant) -> Vec<(T, Insta
     idle.drain(..cut).collect()
 }
 
-/// A single-connection client, and whether its connection carries the socket
-/// timeouts yet.
+/// A single-connection client, and whether [`Connections::prepare`] has set
+/// up its connection (socket timeouts, then authentication).
 struct Conn {
     client: Client,
-    timed: bool,
+    ready: bool,
 }
 
 /// Idle single-connection clients, and the permits that cap how many exist.
@@ -262,6 +262,12 @@ struct Connections {
     /// Unix-socket connection would block forever on a lost reply, holding
     /// its permit. [`Connections::run`] sets it on each connection itself.
     io_timeout: Duration,
+    /// `<user> <password>` for the ASCII `set auth` command, sent once the
+    /// timeouts are on. rust-memcache would authenticate inside the pool's
+    /// connect instead, before a UDP or Unix socket has any timeout: a lost
+    /// reply there blocks that connect forever, and the pool, which allows
+    /// one connect at a time, never connects again.
+    auth: Option<String>,
     /// LIFO, like r2d2: the most recently used connection is reused first,
     /// so the list is ordered by when each client went idle, oldest first.
     idle: Mutex<Vec<(Conn, Instant)>>,
@@ -271,11 +277,18 @@ struct Connections {
 }
 
 impl Connections {
-    fn new(url: Url, connect_timeout: Duration, io_timeout: Duration, pool_size: u32) -> Self {
+    fn new(
+        url: Url,
+        connect_timeout: Duration,
+        io_timeout: Duration,
+        auth: Option<String>,
+        pool_size: u32,
+    ) -> Self {
         Self {
             url,
             connect_timeout,
             io_timeout,
+            auth,
             idle: Mutex::new(Vec::new()),
             permits: Arc::new(Semaphore::new(
                 usize::try_from(pool_size)
@@ -301,21 +314,25 @@ impl Connections {
             .build(ConnectionManager::new(self.url.clone()))?;
         Ok(Conn {
             client: Client::with_pool(pool)?,
-            timed: false,
+            ready: false,
         })
     }
 
-    /// Set the socket timeouts on `conn`'s connection, once. A new client
-    /// connects here, bounded by `connect_timeout`.
+    /// Set the socket timeouts on `conn`'s connection, then authenticate it,
+    /// once. A new client connects here, bounded by `connect_timeout`.
     ///
-    /// They then hold for the client's life: its pool never replaces its one
-    /// connection (no checkout test, no reaper, and rust-memcache's
+    /// The timeouts then hold for the client's life: its pool never replaces
+    /// its one connection (no checkout test, no reaper, and rust-memcache's
     /// `has_broken` is always `false`).
-    fn set_timeouts(&self, conn: &mut Conn) -> Result<(), MemcacheError> {
-        if !conn.timed {
+    fn prepare(&self, conn: &mut Conn) -> Result<(), MemcacheError> {
+        if !conn.ready {
             conn.client.set_read_timeout(Some(self.io_timeout))?;
             conn.client.set_write_timeout(Some(self.io_timeout))?;
-            conn.timed = true;
+            if let Some(auth) = &self.auth {
+                // rust-memcache's own ASCII auth sends exactly this `set`.
+                conn.client.set("auth", auth.as_str(), 0)?;
+            }
+            conn.ready = true;
         }
         Ok(())
     }
@@ -337,7 +354,7 @@ impl Connections {
     }
 
     /// Run `op` on an idle client, or a new one, on the calling thread, after
-    /// setting the socket timeouts on a connection that lacks them.
+    /// [`prepare`](Self::prepare) on a client not yet prepared.
     ///
     /// The client goes back to the idle list only if `op` returned `Ok`, so
     /// its whole response was parsed. Any error drops it, and a lost
@@ -350,7 +367,7 @@ impl Connections {
         op: impl FnOnce(&Client) -> Result<T, MemcacheError>,
     ) -> Result<T, BackendError> {
         let mut conn = self.checkout().map_err(memcached_err)?;
-        match self.set_timeouts(&mut conn).and_then(|()| op(&conn.client)) {
+        match self.prepare(&mut conn).and_then(|()| op(&conn.client)) {
             Ok(value) => {
                 self.lock_idle().push((conn, Instant::now()));
                 Ok(value)
@@ -588,7 +605,11 @@ impl MemcachedBackendBuilder {
     ///   otherwise the URL fails to connect.
     ///
     /// Every connection carries the [`timeout`](Self::timeout), whatever
-    /// the transport.
+    /// the transport. Credentials in the URL (a `user:pass@` prefix on the host)
+    /// are sent with memcached's ASCII `set auth` after the timeout is set, so
+    /// a lost reply fails one operation. With an explicit `protocol=binary`,
+    /// rust-memcache sends them itself before any timeout exists on a UDP or
+    /// Unix socket.
     pub fn url(mut self, url: impl Into<String>) -> Self {
         self.url = Some(url.into());
         self
@@ -680,6 +701,32 @@ impl MemcachedBackendBuilder {
             .unwrap_or(default)
     }
 
+    /// Move an ASCII-protocol URL's credentials out of the URL, so the
+    /// backend authenticates after the socket timeouts are on (see
+    /// `Connections::auth`). rust-memcache authenticates when the username
+    /// is non-empty and a password is present, with both as written in the
+    /// URL; this takes the same pair under the same condition.
+    ///
+    /// A binary-protocol URL keeps its credentials: its SASL handshake is
+    /// not reachable through rust-memcache's public API.
+    fn take_ascii_credentials(url: Url) -> (Url, Option<String>) {
+        let is_ascii = url
+            .query_pairs()
+            .any(|(name, value)| name == "protocol" && value == "ascii");
+        let Some(password) = url
+            .password()
+            .filter(|_| is_ascii && !url.username().is_empty())
+        else {
+            return (url, None);
+        };
+        let auth = format!("{} {password}", url.username());
+        let mut bare = url.clone();
+        if bare.set_password(None).is_err() || bare.set_username("").is_err() {
+            return (url, None);
+        }
+        (bare, Some(auth))
+    }
+
     /// Connect to memcached and construct a [`MemcachedBackend`].
     ///
     /// Opens one connection and pings the server (`version`), so a bad
@@ -715,6 +762,7 @@ impl MemcachedBackendBuilder {
         }
 
         let io_timeout = Self::socket_timeout(&url, timeout);
+        let (url, auth) = Self::take_ascii_credentials(url);
 
         // Budget: a connect plus a few socket timeouts' worth of I/O covers
         // the healthy path with slack while still failing a wedged server
@@ -726,6 +774,7 @@ impl MemcachedBackendBuilder {
                 url,
                 connect_timeout,
                 io_timeout,
+                auth,
                 pool_size,
             )),
             max_item_size_bytes: self
@@ -863,7 +912,13 @@ mod tests {
         // ago. Checkout must close those nine, not only look at the top one.
         // Building a Pool with min_idle 0 opens no socket, so no server runs.
         let url = Url::parse("memcache://127.0.0.1:1?protocol=ascii&timeout=1").expect("url");
-        let conns = Connections::new(url, Duration::from_millis(100), Duration::from_secs(1), 10);
+        let conns = Connections::new(
+            url,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            None,
+            10,
+        );
         let cold = Instant::now()
             .checked_sub(Duration::from_secs(601))
             .expect("uptime");
@@ -915,6 +970,30 @@ mod tests {
         );
         assert_eq!(at("memcache://h:1?timeout=soon"), Duration::from_secs(1));
         assert_eq!(at("memcache://h:1?timeout=-1"), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn ascii_credentials_move_out_of_the_url() {
+        let take = |url: &str| {
+            let (url, auth) =
+                MemcachedBackendBuilder::take_ascii_credentials(Url::parse(url).expect("url"));
+            (url.to_string(), auth)
+        };
+        assert_eq!(
+            take("memcache+udp://u:p%20w@h:1?protocol=ascii&timeout=1"), // pragma: allowlist secret
+            (
+                "memcache+udp://h:1?protocol=ascii&timeout=1".to_string(),
+                Some("u p%20w".to_string())
+            )
+        );
+        // rust-memcache's condition: a non-empty username and a password.
+        assert_eq!(take("memcache://u@h:1?protocol=ascii").1, None);
+        assert_eq!(take("memcache://:p@h:1?protocol=ascii").1, None);
+        // Binary: rust-memcache's SASL handshake keeps them.
+        assert_eq!(
+            take("memcache://u:p@h:1?protocol=binary"),
+            ("memcache://u:p@h:1?protocol=binary".to_string(), None)
+        );
     }
 
     #[test]
