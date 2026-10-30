@@ -1,5 +1,6 @@
 mod common;
 
+use bytes::Bytes;
 use cachekit::error::{BackendError, CachekitError};
 
 use crate::common::MockBackend;
@@ -13,6 +14,19 @@ async fn roundtrip_set_and_get() {
     backend.set("hello", b"world".to_vec(), None).await.unwrap();
     let result = backend.get("hello").await.unwrap();
     assert_eq!(result, Some(b"world".to_vec()));
+}
+
+/// `MockBackend` implements only the required methods, as a backend written
+/// before `set_bytes` existed does: the default stores through its `set`.
+#[tokio::test]
+async fn default_set_bytes_stores_through_set() {
+    let backend = MockBackend::default();
+    let value = Bytes::from(b"world".to_vec());
+    backend
+        .set_bytes("hello", value.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(backend.get("hello").await.unwrap(), Some(value.to_vec()));
 }
 
 #[tokio::test]

@@ -366,16 +366,45 @@ impl CacheKit {
         }
     }
 
-    /// Write-through to L1 after a write the backend accepted. The copy lives
+    /// Write-through to L1 after a write the backend accepted. The entry lives
     /// no longer than the TTL the write sent on the wire ([`ttl_wire_secs`]):
     /// `spec/saas-api.md` forbids serving it past `min(local_ttl, effective_ttl)`,
     /// and the wire truncates a fractional TTL from 1 s up (1.5 s goes as 1).
-    #[cfg(feature = "l1")]
-    fn l1_set(&self, full_key: &str, bytes: Bytes, ttl: Duration) {
-        if let Some(ref l1) = self.l1 {
+    /// `None`, from [`Self::share_with_l1`] on a client without an L1, does
+    /// nothing.
+    #[cfg_attr(not(feature = "l1"), allow(clippy::unused_self))]
+    fn l1_set(&self, full_key: &str, bytes: Option<Bytes>, ttl: Duration) {
+        #[cfg(feature = "l1")]
+        if let (Some(l1), Some(bytes)) = (&self.l1, bytes) {
             let wire = Duration::from_secs(ttl_wire_secs(ttl));
             l1.set_shared(full_key, bytes, ttl.min(wire));
         }
+        #[cfg(not(feature = "l1"))]
+        let _ = (full_key, bytes, ttl);
+    }
+
+    /// Wrap a write's payload for the backend, plus a handle to the same
+    /// buffer for [`Self::l1_set`] when the client has an L1. Clones no
+    /// payload. The shrink below runs in place on glibc's system allocator;
+    /// another allocator (a `#[global_allocator]` such as jemalloc) may move
+    /// the buffer.
+    ///
+    /// A synchronous step, not an async helper around the backend write: the
+    /// nested future cost `bench_hot_path`'s 40 B `set/plain` about 75 more
+    /// instructions per op. Each caller writes the L1 only after the backend
+    /// accepted the write.
+    #[cfg_attr(not(feature = "l1"), allow(clippy::unused_self))]
+    fn share_with_l1(&self, bytes: Vec<u8>) -> (Bytes, Option<Bytes>) {
+        #[cfg(feature = "l1")]
+        if self.l1.is_some() {
+            // The L1 keeps this buffer for the entry's lifetime, so drop the
+            // serializer's spare capacity first.
+            let mut bytes = bytes;
+            bytes.shrink_to_fit();
+            let bytes = Bytes::from(bytes);
+            return (bytes.clone(), Some(bytes));
+        }
+        (Bytes::from(bytes), None)
     }
 
     /// Invalidate L1 entry.
@@ -416,8 +445,8 @@ impl CacheKit {
         if !mutation.is_current(&token.state, token.version) {
             return Ok(false);
         }
-        let l1_bytes = Bytes::copy_from_slice(&bytes);
-        self.backend.set(&full_key, bytes, Some(ttl)).await?;
+        let (bytes, l1_bytes) = self.share_with_l1(bytes);
+        self.backend.set_bytes(&full_key, bytes, Some(ttl)).await?;
         self.l1_set(&full_key, l1_bytes, ttl);
         mutation.advance();
         crate::metrics::trace_write(&full_key, ttl);
@@ -793,17 +822,9 @@ impl CacheKit {
             mutation.advance();
         }
 
-        // L1 needs its own copy: the backend consumes the Vec.
-        #[cfg(feature = "l1")]
-        {
-            let l1_bytes = Bytes::copy_from_slice(&bytes);
-            self.backend.set(&full_key, bytes, Some(ttl)).await?;
-            self.l1_set(&full_key, l1_bytes, ttl);
-        }
-        #[cfg(not(feature = "l1"))]
-        {
-            self.backend.set(&full_key, bytes, Some(ttl)).await?;
-        }
+        let (bytes, l1_bytes) = self.share_with_l1(bytes);
+        self.backend.set_bytes(&full_key, bytes, Some(ttl)).await?;
+        self.l1_set(&full_key, l1_bytes, ttl);
 
         crate::metrics::trace_write(&full_key, ttl);
         Ok(())
@@ -1164,23 +1185,12 @@ impl SecureCache<'_> {
             mutation.advance();
         }
 
-        // L1 needs its own copy: the backend consumes the Vec.
-        #[cfg(feature = "l1")]
-        {
-            let l1_bytes = Bytes::copy_from_slice(&ciphertext);
-            self.client
-                .backend
-                .set(&full_key, ciphertext, Some(ttl))
-                .await?;
-            self.client.l1_set(&full_key, l1_bytes, ttl);
-        }
-        #[cfg(not(feature = "l1"))]
-        {
-            self.client
-                .backend
-                .set(&full_key, ciphertext, Some(ttl))
-                .await?;
-        }
+        let (ciphertext, l1_bytes) = self.client.share_with_l1(ciphertext);
+        self.client
+            .backend
+            .set_bytes(&full_key, ciphertext, Some(ttl))
+            .await?;
+        self.client.l1_set(&full_key, l1_bytes, ttl);
 
         crate::metrics::trace_write(&full_key, ttl);
         Ok(())
@@ -2089,7 +2099,7 @@ mod secure_l1_tests {
             .unwrap();
         client.l1_set(
             "poisoned-stale",
-            bytes::Bytes::from_static(b"not ciphertext"),
+            Some(bytes::Bytes::from_static(b"not ciphertext")),
             Duration::from_secs(60),
         );
         // Real time, not tokio's paused clock: L1 ages entries by std
@@ -2113,5 +2123,135 @@ mod secure_l1_tests {
             secure.interop_get_swr::<String>("poisoned-stale").await,
             Ok(SwrRead::Miss)
         ));
+    }
+}
+
+// One buffer per write: every retry attempt and the L1 write-through share it.
+#[cfg(all(
+    test,
+    feature = "l1",
+    feature = "reliability",
+    not(feature = "unsync"),
+    not(target_arch = "wasm32")
+))]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test-only: a failed setup step should panic loudly
+mod shared_write_buffer_tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+
+    use super::{CacheKit, CacheKitBuilder};
+    use crate::backend::{Backend, HealthStatus};
+    use crate::error::BackendError;
+    use crate::reliability::{ReliabilityConfig, RetryConfig};
+
+    /// Records the address of every buffer `set_bytes` is handed and fails the
+    /// first two calls with a transient error. `set` refuses: the client must
+    /// not write through it.
+    #[derive(Default)]
+    struct Recorder {
+        buffers: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl Backend for Recorder {
+        async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+            Ok(None)
+        }
+
+        async fn set(
+            &self,
+            _key: &str,
+            _value: Vec<u8>,
+            _ttl: Option<Duration>,
+        ) -> Result<(), BackendError> {
+            Err(BackendError::permanent("the client wrote through set"))
+        }
+
+        async fn set_bytes(
+            &self,
+            _key: &str,
+            value: Bytes,
+            _ttl: Option<Duration>,
+        ) -> Result<(), BackendError> {
+            let mut buffers = self.buffers.lock().unwrap();
+            buffers.push(value.as_ptr() as usize);
+            if buffers.len() < 3 {
+                Err(BackendError::transient("scripted failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+            Ok(false)
+        }
+
+        async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+            Ok(false)
+        }
+
+        async fn health(&self) -> Result<HealthStatus, BackendError> {
+            Ok(HealthStatus {
+                is_healthy: true,
+                latency_ms: 0.0,
+                backend_type: "recorder".to_owned(),
+                details: HashMap::new(),
+            })
+        }
+    }
+
+    /// Three retry attempts and an L1, over `backend`.
+    fn builder(backend: &Arc<Recorder>) -> CacheKitBuilder {
+        CacheKit::builder()
+            .backend(backend.clone())
+            .reliability(ReliabilityConfig {
+                retry: Some(RetryConfig {
+                    max_attempts: 3,
+                    base_delay: Duration::from_millis(1),
+                    max_delay: Duration::from_millis(5),
+                    jitter: false,
+                }),
+                circuit_breaker: None,
+                backpressure: None,
+            })
+            .l1_capacity(16)
+    }
+
+    /// Write 64 KiB, then check that the three attempts and the L1 entry all
+    /// hold the same buffer.
+    async fn assert_one_buffer(client: &CacheKit, backend: &Recorder) {
+        client.set("k", &"x".repeat(64 * 1024)).await.unwrap();
+
+        let buffers = backend.buffers.lock().unwrap().clone();
+        assert_eq!(buffers.len(), 3, "two transient failures, then a success");
+        let l1 = client.l1_get("k").expect("written through to L1");
+        let l1 = l1.as_ptr() as usize;
+        assert!(
+            buffers.iter().all(|&b| b == l1),
+            "a copy reached the backend or the L1: attempts {buffers:x?}, L1 {l1:x}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retried_set_shares_one_buffer() {
+        let backend = Arc::new(Recorder::default());
+        let client = builder(&backend).build().unwrap();
+        assert_one_buffer(&client, &backend).await;
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn retried_encrypted_set_shares_one_buffer() {
+        let backend = Arc::new(Recorder::default());
+        let client = builder(&backend)
+            .encryption_from_bytes(&[7u8; 32], "test-tenant")
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_one_buffer(&client, &backend).await;
     }
 }

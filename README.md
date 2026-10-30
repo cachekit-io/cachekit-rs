@@ -470,6 +470,8 @@ impl Backend for MyBackend {
 
 Optional extension traits: `TtlInspectable` (TTL queries), `LockableBackend` (distributed locking).
 
+The client writes through `async fn set_bytes(&self, key: &str, value: bytes::Bytes, ttl: Option<Duration>)`, so the L1 and every retry attempt share one buffer. Its default turns the buffer into a `Vec<u8>` (a copy while another handle shares it) and calls `set`. Override it (with `bytes = "1"` as a dependency) if your backend can store a `Bytes` without copying, as the cachekit.io backend does with its request body. An override must store exactly what `set` would.
+
 </details>
 
 ---

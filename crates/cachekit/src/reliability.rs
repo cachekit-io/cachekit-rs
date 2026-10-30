@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
 use crate::backend::{Backend, Freshness, HealthStatus, LockableBackend};
 use crate::client::SharedBackend;
@@ -233,7 +234,7 @@ impl ReliabilityConfig {
 pub(crate) struct RetryDeadlines {
     /// For `get`, `get_with_freshness` and `exists`.
     pub(crate) read: Duration,
-    /// For `set` and `delete`.
+    /// For `set`, `set_bytes` and `delete`.
     pub(crate) write: Duration,
 }
 
@@ -821,9 +822,19 @@ impl Backend for ReliableBackend {
         value: Vec<u8>,
         ttl: Option<Duration>,
     ) -> Result<(), BackendError> {
-        // Clone per attempt: the inner call consumes the buffer.
+        self.set_bytes(key, Bytes::from(value), ttl).await
+    }
+
+    // Required, not just faster: `set` forwards here, and the default calls
+    // `set`. Each attempt clones the handle, not the buffer.
+    async fn set_bytes(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
         self.guarded(self.deadlines.map(|d| d.write), || {
-            self.inner.set(key, value.clone(), ttl)
+            self.inner.set_bytes(key, value.clone(), ttl)
         })
         .await
     }

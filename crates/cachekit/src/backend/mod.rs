@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
 use crate::error::BackendError;
 use crate::metrics::MetricsProvider;
@@ -78,6 +79,31 @@ pub trait Backend: Send + Sync {
         ttl: Option<Duration>,
     ) -> Result<(), BackendError>;
 
+    /// Store a shared buffer under `key`, optionally expiring after `ttl`.
+    ///
+    /// The client writes through this method, so it can hand one buffer to
+    /// its L1 and to every retry attempt without copying the payload. The
+    /// default converts `value` to a `Vec<u8>` and calls [`Self::set`]; the
+    /// conversion copies the payload while another handle shares the buffer,
+    /// as the L1 or a retry does.
+    ///
+    /// Override it when the backend can store a [`Bytes`] without that copy.
+    /// An override must store exactly what `set` would. A backend that wraps
+    /// another and overrides it applies the same wrapping as its `set` and
+    /// calls the inner backend's `set_bytes`; one that does not override it
+    /// keeps working through its `set`, but the inner backend's override is
+    /// never reached. Implement `set` by calling `set_bytes` only when you
+    /// also override `set_bytes`: the default calls `set`, and the pair would
+    /// recurse.
+    async fn set_bytes(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        self.set(key, Vec::from(value), ttl).await
+    }
+
     /// Remove `key` and return `true` if it existed.
     ///
     /// `CachekitIO` and `WorkersCachekitIO` return `true` on every successful
@@ -150,6 +176,31 @@ pub trait Backend {
         value: Vec<u8>,
         ttl: Option<Duration>,
     ) -> Result<(), BackendError>;
+
+    /// Store a shared buffer under `key`, optionally expiring after `ttl`.
+    ///
+    /// The client writes through this method, so it can hand one buffer to
+    /// its L1 and to every retry attempt without copying the payload. The
+    /// default converts `value` to a `Vec<u8>` and calls [`Self::set`]; the
+    /// conversion copies the payload while another handle shares the buffer,
+    /// as the L1 or a retry does.
+    ///
+    /// Override it when the backend can store a [`Bytes`] without that copy.
+    /// An override must store exactly what `set` would. A backend that wraps
+    /// another and overrides it applies the same wrapping as its `set` and
+    /// calls the inner backend's `set_bytes`; one that does not override it
+    /// keeps working through its `set`, but the inner backend's override is
+    /// never reached. Implement `set` by calling `set_bytes` only when you
+    /// also override `set_bytes`: the default calls `set`, and the pair would
+    /// recurse.
+    async fn set_bytes(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        self.set(key, Vec::from(value), ttl).await
+    }
 
     /// Remove `key` and return `true` if it existed.
     ///

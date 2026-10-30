@@ -128,12 +128,12 @@ impl CachekitIO {
         req
     }
 
-    /// Build the `PUT` for [`Backend::set`] without sending it, so tests can
-    /// pin its headers.
+    /// Build the `PUT` for [`Backend::set_bytes`] without sending it, so tests
+    /// can pin its headers.
     fn put_request(
         &self,
         key: &str,
-        value: Vec<u8>,
+        value: Bytes,
         ttl: Option<Duration>,
     ) -> Result<reqwest::RequestBuilder, BackendError> {
         let mut req = self
@@ -275,6 +275,18 @@ impl Backend for CachekitIO {
         &self,
         key: &str,
         value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        self.set_bytes(key, Bytes::from(value), ttl).await
+    }
+
+    // The request body takes the buffer as is, so a retry or the client's L1
+    // can share it. Required, not just faster: `set` forwards here, and the
+    // default calls `set`.
+    async fn set_bytes(
+        &self,
+        key: &str,
+        value: Bytes,
         ttl: Option<Duration>,
     ) -> Result<(), BackendError> {
         let resp = self
@@ -930,24 +942,42 @@ mod path_encoding_tests {
     }
 }
 
-// ── PUT TTL header tests ──────────────────────────────────────────────────────
+// ── PUT request tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
 #[allow(clippy::expect_used)] // test-only: a builder failure on a fixture should panic loudly
-mod put_ttl_header_tests {
+mod put_request_tests {
     use std::time::Duration;
+
+    use bytes::Bytes;
 
     use super::CachekitIO;
 
-    fn put(ttl: Option<Duration>) -> reqwest::Request {
+    fn put_value(value: Bytes, ttl: Option<Duration>) -> reqwest::Request {
         CachekitIO::builder()
             .api_key("ck_test_key")
             .build()
             .expect("builder succeeds")
-            .put_request("k", b"v".to_vec(), ttl)
+            .put_request("k", value, ttl)
             .expect("key encodes")
             .build()
             .expect("request builds")
+    }
+
+    fn put(ttl: Option<Duration>) -> reqwest::Request {
+        put_value(Bytes::from_static(b"v"), ttl)
+    }
+
+    #[test]
+    fn put_body_is_the_callers_buffer_not_a_copy() {
+        let value = Bytes::from(vec![7u8; 64 * 1024]);
+        let req = put_value(value.clone(), None);
+        let body = req
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .expect("buffered body");
+        assert_eq!(body.as_ptr(), value.as_ptr(), "body was copied");
+        assert_eq!(body.len(), value.len());
     }
 
     #[test]
@@ -992,7 +1022,7 @@ mod prebuilt_header_tests {
         builder
             .build()
             .expect("builder succeeds")
-            .put_request("k", b"v".to_vec(), None)
+            .put_request("k", bytes::Bytes::from_static(b"v"), None)
             .expect("key encodes")
             .build()
             .expect("request builds")
