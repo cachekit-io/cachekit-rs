@@ -43,6 +43,13 @@
 //!   fill's unlock is sent after the call returns, so the probe waits for it
 //!   off the clock and judges it with that call.
 //!
+//! `--macro-lock on,off` sets slot A's and slot B's cold miss (default
+//! `on,on`). An `off` slot calls the same function declared with
+//! `distributed_lock = false`, labelled `macro-cold-miss-unlocked`: it must
+//! send GET and PUT only, so it is budgeted at three requests and any lock or
+//! unlock request stops the run. Both slots are paced at the lock-on budget,
+//! so the arms differ only by the attribute.
+//!
 //! `--versions A,B --override-worker NAME` compares two server versions instead
 //! of two clients. It needs `--arms transport,transport`: each slot's requests
 //! carry a `Cloudflare-Workers-Version-Overrides` header naming that slot's
@@ -99,6 +106,10 @@ const MAX_SERVER_ERRORS: usize = 5;
 /// (GET miss, lock, PUT, unlock); the fifth is a margin. A call that records
 /// more than this stops the run.
 const MACRO_REQUESTS: usize = 5;
+/// Budget for a `distributed_lock = false` cold miss: GET miss and PUT, plus
+/// a margin. It must send no lock or unlock request at all.
+const MACRO_UNLOCKED_REQUESTS: usize = 3;
+const MACRO_UNLOCKED_LABEL: &str = "macro-cold-miss-unlocked";
 /// How long `--hold-lock`'s second client holds its lock: past the one call it
 /// blocks, and short enough to lapse on its own if the release fails.
 const HOLD_LOCK_MS: u64 = 10_000;
@@ -147,6 +158,8 @@ struct Args {
     concurrency: usize,
     ops: Vec<Op>,
     macro_cold_miss: bool,
+    /// Whether slot A's and slot B's cold miss takes the distributed lock.
+    macro_locks: [bool; 2],
     hold_lock: bool,
     /// Slot A's and slot B's Worker version ids, with `override_worker`.
     versions: Option<[String; 2]>,
@@ -160,11 +173,12 @@ struct Args {
 const USAGE: &str = "usage: wall_time_probe --run ID --phase NAME --out FILE --ledger FILE \
 [--env dev] [--key-prefix P] [--arms sdk,sdk|sdk,transport|transport,transport] \
 [--samples N per arm] [--block N] [--gap-ms MS] [--fresh-conn] [--concurrency C] \
-[--ops put,get,head,delete | --macro-cold-miss [--hold-lock]] [--size BYTES] [--ttl-s S] \
-[--max-per-min N] [--max-ops N] [--versions A_ID,B_ID --override-worker NAME]
+[--ops put,get,head,delete | --macro-cold-miss [--macro-lock on|off,on|off] [--hold-lock]] \
+[--size BYTES] [--ttl-s S] [--max-per-min N] [--max-ops N] \
+[--versions A_ID,B_ID --override-worker NAME]
 env: CACHEKIT_API_KEY, CACHEKIT_API_URL";
 
-const VALUE_FLAGS: [&str; 18] = [
+const VALUE_FLAGS: [&str; 19] = [
     "run",
     "env",
     "phase",
@@ -177,6 +191,7 @@ const VALUE_FLAGS: [&str; 18] = [
     "gap-ms",
     "concurrency",
     "ops",
+    "macro-lock",
     "size",
     "ttl-s",
     "max-per-min",
@@ -243,6 +258,19 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             _ => Err(format!("unknown op {s:?}")),
         })
         .collect::<Result<_, _>>()?;
+    let locks: Vec<bool> = kv
+        .get("macro-lock")
+        .unwrap_or(&"on,on")
+        .split(',')
+        .map(|s| match s {
+            "on" => Ok(true),
+            "off" => Ok(false),
+            _ => Err(format!("--macro-lock: not on or off: {s:?}")),
+        })
+        .collect::<Result<_, _>>()?;
+    let [lock_a, lock_b] = locks[..] else {
+        return Err("--macro-lock takes exactly two values, A,B".into());
+    };
     let versions = match kv.get("versions") {
         None => None,
         Some(v) => match v.split(',').collect::<Vec<_>>()[..] {
@@ -271,6 +299,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         concurrency: num("concurrency", 1)?,
         ops,
         macro_cold_miss: flags.contains("macro-cold-miss"),
+        macro_locks: [lock_a, lock_b],
         hold_lock: flags.contains("hold-lock"),
         versions,
         override_worker: kv.get("override-worker").map(|v| (*v).to_owned()),
@@ -319,6 +348,13 @@ fn validate(a: &Args) -> Result<(), String> {
     }
     if a.hold_lock && !a.macro_cold_miss {
         return Err("--hold-lock contends a cold miss's fill lock; add --macro-cold-miss".into());
+    }
+    if a.macro_locks != [true, true] && !a.macro_cold_miss {
+        return Err("--macro-lock selects a cold miss's lock; add --macro-cold-miss".into());
+    }
+    if a.hold_lock && !a.macro_locks[0] {
+        // The held lock meets slot A's first call, which must take the lock.
+        return Err("--hold-lock needs slot A's lock on".into());
     }
     validate_versions(a)?;
     let per_sample = if a.macro_cold_miss {
@@ -756,6 +792,8 @@ struct Arm {
     cache: CacheKit,
     wire: Option<Arc<Transport>>,
     recorded: Option<Arc<Recorded>>,
+    /// Whether this arm's cold miss takes the distributed fill lock.
+    distributed_lock: bool,
 }
 
 /// `record` wraps the sdk arm's backend in [`Recorded`]; only the macro
@@ -768,6 +806,7 @@ fn build_arm(
     api_url: &str,
     record: bool,
     version: Option<(&str, &str)>,
+    distributed_lock: bool,
 ) -> Result<Arm, CachekitError> {
     let (mut wire, mut recorded) = (None, None);
     let backend: cachekit::SharedBackend = match kind {
@@ -804,6 +843,7 @@ fn build_arm(
         cache,
         wire,
         recorded,
+        distributed_lock,
     })
 }
 
@@ -814,6 +854,18 @@ const MACRO_OP: &str = "cold-miss";
 
 #[cachekit::cachekit(client = cache, ttl = 900, interop = "cold-miss", namespace = "wall-time-probe")]
 async fn cold_miss(cache: &CacheKit, id: String) -> Result<String, CachekitError> {
+    Ok(id)
+}
+
+/// [`cold_miss`] without the distributed fill lock; the same key.
+#[cachekit::cachekit(
+    client = cache,
+    ttl = 900,
+    interop = "cold-miss",
+    namespace = "wall-time-probe",
+    distributed_lock = false
+)]
+async fn cold_miss_unlocked(cache: &CacheKit, id: String) -> Result<String, CachekitError> {
     Ok(id)
 }
 
@@ -932,7 +984,12 @@ async fn timed_cold_miss(arm: &Arm, id: &str) -> Timed {
     let before = tls_sockets();
     let started = iso_now();
     let t0 = Instant::now();
-    let called = cold_miss(&arm.cache, id.to_owned()).await.map(|_| None);
+    let called = if arm.distributed_lock {
+        cold_miss(&arm.cache, id.to_owned()).await
+    } else {
+        cold_miss_unlocked(&arm.cache, id.to_owned()).await
+    }
+    .map(|_| None);
     let total = t0.elapsed();
     let ended = iso_now();
     let after = tls_sockets();
@@ -946,7 +1003,11 @@ async fn timed_cold_miss(arm: &Arm, id: &str) -> Timed {
         None => called.map_err(|e| e.to_string()),
     };
     Timed {
-        op: "macro-cold-miss",
+        op: if arm.distributed_lock {
+            "macro-cold-miss"
+        } else {
+            MACRO_UNLOCKED_LABEL
+        },
         method: "CALL",
         key: macro_key(id).unwrap_or_default(),
         started,
@@ -1099,12 +1160,24 @@ impl Sink {
             return self.judge(t.method, status, t.outcome.is_ok(), t);
         }
         // A macro call: every request it sent is judged on its own.
-        if t.parts.len() > MACRO_REQUESTS {
+        let unlocked = t.op == MACRO_UNLOCKED_LABEL;
+        let budget = if unlocked {
+            MACRO_UNLOCKED_REQUESTS
+        } else {
+            MACRO_REQUESTS
+        };
+        if t.parts.len() > budget {
             return Err(Stop::Refused(format!(
-                "{}: sent {} requests, over the budget of {MACRO_REQUESTS}: {:?}",
+                "{}: sent {} requests, over the budget of {budget}: {:?}",
                 t.op,
                 t.parts.len(),
                 t.parts
+            )));
+        }
+        if unlocked && t.parts.iter().any(|(m, _)| matches!(*m, "LOCK" | "UNLOCK")) {
+            return Err(Stop::Refused(format!(
+                "{}: sent a lock request with the lock off: {:?}",
+                t.op, t.parts
             )));
         }
         let mut failed = false;
@@ -1228,13 +1301,16 @@ async fn schedule(sink: &mut Sink, api_key: &str, api_url: &str) -> Result<(), S
     let slots = ["A", "B"];
     let versions = a.versions.clone();
     let worker = a.override_worker.clone();
+    let locks = a.macro_locks;
     let build = |i: usize| {
         let version = worker
             .as_deref()
             .zip(versions.as_ref().map(|v| v[i].as_str()));
-        build_arm(arms[i], slots[i], api_key, api_url, macro_mode, version)
-            .map(Arc::new)
-            .map_err(|e| Stop::Fault(e.to_string()))
+        build_arm(
+            arms[i], slots[i], api_key, api_url, macro_mode, version, locks[i],
+        )
+        .map(Arc::new)
+        .map_err(|e| Stop::Fault(e.to_string()))
     };
     let mut pool = [build(0)?, build(1)?];
     let mut counter = 0usize;
@@ -1502,6 +1578,31 @@ mod tests {
         let base = ["--run", "R", "--phase", "p", "--out", "o", "--ledger", "l"];
         let argv: Vec<String> = base.iter().chain(extra).map(|s| (*s).to_owned()).collect();
         parse_args(&argv)
+    }
+
+    #[test]
+    fn macro_lock_sets_each_slot_and_refuses_misuse() {
+        assert_eq!(args(&[]).expect("valid").macro_locks, [true, true]);
+        let a = args(&["--macro-cold-miss", "--macro-lock", "on,off"]).expect("valid");
+        assert_eq!(a.macro_locks, [true, false]);
+        for (extra, why) in [
+            (vec!["--macro-lock", "on,off"], "add --macro-cold-miss"),
+            (
+                vec!["--macro-cold-miss", "--macro-lock", "on"],
+                "exactly two",
+            ),
+            (
+                vec!["--macro-cold-miss", "--macro-lock", "on,no"],
+                "not on or off",
+            ),
+            (
+                vec!["--macro-cold-miss", "--macro-lock", "off,on", "--hold-lock"],
+                "slot A's lock on",
+            ),
+        ] {
+            let err = args(&extra).expect_err(why);
+            assert!(err.contains(why), "{extra:?}: {err}");
+        }
     }
 
     #[test]
