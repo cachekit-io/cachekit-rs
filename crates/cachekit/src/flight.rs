@@ -105,7 +105,9 @@ const FILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// refresh stands down; a cold miss polls and may be cancelled or fail), and
 /// a queued cold miss whose re-check misses must contest that lock before
 /// computing. A holder that leads clears the note: on acquire, or when its
-/// own lease contest makes it a leader. A follower leaves it as it found it,
+/// own lease contest makes it a leader. A leader that skipped the lock
+/// (`#[cachekit(distributed_lock = false)]`) sets it instead, since it holds
+/// no lease either. A follower leaves it as it found it,
 /// whether it finds a fill, errors out or is dropped, so the next follower
 /// still sees it. A stale `true` costs at most one lock call, by a follower
 /// that was about to compute anyway.
@@ -716,7 +718,8 @@ impl SingleFlight {
     ///
     /// Without `distributed` the flight never touches the distributed lock:
     /// no acquire, no unlock, and a follower never contests the lease on a
-    /// stand-down note. In-process dedup is unchanged.
+    /// stand-down note. As a leader it sets that note (see [`FlightMap`]).
+    /// In-process dedup is unchanged.
     pub(crate) async fn acquire(
         map: &crate::client::SharedFlight,
         backend: &SharedBackend,
@@ -746,9 +749,12 @@ impl SingleFlight {
             flight.lock_id = lock_id;
             return flight;
         }
-        #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
-        let _ = distributed;
-        Self::new(map, local, Role::Leader, backend, full_key)
+        let mut flight = Self::new(map, local, Role::Leader, backend, full_key);
+        // A leader without the lease suppresses nothing across processes, so
+        // it leaves the note set, as a contested holder does: a locking cold
+        // miss queued behind it that misses must contest the lease.
+        flight.local.stand_down |= !distributed;
+        flight
     }
 
     /// Refresh-ahead entry: lead the fill, or `None` to stand down at once.

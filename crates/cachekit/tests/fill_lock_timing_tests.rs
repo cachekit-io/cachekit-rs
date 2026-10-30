@@ -681,6 +681,32 @@ async fn opted_out_follower_does_not_contest_the_lease_after_a_stand_down() {
     );
 }
 
+/// An opted-out leader holds no lease, so when it fills nothing, a locking
+/// cold miss queued behind it contests the lease before computing: another
+/// process may be filling under it.
+#[tokio::test(start_paused = true)]
+async fn locking_follower_contests_the_lease_after_an_opted_out_leader_fails() {
+    let backend = Timed::new();
+    let cache = backend.client();
+
+    let held = cache.__local_single_flight(&fill_key(19)).await;
+    let holder = async move {
+        // Let go once the locking call has missed and queued behind it.
+        tokio::time::sleep(ms(GET + 10)).await;
+        drop(held); // fills nothing
+    };
+    let (value, ()) = tokio::join!(fill(&cache, 19), holder);
+
+    assert_eq!(value.unwrap(), 190);
+    let ops = backend.ops_by(Instant::now());
+    let lock = ops.iter().position(|op| *op == "lock");
+    let set = ops.iter().position(|op| *op == "set");
+    assert!(
+        lock.is_some() && lock < set,
+        "the follower computed without contesting the lease: {ops:?}"
+    );
+}
+
 // ── The leader's runtime idles or goes away before the unlock is sent ───────
 
 fn current_thread() -> tokio::runtime::Runtime {
