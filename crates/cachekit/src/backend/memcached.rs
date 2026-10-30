@@ -1,5 +1,6 @@
 //! Memcached backend via [`rust-memcache`](https://crates.io/crates/memcache)
-//! (r2d2-pooled, per-socket read/write timeouts, ASCII protocol).
+//! (ASCII protocol, per-socket read/write timeouts, backend-owned connection
+//! checkout).
 //!
 //! ## Why the ASCII protocol
 //!
@@ -8,11 +9,33 @@
 //! does not correlate responses to requests (opcode/opaque unchecked), so a
 //! connection desynced by a timed-out operation could serve a *late* response
 //! as the answer to the next command — worst case a wrong value for a
-//! different key. The ASCII `get` validates the echoed key, and a desynced
-//! connection fails its next pool-checkout ping and is discarded. Every
-//! operation additionally runs under a hard async time budget (see
+//! different key. The ASCII `get` validates the echoed key. Every operation
+//! additionally runs under a hard async time budget (see
 //! [`crate::backend::memcached::MemcachedBackendBuilder::timeout`]) so a wedged server surfaces as a
 //! `Timeout` error instead of hanging callers.
+//!
+//! ## The desync guard: discard on error
+//!
+//! A connection goes back to the idle list only after an operation whose
+//! complete response parsed and returned `Ok`. Any error drops it, so a late
+//! or partial response is never read as the answer to a later request. The
+//! decision runs on the blocking thread that ran the operation: an operation
+//! the async budget abandoned keeps its connection until it ends, and returns
+//! it only if it then ends cleanly.
+//!
+//! rust-memcache's own pool cannot enforce this. Its `has_broken` always
+//! returns `false`, so an errored connection goes back into the pool, and its
+//! only guard is r2d2's checkout test: a `version` round trip before every
+//! operation. The backend instead keeps its own idle list of
+//! single-connection clients with that test off, which halves the round trips
+//! per operation. The cost: each client's one-connection r2d2 pool runs its
+//! own 3 worker threads, so a backend holds up to `3 × pool_size` parked
+//! threads (30 at the default `pool_size` of 10).
+//!
+//! A connection that died while idle (server restart, NAT idle drop) now fails
+//! the one operation that finds it, with a retryable error, where the checkout
+//! test used to replace it silently. A lost connection also drops every idle
+//! connection, so a server restart costs about one failed operation.
 //!
 //! ## TTL capability — the honest parity picture
 //!
@@ -42,10 +65,13 @@
 //! backend), per-socket timeouts, and `touch`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use memcache::{Client, CommandError, MemcacheError, ServerError};
+use memcache::{
+    Client, ClientError, CommandError, ConnectionManager, MemcacheError, ServerError, Url,
+};
+use tokio::sync::Semaphore;
 
 use async_trait::async_trait;
 
@@ -101,15 +127,34 @@ fn validate_key(key: &str) -> Result<(), BackendError> {
 
 // ── Error mapping ─────────────────────────────────────────────────────────────
 
+/// SO_RCVTIMEO/SO_SNDTIMEO expiry surfaces as `WouldBlock` on unix.
+fn is_timeout(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// rust-memcache 0.19's ASCII reader reports a peer that closed the socket
+/// (a read of 0 bytes) as this `ClientError`, not as an I/O error.
+const ASCII_EOF: &str = "Ascii protocol no line found";
+
+/// The connection is gone, not merely slow: reset, broken pipe or EOF. That
+/// usually means a server restart, so every idle connection is suspect too.
+fn connection_lost(e: &MemcacheError) -> bool {
+    match e {
+        MemcacheError::IOError(io) => !is_timeout(io.kind()),
+        MemcacheError::ClientError(ClientError::Error(msg)) => msg == ASCII_EOF,
+        _ => false,
+    }
+}
+
 fn memcached_err(e: MemcacheError) -> BackendError {
     let kind = match &e {
-        MemcacheError::IOError(io) => match io.kind() {
-            // SO_RCVTIMEO/SO_SNDTIMEO expiry surfaces as WouldBlock on unix.
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-                BackendErrorKind::Timeout
-            }
-            _ => BackendErrorKind::Transient,
-        },
+        MemcacheError::IOError(io) if is_timeout(io.kind()) => BackendErrorKind::Timeout,
+        MemcacheError::IOError(_) => BackendErrorKind::Transient,
+        // EOF: the server closed the connection. The retry runs on a fresh one.
+        e if connection_lost(e) => BackendErrorKind::Transient,
         // Pool exhaustion / connection acquisition — retryable.
         MemcacheError::PoolError(_) => BackendErrorKind::Transient,
         // Oversized items must NOT be retried — the same payload fails
@@ -152,6 +197,89 @@ fn expiration_secs(ttl: Option<Duration>) -> u32 {
     }
 }
 
+// ── Connection checkout ───────────────────────────────────────────────────────
+
+/// Idle single-connection clients, and the permits that cap how many exist.
+///
+/// This is the desync guard the module docs describe. Each client wraps a
+/// one-connection r2d2 pool with the checkout test off, because
+/// rust-memcache's `Client` has no public constructor over a bare connection.
+struct Connections {
+    url: Url,
+    connect_timeout: Duration,
+    /// LIFO, like r2d2: the most recently used connection is reused first.
+    idle: Mutex<Vec<Client>>,
+    /// One permit per client in use, held until the blocking call ends, so
+    /// idle plus in-use clients never exceed `pool_size`.
+    permits: Arc<Semaphore>,
+}
+
+impl Connections {
+    fn new(url: Url, connect_timeout: Duration, pool_size: u32) -> Self {
+        Self {
+            url,
+            connect_timeout,
+            idle: Mutex::new(Vec::new()),
+            permits: Arc::new(Semaphore::new(
+                usize::try_from(pool_size)
+                    .map_or(Semaphore::MAX_PERMITS, |n| n.min(Semaphore::MAX_PERMITS)),
+            )),
+        }
+    }
+
+    fn open(&self) -> Result<Client, MemcacheError> {
+        let pool = memcache::Pool::builder()
+            .max_size(1)
+            // build() opens nothing; the op's first checkout connects, bounded
+            // by connection_timeout.
+            .min_idle(Some(0))
+            .test_on_check_out(false)
+            // rust-memcache's ClientBuilder default.
+            .max_lifetime(None)
+            .connection_timeout(self.connect_timeout)
+            .build(ConnectionManager::new(self.url.clone()))?;
+        Client::with_pool(pool)
+    }
+
+    /// Run `op` on an idle client, or a new one, on the calling thread.
+    ///
+    /// The client goes back to the idle list only if `op` returned `Ok`, so
+    /// its whole response was parsed. Any error drops it, and a lost
+    /// connection drops every idle one too.
+    fn run<T>(
+        &self,
+        op: impl FnOnce(&Client) -> Result<T, MemcacheError>,
+    ) -> Result<T, BackendError> {
+        let idle = self.lock_idle().pop();
+        let client = match idle {
+            Some(client) => client,
+            None => self.open().map_err(memcached_err)?,
+        };
+        match op(&client) {
+            Ok(value) => {
+                self.lock_idle().push(client);
+                Ok(value)
+            }
+            Err(e) => {
+                drop(client);
+                if connection_lost(&e) {
+                    // Dropped outside the lock: each drop stops a client's
+                    // r2d2 worker threads.
+                    let stale = std::mem::take(&mut *self.lock_idle());
+                    drop(stale);
+                }
+                Err(memcached_err(e))
+            }
+        }
+    }
+
+    /// The list is only pushed, popped and taken, so a poisoned lock still
+    /// guards a consistent `Vec`.
+    fn lock_idle(&self) -> MutexGuard<'_, Vec<Client>> {
+        self.idle.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 // ── MemcachedBackend ──────────────────────────────────────────────────────────
 
 /// Memcached backend powered by [`rust-memcache`](https://crates.io/crates/memcache).
@@ -163,13 +291,13 @@ fn expiration_secs(ttl: Option<Duration>) -> u32 {
 ///
 /// [`RedisBackend`]: crate::backend::redis::RedisBackend
 pub struct MemcachedBackend {
-    // ponytail: single server behind an r2d2 pool — py's HashClient shards
-    // across servers; add multi-server + consistent hashing when needed.
-    client: Arc<Client>,
+    // ponytail: single server — py's HashClient shards across servers; add
+    // multi-server + consistent hashing when needed.
+    conns: Arc<Connections>,
     max_item_size_bytes: usize,
-    /// Hard async ceiling per operation. Socket timeouts bound each I/O call,
-    /// but r2d2's checkout loop can retry pings against a wedged-but-accepting
-    /// server past any single socket timeout — this budget bounds the caller.
+    /// Hard async ceiling per operation, including the wait for a free
+    /// connection. Socket timeouts bound each I/O call, not the whole
+    /// operation — this budget bounds the caller.
     op_budget: Duration,
 }
 
@@ -185,25 +313,38 @@ impl MemcachedBackend {
         MemcachedBackendBuilder::default()
     }
 
-    /// Run a pooled-client call on the blocking pool under the op budget.
+    /// Wait for a free connection, then run `op` on the blocking pool, all
+    /// under the op budget.
     ///
-    /// A wedged-but-accepting server can keep r2d2's checkout loop pinging
-    /// (each ping bounded by the socket timeout) past any single I/O
-    /// deadline; the budget converts that into an immediate `Timeout` error
-    /// for the caller. The abandoned blocking task exits on its next socket
-    /// timeout. Under `unsync` the call runs inline (no budget — there is no
-    /// executor to time it out against; the socket timeouts still bound each
-    /// I/O call).
+    /// A server that trickles its response, or a connect or a busy pool, can
+    /// outlast any single socket timeout; the budget converts that into an
+    /// immediate `Timeout` error for the caller. The abandoned blocking task
+    /// keeps its permit and connection until its own I/O ends, then returns
+    /// the connection only on `Ok` (see [`Connections::run`]). Under `unsync`
+    /// the call runs inline (no budget — there is no executor to time it out
+    /// against; the socket timeouts still bound each I/O call).
     #[cfg(not(feature = "unsync"))]
     async fn run_op<T: Send + 'static>(
         &self,
-        f: impl FnOnce() -> Result<T, BackendError> + Send + 'static,
+        op: impl FnOnce(&Client) -> Result<T, MemcacheError> + Send + 'static,
     ) -> Result<T, BackendError> {
-        match tokio::time::timeout(self.op_budget, run_blocking(f)).await {
+        let conns = Arc::clone(&self.conns);
+        let checkout = async move {
+            let permit = Arc::clone(&conns.permits)
+                .acquire_owned()
+                .await
+                .map_err(|_| BackendError::permanent("memcached connection permits closed"))?;
+            run_blocking(move || {
+                let _permit = permit;
+                conns.run(op)
+            })
+            .await
+        };
+        match tokio::time::timeout(self.op_budget, checkout).await {
             Ok(result) => result,
             Err(_) => Err(BackendError::timeout(format!(
-                "memcached operation exceeded its {}ms budget (server hung or pool checkout \
-                 retrying); the in-flight call was abandoned",
+                "memcached operation exceeded its {}ms budget (server hung or every \
+                 connection busy); the in-flight call was abandoned",
                 self.op_budget.as_millis()
             ))),
         }
@@ -213,9 +354,15 @@ impl MemcachedBackend {
     #[cfg(feature = "unsync")]
     async fn run_op<T>(
         &self,
-        f: impl FnOnce() -> Result<T, BackendError>,
+        op: impl FnOnce(&Client) -> Result<T, MemcacheError>,
     ) -> Result<T, BackendError> {
-        run_blocking(f).await
+        let _permit = self
+            .conns
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| BackendError::permanent("memcached connection permits closed"))?;
+        run_blocking(|| self.conns.run(op)).await
     }
 
     /// Refresh a key's TTL via the memcached `touch` command.
@@ -235,11 +382,9 @@ impl MemcachedBackend {
         ttl: Option<Duration>,
     ) -> Result<bool, BackendError> {
         validate_key(key)?;
-        let client = Arc::clone(&self.client);
         let key = key.to_owned();
         let expire = expiration_secs(ttl);
-        self.run_op(move || client.touch(&key, expire).map_err(memcached_err))
-            .await
+        self.run_op(move |client| client.touch(&key, expire)).await
     }
 }
 
@@ -251,10 +396,8 @@ impl MemcachedBackend {
 impl Backend for MemcachedBackend {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
         validate_key(key)?;
-        let client = Arc::clone(&self.client);
         let key = key.to_owned();
-        self.run_op(move || client.get::<Vec<u8>>(&key).map_err(memcached_err))
-            .await
+        self.run_op(move |client| client.get::<Vec<u8>>(&key)).await
     }
 
     async fn set(
@@ -278,46 +421,30 @@ impl Backend for MemcachedBackend {
             )));
         }
 
-        let client = Arc::clone(&self.client);
         let key = key.to_owned();
         let expire = expiration_secs(ttl);
-        self.run_op(move || {
-            client
-                .set(&key, value.as_slice(), expire)
-                .map_err(memcached_err)
-        })
-        .await
+        self.run_op(move |client| client.set(&key, value.as_slice(), expire))
+            .await
     }
 
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
         validate_key(key)?;
-        let client = Arc::clone(&self.client);
         let key = key.to_owned();
-        self.run_op(move || client.delete(&key).map_err(memcached_err))
-            .await
+        self.run_op(move |client| client.delete(&key)).await
     }
 
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
         // Memcached has no EXISTS command; a get is the probe (same trade-off
         // as cachekit-py — the value crosses the wire and is discarded).
         validate_key(key)?;
-        let client = Arc::clone(&self.client);
         let key = key.to_owned();
-        self.run_op(move || {
-            Ok(client
-                .get::<Vec<u8>>(&key)
-                .map_err(memcached_err)?
-                .is_some())
-        })
-        .await
+        self.run_op(move |client| Ok(client.get::<Vec<u8>>(&key)?.is_some()))
+            .await
     }
 
     async fn health(&self) -> Result<HealthStatus, BackendError> {
         let start = std::time::Instant::now();
-        let client = Arc::clone(&self.client);
-        let versions = self
-            .run_op(move || client.version().map_err(memcached_err))
-            .await?;
+        let versions = self.run_op(|client| client.version()).await?;
         let latency = start.elapsed();
 
         let mut details = HashMap::new();
@@ -380,7 +507,10 @@ impl MemcachedBackendBuilder {
         self
     }
 
-    /// Connection pool size (default 10).
+    /// Maximum open connections, and so concurrent operations (default 10).
+    ///
+    /// Each connection also runs 3 parked r2d2 worker threads (see the module
+    /// docs), so the default costs up to 30 threads.
     pub fn pool_size(mut self, size: u32) -> Self {
         self.pool_size = Some(size.max(1));
         self
@@ -402,8 +532,8 @@ impl MemcachedBackendBuilder {
     /// - `protocol=ascii`: see the module docs — the binary parser does not
     ///   correlate responses to requests, so a timed-out op could desync a
     ///   pooled connection into serving wrong values.
-    /// - `timeout=<secs>`: the ONLY spelling that applies socket read/write
-    ///   timeouts to **every** pooled connection at creation.
+    /// - `timeout=<secs>`: the only spelling that applies socket read/write
+    ///   timeouts to **every** connection at creation.
     ///   `ClientBuilder::with_read_timeout` reaches exactly one checked-out
     ///   connection and none of the replacements r2d2 creates later (a hung
     ///   server wedged the backend despite configured timeouts).
@@ -432,8 +562,9 @@ impl MemcachedBackendBuilder {
 
     /// Connect to memcached and construct a [`MemcachedBackend`].
     ///
-    /// Establishes the pool and pings the server (`version`), so a bad
-    /// address fails here rather than on the first cache operation.
+    /// Opens one connection and pings the server (`version`), so a bad
+    /// address fails here rather than on the first cache operation. Later
+    /// operations send no ping.
     ///
     /// # Errors
     ///
@@ -451,68 +582,36 @@ impl MemcachedBackendBuilder {
         let connect_timeout = self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
         let pool_size = self.pool_size.unwrap_or(DEFAULT_POOL_SIZE);
         let url = Self::with_connection_params(&Self::normalized_url(&url), timeout);
+        let url =
+            Url::parse(&url).map_err(|e| memcached_err(MemcacheError::BadURL(e.to_string())))?;
+        // rust-memcache's ClientBuilder check, kept so a wrong scheme fails
+        // here instead of as a connect timeout on the first checkout.
+        if !matches!(url.scheme(), "memcache" | "memcache+tls" | "memcache+udp") {
+            return Err(memcached_err(MemcacheError::BadURL(format!(
+                "Unsupported protocol: {}",
+                url.scheme()
+            )))
+            .into());
+        }
 
-        // Budget: pool checkout may burn one socket timeout per ping retry
-        // plus a connect; 3× socket timeout + connect covers the healthy
-        // path with slack while still failing a wedged server fast.
+        // Budget: a connect plus a few socket timeouts' worth of I/O covers
+        // the healthy path with slack while still failing a wedged server
+        // fast. It also bounds the wait for a free connection.
         let op_budget = timeout * 3 + connect_timeout;
 
-        let build = move || {
-            let client = Client::builder()
-                .add_server(url)
-                .map_err(memcached_err)?
-                .with_max_pool_size(pool_size)
-                // min_idle = 0 is load-bearing, not a tuning preference:
-                // with eager replenishment (the default), a checkout whose
-                // test-ping times out gets a fresh eagerly-created connection
-                // on every loop iteration and r2d2's deadline is never
-                // consulted — a wedged-but-accepting server live-loops the
-                // checkout forever (reproduced). With 0, a
-                // failed test leaves no idle connection, the loop parks on
-                // the condvar, and the connection_timeout deadline fires.
-                .with_min_idle_conns(0)
-                .with_connection_timeout(connect_timeout)
-                // BOTH timeout spellings are required. build() unconditionally
-                // applies the builder values to the connection it touches —
-                // leaving these unset would CLEAR the URL-applied socket
-                // timeout on that (LIFO-hot) connection. The URL param covers
-                // every connection r2d2 creates later; these cover the one
-                // build() strips (re-verified and reproduced).
-                .with_read_timeout(timeout)
-                .with_write_timeout(timeout)
-                .build()
-                .map_err(memcached_err)?;
-            // Eager reachability check — connect() promises a live server.
-            // Socket timeouts (via the URL) bound this even against a
-            // wedged-but-accepting server.
-            client.version().map_err(memcached_err)?;
-            Ok(client)
-        };
-        // Budget the connect too: pool construction + ping must not hang.
-        #[cfg(not(feature = "unsync"))]
-        let client = {
-            let connect_budget = (connect_timeout + timeout) * pool_size.min(4) + timeout;
-            match tokio::time::timeout(connect_budget, run_blocking(build)).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Err(BackendError::timeout(format!(
-                        "memcached connect exceeded its {}ms budget",
-                        connect_budget.as_millis()
-                    ))
-                    .into())
-                }
-            }
-        };
-        #[cfg(feature = "unsync")]
-        let client = run_blocking(build).await?;
-
-        Ok(MemcachedBackend {
-            client: Arc::new(client),
+        let backend = MemcachedBackend {
+            conns: Arc::new(Connections::new(url, connect_timeout, pool_size)),
             max_item_size_bytes: self
                 .max_item_size_bytes
                 .unwrap_or(DEFAULT_MAX_ITEM_SIZE_BYTES),
             op_budget,
-        })
+        };
+        // Eager reachability check — connect() promises a live server. The
+        // socket timeouts (via the URL) and the op budget bound it even
+        // against a wedged-but-accepting server. The connection it opens is
+        // the first idle one.
+        backend.run_op(|client| client.version()).await?;
+        Ok(backend)
     }
 }
 
