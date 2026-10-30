@@ -946,7 +946,16 @@ impl CacheKit {
     /// actual cache operation.
     pub async fn single_flight(&self, key: &str) -> crate::flight::SingleFlight {
         let full_key = self.namespaced_key(key);
-        crate::flight::SingleFlight::acquire(&self.flight, &self.backend, &full_key).await
+        crate::flight::SingleFlight::acquire(&self.flight, &self.backend, &full_key, true).await
+    }
+
+    /// [`Self::single_flight`] without the distributed fill lock: in-process
+    /// dedup only, so the flight sends no lock or unlock request. Macro
+    /// plumbing for `#[cachekit(distributed_lock = false)]` — not public API.
+    #[doc(hidden)]
+    pub async fn __local_single_flight(&self, key: &str) -> crate::flight::SingleFlight {
+        let full_key = self.namespaced_key(key);
+        crate::flight::SingleFlight::acquire(&self.flight, &self.backend, &full_key, false).await
     }
 
     /// Begin the single-flight for an SWR background refresh, or `None` when

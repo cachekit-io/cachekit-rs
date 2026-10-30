@@ -131,11 +131,12 @@ impl Timed {
         self.st().gets
     }
 
-    fn unlocks(&self) -> usize {
+    /// Completed backend calls of any of these kinds.
+    fn count(&self, kinds: &[&str]) -> usize {
         self.st()
             .ops
             .iter()
-            .filter(|(op, _)| *op == "unlock")
+            .filter(|(op, _)| kinds.contains(op))
             .count()
     }
 }
@@ -239,6 +240,25 @@ async fn fail(cache: &CacheKit, id: u64) -> Result<u64, CachekitError> {
     Err(CachekitError::Config(format!("origin {id} failed")))
 }
 
+thread_local! {
+    /// How many times `fill_unlocked`'s body ran on this test's thread.
+    static UNLOCKED_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `fill` without the distributed fill lock, under the same key.
+#[cachekit(
+    client = cache,
+    ttl = 600,
+    interop = "fill",
+    namespace = "timing",
+    distributed_lock = false
+)]
+async fn fill_unlocked(cache: &CacheKit, id: u64) -> Result<u64, CachekitError> {
+    UNLOCKED_RUNS.set(UNLOCKED_RUNS.get() + 1);
+    tokio::time::sleep(ms(ORIGIN)).await;
+    Ok(id * 10)
+}
+
 fn fill_key(id: u64) -> String {
     interop_key("timing", "fill", &[InteropValue::from(id)]).expect("key")
 }
@@ -275,7 +295,7 @@ async fn cold_miss_leader_returns_without_waiting_for_the_unlock() {
     // The unlock is still sent. (+1: a timer at the same instant may wake
     // this task before the release task records its call.)
     tokio::time::sleep(ms(UNLOCK + 1)).await;
-    assert_eq!(backend.unlocks(), 1);
+    assert_eq!(backend.count(&["unlock"]), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -568,6 +588,103 @@ async fn local_follower_counts_one_hit_and_its_leader_one_miss() {
     assert_eq!(outcomes(&cache), want);
 }
 
+// ── distributed_lock = false: in-process dedup only ──────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn opted_out_cold_miss_sends_no_lock_or_unlock() {
+    let backend = Timed::new();
+    let t0 = Instant::now();
+    assert_eq!(fill_unlocked(&backend.client(), 16).await.unwrap(), 160);
+    let returned = Instant::now();
+
+    // Against the lock-on leader above: no LOCK leg, and no inline UNLOCK.
+    println!("opted-out cold miss: {} ms", since(t0));
+    assert_eq!(since(t0), GET + ORIGIN + SET);
+    assert_eq!(backend.ops_by(returned), ["get", "set"]);
+
+    // Nothing is sent after the call returns either.
+    tokio::time::sleep(ms(FILL_LOCK_TIMEOUT)).await;
+    assert_eq!(backend.count(&["lock", "unlock"]), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn opted_out_concurrent_misses_run_the_body_once_and_set_once() {
+    let backend = Timed::new();
+    let cache = backend.client();
+
+    let values = tokio::join!(
+        fill_unlocked(&cache, 17),
+        fill_unlocked(&cache, 17),
+        fill_unlocked(&cache, 17),
+        fill_unlocked(&cache, 17),
+        fill_unlocked(&cache, 17),
+    );
+    let values = [values.0, values.1, values.2, values.3, values.4].map(Result::unwrap);
+    assert_eq!(values, [170; 5]);
+    assert_eq!(UNLOCKED_RUNS.get(), 1, "the body ran more than once");
+
+    tokio::time::sleep(ms(FILL_LOCK_TIMEOUT)).await;
+    assert_eq!(backend.count(&["set"]), 1);
+    assert_eq!(backend.count(&["lock", "unlock"]), 0);
+}
+
+/// A holder that found the lease contested and let go without a fill leaves
+/// a stand-down note. A locking cold miss queued behind it contests the lease;
+/// an opted-out one computes without a lock call.
+#[tokio::test(start_paused = true)]
+async fn opted_out_follower_does_not_contest_the_lease_after_a_stand_down() {
+    let backend = Timed::new();
+    backend.st().remote_holds = true;
+    let cache = backend.client();
+
+    let held = cache.single_flight(&fill_key(18)).await;
+    assert_eq!(
+        backend.count(&["lock", "unlock"]),
+        1,
+        "the holder's contested lock"
+    );
+    let holder = async move {
+        // Let go once the opted-out call has missed and queued behind it.
+        tokio::time::sleep(ms(GET + 10)).await;
+        drop(held); // stands down without a fill
+    };
+    let (value, ()) = tokio::join!(fill_unlocked(&cache, 18), holder);
+
+    assert_eq!(value.unwrap(), 180);
+    assert_eq!(UNLOCKED_RUNS.get(), 1);
+    assert_eq!(
+        backend.count(&["lock", "unlock"]),
+        1,
+        "the opted-out follower sent a lock call"
+    );
+}
+
+/// An opted-out leader holds no lease, so when it fills nothing, a locking
+/// cold miss queued behind it contests the lease before computing: another
+/// process may be filling under it.
+#[tokio::test(start_paused = true)]
+async fn locking_follower_contests_the_lease_after_an_opted_out_leader_fails() {
+    let backend = Timed::new();
+    let cache = backend.client();
+
+    let held = cache.__local_single_flight(&fill_key(19)).await;
+    let holder = async move {
+        // Let go once the locking call has missed and queued behind it.
+        tokio::time::sleep(ms(GET + 10)).await;
+        drop(held); // fills nothing
+    };
+    let (value, ()) = tokio::join!(fill(&cache, 19), holder);
+
+    assert_eq!(value.unwrap(), 190);
+    let ops = backend.ops_by(Instant::now());
+    let lock = ops.iter().position(|op| *op == "lock");
+    let set = ops.iter().position(|op| *op == "set");
+    assert!(
+        lock.is_some() && lock < set,
+        "the follower computed without contesting the lease: {ops:?}"
+    );
+}
+
 // ── The leader's runtime idles or goes away before the unlock is sent ───────
 
 fn current_thread() -> tokio::runtime::Runtime {
@@ -625,7 +742,7 @@ fn re_miss_after_the_leaders_runtime_is_dropped_sends_the_unlock_and_leads() {
             "re-miss after the runtime drop: {} ms, {} GETs, {} unlocks",
             t.elapsed().as_millis(),
             backend.gets() - gets,
-            backend.unlocks()
+            backend.count(&["unlock"])
         );
         assert_eq!(backend.gets() - gets, 1, "led without polling");
     });

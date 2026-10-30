@@ -5,7 +5,7 @@ use syn::{
     parse::{Parse, ParseStream},
     parse_macro_input,
     spanned::Spanned,
-    Ident, ItemFn, LitInt, LitStr, ReturnType, Token, Type,
+    Ident, ItemFn, LitBool, LitInt, LitStr, ReturnType, Token, Type,
 };
 
 // ── Attribute argument parsing ───────────────────────────────────────────────
@@ -16,6 +16,8 @@ struct MacroArgs {
     interop: String,
     namespace: String,
     secure: bool,
+    /// Take the distributed fill lock on a cold miss (default `true`).
+    distributed_lock: bool,
 }
 
 /// Compile-time mirror of the interop/v1 segment grammar
@@ -81,6 +83,7 @@ impl Parse for MacroArgs {
         let mut interop: Option<String> = None;
         let mut namespace: Option<String> = None;
         let mut secure = false;
+        let mut distributed_lock = true;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -106,6 +109,10 @@ impl Parse for MacroArgs {
                 }
                 "secure" => {
                     secure = true;
+                }
+                "distributed_lock" => {
+                    input.parse::<Token![=]>()?;
+                    distributed_lock = input.parse::<LitBool>()?.value;
                 }
                 other => {
                     return Err(syn::Error::new(
@@ -148,6 +155,7 @@ impl Parse for MacroArgs {
             interop,
             namespace,
             secure,
+            distributed_lock,
         })
     }
 }
@@ -216,6 +224,18 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   encrypts: on a client with encryption configured, a function without it
 ///   stores and reads ciphertext too, because the client's value methods
 ///   encrypt.
+/// - `distributed_lock = <bool>` (optional, default `true`): `false` skips
+///   the distributed fill lock on a cold miss, so the miss sends no lock or
+///   unlock request. It saves the lock round trip before the body runs, and
+///   the unlock round trip where the build keeps it on the caller's path
+///   (without `l1`, under `unsync`, or after an `Err` or a failed store).
+///   Concurrent misses in one process still run the body once, but
+///   processes no longer wait for each other's fill: N processes that miss
+///   one key together may each run the body and store it. Use it for
+///   single-process deployments or cheap, idempotent bodies. The
+///   stale-while-revalidate refresh still takes the lock (it runs off the
+///   caller's path). The per-function counterpart of TypeScript's per-cache
+///   `stampede.distributedLock`, which defaults to off there.
 ///
 /// # Requirements
 ///
@@ -292,8 +312,9 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 /// - **Cold-miss single-flight**: concurrent calls that miss on the same
 ///   key are collapsed to one execution per process (and per fleet, when
 ///   the backend supports distributed fill locks — CachekitIO and Redis do,
-///   with the `reliability` feature). Waiters re-read the filled entry
-///   instead of recomputing. See `cachekit::flight`.
+///   with the `reliability` feature, unless `distributed_lock = false`).
+///   Waiters re-read the filled entry instead of recomputing. See
+///   `cachekit::flight`.
 ///
 /// # Example
 ///
@@ -505,6 +526,16 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
         }
     };
 
+    // `distributed_lock = false` keeps the cold miss's in-process dedup and
+    // drops its distributed fill lock: no lock or unlock round trip, and no
+    // cross-process suppression. The SWR refresh keeps its lock either way;
+    // it runs off the caller's path, so dropping it would save no latency.
+    let single_flight_expr = if args.distributed_lock {
+        quote! { #client_ident.single_flight(&__ck_key).await }
+    } else {
+        quote! { #client_ident.__local_single_flight(&__ck_key).await }
+    };
+
     // Capture the original function body.
     let original_body = &func.block;
 
@@ -615,7 +646,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             // to one execution (misses are billable). While another worker is
             // filling, re-check the cache instead of recomputing. A re-check
             // still running at a contested flight's deadline counts as a miss.
-            let mut __ck_flight = #client_ident.single_flight(&__ck_key).await;
+            let mut __ck_flight = #single_flight_expr;
             while __ck_flight.wait_for_fill().await {
                 let Some(__ck_read) = __ck_flight.__bounded_poll(async { #get_expr }).await else {
                     continue;
@@ -738,6 +769,33 @@ mod tests {
             }
         };
         expand(&args, func).expect("async fn must expand");
+    }
+
+    /// `distributed_lock` defaults to on, takes a bool literal, and only
+    /// `false` swaps in the lock-free flight.
+    #[test]
+    fn distributed_lock_selects_the_flight() {
+        let expand_with = |extra: &str| {
+            let args = syn::parse_str::<MacroArgs>(&format!(
+                "client = cache, ttl = 60, interop = \"get_user\", namespace = \"users\"{extra}"
+            ))?;
+            let func: syn::ItemFn = syn::parse_quote! {
+                async fn get_user(cache: &CacheKit, id: u64) -> Result<String, CachekitError> {
+                    Ok(format!("User {id}"))
+                }
+            };
+            expand(&args, func).map(|tokens| tokens.to_string())
+        };
+        for (extra, local) in [
+            ("", false),
+            (", distributed_lock = true", false),
+            (", distributed_lock = false", true),
+        ] {
+            let code = expand_with(extra).expect("expands");
+            assert_eq!(code.contains("__local_single_flight"), local, "{extra:?}");
+        }
+        assert!(expand_with(", distributed_lock = \"no\"").is_err());
+        assert!(expand_with(", distributed_lock").is_err());
     }
 
     /// Mirror of interop.rs's validate_segment acceptance table — the two
