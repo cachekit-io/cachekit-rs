@@ -394,7 +394,7 @@ The backend follows fred's connection events, so with the option `connect` may b
 
 ### Memcached
 
-Memcached via [rust-memcache](https://crates.io/crates/memcache) (single server, connection-pooled, per-socket timeouts — a hung server errors one operation instead of wedging the backend). Keys are validated against protocol metacharacters (whitespace/control bytes) before anything reaches the wire, keeping the key space identical to cachekit-py's.
+Memcached via [rust-memcache](https://crates.io/crates/memcache) (single server, connection-pooled, per-socket timeouts — a hung server errors one operation instead of wedging the backend). Each operation is one round trip: a connection is reused only after a fully parsed response, and any error discards it, so a late reply can never answer a later request. A connection that died while idle fails the one operation that finds it, with a retryable error; when the server closed it (a restart), the other idle connections are dropped too. Each pooled connection runs 3 parked r2d2 worker threads, up to 30 at the default `pool_size(10)`. Keys are validated against protocol metacharacters (whitespace/control bytes) before anything reaches the wire, keeping the key space identical to cachekit-py's.
 
 **TTL capability, precisely:** memcached's protocol cannot *read* a key's remaining TTL, so this backend does not implement `TtlInspectable` — matching cachekit-py, where Memcached is likewise not TTL-inspectable. Both SDKs do ship a bare `refresh_ttl` (wrapping the memcached `touch` command) callable directly on the backend, outside the capability trait — so TTL-refresh works, but TTL-*driven* features that need to read TTLs never engage on memcached in any SDK.
 
