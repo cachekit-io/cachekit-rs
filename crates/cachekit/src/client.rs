@@ -385,7 +385,9 @@ impl CacheKit {
 
     /// Wrap a write's payload for the backend, plus a handle to the same
     /// buffer for [`Self::l1_set`] when the client has an L1. Clones no
-    /// payload; outside glibc the shrink below may reallocate.
+    /// payload. The shrink below runs in place on glibc's system allocator;
+    /// another allocator (a `#[global_allocator]` such as jemalloc) may move
+    /// the buffer.
     ///
     /// A synchronous step, not an async helper around the backend write: the
     /// nested future cost `bench_hot_path`'s 40 B `set/plain` about 75 more
@@ -396,7 +398,7 @@ impl CacheKit {
         #[cfg(feature = "l1")]
         if self.l1.is_some() {
             // The L1 keeps this buffer for the entry's lifetime, so drop the
-            // serializer's spare capacity first. glibc shrinks in place.
+            // serializer's spare capacity first.
             let mut bytes = bytes;
             bytes.shrink_to_fit();
             let bytes = Bytes::from(bytes);

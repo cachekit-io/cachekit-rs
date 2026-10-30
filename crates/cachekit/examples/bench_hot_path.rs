@@ -66,8 +66,8 @@ const MEASURED: &str = "bench_hot_path::measured";
 /// `DefaultHasher::new()` has fixed keys, so the map probes the same way in
 /// every process; `RandomState` would add run-to-run instruction spread.
 /// Values are [`Bytes`] so a write keeps the client's buffer, as the
-/// cachekit.io backend's request body does: every copy a case pays is the
-/// client's own.
+/// cachekit.io backend's request body does: every copy a write case pays is
+/// the client's own. A read still copies the value out in `get`.
 type FixedMap = HashMap<String, Bytes, BuildHasherDefault<DefaultHasher>>;
 
 #[derive(Default)]
