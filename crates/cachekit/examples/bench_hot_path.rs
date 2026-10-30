@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use cachekit::backend::{Backend, HealthStatus};
 use cachekit::reliability::ReliabilityConfig;
 use cachekit::{BackendError, CacheKit, CachekitError};
@@ -64,7 +65,10 @@ const MEASURED: &str = "bench_hot_path::measured";
 
 /// `DefaultHasher::new()` has fixed keys, so the map probes the same way in
 /// every process; `RandomState` would add run-to-run instruction spread.
-type FixedMap = HashMap<String, Vec<u8>, BuildHasherDefault<DefaultHasher>>;
+/// Values are [`Bytes`] so a write keeps the client's buffer, as the
+/// cachekit.io backend's request body does: every copy a case pays is the
+/// client's own.
+type FixedMap = HashMap<String, Bytes, BuildHasherDefault<DefaultHasher>>;
 
 #[derive(Default)]
 struct MemBackend {
@@ -83,12 +87,20 @@ impl MemBackend {
 #[async_trait]
 impl Backend for MemBackend {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
-        Ok(self.map().get(key).cloned())
+        Ok(self.map().get(key).map(|v| v.to_vec()))
     }
     async fn set(
         &self,
         key: &str,
         value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        self.set_bytes(key, Bytes::from(value), ttl).await
+    }
+    async fn set_bytes(
+        &self,
+        key: &str,
+        value: Bytes,
         _ttl: Option<Duration>,
     ) -> Result<(), BackendError> {
         self.map().insert(key.to_owned(), value);
