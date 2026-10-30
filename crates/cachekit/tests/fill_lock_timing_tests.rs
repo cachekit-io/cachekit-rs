@@ -239,6 +239,34 @@ async fn fail(cache: &CacheKit, id: u64) -> Result<u64, CachekitError> {
     Err(CachekitError::Config(format!("origin {id} failed")))
 }
 
+thread_local! {
+    /// How many times `fill_unlocked`'s body ran on this test's thread.
+    static UNLOCKED_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `fill` without the distributed fill lock, under the same key.
+#[cachekit(
+    client = cache,
+    ttl = 600,
+    interop = "fill",
+    namespace = "timing",
+    distributed_lock = false
+)]
+async fn fill_unlocked(cache: &CacheKit, id: u64) -> Result<u64, CachekitError> {
+    UNLOCKED_RUNS.set(UNLOCKED_RUNS.get() + 1);
+    tokio::time::sleep(ms(ORIGIN)).await;
+    Ok(id * 10)
+}
+
+fn lock_ops(backend: &Timed) -> usize {
+    backend
+        .st()
+        .ops
+        .iter()
+        .filter(|(op, _)| matches!(*op, "lock" | "unlock"))
+        .count()
+}
+
 fn fill_key(id: u64) -> String {
     interop_key("timing", "fill", &[InteropValue::from(id)]).expect("key")
 }
@@ -566,6 +594,91 @@ async fn local_follower_counts_one_hit_and_its_leader_one_miss() {
         (0, 1, 1)
     };
     assert_eq!(outcomes(&cache), want);
+}
+
+// ── distributed_lock = false: in-process dedup only ──────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn opted_out_cold_miss_sends_no_lock_or_unlock() {
+    let locked = Timed::new();
+    let t0 = Instant::now();
+    fill(&locked.client(), 16).await.unwrap();
+    let with_lock = since(t0);
+
+    let backend = Timed::new();
+    let t0 = Instant::now();
+    assert_eq!(fill_unlocked(&backend.client(), 16).await.unwrap(), 160);
+    let returned = Instant::now();
+    let without_lock = since(t0);
+
+    println!(
+        "cold miss: lock on {with_lock} ms, opted out {without_lock} ms, saved {} ms",
+        with_lock - without_lock
+    );
+    assert_eq!(without_lock, GET + ORIGIN + SET);
+    assert_eq!(backend.ops_by(returned), ["get", "set"]);
+    // The lock-on arm waits for the acquire, and for the unlock too unless
+    // the build detaches it.
+    let saved = LOCK + if DETACHED { 0 } else { UNLOCK };
+    assert_eq!(with_lock - without_lock, saved);
+
+    // Nothing is sent after the call returns either.
+    tokio::time::sleep(ms(FILL_LOCK_TIMEOUT)).await;
+    assert_eq!(lock_ops(&backend), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn opted_out_concurrent_misses_run_the_body_once_and_set_once() {
+    let backend = Timed::new();
+    let cache = backend.client();
+
+    let values = tokio::join!(
+        fill_unlocked(&cache, 17),
+        fill_unlocked(&cache, 17),
+        fill_unlocked(&cache, 17),
+        fill_unlocked(&cache, 17),
+        fill_unlocked(&cache, 17),
+    );
+    let values = [values.0, values.1, values.2, values.3, values.4].map(Result::unwrap);
+    assert_eq!(values, [170; 5]);
+    assert_eq!(UNLOCKED_RUNS.get(), 1, "the body ran more than once");
+
+    tokio::time::sleep(ms(FILL_LOCK_TIMEOUT)).await;
+    let sets = backend
+        .st()
+        .ops
+        .iter()
+        .filter(|(op, _)| *op == "set")
+        .count();
+    assert_eq!(sets, 1);
+    assert_eq!(lock_ops(&backend), 0);
+}
+
+/// A holder that found the lease contested and let go without a fill leaves
+/// a stand-down note. A locking cold miss queued behind it contests the lease;
+/// an opted-out one computes without a lock call.
+#[tokio::test(start_paused = true)]
+async fn opted_out_follower_does_not_contest_the_lease_after_a_stand_down() {
+    let backend = Timed::new();
+    backend.st().remote_holds = true;
+    let cache = backend.client();
+
+    let held = cache.single_flight(&fill_key(18)).await;
+    assert_eq!(lock_ops(&backend), 1, "the holder's contested lock");
+    let holder = async move {
+        // Let go once the opted-out call has missed and queued behind it.
+        tokio::time::sleep(ms(GET + 10)).await;
+        drop(held); // stands down without a fill
+    };
+    let (value, ()) = tokio::join!(fill_unlocked(&cache, 18), holder);
+
+    assert_eq!(value.unwrap(), 180);
+    assert_eq!(UNLOCKED_RUNS.get(), 1);
+    assert_eq!(
+        lock_ops(&backend),
+        1,
+        "the opted-out follower sent a lock call"
+    );
 }
 
 // ── The leader's runtime idles or goes away before the unlock is sent ───────

@@ -31,7 +31,9 @@
 //! slow leader.
 //!
 //! The `#[cachekit]` macro wires this in automatically around its miss path.
-//! Its stale-while-revalidate refresh takes the same locks but never waits
+//! With `#[cachekit(distributed_lock = false)]` its cold miss keeps only the
+//! in-process half: it sends no lock or unlock request, and a queued miss
+//! never contests the lease. Its stale-while-revalidate refresh takes the same locks but never waits
 //! for another worker's fill: if another worker holds either one, or the lock
 //! call fails, the refresh stands down without polling or re-reading the
 //! cache, and the stale copy keeps being served. A cold miss queued behind a
@@ -709,12 +711,17 @@ impl SingleFlight {
     }
 
     /// Cold-miss entry: lead (attempting cross-process suppression via the
-    /// backend's distributed lock, when available), or queue behind a local
-    /// holder.
+    /// backend's distributed lock, when available and `distributed` is set),
+    /// or queue behind a local holder.
+    ///
+    /// Without `distributed` the flight never touches the distributed lock:
+    /// no acquire, no unlock, and a follower never contests the lease on a
+    /// stand-down note. In-process dedup is unchanged.
     pub(crate) async fn acquire(
         map: &crate::client::SharedFlight,
         backend: &SharedBackend,
         full_key: &str,
+        distributed: bool,
     ) -> Self {
         let handle = map.handle(full_key);
         #[cfg_attr(
@@ -726,20 +733,21 @@ impl SingleFlight {
             let local = handle.lock_owned().await;
             let role = Role::LocalFollower {
                 rechecked: false,
-                contest_lease: local.stand_down,
+                contest_lease: distributed && local.stand_down,
             };
             return Self::new(map, local, role, backend, full_key);
         };
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-        {
+        if distributed {
             let (role, lock_id) = LockAttempt::run(&mut local, backend, full_key)
                 .await
                 .cold_role();
             let mut flight = Self::new(map, local, role, backend, full_key);
             flight.lock_id = lock_id;
-            flight
+            return flight;
         }
         #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
+        let _ = distributed;
         Self::new(map, local, Role::Leader, backend, full_key)
     }
 
@@ -897,7 +905,7 @@ mod tests {
         let map: crate::client::SharedFlight = Arc::default();
         let _held = map.handle("k");
 
-        SingleFlight::acquire(&map, &backend, "k")
+        SingleFlight::acquire(&map, &backend, "k", true)
             .await
             .__release_detached()
             .await;
@@ -905,7 +913,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let flight = SingleFlight::acquire(&map, &backend, "k").await;
+        let flight = SingleFlight::acquire(&map, &backend, "k", true).await;
         assert_eq!(flight.lock_id.as_deref(), Some("lease"));
         assert_eq!(
             locks.unlocks.load(Ordering::SeqCst),
