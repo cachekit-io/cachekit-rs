@@ -30,7 +30,10 @@
 //! single-connection clients with that test off, which halves the round trips
 //! per operation. The cost: each client's one-connection r2d2 pool runs its
 //! own 3 worker threads, so a backend holds up to `3 × pool_size` parked
-//! threads (30 at the default `pool_size` of 10).
+//! threads (30 at the default `pool_size` of 10). The inner pools run no
+//! reaper, so a discarded client's threads exit when it is dropped; the
+//! backend closes connections idle for over 10 minutes itself (r2d2's
+//! default).
 //!
 //! A connection that died while idle (server restart, NAT idle drop) now fails
 //! the one operation that finds it, with a retryable error, where the checkout
@@ -66,7 +69,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use memcache::{
     Client, ClientError, CommandError, ConnectionManager, MemcacheError, ServerError, Url,
@@ -139,6 +142,9 @@ fn is_timeout(kind: std::io::ErrorKind) -> bool {
 /// (a read of 0 bytes) as this `ClientError`, not as an I/O error.
 const ASCII_EOF: &str = "Ascii protocol no line found";
 
+/// memcached's reply when it is at `-c` (maxconns).
+const CONN_LIMIT: &str = "ERROR Too many open connections";
+
 /// The connection is gone, not merely slow: reset, broken pipe or EOF. That
 /// usually means a server restart, so every idle connection is suspect too.
 fn connection_lost(e: &MemcacheError) -> bool {
@@ -169,6 +175,14 @@ fn memcached_err(e: MemcacheError) -> BackendError {
         // MemcacheServerError → TRANSIENT); malformed responses are protocol
         // violations — not.
         MemcacheError::ServerError(ServerError::Error(_)) => BackendErrorKind::Transient,
+        // A server at its connection limit answers a new connection's first
+        // command with this line, then closes it. rust-memcache passes it
+        // through as a malformed response, but it is capacity, not protocol.
+        MemcacheError::ServerError(ServerError::BadResponse(msg))
+            if msg.starts_with(CONN_LIMIT) =>
+        {
+            BackendErrorKind::Transient
+        }
         MemcacheError::ServerError(_) => BackendErrorKind::Permanent,
         MemcacheError::CommandError(CommandError::ValueTooLarge) => BackendErrorKind::Permanent,
         MemcacheError::ClientError(_)
@@ -199,6 +213,10 @@ fn expiration_secs(ttl: Option<Duration>) -> u32 {
 
 // ── Connection checkout ───────────────────────────────────────────────────────
 
+/// An idle connection older than this is closed instead of reused: r2d2's
+/// default `idle_timeout`, which the inner pools turn off (see `open`).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// Idle single-connection clients, and the permits that cap how many exist.
 ///
 /// This is the desync guard the module docs describe. Each client wraps a
@@ -207,8 +225,9 @@ fn expiration_secs(ttl: Option<Duration>) -> u32 {
 struct Connections {
     url: Url,
     connect_timeout: Duration,
-    /// LIFO, like r2d2: the most recently used connection is reused first.
-    idle: Mutex<Vec<Client>>,
+    /// LIFO, like r2d2: the most recently used connection is reused first,
+    /// so the list is ordered by when each client went idle, oldest first.
+    idle: Mutex<Vec<(Client, Instant)>>,
     /// One permit per client in use, held until the blocking call ends, so
     /// idle plus in-use clients never exceed `pool_size`.
     permits: Arc<Semaphore>,
@@ -234,37 +253,59 @@ impl Connections {
             // by connection_timeout.
             .min_idle(Some(0))
             .test_on_check_out(false)
-            // rust-memcache's ClientBuilder default.
+            // No reaper. With either lifetime set, r2d2 schedules a reaper on
+            // the pool's 3 worker threads, and a dropped pool's threads stay
+            // alive until that job is due (30 s): every discarded client would
+            // leave 3 threads behind. Idle expiry is done in `checkout`.
             .max_lifetime(None)
+            .idle_timeout(None)
             .connection_timeout(self.connect_timeout)
             .build(ConnectionManager::new(self.url.clone()))?;
         Client::with_pool(pool)
+    }
+
+    /// The most recently idled client, or a new one. When it is past
+    /// [`IDLE_TIMEOUT`], so is every client below it: all are closed.
+    fn checkout(&self) -> Result<Client, MemcacheError> {
+        let mut idle = self.lock_idle();
+        match idle.pop() {
+            Some((client, since)) if since.elapsed() < IDLE_TIMEOUT => return Ok(client),
+            Some(stale) => {
+                let older = std::mem::take(&mut *idle);
+                drop(idle);
+                // Dropped outside the lock: each drop stops 3 worker threads.
+                drop((stale, older));
+            }
+            None => drop(idle),
+        }
+        self.open()
     }
 
     /// Run `op` on an idle client, or a new one, on the calling thread.
     ///
     /// The client goes back to the idle list only if `op` returned `Ok`, so
     /// its whole response was parsed. Any error drops it, and a lost
-    /// connection drops every idle one too.
+    /// connection drops every idle one too. The one exception is a failed
+    /// checkout (`PoolError`): the client never held a connection, so there
+    /// is nothing to desync, and keeping it stops a dead server from costing
+    /// 3 new threads per attempt.
     fn run<T>(
         &self,
         op: impl FnOnce(&Client) -> Result<T, MemcacheError>,
     ) -> Result<T, BackendError> {
-        let idle = self.lock_idle().pop();
-        let client = match idle {
-            Some(client) => client,
-            None => self.open().map_err(memcached_err)?,
-        };
+        let client = self.checkout().map_err(memcached_err)?;
         match op(&client) {
             Ok(value) => {
-                self.lock_idle().push(client);
+                self.lock_idle().push((client, Instant::now()));
                 Ok(value)
+            }
+            Err(e @ MemcacheError::PoolError(_)) => {
+                self.lock_idle().push((client, Instant::now()));
+                Err(memcached_err(e))
             }
             Err(e) => {
                 drop(client);
                 if connection_lost(&e) {
-                    // Dropped outside the lock: each drop stops a client's
-                    // r2d2 worker threads.
                     let stale = std::mem::take(&mut *self.lock_idle());
                     drop(stale);
                 }
@@ -275,7 +316,7 @@ impl Connections {
 
     /// The list is only pushed, popped and taken, so a poisoned lock still
     /// guards a consistent `Vec`.
-    fn lock_idle(&self) -> MutexGuard<'_, Vec<Client>> {
+    fn lock_idle(&self) -> MutexGuard<'_, Vec<(Client, Instant)>> {
         self.idle.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -670,6 +711,28 @@ mod tests {
 
         assert_eq!(
             memcached_err(MemcacheError::ClientError(ClientError::KeyTooLong)).kind,
+            BackendErrorKind::Permanent
+        );
+
+        // EOF (server closed the connection) is retryable on a fresh one, and
+        // drops the idle list; a timeout is neither.
+        let eof = MemcacheError::ClientError(ClientError::Error(ASCII_EOF.into()));
+        assert!(connection_lost(&eof));
+        assert_eq!(memcached_err(eof).kind, BackendErrorKind::Transient);
+        let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        assert!(connection_lost(&MemcacheError::IOError(reset)));
+        let slow = std::io::Error::new(std::io::ErrorKind::WouldBlock, "recv timeout");
+        assert!(!connection_lost(&MemcacheError::IOError(slow)));
+
+        // A server at maxconns is capacity, not a protocol violation.
+        let full = ServerError::BadResponse(format!("{CONN_LIMIT}\r\n").into());
+        assert_eq!(
+            memcached_err(MemcacheError::ServerError(full)).kind,
+            BackendErrorKind::Transient
+        );
+        let garbage = ServerError::BadResponse("key doesn't match in the response".into());
+        assert_eq!(
+            memcached_err(MemcacheError::ServerError(garbage)).kind,
             BackendErrorKind::Permanent
         );
     }
