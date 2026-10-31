@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 struct L1Entry {
-    // Bytes, not Vec: quick_cache's `get` clones the entry, and a refcount
+    // `Payload` wraps Bytes, not Vec: quick_cache's `get` clones the entry, and a refcount
     // bump is cheaper than a deep copy of a payload of up to the 5 MiB cap.
     data: Payload,
     ttl: Duration,
@@ -119,7 +119,7 @@ impl L1Cache {
 
     /// Retrieve cached bytes by key, or `None` if absent or expired.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
-        self.get_shared(key).map(|data| data.bytes.to_vec())
+        self.get_shared(key).map(|data| data.bytes().to_vec())
     }
 
     /// [`Self::get`] without the copy: the stored buffer, by refcount, with
@@ -169,8 +169,8 @@ impl L1Cache {
     /// `CacheKit::single_flight`).
     pub fn get_with_swr(&self, key: &str, threshold_ratio: f64) -> L1SwrRead {
         match self.get_with_swr_shared(key, threshold_ratio) {
-            SharedSwrRead::Fresh(data) => L1SwrRead::Fresh(data.bytes.to_vec()),
-            SharedSwrRead::Stale(data) => L1SwrRead::Stale(data.bytes.to_vec()),
+            SharedSwrRead::Fresh(data) => L1SwrRead::Fresh(data.bytes().to_vec()),
+            SharedSwrRead::Stale(data) => L1SwrRead::Stale(data.bytes().to_vec()),
             SharedSwrRead::Miss => L1SwrRead::Miss,
         }
     }

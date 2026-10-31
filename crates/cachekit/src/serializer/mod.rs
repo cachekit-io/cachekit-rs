@@ -18,10 +18,11 @@ use crate::error::CachekitError;
 /// every profile and target (wasm32 included), and sits inside the protocol's
 /// required `32..=1024` window (`spec/interop-mode.md` → Decode bounds).
 ///
-/// Enforced by cachekit-core's `msgpack_document_len`, which runs before
-/// every decode in [`deserialize`] and [`crate::interop::deserialize`], and
-/// once per payload a read or write admits to L1, whose hits then decode
-/// without it (see `Payload`). Depth
+/// Enforced by [`check_bounds`] (cachekit-core's `msgpack_document_len`). It
+/// runs before every decode in [`deserialize`] and
+/// [`crate::interop::deserialize`]. A client without encryption also runs it
+/// once when a backend read or its own write admits bytes, and a decode of
+/// bytes that passed then skips it (see `Payload`). Depth
 /// counts every array and map header on the deepest path, empty ones included;
 /// scalars, str, bin and ext are leaves.
 /// Exactly `MAX_DECODE_DEPTH` levels are accepted, and one more is rejected
@@ -36,8 +37,8 @@ pub(crate) type SliceDeserializer<'a> = rmp_serde::Deserializer<ReadRefReader<'a
 ///
 /// Every decode of backend-supplied bytes (auto-mode [`deserialize`] and
 /// [`crate::interop::deserialize`]) MUST go through here, or through
-/// `Payload::walk` before a read hands its bytes on, so the bounds cannot
-/// drift between paths: both run the same checks. It runs cachekit-core's header-only
+/// `Payload::deserializer`, which skips the walk only for bytes whose mark
+/// `Payload::walk` set after running these same checks. It runs cachekit-core's header-only
 /// `msgpack_document_len` walk first. The walk proves that a complete
 /// document lies within `bytes`, that it nests no deeper than
 /// [`MAX_DECODE_DEPTH`], and that no header declares more elements or bytes
@@ -123,7 +124,9 @@ fn depth_limited(bytes: &[u8]) -> SliceDeserializer<'_> {
 /// decodes without walking again. L1 keeps the mark for the entry's lifetime.
 #[derive(Clone, Debug)]
 pub(crate) struct Payload {
-    pub(crate) bytes: Bytes,
+    // Private, with `walked`: nothing outside `walk` can pair a mark with
+    // other bytes.
+    bytes: Bytes,
     walked: bool,
 }
 
@@ -143,6 +146,11 @@ impl Payload {
     pub(crate) fn walk(bytes: Bytes) -> Self {
         let walked = check_bounds(&bytes).is_ok();
         Self { bytes, walked }
+    }
+
+    /// The stored bytes, by reference: a clone is a refcount bump.
+    pub(crate) fn bytes(&self) -> &Bytes {
+        &self.bytes
     }
 
     /// Whether the bytes passed the walk.

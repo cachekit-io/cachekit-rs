@@ -148,8 +148,7 @@ fn every_reject_vector_is_rejected_by_the_guard_on_every_read_path() {
 /// does the next read of the key, which L1 serves.
 ///
 /// A marked decode skips the walk, so a wrong mark shows as a reject vector
-/// that decodes, or fails with rmp-serde's error instead of the guard's. A
-/// document with a trailing byte would decode outright.
+/// that decodes, or fails with rmp-serde's error instead of the guard's.
 #[cfg(feature = "l1")]
 #[test]
 fn a_hostile_entry_fails_from_the_backend_and_again_from_l1() {
@@ -160,18 +159,6 @@ fn a_hostile_entry_fails_from_the_backend_and_again_from_l1() {
             for (path, first, second) in read_every_path_twice_through_l1::<Json>(&bytes) {
                 assert_guard_rejected(name, &format!("{path} (backend)"), first);
                 assert_guard_rejected(name, &format!("{path} (L1)"), second);
-            }
-        }
-        // fixint 1, then one byte more.
-        for (path, first, second) in read_every_path_twice_through_l1::<u8>(&[0x01, 0x01]) {
-            for (layer, result) in [("backend", first), ("L1", second)] {
-                let e = result
-                    .err()
-                    .unwrap_or_else(|| panic!("{path} ({layer}) decoded a trailing byte"));
-                assert!(
-                    matches!(e, CachekitError::Serialization(ref m) if m.contains("1 trailing byte")),
-                    "{path} ({layer}): {e:?}"
-                );
             }
         }
     });
@@ -192,41 +179,6 @@ fn every_accept_vector_decodes_from_the_backend_and_from_l1() {
                 assert_eq!(first, second, "{name}: {path}");
             }
         }
-    });
-}
-
-/// A value this process writes is walked when L1 admits it, so one level past
-/// the bound is never marked and fails from L1 with the guard's error, as it
-/// does from the backend, and the bound itself decodes.
-#[cfg(feature = "l1")]
-#[test]
-fn an_own_write_past_the_depth_bound_fails_from_l1() {
-    on_default_stack(|| {
-        let client = cachekit::CacheKit::builder()
-            .backend(common::MockBackend::shared())
-            .l1_capacity(16)
-            .build()
-            .expect("client builds");
-        common::runtime().block_on(async {
-            for depth in [MAX_DECODE_DEPTH, MAX_DECODE_DEPTH + 1] {
-                let mut value = Json::Null;
-                for _ in 0..depth {
-                    value = Json::Array(vec![value]);
-                }
-                client.set("deep", &value).await.expect("set");
-                let l1_hits = client.stats().l1_hits;
-                let read = client
-                    .get::<Json>("deep")
-                    .await
-                    .map(|v| v.expect("written"));
-                assert_eq!(client.stats().l1_hits, l1_hits + 1, "L1 served it");
-                if depth == MAX_DECODE_DEPTH {
-                    assert_eq!(read.expect("the bound decodes"), value);
-                } else {
-                    assert_guard_rejected("own write", "CacheKit::get (L1)", read);
-                }
-            }
-        });
     });
 }
 

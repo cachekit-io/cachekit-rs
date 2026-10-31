@@ -367,11 +367,11 @@ impl CacheKit {
     }
 
     /// Value bytes as this client admits them, from a backend read or its own
-    /// write to L1. A client without encryption walks them here: a read's
-    /// before the L1 backfill, which runs before any decode, so an L1 copy is
-    /// marked only if it passed, and the read's own decode skips a second
-    /// walk. An encrypting client's bytes are ciphertext: they are not
-    /// MessagePack, and the decrypted plaintext is walked on every read.
+    /// write to L1. A client without encryption walks them here. On a backend
+    /// read that is before the L1 backfill, which runs before any decode, so
+    /// L1 only holds a mark the bytes earned, and the read's own decode does
+    /// not walk again. An encrypting client's bytes are ciphertext: they are
+    /// not MessagePack, and the decrypted plaintext is walked on every read.
     #[cfg_attr(not(feature = "encryption"), allow(clippy::unused_self))]
     fn admit(&self, bytes: Bytes) -> Payload {
         #[cfg(feature = "encryption")]
@@ -685,7 +685,7 @@ impl CacheKit {
             if let Some(ref l1) = self.l1 {
                 match l1.get_with_swr_shared(full_key, self.swr_threshold_ratio) {
                     crate::l1::SharedSwrRead::Fresh(payload) => {
-                        self.check_payload_size(payload.bytes.len())?;
+                        self.check_payload_size(payload.bytes().len())?;
                         return Ok(SwrRead::Fresh((payload, ReadOutcome::L1Hit)));
                     }
                     crate::l1::SharedSwrRead::Stale(_) => {
@@ -696,11 +696,11 @@ impl CacheKit {
                         let mutation = self.mutations.lock(full_key).await;
                         match l1.get_with_swr_shared(full_key, self.swr_threshold_ratio) {
                             crate::l1::SharedSwrRead::Fresh(payload) => {
-                                self.check_payload_size(payload.bytes.len())?;
+                                self.check_payload_size(payload.bytes().len())?;
                                 return Ok(SwrRead::Fresh((payload, ReadOutcome::L1Hit)));
                             }
                             crate::l1::SharedSwrRead::Stale(payload) => {
-                                self.check_payload_size(payload.bytes.len())?;
+                                self.check_payload_size(payload.bytes().len())?;
                                 let (state, version) = mutation.snapshot();
                                 return Ok(SwrRead::Stale(
                                     (payload, ReadOutcome::L1Stale),
@@ -733,7 +733,7 @@ impl CacheKit {
         // L1 hit
         #[cfg(feature = "l1")]
         if let Some(payload) = self.l1_get(full_key) {
-            self.check_payload_size(payload.bytes.len())?;
+            self.check_payload_size(payload.bytes().len())?;
             return Ok(Some((payload, ReadOutcome::L1Hit)));
         }
 
@@ -745,7 +745,7 @@ impl CacheKit {
 
         #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
         if let Some(payload) = self.l1_get(full_key) {
-            self.check_payload_size(payload.bytes.len())?;
+            self.check_payload_size(payload.bytes().len())?;
             return Ok(Some((payload, ReadOutcome::L1Hit)));
         }
 
@@ -756,7 +756,6 @@ impl CacheKit {
 
         self.check_payload_size(bytes.len())?;
         // Takes over the Vec's allocation: no copy, and L1 shares it below.
-        // Walked before the backfill, which runs before any decode.
         let payload = self.admit(Bytes::from(bytes));
 
         // Populate L1 on L2 hit, bounded by the cap and the server's freshness
@@ -1307,11 +1306,11 @@ impl SecureCache<'_> {
         self.client.reject_namespaced_interop()?;
         match self.client.get_bytes_swr(key).await? {
             SwrRead::Fresh(ct) => Ok(SwrRead::Fresh(redact_decode(crate::interop::deserialize(
-                &self.decrypt_or_evict(&ct.bytes, key)?,
+                &self.decrypt_or_evict(ct.bytes(), key)?,
             ))?)),
             SwrRead::Stale(ct, token) => Ok(SwrRead::Stale(
                 redact_decode(crate::interop::deserialize(
-                    &self.decrypt_or_evict(&ct.bytes, key)?,
+                    &self.decrypt_or_evict(ct.bytes(), key)?,
                 ))?,
                 token,
             )),
@@ -1330,7 +1329,7 @@ impl SecureCache<'_> {
         match self.client.read_bytes(&full_key).await? {
             Some((ct, by)) => Ok(Some((
                 redact_decode(crate::interop::deserialize(
-                    &self.decrypt_or_evict(&ct.bytes, key)?,
+                    &self.decrypt_or_evict(ct.bytes(), key)?,
                 ))?,
                 by,
             ))),
@@ -1352,8 +1351,8 @@ impl SecureCache<'_> {
             ))
         };
         Ok(match self.client.read_bytes_swr(&full_key).await? {
-            SwrRead::Fresh((ct, by)) => SwrRead::Fresh((decode(&ct.bytes)?, by)),
-            SwrRead::Stale((ct, by), token) => SwrRead::Stale((decode(&ct.bytes)?, by), token),
+            SwrRead::Fresh((ct, by)) => SwrRead::Fresh((decode(ct.bytes())?, by)),
+            SwrRead::Stale((ct, by), token) => SwrRead::Stale((decode(ct.bytes())?, by), token),
             SwrRead::Miss => SwrRead::Miss,
         })
     }
@@ -1365,7 +1364,7 @@ impl SecureCache<'_> {
     /// ciphertext, so decrypt receives the same bytes the backend holds.
     async fn get_plaintext(&self, key: &str) -> Result<Option<Vec<u8>>, CachekitError> {
         match self.client.get_bytes(key).await? {
-            Some(ciphertext) => Ok(Some(self.decrypt_or_evict(&ciphertext.bytes, key)?)),
+            Some(ciphertext) => Ok(Some(self.decrypt_or_evict(ciphertext.bytes(), key)?)),
             None => Ok(None),
         }
     }
@@ -2248,7 +2247,7 @@ mod shared_write_buffer_tests {
         let buffers = backend.buffers.lock().unwrap().clone();
         assert_eq!(buffers.len(), 3, "two transient failures, then a success");
         let l1 = client.l1_get("k").expect("written through to L1");
-        let l1 = l1.bytes.as_ptr() as usize;
+        let l1 = l1.bytes().as_ptr() as usize;
         assert!(
             buffers.iter().all(|&b| b == l1),
             "a copy reached the backend or the L1: attempts {buffers:x?}, L1 {l1:x}"

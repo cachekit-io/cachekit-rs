@@ -398,7 +398,7 @@ pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError
 pub(crate) fn deserialize_payload<T: DeserializeOwned>(
     payload: &crate::serializer::Payload,
 ) -> Result<T, CachekitError> {
-    reject_ck_frame(&payload.bytes)?;
+    reject_ck_frame(payload.bytes())?;
     decode(payload.deserializer()?)
 }
 

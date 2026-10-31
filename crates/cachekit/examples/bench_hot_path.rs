@@ -70,8 +70,8 @@ const WARM: usize = 16;
 const MEASURED: &str = "bench_hot_path::measured";
 
 /// The value of `l1_hit_row`: a struct of 20 named fields, stored as a
-/// MessagePack map of 20 entries, so a decode walks 41 headers where a
-/// `String` value has one. `name` holds the case's `x` string, so the size
+/// MessagePack map of 20 entries, so a bounds walk, where one runs, covers 41
+/// headers where a `String` value has one. `name` holds the case's `x` string, so the size
 /// still scales the payload.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Row {
