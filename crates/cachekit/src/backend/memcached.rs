@@ -50,10 +50,16 @@
 //! backend closes connections idle for over 10 minutes itself (r2d2's
 //! default).
 //!
-//! A connection that died while idle (server restart, NAT idle drop) now fails
-//! the one operation that finds it, with a retryable error, where the checkout
-//! test used to replace it silently. A lost connection also drops every idle
-//! connection, so a server restart costs about one failed operation.
+//! A connection that died while idle now fails the one operation that finds
+//! it, with a retryable error, where the checkout test used to replace it
+//! silently. When the server reset or closed that connection (EOF), as a
+//! restart does, every other idle connection is dropped too, so a restart
+//! costs about one failed operation. A new connection lost the same way drops
+//! nothing: a server at its connection limit closes new connections while the
+//! idle ones still work. A NAT or firewall that drops an idle connection
+//! silently sends no reset, so the operation fails with a read timeout and
+//! nothing is dropped: each dead idle connection costs one operation, after
+//! [`timeout`](crate::backend::memcached::MemcachedBackendBuilder::timeout).
 //!
 //! ## TTL capability — the honest parity picture
 //!
@@ -89,6 +95,7 @@ use std::time::{Duration, Instant};
 use memcache::{
     Client, ClientError, CommandError, ConnectionManager, MemcacheError, ServerError, Url,
 };
+#[cfg(not(feature = "unsync"))]
 use tokio::sync::Semaphore;
 
 use async_trait::async_trait;
@@ -160,8 +167,9 @@ const ASCII_EOF: &str = "Ascii protocol no line found";
 /// memcached's reply when it is at `-c` (maxconns).
 const CONN_LIMIT: &str = "ERROR Too many open connections";
 
-/// The connection is gone, not merely slow: reset, broken pipe or EOF. That
-/// usually means a server restart, so every idle connection is suspect too.
+/// The connection is gone, not merely slow: reset, broken pipe or EOF. On a
+/// connection that was idle, that usually means a server restart, so every
+/// idle connection is suspect too.
 fn connection_lost(e: &MemcacheError) -> bool {
     match e {
         MemcacheError::IOError(io) => !is_timeout(io.kind()),
@@ -272,11 +280,15 @@ struct Connections {
     /// so the list is ordered by when each client went idle, oldest first.
     idle: Mutex<Vec<(Conn, Instant)>>,
     /// One permit per client in use, held until the blocking call ends, so
-    /// idle plus in-use clients never exceed `pool_size`.
+    /// idle plus in-use clients never exceed `pool_size`. Under `unsync` an
+    /// operation runs inline, so only one client is ever in use.
+    #[cfg(not(feature = "unsync"))]
     permits: Arc<Semaphore>,
 }
 
 impl Connections {
+    // Under `unsync` no permits cap the clients (see `run_op`).
+    #[cfg_attr(feature = "unsync", allow(unused_variables))]
     fn new(
         url: Url,
         connect_timeout: Duration,
@@ -290,6 +302,7 @@ impl Connections {
             io_timeout,
             auth,
             idle: Mutex::new(Vec::new()),
+            #[cfg(not(feature = "unsync"))]
             permits: Arc::new(Semaphore::new(
                 usize::try_from(pool_size)
                     .map_or(Semaphore::MAX_PERMITS, |n| n.min(Semaphore::MAX_PERMITS)),
@@ -357,34 +370,36 @@ impl Connections {
     /// [`prepare`](Self::prepare) on a client not yet prepared.
     ///
     /// The client goes back to the idle list only if `op` returned `Ok`, so
-    /// its whole response was parsed. Any error drops it, and a lost
-    /// connection drops every idle one too. The one exception is a failed
-    /// checkout (`PoolError`): the client never held a connection, so there
-    /// is nothing to desync, and keeping it stops a dead server from costing
-    /// 3 new threads per attempt.
+    /// its whole response was parsed. Any error drops it. The one exception
+    /// is a failed checkout (`PoolError`): the client never held a
+    /// connection, so there is nothing to desync, and keeping it stops a dead
+    /// server from costing 3 new threads per attempt.
+    ///
+    /// A lost connection that had been idle drops every idle one too. A new
+    /// one drops nothing: it was lost before it went idle, so it says nothing
+    /// about the others.
     fn run<T>(
         &self,
         op: impl FnOnce(&Client) -> Result<T, MemcacheError>,
     ) -> Result<T, BackendError> {
         let mut conn = self.checkout().map_err(memcached_err)?;
-        match self.prepare(&mut conn).and_then(|()| op(&conn.client)) {
-            Ok(value) => {
+        // Only a client that came back from the idle list is prepared: a new
+        // one, or one kept after a failed connect, is not.
+        let was_idle = conn.ready;
+        let result = self.prepare(&mut conn).and_then(|()| op(&conn.client));
+        match &result {
+            Ok(_) | Err(MemcacheError::PoolError(_)) => {
                 self.lock_idle().push((conn, Instant::now()));
-                Ok(value)
-            }
-            Err(e @ MemcacheError::PoolError(_)) => {
-                self.lock_idle().push((conn, Instant::now()));
-                Err(memcached_err(e))
             }
             Err(e) => {
                 drop(conn);
-                if connection_lost(&e) {
+                if was_idle && connection_lost(e) {
                     let stale = std::mem::take(&mut *self.lock_idle());
                     drop(stale);
                 }
-                Err(memcached_err(e))
             }
         }
+        result.map_err(memcached_err)
     }
 
     /// The list is only pushed, popped and taken, so a poisoned lock still
@@ -411,7 +426,8 @@ pub struct MemcachedBackend {
     max_item_size_bytes: usize,
     /// Hard async ceiling per operation, including the wait for a free
     /// connection. Socket timeouts bound each I/O call, not the whole
-    /// operation — this budget bounds the caller.
+    /// operation — this budget bounds the caller. Unused under `unsync`.
+    #[cfg_attr(feature = "unsync", allow(dead_code))]
     op_budget: Duration,
 }
 
@@ -436,7 +452,9 @@ impl MemcachedBackend {
     /// keeps its permit and connection until its own I/O ends, then returns
     /// the connection only on `Ok` (see [`Connections::run`]). Under `unsync`
     /// the call runs inline (no budget — there is no executor to time it out
-    /// against; the socket timeouts still bound each I/O call).
+    /// against; the socket timeouts still bound each I/O call), and needs no
+    /// permit: it holds its client across no `.await`, so no other operation
+    /// can run meanwhile.
     #[cfg(not(feature = "unsync"))]
     async fn run_op<T: Send + 'static>(
         &self,
@@ -470,12 +488,6 @@ impl MemcachedBackend {
         &self,
         op: impl FnOnce(&Client) -> Result<T, MemcacheError>,
     ) -> Result<T, BackendError> {
-        let _permit = self
-            .conns
-            .permits
-            .acquire()
-            .await
-            .map_err(|_| BackendError::permanent("memcached connection permits closed"))?;
         run_blocking(|| self.conns.run(op)).await
     }
 
@@ -663,10 +675,10 @@ impl MemcachedBackendBuilder {
     /// - `protocol=ascii`: see the module docs — the binary parser does not
     ///   correlate responses to requests, so a timed-out op could desync a
     ///   pooled connection into serving wrong values.
-    /// - `timeout=<secs>`: rust-memcache sets it on each TCP (and TLS) socket
-    ///   as it connects. It ignores it for UDP and Unix sockets, so the
-    ///   backend sets the same value on every connection itself (see
-    ///   [`Connections::run`]).
+    /// - `timeout=<secs>`: rust-memcache's `ConnectionManager` applies it on
+    ///   every TCP (and TLS) connect. It ignores it for UDP and Unix sockets,
+    ///   so the backend sets the same value on every connection itself (see
+    ///   [`Connections::prepare`]).
     ///
     /// Explicit user-supplied `protocol=`/`timeout=` params win.
     fn with_connection_params(url: &str, timeout: Duration) -> String {

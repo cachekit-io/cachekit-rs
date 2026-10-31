@@ -95,14 +95,18 @@ mod memcached_tests {
             pub delete: AtomicU64,
             pub touch: AtomicU64,
             pub stalled: AtomicU64,
+            pub rejected: AtomicU64,
         }
 
         pub struct Stub {
             pub addr: SocketAddr,
             pub counts: Arc<Counts>,
             /// Gets 1-based numbers in this list are stalled.
-            stall_gets: Arc<Mutex<Vec<u64>>>,
+            stall_gets: Arc<[u64]>,
             reply_delay_ms: Arc<AtomicU64>,
+            /// Nonzero: new connections are held this long unread, then
+            /// closed, as a server at its connection limit closes them.
+            reject_new_ms: Arc<AtomicU64>,
             live: Arc<Mutex<Vec<TcpStream>>>,
         }
 
@@ -112,20 +116,31 @@ mod memcached_tests {
                 let stub = Stub {
                     addr: listener.local_addr().expect("addr"),
                     counts: Arc::default(),
-                    stall_gets: Arc::new(Mutex::new(stall_gets.to_vec())),
+                    stall_gets: stall_gets.into(),
                     reply_delay_ms: Arc::default(),
+                    reject_new_ms: Arc::default(),
                     live: Arc::default(),
                 };
-                let (counts, stall_gets, delay, live) = (
+                let (counts, stall_gets, delay, reject, live) = (
                     Arc::clone(&stub.counts),
                     Arc::clone(&stub.stall_gets),
                     Arc::clone(&stub.reply_delay_ms),
+                    Arc::clone(&stub.reject_new_ms),
                     Arc::clone(&stub.live),
                 );
                 let store = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
                 std::thread::spawn(move || {
                     for sock in listener.incoming().flatten() {
                         counts.conns.fetch_add(1, Ordering::SeqCst);
+                        let hold = reject.load(Ordering::SeqCst);
+                        if hold > 0 {
+                            counts.rejected.fetch_add(1, Ordering::SeqCst);
+                            std::thread::spawn(move || {
+                                std::thread::sleep(Duration::from_millis(hold));
+                                drop(sock);
+                            });
+                            continue;
+                        }
                         live.lock()
                             .expect("live")
                             .push(sock.try_clone().expect("clone"));
@@ -157,6 +172,12 @@ mod memcached_tests {
                 self.reply_delay_ms.store(ms, Ordering::SeqCst);
             }
 
+            /// Hold every new connection for `hold`, then close it unanswered.
+            pub fn reject_new(&self, hold: Duration) {
+                let ms = u64::try_from(hold.as_millis()).expect("ms");
+                self.reject_new_ms.store(ms, Ordering::SeqCst);
+            }
+
             /// Send FIN on every server-side socket, as a restarting server
             /// does. Only the write half closes, so the client's next request
             /// draws no RST and its read sees EOF, as it does over a real
@@ -171,7 +192,7 @@ mod memcached_tests {
         fn serve(
             sock: TcpStream,
             c: &Counts,
-            stall_gets: &Mutex<Vec<u64>>,
+            stall_gets: &[u64],
             delay_ms: &AtomicU64,
             store: &Mutex<HashMap<String, Vec<u8>>>,
             stall: Option<Stall>,
@@ -194,7 +215,7 @@ mod memcached_tests {
                     }
                     "get" => {
                         let n = c.get.fetch_add(1, Ordering::SeqCst) + 1;
-                        stalled = stall_gets.lock().expect("stall").contains(&n);
+                        stalled = stall_gets.contains(&n);
                         let mut out = Vec::new();
                         if let Some(v) = store.lock().expect("store").get(&parts[1]) {
                             out.extend(format!("VALUE {} 0 {}\r\n", parts[1], v.len()).bytes());
@@ -315,9 +336,10 @@ mod memcached_tests {
         (ok, errors)
     }
 
-    /// r2d2 worker threads alive in this process (Linux: thread names).
+    /// Thread ids of the r2d2 worker threads alive in this process (Linux:
+    /// thread names).
     #[cfg(target_os = "linux")]
-    fn r2d2_threads() -> usize {
+    fn r2d2_threads() -> std::collections::BTreeSet<std::ffi::OsString> {
         std::fs::read_dir("/proc/self/task")
             .expect("task dir")
             .flatten()
@@ -325,7 +347,8 @@ mod memcached_tests {
                 std::fs::read_to_string(t.path().join("comm"))
                     .is_ok_and(|name| name.starts_with("r2d2-worker"))
             })
-            .count()
+            .map(|t| t.file_name())
+            .collect()
     }
 
     #[tokio::test]
@@ -509,7 +532,7 @@ mod memcached_tests {
         );
 
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let live = r2d2_threads();
+        let live = r2d2_threads().len();
         assert!(
             live <= 3 * 2,
             "{live} r2d2 threads alive; at most 3 per pooled connection (pool_size 2)"
@@ -560,6 +583,113 @@ mod memcached_tests {
             );
         }
         assert_eq!(stub.count(|c| &c.version), 1, "no checkout ping");
+    }
+
+    #[cfg(not(feature = "unsync"))] // tokio::spawn needs Send futures
+    #[tokio::test]
+    #[serial]
+    async fn lost_new_connection_keeps_the_idle_ones() {
+        // A server at its connection limit closes each new connection. That
+        // says nothing about the connections already idle, so losing a new
+        // one must not drop them: they keep serving while new ones fail.
+        let stub = Stub::start(None, &[]);
+        let backend = std::sync::Arc::new(stub_backend(&stub, Duration::from_secs(1), 3).await);
+        let concurrent_sets = |n: usize| {
+            let calls: Vec<_> = (0..n)
+                .map(|i| {
+                    let b = std::sync::Arc::clone(&backend);
+                    tokio::spawn(async move { b.set(&format!("w{i}"), b"v".to_vec(), None).await })
+                })
+                .collect();
+            async move {
+                let mut results = Vec::new();
+                for call in calls {
+                    results.push(call.await.expect("join"));
+                }
+                results
+            }
+        };
+
+        // Two slow concurrent ops leave two idle connections.
+        stub.set_reply_delay(Duration::from_millis(100));
+        for result in concurrent_sets(2).await {
+            result.expect("warm-up set");
+        }
+        assert_eq!(stub.count(|c| &c.conns), 2, "two connections warmed");
+
+        // Three concurrent ops: two take the idle connections and return them
+        // after 100 ms; the third opens a new one, which the server closes
+        // after 500 ms, once the other two are idle again.
+        stub.reject_new(Duration::from_millis(500));
+        let failures: Vec<_> = concurrent_sets(3)
+            .await
+            .into_iter()
+            .filter_map(Result::err)
+            .collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "only the new connection fails: {failures:?}"
+        );
+        assert!(failures[0].kind.is_retryable(), "{}", failures[0]);
+
+        stub.set_reply_delay(Duration::ZERO);
+        for i in 0..6 {
+            backend
+                .set(&format!("after{i}"), b"v".to_vec(), None)
+                .await
+                .expect("the idle connections still serve");
+        }
+        assert_eq!(stub.count(|c| &c.rejected), 1, "no new connection after");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial]
+    async fn dead_server_reuses_one_client_and_its_threads() {
+        // Once the server is gone, every op fails its connect. That failure
+        // (`PoolError`) keeps the client, which never held a connection, so
+        // the retries reuse its 3 r2d2 threads instead of starting 3 more.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let (sock, _) = listener.accept().expect("accept");
+            drop(listener); // the port is closed: every later connect is refused
+            let mut line = String::new();
+            BufReader::new(&sock).read_line(&mut line).expect("version");
+            (&sock)
+                .write_all(b"VERSION 1.6.99-stub\r\n")
+                .expect("reply");
+            sock
+        });
+        let backend = MemcachedBackend::builder()
+            .url(format!("tcp://{addr}"))
+            .timeout(Duration::from_millis(200))
+            .connect_timeout(Duration::from_millis(100))
+            .pool_size(1)
+            .connect()
+            .await
+            .expect("connect: the server answers version");
+        drop(server.join().expect("server")); // closes the idle connection
+
+        let mut threads = Vec::new();
+        for i in 0..8 {
+            let err = backend
+                .get(&format!("k{i}"))
+                .await
+                .expect_err("the server is gone");
+            assert!(err.kind.is_retryable(), "get #{i}: {err}");
+            if i >= 1 {
+                threads.push(r2d2_threads());
+            }
+        }
+        assert!(threads[0].len() <= 3, "{} r2d2 threads", threads[0].len());
+        assert!(
+            threads.iter().all(|t| *t == threads[0]),
+            "every retry reuses the same client's threads: {threads:?}"
+        );
+        drop(backend);
     }
 
     /// Silent memcached stubs for the UDP and Unix-socket transports: each
