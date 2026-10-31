@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.13.1...cachekit-macros-v0.14.0) (2026-10-31)
+
+
+### Features
+
+* **macros:** let #[cachekit] opt out of the distributed fill lock (LAB-7171) ([#201](https://github.com/cachekit-io/cachekit-rs/issues/201)) ([2358ae6](https://github.com/cachekit-io/cachekit-rs/commit/2358ae6e1221f7ecb53aede590d7986da8e20606))
+
 ## [0.13.1](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.13.0...cachekit-macros-v0.13.1) (2026-10-27)
 
 
