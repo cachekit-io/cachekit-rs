@@ -557,14 +557,20 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             // key is computable from any SDK (protocol spec/interop-mode.md).
             // The prefix is validated and joined once per function, so a call
             // only hashes its arguments; the bytes equal `interop_key`'s.
+            // The arguments are evaluated outside the block that declares the
+            // static: an item is visible throughout its block, so a parameter
+            // with the static's name would otherwise resolve to the static.
             // The generated `.clone()` per argument keeps the binding usable
             // by the body; for Copy types it is a copy and for `&str` it is
             // a deliberate reference copy — hence the allows.
             #[allow(clippy::clone_on_copy, noop_method_call)]
             let __ck_key = {
-                static __CK_KEY_PREFIX: cachekit::interop::__KeyPrefix<'static> =
-                    cachekit::interop::__KeyPrefix::new(#namespace, #operation);
-                __CK_KEY_PREFIX.key(&[#(#interop_args),*])?
+                let __ck_args: &[cachekit::interop::InteropValue] = &[#(#interop_args),*];
+                {
+                    static __CK_KEY_PREFIX: cachekit::interop::__KeyPrefix<'static> =
+                        cachekit::interop::__KeyPrefix::new(#namespace, #operation);
+                    __CK_KEY_PREFIX.key(__ck_args)?
+                }
             };
 
             // Try cache hit, classified against the stale-while-revalidate
