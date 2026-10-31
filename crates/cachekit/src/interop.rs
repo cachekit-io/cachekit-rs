@@ -52,6 +52,7 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use blake2::{digest::consts::U32, Blake2b, Digest};
 use serde::de::DeserializeOwned;
@@ -318,15 +319,95 @@ pub fn interop_key(
     operation: &str,
     args: &[InteropValue],
 ) -> Result<String, CachekitError> {
+    push_args_hash(checked_prefix(namespace, operation)?, args)
+}
+
+/// Length of `args_hash`: a 32-byte digest in hex.
+const ARGS_HASH_LEN: usize = 64;
+
+/// `{namespace}:{operation}:` once both segments pass [`validate_segment`],
+/// with room for the hash. With [`push_args_hash`], the one implementation of
+/// the key, shared by [`interop_key`] and [`__KeyPrefix::key`], so both mint
+/// the same bytes and the same errors.
+fn checked_prefix(namespace: &str, operation: &str) -> Result<String, CachekitError> {
     validate_segment("namespace", namespace)?;
     validate_segment("operation", operation)?;
+    let mut prefix = String::with_capacity(namespace.len() + operation.len() + 2 + ARGS_HASH_LEN);
+    prefix.push_str(namespace);
+    prefix.push(':');
+    prefix.push_str(operation);
+    prefix.push(':');
+    Ok(prefix)
+}
 
-    let encoded = canonical_args(args)?;
-    let mut hasher = Blake2b256::new();
-    hasher.update(&encoded);
-    let args_hash = hex::encode(hasher.finalize());
+/// Append `args_hash` to `key`, which holds a [`checked_prefix`] and room for
+/// the hash.
+fn push_args_hash(mut key: String, args: &[InteropValue]) -> Result<String, CachekitError> {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let digest = Blake2b256::digest(canonical_args(args)?);
+    let mut hex = [0u8; ARGS_HASH_LEN];
+    for (pair, byte) in hex.as_chunks_mut::<2>().0.iter_mut().zip(digest) {
+        *pair = [
+            HEX_DIGITS[usize::from(byte >> 4)],
+            HEX_DIGITS[usize::from(byte & 0x0f)],
+        ];
+    }
+    // Every byte is an ASCII hex digit, so this cannot fail. Kept as an error,
+    // not a panic or a lossy conversion: a key with a broken hash must never
+    // be minted.
+    let hex = std::str::from_utf8(&hex)
+        .map_err(|e| CachekitError::InvalidKey(format!("args_hash digits are not UTF-8: {e}")))?;
+    key.push_str(hex);
+    Ok(key)
+}
 
-    Ok(format!("{namespace}:{operation}:{args_hash}"))
+/// One `#[cachekit]` function's key prefix, `{namespace}:{operation}:`, which
+/// the macro keeps in a `static`: its segments are validated and joined on the
+/// first call that passes validation, and each call after that only hashes its
+/// arguments. Keys are byte-identical to [`interop_key`]'s.
+///
+/// The macro validates both segments at compile time against a mirror of
+/// [`validate_segment`]; this runtime check is the drift guard behind that
+/// mirror. Only a valid prefix is kept, so a segment the mirror wrongly
+/// accepts fails every call with [`CachekitError::InvalidKey`], not just the
+/// first.
+///
+/// No argument is kept: the prefix depends on the function alone.
+#[doc(hidden)]
+pub struct __KeyPrefix<'a> {
+    namespace: &'a str,
+    operation: &'a str,
+    prefix: OnceLock<String>,
+}
+
+impl<'a> __KeyPrefix<'a> {
+    /// A prefix for `namespace` and `operation`, validated on first use.
+    #[must_use]
+    pub const fn new(namespace: &'a str, operation: &'a str) -> Self {
+        Self {
+            namespace,
+            operation,
+            prefix: OnceLock::new(),
+        }
+    }
+
+    /// The interop/v1 key for `args`: `interop_key(namespace, operation, args)`.
+    ///
+    /// # Errors
+    ///
+    /// As [`interop_key`].
+    pub fn key(&self, args: &[InteropValue]) -> Result<String, CachekitError> {
+        let prefix = match self.prefix.get() {
+            Some(prefix) => prefix,
+            None => {
+                let checked = checked_prefix(self.namespace, self.operation)?;
+                self.prefix.get_or_init(|| checked)
+            }
+        };
+        let mut key = String::with_capacity(prefix.len() + ARGS_HASH_LEN);
+        key.push_str(prefix);
+        push_args_hash(key, args)
+    }
 }
 
 /// Encode the flat argument array to canonical MessagePack (argument profile:
@@ -339,7 +420,9 @@ pub fn interop_key(
 ///
 /// [`CachekitError::Serialization`] for out-of-model values (see [`interop_key`]).
 pub fn canonical_args(args: &[InteropValue]) -> Result<Vec<u8>, CachekitError> {
-    let mut buf = Vec::new();
+    // Most argument lists encode in under 64 bytes: one allocation, where
+    // growing from empty took up to four (8, 16, 32, 64 bytes).
+    let mut buf = Vec::with_capacity(64);
     encode_array_header(&mut buf, args.len())?;
     for arg in args {
         encode(&mut buf, arg, Profile::Args)?;
@@ -771,6 +854,62 @@ mod tests {
                 "{ok:?} should be accepted"
             );
         }
+    }
+
+    /// The drift guard behind `#[cachekit]`'s compile-time segment check: a
+    /// segment the macro's mirror wrongly accepted fails every call with
+    /// `interop_key`'s error, and no prefix is kept.
+    #[test]
+    fn key_prefix_rejects_an_invalid_segment_on_every_call() {
+        for (namespace, operation) in [
+            ("ns", "get_user"),
+            ("nsapi", "get_user"),
+            ("Users", "get_user"),
+            ("users", "get user"),
+            ("a..b", "get_user"),
+            ("users", "x.."),
+            ("users\n", "get_user"),
+            ("", "get_user"),
+            ("users", ""),
+        ] {
+            let prefix = __KeyPrefix::new(namespace, operation);
+            let expected = interop_key(namespace, operation, &[]).unwrap_err();
+            // An invalid argument too: the segment error still comes first.
+            let nan = [InteropValue::from(f64::NAN)];
+            for (call, args) in [&[][..], &nan, &[]].into_iter().enumerate() {
+                let err = prefix.key(args).unwrap_err();
+                assert!(
+                    matches!(err, CachekitError::InvalidKey(_)),
+                    "{namespace:?}/{operation:?} call {call}: {err}"
+                );
+                assert_eq!(err.to_string(), expected.to_string());
+            }
+            assert!(prefix.prefix.get().is_none(), "{namespace:?}/{operation:?}");
+        }
+    }
+
+    /// A valid prefix is joined once and reused, and an argument error leaves
+    /// it in place.
+    #[test]
+    fn key_prefix_keeps_a_valid_prefix() {
+        let prefix = __KeyPrefix::new("users", "get_user");
+        let args = [InteropValue::from(42i64)];
+        assert_eq!(
+            prefix.key(&args).unwrap(),
+            interop_key("users", "get_user", &args).unwrap()
+        );
+        assert_eq!(
+            prefix.prefix.get().map(String::as_str),
+            Some("users:get_user:")
+        );
+        assert!(matches!(
+            prefix.key(&[InteropValue::from(f64::NAN)]),
+            Err(CachekitError::Serialization(_))
+        ));
+        assert_eq!(
+            prefix.key(&args).unwrap(),
+            interop_key("users", "get_user", &args).unwrap()
+        );
     }
 
     #[test]
