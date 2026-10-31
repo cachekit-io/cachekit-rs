@@ -472,17 +472,8 @@ impl LockAttempt {
         let Some(lockable) = backend.as_lockable() else {
             return Self::Unlockable;
         };
-        // Cleared only once settled, so a cancelled settle is redone by the
-        // next attempt.
-        #[cfg(all(feature = "l1", not(feature = "unsync")))]
-        if let Some(pending) = &state.pending_release {
-            pending.settle(backend, full_key).await;
-            state.pending_release = None;
-        }
-        #[cfg(not(all(feature = "l1", not(feature = "unsync"))))]
-        let _ = state;
-        let timeout = std::time::Duration::from_millis(FILL_LOCK_TIMEOUT_MS);
-        let deadline = tokio::time::Instant::now() + timeout;
+        settle_pending_release(state, backend, full_key).await;
+        let deadline = Self::deadline();
         match lockable.acquire_lock(full_key, FILL_LOCK_TIMEOUT_MS).await {
             Ok(Some(lock_id)) => Self::Granted(lock_id),
             Ok(None) => Self::Contested { deadline },
@@ -491,6 +482,11 @@ impl LockAttempt {
                 Self::Failed
             }
         }
+    }
+
+    /// A contested attempt's deadline, for an attempt starting now.
+    fn deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_millis(FILL_LOCK_TIMEOUT_MS)
     }
 
     /// Cold-miss policy: poll a contested lease; a lock-infrastructure error
@@ -802,6 +798,113 @@ impl SingleFlight {
     }
 }
 
+// ── Cold lead ────────────────────────────────────────────────────────────────
+
+/// A cold miss's in-process flight, taken before its backend read so that the
+/// read carries the distributed lock attempt: one round trip
+/// ([`LockableBackend::__get_or_lock`](crate::backend::LockableBackend::__get_or_lock))
+/// where a read, then [`SingleFlight::acquire`]'s lock call, take two.
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+pub(crate) struct ColdLead {
+    map: crate::client::SharedFlight,
+    local: tokio::sync::OwnedMutexGuard<KeyState>,
+    backend: SharedBackend,
+    full_key: String,
+}
+
+/// What a [`ColdLead`]'s read found.
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+pub(crate) enum ColdRead {
+    /// The key holds a value. No lock was attempted, and the in-process
+    /// flight is free again, its stand-down note as it was.
+    Hit(Vec<u8>, crate::backend::Freshness),
+    /// The key was absent: the flight, as [`SingleFlight::acquire`] returns
+    /// it to a leader after its lock attempt.
+    Miss(SingleFlight),
+    /// The call failed: the read's error, and the flight leading without the
+    /// lock, as after a failed lock call.
+    Failed(crate::error::BackendError, SingleFlight),
+}
+
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+impl ColdLead {
+    /// Take `full_key`'s in-process flight without waiting, if the backend
+    /// reads and locks in one round trip. `None` if it does not, or if another
+    /// worker holds the flight: the caller reads, then
+    /// [`SingleFlight::acquire`]s, as before. Never waiting keeps a hit from
+    /// queueing behind another worker's fill or refresh.
+    pub(crate) fn try_take(
+        map: &crate::client::SharedFlight,
+        backend: &SharedBackend,
+        full_key: &str,
+    ) -> Option<Self> {
+        if !backend.as_lockable()?.__combines_get_and_lock() {
+            return None;
+        }
+        let local = map.handle(full_key).try_lock_owned().ok()?;
+        Some(Self {
+            map: map.clone(),
+            local,
+            backend: backend.clone(),
+            full_key: full_key.to_owned(),
+        })
+    }
+
+    /// Read the key and, only if it is absent, try its distributed lock. A
+    /// pending detached unlock is sent first, as before any lock attempt.
+    pub(crate) async fn read(mut self) -> ColdRead {
+        settle_pending_release(&mut self.local, &self.backend, &self.full_key).await;
+        let deadline = LockAttempt::deadline();
+        let read = match self.backend.as_lockable() {
+            Some(lockable) => {
+                lockable
+                    .__get_or_lock(&self.full_key, FILL_LOCK_TIMEOUT_MS)
+                    .await
+            }
+            // `try_take` found it lockable; a backend that changed its mind
+            // gets the read's own error path.
+            None => Err(crate::error::BackendError::permanent(
+                "the backend no longer has a distributed lock",
+            )),
+        };
+        match read {
+            Ok(crate::backend::GetOrLock::Value(bytes, freshness)) => {
+                ColdRead::Hit(bytes, freshness)
+            }
+            Ok(crate::backend::GetOrLock::Locked(lock_id)) => {
+                ColdRead::Miss(self.lead(LockAttempt::Granted(lock_id)))
+            }
+            Ok(crate::backend::GetOrLock::Contested) => {
+                ColdRead::Miss(self.lead(LockAttempt::Contested { deadline }))
+            }
+            Err(err) => ColdRead::Failed(err, self.lead(LockAttempt::Failed)),
+        }
+    }
+
+    fn lead(self, attempt: LockAttempt) -> SingleFlight {
+        let (role, lock_id) = attempt.cold_role();
+        let mut flight =
+            SingleFlight::new(&self.map, self.local, role, &self.backend, &self.full_key);
+        flight.lock_id = lock_id;
+        flight
+    }
+}
+
+/// Send the key's pending detached unlock, if any, before this client
+/// contests the key again (see [`PendingRelease::settle`]). Must be called
+/// with the key's in-process lock held (`state`). Cleared only once settled,
+/// so a cancelled settle is redone by the next attempt.
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+async fn settle_pending_release(state: &mut KeyState, backend: &SharedBackend, full_key: &str) {
+    #[cfg(all(feature = "l1", not(feature = "unsync")))]
+    if let Some(pending) = &state.pending_release {
+        pending.settle(backend, full_key).await;
+        state.pending_release = None;
+    }
+    #[cfg(not(all(feature = "l1", not(feature = "unsync"))))]
+    let _ = (state, backend, full_key);
+}
+
 /// Free a distributed fill lock; `true` once the backend answered. Best-effort:
 /// a failed unlock is traced (feature `tracing`) and otherwise ignored, since
 /// the lock expires server-side regardless.
@@ -886,6 +989,22 @@ mod tests {
             self.unlocks.fetch_add(1, Ordering::SeqCst);
             Ok(true)
         }
+    }
+
+    /// A backend that does not override the combined call is never asked to
+    /// combine: its cold miss reads, then locks, in two calls. Called anyway,
+    /// the default makes those two calls.
+    #[tokio::test]
+    async fn a_backend_that_cannot_combine_reads_then_locks() {
+        let locks = Arc::new(Locks::default());
+        let backend: SharedBackend = locks.clone();
+        let map: crate::client::SharedFlight = Arc::default();
+
+        assert!(ColdLead::try_take(&map, &backend, "k").is_none());
+        assert_eq!(
+            locks.__get_or_lock("k", 1).await.unwrap(),
+            crate::backend::GetOrLock::Locked("lease".to_owned())
+        );
     }
 
     /// A cold-key burst's dead slots go within a lease timeout of the burst,

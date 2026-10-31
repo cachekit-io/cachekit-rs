@@ -14,7 +14,10 @@ use fred::types::{ConnectHandle, Options};
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::backend::{nonzero_timeout, Backend, HealthStatus, LockableBackend, TtlInspectable};
+use crate::backend::{
+    get_then_lock, nonzero_timeout, Backend, Freshness, GetOrLock, HealthStatus, LockableBackend,
+    TtlInspectable,
+};
 use crate::error::{BackendError, BackendErrorKind};
 
 // ── Error mapping ─────────────────────────────────────────────────────────────
@@ -395,6 +398,24 @@ fn lock_key(key: &str) -> String {
 /// and delete a lock some other client has since acquired.
 const RELEASE_LOCK_SCRIPT: &str = r#"if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end"#;
 
+/// The value of KEYS[1] if it has one; otherwise `acquire_lock`'s exact
+/// `SET <KEYS[2]> <token> NX PX <ms>`, answering 1 when granted and 0 when
+/// contested. One round trip where a GET and then a SET take two. A script
+/// runs atomically, so no lock is taken over a value written between the two.
+/// KEYS[1] and KEYS[2] usually hash to different cluster slots, so a cluster
+/// never runs it (CROSSSLOT).
+const GET_OR_LOCK_SCRIPT: &str = r#"local value = redis.call("GET", KEYS[1])
+if value then return value end
+if redis.call("SET", KEYS[2], ARGV[1], "NX", "PX", ARGV[2]) then return 1 end
+return 0"#;
+
+/// A fresh lock token and the lock's expiry for `PX`, which must be >= 1
+/// (Redis rejects 0); clamped like `Backend::set` does for EX.
+fn new_lock(timeout_ms: u64) -> (String, i64) {
+    let px = i64::try_from(timeout_ms.max(1)).unwrap_or(i64::MAX);
+    (uuid::Uuid::new_v4().to_string(), px)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(not(feature = "unsync"), async_trait)]
 #[cfg_attr(feature = "unsync", async_trait(?Send))]
@@ -404,9 +425,7 @@ impl LockableBackend for RedisBackend {
         key: &str,
         timeout_ms: u64,
     ) -> Result<Option<String>, BackendError> {
-        let lock_id = uuid::Uuid::new_v4().to_string();
-        // PX must be >= 1 (Redis rejects 0); clamp like Backend::set does for EX.
-        let px = i64::try_from(timeout_ms.max(1)).unwrap_or(i64::MAX);
+        let (lock_id, px) = new_lock(timeout_ms);
 
         // SET NX PX: returns OK when the lock was free, nil when contested.
         let result: Option<String> = self
@@ -431,6 +450,40 @@ impl LockableBackend for RedisBackend {
             .await
             .map_err(redis_err)?;
         Ok(deleted == 1)
+    }
+
+    fn __combines_get_and_lock(&self) -> bool {
+        !self.client.is_clustered()
+    }
+
+    async fn __get_or_lock(&self, key: &str, timeout_ms: u64) -> Result<GetOrLock, BackendError> {
+        if self.client.is_clustered() {
+            return get_then_lock(self, key, timeout_ms).await;
+        }
+        let (lock_id, px) = new_lock(timeout_ms);
+        let reply: RedisValue = self
+            .redis()?
+            .eval(
+                GET_OR_LOCK_SCRIPT,
+                vec![key.to_owned(), lock_key(key)],
+                vec![RedisValue::from(lock_id.as_str()), RedisValue::from(px)],
+            )
+            .await
+            .map_err(redis_err)?;
+        match reply {
+            RedisValue::Integer(1) => Ok(GetOrLock::Locked(lock_id)),
+            RedisValue::Integer(0) => Ok(GetOrLock::Contested),
+            RedisValue::Bytes(bytes) => Ok(GetOrLock::Value(bytes.to_vec(), Freshness::default())),
+            RedisValue::String(text) => Ok(GetOrLock::Value(
+                text.inner().to_vec(),
+                Freshness::default(),
+            )),
+            // The kind only: a reply may carry cached data.
+            other => Err(BackendError::permanent(format!(
+                "unexpected get-or-lock reply of kind {:?}",
+                other.kind()
+            ))),
+        }
     }
 }
 
@@ -826,6 +879,36 @@ mod tests {
                 0
             );
             assert!(backend.offline.is_some());
+        }
+    }
+
+    /// A cluster spreads `<key>` and `<key>:lock` over slots, where one script
+    /// touching both fails CROSSSLOT, so a cold miss there keeps the separate
+    /// GET and `SET NX PX`: the client never takes its cold-miss flight ahead
+    /// of the read, directly or through the reliability stack.
+    #[test]
+    fn a_cluster_url_never_combines_get_and_lock() {
+        for (url, combines) in [(URL, true), ("redis-cluster://localhost:30001", false)] {
+            let backend = RedisBackend::builder().url(url).build().expect("builds");
+            assert_eq!(backend.__combines_get_and_lock(), combines, "{url}");
+
+            #[cfg(feature = "reliability")]
+            {
+                #[cfg(not(feature = "unsync"))]
+                let backend: crate::client::SharedBackend = Arc::new(backend);
+                #[cfg(feature = "unsync")]
+                let backend: crate::client::SharedBackend = std::rc::Rc::new(backend);
+                let (reliable, _) = crate::reliability::wrap_reliable(
+                    backend,
+                    crate::reliability::ReliabilityConfig::default(),
+                    None,
+                );
+                let lockable = reliable.as_lockable().expect("lockable");
+                assert_eq!(lockable.__combines_get_and_lock(), combines, "{url}");
+                let map = crate::client::SharedFlight::default();
+                let lead = crate::flight::ColdLead::try_take(&map, &reliable, "k");
+                assert_eq!(lead.is_some(), combines, "{url}");
+            }
         }
     }
 

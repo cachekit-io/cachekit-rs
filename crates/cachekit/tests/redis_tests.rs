@@ -120,6 +120,115 @@ mod redis_tests {
             .expect("cleanup release should not error");
     }
 
+    /// Live: the cold miss's one-round-trip read-or-lock and cachekit-py's
+    /// fill lock exclude each other on `<key>:lock`. cachekit-py's redis-py
+    /// lock takes it with a plain `SET <key>:lock <token> NX PX`, sent here
+    /// from a raw client. Same env gate as `redis_lock_live_semantics`.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // test-only: failures should panic loudly
+    async fn redis_get_or_lock_live_interop() {
+        use cachekit::backend::{Freshness, GetOrLock};
+        use fred::prelude::*;
+
+        let Ok(url) = std::env::var("CACHEKIT_TEST_REDIS_URL") else {
+            eprintln!("skipping redis_get_or_lock_live_interop: CACHEKIT_TEST_REDIS_URL not set");
+            return;
+        };
+        let backend = RedisBackendBuilder::default()
+            .url(&url)
+            .build()
+            .expect("builder should succeed");
+        let _handle = backend.connect().await.expect("redis should be reachable");
+        assert!(backend.__combines_get_and_lock(), "a single node combines");
+
+        let py = RedisClient::new(RedisConfig::from_url(&url).expect("url"), None, None, None);
+        let _py_handle = py.init().await.expect("raw client connects");
+        let py_lock = |key: &str| {
+            let (py, lock_key) = (py.clone(), format!("{key}:lock"));
+            async move {
+                py.set::<Option<String>, _, _>(
+                    lock_key,
+                    "py-token",
+                    Some(Expiration::PX(30_000)),
+                    Some(SetOptions::NX),
+                    false,
+                )
+                .await
+                .expect("py-shaped SET NX PX")
+                .is_some()
+            }
+        };
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let key = format!("cachekit-test:get-or-lock:{nanos}");
+        let lock_key = format!("{key}:lock");
+
+        // py holds the lock: the combined op reports contested and leaves
+        // py's token in place.
+        assert!(py_lock(&key).await, "py takes the free lock");
+        assert_eq!(
+            backend
+                .__get_or_lock(&key, 30_000)
+                .await
+                .expect("get_or_lock"),
+            GetOrLock::Contested
+        );
+        let held: Option<String> = py.get(&lock_key).await.expect("raw get");
+        assert_eq!(held.as_deref(), Some("py-token"));
+        let _: i64 = py.del(&lock_key).await.expect("raw del");
+
+        // The combined op holds the lock: py's SET NX fails, and the lock
+        // carries the token and expiry `acquire_lock` would set.
+        let GetOrLock::Locked(token) = backend
+            .__get_or_lock(&key, 30_000)
+            .await
+            .expect("get_or_lock")
+        else {
+            panic!("the free lock must be granted");
+        };
+        assert!(!py_lock(&key).await, "py must not take a held lock");
+        let held: Option<String> = py.get(&lock_key).await.expect("raw get");
+        assert_eq!(held.as_deref(), Some(token.as_str()));
+        let pttl: i64 = py.pttl(&lock_key).await.expect("raw pttl");
+        assert!((1..=30_000).contains(&pttl), "lock expiry {pttl} ms");
+        assert!(
+            backend.release_lock(&key, &token).await.expect("release"),
+            "the combined op's token releases its lock"
+        );
+
+        // A stored value comes back as it was written, and no lock is taken,
+        // whether or not it is valid UTF-8.
+        for value in [
+            b"\x00\xff\xc1 msgpack".to_vec(),
+            b"utf-8 text".to_vec(),
+            Vec::new(),
+        ] {
+            backend
+                .set(
+                    &key,
+                    value.clone(),
+                    Some(std::time::Duration::from_secs(60)),
+                )
+                .await
+                .expect("set");
+            assert_eq!(
+                backend
+                    .__get_or_lock(&key, 30_000)
+                    .await
+                    .expect("get_or_lock"),
+                GetOrLock::Value(value, Freshness::default())
+            );
+            assert!(
+                !backend.exists(&lock_key).await.expect("exists"),
+                "no lock on a hit"
+            );
+        }
+        backend.delete(&key).await.expect("cleanup");
+    }
+
     /// A server that completes fred's connection handshake, then never answers
     /// again: no reply, no RST. This is the black-hole case, where an unbounded
     /// client waits until TCP gives up (minutes).

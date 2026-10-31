@@ -16,7 +16,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::common::MockBackend;
-use cachekit::backend::{Backend, HealthStatus, LockableBackend};
+use cachekit::backend::{Backend, GetOrLock, HealthStatus, LockableBackend};
 use cachekit::client::SharedBackend;
 use cachekit::error::{BackendError, BackendErrorKind};
 use cachekit::reliability::{
@@ -1172,4 +1172,155 @@ async fn a_custom_backend_gets_no_retry_deadline() {
         "3 x 30 s + 100 + 200 ms"
     );
     assert_eq!(handle.calls(), 3);
+}
+
+// ── Combined read and lock: one attempt, behind the breaker ─────────────────
+
+/// Reads and locks in one round trip, and every call fails with a retryable
+/// error. Counts combined calls and plain reads apart.
+#[derive(Debug, Clone, Default)]
+struct FailingCombined {
+    combined: Arc<AtomicU32>,
+    gets: Arc<AtomicU32>,
+}
+
+impl FailingCombined {
+    fn shared(&self) -> SharedBackend {
+        #[cfg(not(feature = "unsync"))]
+        let shared: SharedBackend = Arc::new(self.clone());
+        #[cfg(feature = "unsync")]
+        let shared: SharedBackend = std::rc::Rc::new(self.clone());
+        shared
+    }
+
+    fn combined(&self) -> u32 {
+        self.combined.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
+impl Backend for FailingCombined {
+    async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        Err(BackendError::transient("scripted failure"))
+    }
+
+    async fn set(
+        &self,
+        _key: &str,
+        _value: Vec<u8>,
+        _ttl: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
+    async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
+    async fn health(&self) -> Result<HealthStatus, BackendError> {
+        Ok(HealthStatus {
+            is_healthy: true,
+            latency_ms: 0.0,
+            backend_type: "failing-combined".to_owned(),
+            details: HashMap::new(),
+        })
+    }
+
+    fn as_lockable(&self) -> Option<&dyn LockableBackend> {
+        Some(self)
+    }
+}
+
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
+impl LockableBackend for FailingCombined {
+    async fn acquire_lock(
+        &self,
+        _key: &str,
+        _timeout_ms: u64,
+    ) -> Result<Option<String>, BackendError> {
+        Ok(Some("lock-1".to_owned()))
+    }
+
+    async fn release_lock(&self, _key: &str, _lock_id: &str) -> Result<bool, BackendError> {
+        Ok(true)
+    }
+
+    fn __combines_get_and_lock(&self) -> bool {
+        true
+    }
+
+    async fn __get_or_lock(&self, _key: &str, _timeout_ms: u64) -> Result<GetOrLock, BackendError> {
+        self.combined.fetch_add(1, Ordering::SeqCst);
+        Err(BackendError::transient("scripted failure"))
+    }
+}
+
+/// A retry after a lost reply would find the lock the first attempt took and
+/// report it contested, so the combined call runs once where a plain read is
+/// retried. The failed read still leaves the flight, leading without a lock.
+#[tokio::test(start_paused = true)]
+async fn the_combined_read_and_lock_is_never_retried() {
+    let backend = FailingCombined::default();
+    let client = jitter_off_stack(backend.shared());
+
+    let mut lead = None;
+    let err = client
+        .__interop_read_swr_leading::<u64>("k", &mut lead)
+        .await
+        .expect_err("the read fails");
+    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Transient));
+    assert_eq!(backend.combined(), 1, "the combined call was retried");
+    let mut flight = lead.expect("a failed read leaves the key's flight");
+    assert!(!flight.wait_for_fill().await, "the flight leads");
+    flight.release().await;
+
+    // The same stack retries a plain read.
+    client
+        .__interop_read_swr::<u64>("k")
+        .await
+        .expect_err("the read fails");
+    assert_eq!(backend.gets.load(Ordering::SeqCst), 3);
+}
+
+/// The combined call is a read to the breaker: its failures open it, and an
+/// open breaker fails it fast without reaching the backend.
+#[tokio::test(start_paused = true)]
+async fn the_combined_read_and_lock_passes_the_breaker() {
+    let backend = FailingCombined::default();
+    let client = client_with(
+        backend.shared(),
+        ReliabilityConfig {
+            retry: None,
+            circuit_breaker: Some(CircuitBreakerConfig {
+                failure_threshold: 2,
+                ..CircuitBreakerConfig::default()
+            }),
+            ..ReliabilityConfig::default()
+        },
+    );
+
+    for _ in 0..2 {
+        let mut lead = None;
+        client
+            .__interop_read_swr_leading::<u64>("k", &mut lead)
+            .await
+            .expect_err("the read fails");
+    }
+    assert_eq!(client.circuit_state(), Some(CircuitState::Open));
+
+    let mut lead = None;
+    let err = client
+        .__interop_read_swr_leading::<u64>("k", &mut lead)
+        .await
+        .expect_err("the open breaker fails it");
+    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::CircuitOpen));
+    assert_eq!(backend.combined(), 2, "the open breaker let it through");
+    assert!(lead.is_some(), "the flight leads without a lock");
 }

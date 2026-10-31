@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::backend::{Backend, Freshness, HealthStatus, LockableBackend};
+use crate::backend::{Backend, Freshness, GetOrLock, HealthStatus, LockableBackend};
 use crate::client::SharedBackend;
 use crate::error::BackendError;
 use crate::random_unit;
@@ -733,8 +733,13 @@ impl ConcurrencyLimiter {
 /// - `health` passes through unguarded — it is a diagnostic and must keep
 ///   reporting truthfully while the breaker fails data calls fast (or the
 ///   limiter sheds them).
-/// - [`Backend::as_lockable`] forwards to the inner backend so distributed
-///   fill locks bypass the stack (locks are best-effort advisory).
+/// - Distributed fill lock and unlock calls go straight to the inner
+///   backend, bypassing the stack (locks are best-effort advisory).
+/// - A cold miss's combined read and lock attempt
+///   ([`LockableBackend::__get_or_lock`]) is a read: it takes a limiter
+///   permit and passes the breaker like `get`, but runs once. A retry after
+///   a lost reply would find the lock its first attempt took and report it
+///   contested.
 pub(crate) struct ReliableBackend {
     inner: SharedBackend,
     retry: Option<RetryPolicy>,
@@ -769,6 +774,29 @@ impl ReliableBackend {
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T, BackendError>>,
     {
+        self.run(self.retry.as_ref(), budget, f).await
+    }
+
+    /// Run `f` once, behind the limiter and the breaker: for an op that a
+    /// retry would get wrong.
+    async fn guarded_once<T, F, Fut>(&self, f: F) -> Result<T, BackendError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<T, BackendError>>,
+    {
+        self.run(None, None, f).await
+    }
+
+    async fn run<T, F, Fut>(
+        &self,
+        retry: Option<&RetryPolicy>,
+        budget: Option<Duration>,
+        f: F,
+    ) -> Result<T, BackendError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<T, BackendError>>,
+    {
         // Outermost layer: one permit per logical operation, held across the
         // whole breaker/retry sequence (see the module docs for why). A shed
         // call returns here — before touching breaker state.
@@ -780,7 +808,7 @@ impl ReliableBackend {
             Some(cb) => Some(cb.try_acquire()?),
             None => None,
         };
-        let result = match &self.retry {
+        let result = match retry {
             Some(retry) => retry.execute(budget, f).await,
             None => f().await,
         };
@@ -854,7 +882,49 @@ impl Backend for ReliableBackend {
     }
 
     fn as_lockable(&self) -> Option<&dyn LockableBackend> {
-        self.inner.as_lockable()
+        self.inner
+            .as_lockable()
+            .map(|_| self as &dyn LockableBackend)
+    }
+}
+
+/// Only reachable through [`Backend::as_lockable`], which hands it out only
+/// over a lockable inner backend.
+#[cfg_attr(not(feature = "unsync"), async_trait)]
+#[cfg_attr(feature = "unsync", async_trait(?Send))]
+impl LockableBackend for ReliableBackend {
+    async fn acquire_lock(
+        &self,
+        key: &str,
+        timeout_ms: u64,
+    ) -> Result<Option<String>, BackendError> {
+        self.inner_lockable()?.acquire_lock(key, timeout_ms).await
+    }
+
+    async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError> {
+        self.inner_lockable()?.release_lock(key, lock_id).await
+    }
+
+    fn __combines_get_and_lock(&self) -> bool {
+        self.inner
+            .as_lockable()
+            .is_some_and(LockableBackend::__combines_get_and_lock)
+    }
+
+    // A read, so it stays behind the limiter and the breaker like `get`, but
+    // never retried (see the trait method).
+    async fn __get_or_lock(&self, key: &str, timeout_ms: u64) -> Result<GetOrLock, BackendError> {
+        let inner = self.inner_lockable()?;
+        self.guarded_once(|| inner.__get_or_lock(key, timeout_ms))
+            .await
+    }
+}
+
+impl ReliableBackend {
+    fn inner_lockable(&self) -> Result<&dyn LockableBackend, BackendError> {
+        self.inner
+            .as_lockable()
+            .ok_or_else(|| BackendError::permanent("the inner backend has no distributed lock"))
     }
 }
 

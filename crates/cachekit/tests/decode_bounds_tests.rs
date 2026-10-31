@@ -408,3 +408,141 @@ fn vec_target_amplifier_is_rejected_before_any_allocation() {
         assert_eq!(leaves, vec![vec![1, 2], vec![3]]);
     }
 }
+
+/// A `#[cachekit]` cold miss on a backend that reads and locks in one round
+/// trip gets its value from that call, not from a GET. The value takes an L2
+/// hit's admission before any decode, so a hostile entry fails in the guard
+/// from the backend and, with L1 on, again from the L1 copy it was backfilled
+/// into.
+#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+mod combined_read {
+    #[cfg(feature = "unsync")]
+    use std::rc::Rc as Shared;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    #[cfg(not(feature = "unsync"))]
+    use std::sync::Arc as Shared;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use cachekit::backend::{Backend, Freshness, GetOrLock, HealthStatus, LockableBackend};
+    use cachekit::error::BackendError;
+    use cachekit::{CacheKit, CachekitError, SwrRead};
+    use serde_json::Value as Json;
+
+    use super::{assert_guard_rejected, on_default_stack, unhex, vectors};
+
+    /// Holds one entry, served only through the combined call.
+    struct Combining {
+        value: Vec<u8>,
+        combined: AtomicU32,
+    }
+
+    #[cfg_attr(not(feature = "unsync"), async_trait)]
+    #[cfg_attr(feature = "unsync", async_trait(?Send))]
+    impl Backend for Combining {
+        async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+            Err(BackendError::permanent("only the combined call reads"))
+        }
+
+        async fn set(
+            &self,
+            _key: &str,
+            _value: Vec<u8>,
+            _ttl: Option<Duration>,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _key: &str) -> Result<bool, BackendError> {
+            Ok(false)
+        }
+
+        async fn exists(&self, _key: &str) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+
+        async fn health(&self) -> Result<HealthStatus, BackendError> {
+            Ok(HealthStatus {
+                is_healthy: true,
+                latency_ms: 0.0,
+                backend_type: "combining".to_owned(),
+                details: std::collections::HashMap::new(),
+            })
+        }
+
+        fn as_lockable(&self) -> Option<&dyn LockableBackend> {
+            Some(self)
+        }
+    }
+
+    #[cfg_attr(not(feature = "unsync"), async_trait)]
+    #[cfg_attr(feature = "unsync", async_trait(?Send))]
+    impl LockableBackend for Combining {
+        async fn acquire_lock(
+            &self,
+            _key: &str,
+            _timeout_ms: u64,
+        ) -> Result<Option<String>, BackendError> {
+            Ok(Some("lock".to_owned()))
+        }
+
+        async fn release_lock(&self, _key: &str, _lock_id: &str) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+
+        fn __combines_get_and_lock(&self) -> bool {
+            true
+        }
+
+        async fn __get_or_lock(
+            &self,
+            _key: &str,
+            _timeout_ms: u64,
+        ) -> Result<GetOrLock, BackendError> {
+            self.combined.fetch_add(1, Ordering::SeqCst);
+            Ok(GetOrLock::Value(self.value.clone(), Freshness::default()))
+        }
+    }
+
+    async fn read(client: &CacheKit) -> Result<Json, CachekitError> {
+        let mut lead = None;
+        let read = client
+            .__interop_read_swr_leading::<Json>("forged:combined", &mut lead)
+            .await;
+        assert!(lead.is_none(), "a value leaves the flight free");
+        match read? {
+            SwrRead::Fresh((v, _)) | SwrRead::Stale((v, _), _) => Ok(v),
+            SwrRead::Miss => panic!("the forged entry must be found, not missed"),
+        }
+    }
+
+    #[test]
+    fn a_hostile_entry_from_the_combined_read_fails_in_the_guard() {
+        on_default_stack(|| {
+            let runtime = crate::common::runtime();
+            for vector in vectors()["reject_vectors"].as_array().unwrap() {
+                let name = vector["name"].as_str().unwrap();
+                for l1 in [false, cfg!(feature = "l1")] {
+                    let backend = Shared::new(Combining {
+                        value: unhex(vector["input_hex"].as_str().unwrap()),
+                        combined: AtomicU32::new(0),
+                    });
+                    let mut builder = CacheKit::builder().backend(backend.clone());
+                    builder = if l1 {
+                        builder.l1_capacity(64)
+                    } else {
+                        builder.no_l1()
+                    };
+                    let client = builder.build().expect("client builds");
+                    runtime.block_on(async {
+                        assert_guard_rejected(name, "combined read (backend)", read(&client).await);
+                        if l1 {
+                            assert_guard_rejected(name, "combined read (L1)", read(&client).await);
+                        }
+                    });
+                    assert_eq!(backend.combined.load(Ordering::SeqCst), 1, "{name}");
+                }
+            }
+        });
+    }
+}
