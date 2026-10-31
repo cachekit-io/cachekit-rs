@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.14.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.13.1...cachekit-rs-v0.14.0) (2026-10-31)
+
+
+### Features
+
+* **backend:** add a defaulted Backend::set_bytes so writes share one buffer (LAB-7175) ([#203](https://github.com/cachekit-io/cachekit-rs/issues/203)) ([d94a839](https://github.com/cachekit-io/cachekit-rs/commit/d94a839fdbd3dc8c5b18c63b48c5792dd08486fe))
+* **backend:** add RedisBackendBuilder::disable_offline_queue (LAB-11726) ([#199](https://github.com/cachekit-io/cachekit-rs/issues/199)) ([6519615](https://github.com/cachekit-io/cachekit-rs/commit/6519615c44295859cca49372f6fe4f1e6457910e))
+* **macros:** let #[cachekit] opt out of the distributed fill lock (LAB-7171) ([#201](https://github.com/cachekit-io/cachekit-rs/issues/201)) ([2358ae6](https://github.com/cachekit-io/cachekit-rs/commit/2358ae6e1221f7ecb53aede590d7986da8e20606))
+
+
+### Bug Fixes
+
+* **deps:** pin cachekit-macros exactly so a newer macro never meets an older runtime (LAB-12165) ([b82a0a8](https://github.com/cachekit-io/cachekit-rs/commit/b82a0a8e8a6796101ffc179b69fdb8b9843170d7))
+* **memcached:** set socket timeouts on UDP and Unix-socket connections (LAB-11947) ([#204](https://github.com/cachekit-io/cachekit-rs/issues/204)) ([7efb4f3](https://github.com/cachekit-io/cachekit-rs/commit/7efb4f37d9e131e58a19b4ac0b2f11efcde0e1d2))
+
+
+### Performance Improvements
+
+* **client:** build a namespaced key once per read, without format! (LAB-12105) ([#211](https://github.com/cachekit-io/cachekit-rs/issues/211)) ([7b1685f](https://github.com/cachekit-io/cachekit-rs/commit/7b1685f3b296c4200f21ef1436283c9cfd44b574))
+* **memcached:** drop the per-op version ping; discard connections on error (LAB-7133) ([#202](https://github.com/cachekit-io/cachekit-rs/issues/202)) ([86112c2](https://github.com/cachekit-io/cachekit-rs/commit/86112c2b193bbb1261ec2438ee177eed9033a428))
+
 ## [0.13.1](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.13.0...cachekit-rs-v0.13.1) (2026-10-27)
 
 
