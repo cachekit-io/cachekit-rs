@@ -962,6 +962,24 @@ keeping the job name green. Two properties make that visible:
   it after human sign-off, *then* push a commit — the marker is read from the
   push-time event, so a body edit alone does not re-trigger).
 
+### Why cachekit-macros is pinned exactly
+
+`cachekit-rs` requires `cachekit-macros` with `=`, never a caret, so each
+runtime release only ever meets the macros released with it. `#[cachekit]`
+expands to calls into `#[doc(hidden)]` items of `cachekit-rs`, and a patch
+release of the macros can call one that an older runtime lacks. Under a caret,
+a project that holds `cachekit-rs` at an exact older patch would still resolve
+the newest macros in that minor line, and stop compiling at every
+`#[cachekit]` site.
+
+The requirement lives in the root `Cargo.toml` under `[workspace.dependencies]`,
+and `crates/cachekit/Cargo.toml` inherits it. release-please rewrites a
+dependency version in a member manifest to the bare new version, dropping the
+`=`, so the root line carries an `x-release-please-version` marker instead, and
+a generic `extra-files` entry in `release-please-config.json` bumps only the
+number. `crates/cachekit/tests/macros_pin_tests.rs` fails if the requirement
+is not `=` this crate's version.
+
 ## Minimum Supported Rust Version
 
 New releases support the latest stable Rust. This release requires **Rust 1.91** or later: `rust-version` in `Cargo.toml` is the oldest toolchain CI tests, and any release may raise it when a dependency needs a newer one.
