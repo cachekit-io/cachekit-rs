@@ -815,16 +815,16 @@ both builds run one workload, build the example there, copy its
 `BASE`. The example copies both builds to paths of equal length
 before it measures them, because the length of a binary's path moves its
 counts (by 6 instructions per `exists` op). The runs interleave ABBA, and a
-delta counts only when it beats the case's floor, which comes from the base's
-runs alone, so a change that makes a case noisy cannot widen its own floor.
-Most cases repeat exactly; their floor is 0.5%, and they also fail when the
-head's runs disagree by more than that, because new nondeterminism on a hot
-path is itself a finding. The `l2_hit` cases spread by up to about 2% in CI,
-and the `delete` cases by up to about 10%, from the single-flight and per-key
-mutation lock maps, hash tables seeded afresh in each process. A case like
-that gets a floor of 3 × its base spread, and never less than 2% (in CI, an
-unchanged build moved `l2_hit`'s median by at most 0.52%). `delete` is
-reported but never fails the comparison: a floor that wide would hide any
+delta counts only when it beats the case's floor, which is fixed per op and
+never taken from a run's spread, so a change that makes a case noisy cannot
+widen its own floor. Every op's floor is 0.5%, new ops included, and its
+cases also fail when the head's runs spread by more than 0.5%, because new
+nondeterminism on a hot path is itself a finding. Two ops vary between runs
+of one build, from the single-flight and per-key mutation lock maps, hash
+tables seeded afresh in each process: `l2_hit` by up to about 2% in CI, and
+`delete` by up to about 10%. `l2_hit` gets a fixed 2% floor and no spread
+check (in CI, an unchanged build moved its median by at most 0.52%). `delete`
+is reported but never fails the comparison: a floor that wide would hide any
 regression worth catching. The example exits 1 when a gated case got slower
 or noisier, and 2 when nothing was measured or the run stopped part way (an
 unknown flag, a filter that matches no case, a valgrind failure); `make`

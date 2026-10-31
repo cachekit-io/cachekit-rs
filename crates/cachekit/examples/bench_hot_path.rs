@@ -20,12 +20,10 @@
 //! so only the timed loop is counted and setup needs no differencing. It
 //! reports the median instructions per op and the run-to-run spread. With
 //! `--base`, it runs a second build of this example interleaved (ABBA) and
-//! calls a delta only when it beats the case's floor, which comes from the
-//! base's runs alone (see [`MIN_FLOOR`] and [`NOISY_FLOOR`]); a case whose base
-//! repeats exactly also fails when the head's runs do not. `delete` cases are
-//! reported but never fail (see [`UNGATED`]). `--report` writes the verdict as
-//! Markdown, for CI's PR comment, and `--jobs` measures that many cases at a
-//! time. Exit codes: 1 when any gated case got slower or noisier; 2 when
+//! calls a delta only when it beats the case's floor, which is fixed per op
+//! (see `Compared::new`; the README's "Measuring performance" states the
+//! rule). `--report` writes the verdict as Markdown, for CI's PR comment, and
+//! `--jobs` measures that many cases at a time. Exit codes: 1 when any gated case got slower or noisier; 2 when
 //! nothing was measured or the run stopped part way (an unknown flag, a filter
 //! matching no case, or valgrind failing). Wall time is printed for
 //! orientation and is never a measured saving.
@@ -447,24 +445,22 @@ fn readme() -> Result<bool, String> {
 
 // ── Instruction counting ─────────────────────────────────────────────────────
 
-/// The floor of a case whose base runs repeat exactly: the smallest delta
-/// `instr --base` calls. Such a case also fails NOISIER when the head's runs
-/// disagree by more than this, because new nondeterminism on a hot path is
-/// itself a finding.
-const MIN_FLOOR: f64 = 0.005;
+/// The floor of every op but [`NOISY`] and [`UNGATED`], new ops included, so a
+/// case fails closed by default.
+const FLOOR: f64 = 0.005;
 
-/// The smallest floor of a case whose base runs already disagree (`l2_hit`,
-/// `delete`): it gets the larger of this and `3 x` the base's spread. Five
-/// runs estimate such a case's spread too loosely to compare the head's with
-/// it, so there the head's spread is only reported. The head's spread never
-/// widens a floor: a change that made a case noisy would otherwise excuse its
-/// own regression. CI A/A runs moved `l2_hit`'s median by at most 0.52%.
+/// The one gated op whose count varies between runs of one build: an L2 hit
+/// takes the single-flight lock, whose map is seeded afresh in each process.
+/// It gets [`NOISY_FLOOR`] and no NOISIER check.
+const NOISY: &str = "l2_hit";
+
+/// [`NOISY`]'s floor. CI A/A runs moved its median by at most 0.52%.
 const NOISY_FLOOR: f64 = 0.02;
 
 /// The op measured and reported but never failed. A delete takes the per-key
-/// mutation lock, whose map is seeded afresh in each process, so its count
-/// spreads by up to about 10% between runs of one build and its floor would
-/// hide any regression worth catching.
+/// mutation lock, also seeded per process, so its count spreads by up to
+/// about 10% between runs of one build and its floor would hide any
+/// regression worth catching.
 const UNGATED: &str = "delete";
 
 /// `instr --base` verdicts. `--report` lists SLOWER and NOISIER first, then
@@ -601,24 +597,29 @@ struct Compared {
 }
 
 impl Compared {
+    /// The floor depends on the op alone, never on how a run happened to
+    /// spread: sampled per run, a case's strictness would be random, and a
+    /// change that made a case noisy could widen its own floor. A case at
+    /// [`FLOOR`] also fails NOISIER when the head's runs spread by more than
+    /// that floor, because new nondeterminism on a hot path is a finding.
     fn new(case: &str, size: usize, base: &[f64], head: &[f64]) -> Self {
         let (mb, mh) = (median(base), median(head));
         let delta = (mh - mb) / mb;
-        let exact = spread(base) == 0.0;
-        let floor = if exact {
-            MIN_FLOOR
-        } else {
-            (3.0 * spread(base)).max(NOISY_FLOOR)
-        };
         let head_spread = spread(head);
-        let gated = case.split_once('/').map_or(case, |(op, _)| op) != UNGATED;
+        let op = case.split_once('/').map_or(case, |(op, _)| op);
+        let floor = match op {
+            NOISY => NOISY_FLOOR,
+            // Report-only, so it may follow the base's spread.
+            UNGATED => (3.0 * spread(base)).max(NOISY_FLOOR),
+            _ => FLOOR,
+        };
         let verdict = if delta >= floor {
-            if gated {
-                SLOWER
-            } else {
+            if op == UNGATED {
                 SLOWER_UNGATED
+            } else {
+                SLOWER
             }
-        } else if gated && exact && head_spread > MIN_FLOOR {
+        } else if !matches!(op, NOISY | UNGATED) && head_spread > FLOOR {
             NOISIER
         } else if delta <= -floor {
             FASTER
@@ -635,6 +636,12 @@ impl Compared {
             head_spread,
             verdict,
         }
+    }
+
+    /// The one rule behind a row's bold verdict, the report's FAIL and the
+    /// exit code.
+    fn fails(&self) -> bool {
+        matches!(self.verdict, SLOWER | NOISIER)
     }
 }
 
@@ -672,18 +679,14 @@ fn each_case<T: Send>(
     (results, error)
 }
 
-/// A worker that panicked poisons the lock. The others recover it and measure
-/// the remaining cases; the scope then re-raises the panic, which ends the run.
+/// Nothing under either lock can panic, so neither is ever poisoned; this
+/// recovers instead of unwrapping, as the rest of the example does.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Whether any gated case got slower or noisier than the base: the one rule
-/// behind both the report's FAIL and the exit code.
 fn regressed(rows: &[Option<Compared>]) -> bool {
-    rows.iter()
-        .flatten()
-        .any(|c| matches!(c.verdict, SLOWER | NOISIER))
+    rows.iter().flatten().any(Compared::fails)
 }
 
 /// `instr --report`: the verdict, and every case that needs a look, as
@@ -709,12 +712,12 @@ fn render(all: &[(String, usize)], rows: &[Option<Compared>], error: Option<&str
     }
     out += &format!(
         " A case fails when its median is slower than the base by its floor or more (SLOWER). \
-         The floor is {:.1}% when the base's runs repeat exactly, and such a case also fails \
-         when the head's runs disagree by more than that (NOISIER): new nondeterminism on a \
-         hot path is a finding. When the base's runs already disagree, the floor is the larger \
-         of {:.0}% and 3 x their spread. The head's spread never widens a floor. `{}` cases are \
-         reported, never failed: their count moves with a hash seed drawn in each process.\n\n",
-        100.0 * MIN_FLOOR,
+         The floor is {:.1}%, and such a case also fails when the head's runs spread by more \
+         than that (NOISIER), except `{}`, whose floor is {:.0}% because its count varies \
+         between runs. `{}` cases are reported, never failed. Method: README, *Measuring \
+         performance*.\n\n",
+        100.0 * FLOOR,
+        NOISY,
         100.0 * NOISY_FLOOR,
         UNGATED
     );
@@ -722,7 +725,7 @@ fn render(all: &[(String, usize)], rows: &[Option<Compared>], error: Option<&str
         "| Verdict | Case | Base Ir/op | Head Ir/op | Delta | Floor | Head spread |\n\
                         |---|---|--:|--:|--:|--:|--:|\n";
     let line = |c: &Compared| {
-        let v = if matches!(c.verdict, SLOWER | NOISIER) {
+        let v = if c.fails() {
             format!("**{}**", c.verdict)
         } else {
             c.verdict.to_owned()
@@ -739,10 +742,7 @@ fn render(all: &[(String, usize)], rows: &[Option<Compared>], error: Option<&str
         )
     };
     let mut look = String::new();
-    for c in measured
-        .iter()
-        .filter(|c| matches!(c.verdict, SLOWER | NOISIER))
-    {
+    for c in measured.iter().filter(|c| c.fails()) {
         look += &line(c);
     }
     for ((case, size), _) in all.iter().zip(rows).filter(|(_, r)| r.is_none()) {
@@ -825,18 +825,6 @@ fn instr(args: &[String]) -> Result<bool, String> {
     };
     let stage = Staged::new(&base, &me)?;
     let (base, me) = (stage.base.as_str(), stage.head.as_str());
-    // Written once, at the end: a run killed before then leaves whatever the
-    // caller put at the path (CI puts an INCOMPLETE report there first).
-    let write = |rows: &[Option<Compared>], error: Option<&str>| match &report {
-        // Write then rename, so a run killed mid-write never leaves half a report.
-        Some(path) => {
-            let part = format!("{path}.part");
-            std::fs::write(&part, render(&all, rows, error))
-                .and_then(|()| std::fs::rename(&part, path))
-                .map_err(|e| format!("cannot write the report to {path}: {e}"))
-        }
-        None => Ok(()),
-    };
     println!(
         "{:16} {:>6} {:>12} {:>12} {:>8} {:>8} {:>8}  verdict",
         "case", "size", "base Ir/op", "head Ir/op", "delta", "floor", "h spread"
@@ -855,11 +843,19 @@ fn instr(args: &[String]) -> Result<bool, String> {
         );
         Ok(c)
     });
-    // A failed report write must not hide why the run stopped.
-    write(&rows, error.as_deref()).map_err(|w| match &error {
-        Some(e) => format!("{e}; {w}"),
-        None => w,
-    })?;
+    // Written once, at the end: a run killed before then leaves whatever the
+    // caller put at the path (CI puts an INCOMPLETE report there first). Write
+    // then rename, so a run killed mid-write never leaves half a report.
+    if let Some(path) = &report {
+        let part = format!("{path}.part");
+        std::fs::write(&part, render(&all, &rows, error.as_deref()))
+            .and_then(|()| std::fs::rename(&part, path))
+            .map_err(|w| {
+                // A failed report write must not hide why the run stopped.
+                let w = format!("cannot write the report to {path}: {w}");
+                error.as_ref().map_or(w.clone(), |e| format!("{e}; {w}"))
+            })?;
+    }
     match error {
         Some(e) => Err(e),
         None => Ok(!regressed(&rows)),
