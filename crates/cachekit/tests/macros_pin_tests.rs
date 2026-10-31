@@ -10,8 +10,10 @@
 //! bare new version, which drops the `=`. So this crate's manifest inherits
 //! the requirement from the root `[workspace.dependencies]`, where a generic
 //! `extra-files` entry in `release-please-config.json` bumps only the number.
-//! This file fails the PR that moves the requirement back, and the release PR
-//! if release-please stopped bumping it.
+//! This file fails a PR or release PR that moves the requirement back into
+//! this crate's manifest, drops the `=`, or drops the marker. A number that
+//! release-please stopped bumping fails earlier, in cargo's own resolution,
+//! because the path crate's version no longer matches it.
 
 const ROOT: &str = include_str!("../../../Cargo.toml");
 const MEMBER: &str = include_str!("../Cargo.toml");
@@ -35,9 +37,11 @@ fn macros_line<'a>(manifest: &'a str, section: &str) -> &'a str {
 
 fn check(root: &str, member: &str, version: &str) {
     let line = macros_line(member, "dependencies");
+    // The TOML before any trailing comment, so a comment cannot satisfy the check.
+    let toml = line.split('#').next().unwrap_or_default();
     assert!(
-        line.contains("workspace = true"),
-        "crates/cachekit/Cargo.toml: `{line}` must inherit the root requirement (`workspace = true`); release-please drops the `=` from a requirement declared here"
+        toml.contains("workspace = true") && !toml.contains("version"),
+        "crates/cachekit/Cargo.toml: `{line}` must inherit the root requirement (`workspace = true`, no `version`); release-please drops the `=` from a requirement declared here"
     );
     let line = macros_line(root, "workspace.dependencies");
     assert!(
@@ -91,5 +95,12 @@ fn stale_exact_requirement_fails() {
 #[should_panic(expected = "must inherit the root requirement")]
 fn member_declaring_its_own_requirement_fails() {
     let member = "[dependencies]\ncachekit-macros = { version = \"=0.14.0\", path = \"../cachekit-macros\", optional = true }\n";
+    check(&root("=0.14.0"), member, "0.14.0");
+}
+
+#[test]
+#[should_panic(expected = "must inherit the root requirement")]
+fn comment_cannot_satisfy_the_member_check() {
+    let member = "[dependencies]\ncachekit-macros = { path = \"../cachekit-macros\", optional = true } # workspace = true\n";
     check(&root("=0.14.0"), member, "0.14.0");
 }
