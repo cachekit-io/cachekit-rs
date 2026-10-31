@@ -52,13 +52,14 @@
 //!
 //! A connection that died while idle now fails the one operation that finds
 //! it, with a retryable error, where the checkout test used to replace it
-//! silently. When the server reset or closed that connection (EOF), as a
-//! restart does, every other idle connection is dropped too, so a restart
-//! costs about one failed operation. A new connection lost the same way drops
-//! nothing: a server at its connection limit closes new connections while the
-//! idle ones still work. A NAT or firewall that drops an idle connection
-//! silently sends no reset, so the operation fails with a read timeout and
-//! nothing is dropped: each dead idle connection costs one operation, after
+//! silently. When that connection was reset or closed (EOF), as a server
+//! restart does, or a NAT that resets an expired mapping, every other idle
+//! connection is dropped too, so a restart costs about one failed operation.
+//! A new connection lost the same way drops nothing: a server at its
+//! connection limit closes new connections while the idle ones still work. A
+//! NAT or firewall that drops an idle connection silently sends no reset, so
+//! the operation fails with a read timeout and no other idle connection is
+//! dropped: each dead idle connection costs one operation, after
 //! [`timeout`](crate::backend::memcached::MemcachedBackendBuilder::timeout).
 //!
 //! ## TTL capability — the honest parity picture
