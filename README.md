@@ -889,6 +889,8 @@ and reads one L2 hit, the cost a one-read process pays beyond its start-up.
 or `enc` through a `secure` function) whose interop key is 120 B, so it prices
 the macro's key derivation; it needs the `macros` feature, which the `make`
 targets turn on.
+`ns` and `nsenc` run `l1_hit`, `l2_hit` and `set` as `plain` and `enc` on a
+client with a `.namespace()`, which builds `{namespace}:{key}` on every op.
 
 ```bash
 make bench                                  # wall ns/op: indicative only
