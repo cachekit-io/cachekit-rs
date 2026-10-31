@@ -780,6 +780,96 @@ reintroduced behind an optional feature passes a bare `cargo deny check`.
 and `toxiproxy_rust`, because this SDK is rustls-only. Run `make deny` before
 adding or bumping a dependency.
 
+### Performance practices
+
+These practices come from measured changes in this crate and its sibling SDKs.
+Each says what to do, why, and the PR that measured it. Follow them in any
+change to a hot path: an L1 hit, an L2 hit, a miss, a `set`, their encrypted
+variants, and a short-lived process's first read. A perf PR shows its counts;
+[Measuring performance](#measuring-performance) says how to take them.
+
+1. **Do per-call work once.** Anything that depends only on configuration, the
+   tenant, key material or the cached function is computed when the client or
+   keyring is built. [#185](https://github.com/cachekit-io/cachekit-rs/pull/185)
+   binds the keyring to its tenant once, so reads run no HKDF: the encrypted
+   64 B L1 hit went from 34,178 to 5,124 instructions (−85%). Eager work has a
+   price: with three previous keys, a one-op process whose read the current key
+   serves costs +24.0%, so measure the `oneshot` case and state the trade. A
+   memo on an encrypting client never keeps plaintext alive; every memo is
+   bounded by entries and bytes.
+2. **Allocate once and don't copy.** Size buffers exactly, write in place,
+   borrow instead of owning. [#178](https://github.com/cachekit-io/cachekit-rs/pull/178)
+   borrows the key and checks it 16 bytes at a time: a 64 B L1 hit went from
+   2,927 to 2,564 instructions (−12.4%). The keys it accepts and rejects, and
+   its error text, did not change: only a rejection scans byte by byte, to name
+   the offending byte. [cachekit-core#127](https://github.com/cachekit-io/cachekit-core/pull/127)
+   seals in one buffer: encrypt at 64 KiB went from 33.80 µs to 10.93 µs.
+3. **Don't let allocator luck hide a copy.** When a change slows a path it did
+   not touch, find the work the old timing hid. In
+   [#182](https://github.com/cachekit-io/cachekit-rs/pull/182), moka's late
+   drop of a replaced L1 value had let glibc grow the encrypt buffer in place;
+   quick_cache frees it at once, and `_int_realloc` rose from about 14.8 k to
+   66.5 k instructions per op. The fix went to the root cause, cachekit-core#127,
+   not to recreating moka's drop timing. Removing an allocation can cost too:
+   glibc's adaptive mmap threshold made borrowing a 1 MB payload about 7×
+   slower on retrieve, so [cachekit-core#132](https://github.com/cachekit-io/cachekit-core/pull/132)
+   borrows only below 64 KiB. Count page faults at 64 KiB and up: instruction
+   counts miss kernel work, and cachekit-core#127's encrypt read only −3.2% at
+   1 MiB.
+4. **Before removing a check, find what else it guarded.**
+   [#202](https://github.com/cachekit-io/cachekit-rs/pull/202) dropped
+   memcached's per-operation `version` ping: `get` p50 at 0.5 ms RTT went from
+   1.493 ms to 0.782 ms, and 32-way throughput nearly doubled. The ping was the
+   only desync guard (rust-memcache's `has_broken` always returns `false`), and
+   setting only `test_on_check_out(false)` returned another key's value in the
+   desync tests. Now a connection goes back to the idle list only after a fully
+   parsed `Ok`; any `Err` drops it.
+5. **No per-operation cost that grows with the number of entries.** #182 moved
+   L1 off moka, which recorded every read for its eviction policy, onto
+   quick_cache: at 64 B, the L1 hit −33.4% and `set` −55.1%.
+   [cachekit-py#658](https://github.com/cachekit-io/cachekit-py/pull/658)
+   replaced an expiry scan with a deadline heap, −97.2% instructions per put at
+   10,000 entries; a min-expiry watermark still scanned on 18–51% of puts in
+   simulation, so fix the structure, not the heuristic. A new engine changes behaviour, so
+   measure and state it: #182 took a 1,100-key loop at capacity 1,000 from a
+   90.9% to an 82.3% hit ratio, and its first expiry guard, creation instant
+   plus buffer pointer, could drop a fresh empty value because two writes can
+   share both.
+6. **Count round trips per operation.** Pipeline dependent commands, skip
+   checks an uncontended path cannot need, and keep follow-up work off the
+   caller's path. [cachekit-ts#209](https://github.com/cachekit-io/cachekit-ts/pull/209)
+   skipped the uncontended double-check and released the fill lock off the
+   reply path, so a cold miss went from 5 requests to 4.
+7. **Small values get their own path.** Fixed per-call costs dominate the small
+   values most caches hold, so judge a change at 40 B and 64 B too.
+   [cachekit-core#128](https://github.com/cachekit-io/cachekit-core/pull/128)
+   gave LZ4 a literals-only block below 64 B: −80.8% on a 63 B store.
+8. **No shared mutable state on the operation path.** Use per-thread cells,
+   atomics and lock-free reads: per-thread metric cells gave +52.3% calls/s at
+   16 threads on free-threaded Python
+   ([cachekit-py#661](https://github.com/cachekit-io/cachekit-py/pull/661)).
+9. **Measure it, or it didn't happen.** Judge CPU work on `make bench-instr`
+   against a build of the base on the same machine, and run an A/A: code layout
+   alone moved unchanged code by −4% to +5% across rebuilds
+   ([cachekit-core#144](https://github.com/cachekit-io/cachekit-core/pull/144)),
+   and `delete` drifted 4.38% in an A/A
+   ([#193](https://github.com/cachekit-io/cachekit-rs/pull/193)), so judge it
+   against its own. Bench realistic inputs: #178's 21 B bench key, against an
+   interop key of about 120 B, understated its win. Size the bench L1 at twice
+   its keys, or sharded eviction during setup leaks into the timed loop (#182).
+   Valgrind runs `sha2`'s portable code, about 29,000 instructions per HKDF,
+   which overstates the native share (#185). Pair and interleave wall-time
+   runs. Use `black_box`: [cachekit-core#117](https://github.com/cachekit-io/cachekit-core/pull/117)
+   found a benchmark reporting 230–290 GB/s, faster than memory. Publish no
+   figure you did not measure.
+
+**Sibling paths.** A fix applied to one path tends to leave its siblings slow.
+When a perf PR changes a hot path, its description lists the sibling paths and
+says which it changed: plaintext and encrypted (current and previous key), L1
+hit and L2 hit, the client API and `#[cachekit]`, with and without the
+reliability stack, native and wasm32, each backend, and the same path in the
+other SDKs.
+
 ### Measuring performance
 
 Two examples measure the client. Neither runs in the test suite, and neither
