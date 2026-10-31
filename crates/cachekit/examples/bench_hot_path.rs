@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::hint::black_box;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -449,11 +449,11 @@ fn readme() -> Result<bool, String> {
 /// `3 x` its spread instead, when that is larger.
 const MIN_FLOOR: f64 = 0.005;
 
-/// Ops measured and reported but never failed. A delete takes the per-key
+/// The op measured and reported but never failed. A delete takes the per-key
 /// mutation lock, whose map is seeded afresh in each process, so its count
 /// spreads by up to about 10% between runs of one build and its floor would
 /// hide any regression worth catching.
-const UNGATED: [&str; 1] = ["delete"];
+const UNGATED: &str = "delete";
 
 /// `instr --base` verdicts, in the order `--report` lists them.
 const SLOWER: &str = "SLOWER";
@@ -559,11 +559,10 @@ impl Staged {
             head: dir.join("head/bench_hot_path").display().to_string(),
             dir,
         };
-        for (from, to) in [(base, &stage.base), (head, &stage.head)] {
-            let to = Path::new(to);
-            std::fs::create_dir_all(to.parent().unwrap_or(&stage.dir))
+        for (from, side, to) in [(base, "base", &stage.base), (head, "head", &stage.head)] {
+            std::fs::create_dir_all(stage.dir.join(side))
                 .and_then(|()| std::fs::copy(from, to))
-                .map_err(|e| format!("cannot copy {from} to {}: {e}", to.display()))?;
+                .map_err(|e| format!("cannot copy {from} to {to}: {e}"))?;
         }
         Ok(stage)
     }
@@ -596,7 +595,7 @@ impl Compared {
             NOISE
         } else if delta < 0.0 {
             FASTER
-        } else if UNGATED.contains(&op) {
+        } else if op == UNGATED {
             SLOWER_UNGATED
         } else {
             SLOWER
@@ -684,9 +683,9 @@ fn render(all: &[(String, usize)], rows: &[Option<Compared>], error: Option<&str
          {:.1}% and 3 x the run-to-run spread either build showed. `{}` cases are reported, \
          never failed: their count moves with a hash seed drawn in each process.\n\n",
         100.0 * MIN_FLOOR,
-        UNGATED.join("`, `")
+        UNGATED
     );
-    let head =
+    let table_header =
         "| Verdict | Case | Base Ir/op | Head Ir/op | Delta | Floor |\n|---|---|--:|--:|--:|--:|\n";
     let line = |c: &Compared| {
         let v = if c.verdict == SLOWER {
@@ -717,14 +716,14 @@ fn render(all: &[(String, usize)], rows: &[Option<Compared>], error: Option<&str
         }
     }
     if !look.is_empty() {
-        out += head;
+        out += table_header;
         out += &look;
         out += "\n";
     }
     let quiet: Vec<_> = measured.iter().filter(|c| c.verdict == NOISE).collect();
     if !quiet.is_empty() {
         out += &format!(
-            "<details><summary>{} cases within noise</summary>\n\n{head}",
+            "<details><summary>{} cases within noise</summary>\n\n{table_header}",
             quiet.len()
         );
         for c in quiet {
@@ -834,6 +833,10 @@ fn instr(args: &[String]) -> Result<bool, String> {
             }
         },
     );
+    if let Some(e) = &error {
+        // Printed here as well, so a failed report write cannot hide it.
+        eprintln!("bench_hot_path: {e}");
+    }
     write(&rows, error.as_deref())?;
     match error {
         Some(e) => Err(e),
