@@ -910,6 +910,28 @@ mod memcached_tests {
         });
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn binary_credentials_over_udp_are_rejected() {
+        // rust-memcache would send the SASL handshake before the socket has a
+        // timeout, so one lost reply would wedge the pool. connect() refuses
+        // the URL as config, before any I/O; the port has no listener.
+        for url in [
+            "memcache+udp://user:pw@127.0.0.1:1?protocol=binary", // pragma: allowlist secret
+            "memcache://user:pw@127.0.0.1:1?protocol=binary&udp=true", // pragma: allowlist secret
+        ] {
+            let err = MemcachedBackend::builder()
+                .url(url)
+                .connect()
+                .await
+                .expect_err("rejected");
+            assert!(
+                matches!(err, cachekit::error::CachekitError::Config(_)),
+                "{url}: {err}"
+            );
+        }
+    }
+
     #[test]
     #[serial]
     fn lost_udp_auth_reply_costs_one_operation() {

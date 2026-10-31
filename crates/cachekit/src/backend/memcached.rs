@@ -621,8 +621,10 @@ impl MemcachedBackendBuilder {
     /// the transport. Credentials in the URL (a `user:pass@` prefix on the host)
     /// are sent with memcached's ASCII `set auth` after the timeout is set, so
     /// a lost reply fails one operation. With an explicit `protocol=binary`,
-    /// rust-memcache sends them itself before any timeout exists on a UDP or
-    /// Unix socket.
+    /// rust-memcache sends them itself, before any timeout exists on a UDP or
+    /// Unix socket, so [`connect`](Self::connect) rejects credentials with
+    /// `protocol=binary` on those transports (a config error). Binary over
+    /// TCP or TLS is unaffected.
     pub fn url(mut self, url: impl Into<String>) -> Self {
         self.url = Some(url.into());
         self
@@ -721,7 +723,9 @@ impl MemcachedBackendBuilder {
     /// URL; this takes the same pair under the same condition.
     ///
     /// A binary-protocol URL keeps its credentials: its SASL handshake is
-    /// not reachable through rust-memcache's public API.
+    /// not reachable through rust-memcache's public API. `connect` rejects
+    /// that combination where it would run untimed (see
+    /// [`authenticates_untimed`](Self::authenticates_untimed)).
     fn take_ascii_credentials(url: Url) -> (Url, Option<String>) {
         let is_ascii = url
             .query_pairs()
@@ -740,6 +744,26 @@ impl MemcachedBackendBuilder {
         (bare, Some(auth))
     }
 
+    /// Whether rust-memcache would authenticate on a socket that has no
+    /// timeout yet: the URL still carries credentials (a binary-protocol URL,
+    /// after [`take_ascii_credentials`](Self::take_ascii_credentials)) and
+    /// its transport is UDP or a Unix socket, which rust-memcache opens
+    /// without the URL's `timeout=`. The transport rules are rust-memcache's
+    /// own, for the schemes `connect` allows.
+    fn authenticates_untimed(url: &Url) -> bool {
+        let has_credentials = !url.username().is_empty() && url.password().is_some();
+        let udp = url.scheme() == "memcache+udp"
+            || (url.scheme() == "memcache"
+                && url
+                    .query_pairs()
+                    .any(|(name, value)| name == "udp" && value == "true"));
+        let unix = cfg!(unix)
+            && url.scheme() == "memcache"
+            && url.host().is_none()
+            && url.port().is_none();
+        has_credentials && (udp || unix)
+    }
+
     /// Connect to memcached and construct a [`MemcachedBackend`].
     ///
     /// Opens one connection and pings the server (`version`), so a bad
@@ -748,8 +772,10 @@ impl MemcachedBackendBuilder {
     ///
     /// # Errors
     ///
-    /// Returns a config error if `url` was not provided or is invalid, or a
-    /// backend error if the connection cannot be established.
+    /// Returns a config error if `url` was not provided or is invalid, or
+    /// carries credentials with `protocol=binary` over UDP or a Unix socket
+    /// (see [`url`](Self::url)), or a backend error if the connection cannot
+    /// be established.
     pub async fn connect(self) -> Result<MemcachedBackend, crate::error::CachekitError> {
         use crate::error::CachekitError;
 
@@ -776,6 +802,15 @@ impl MemcachedBackendBuilder {
 
         let io_timeout = Self::socket_timeout(&url, timeout);
         let (url, auth) = Self::take_ascii_credentials(url);
+        if Self::authenticates_untimed(&url) {
+            return Err(CachekitError::Config(
+                "memcached: a URL with credentials and protocol=binary is not supported \
+                 over UDP or a Unix socket: rust-memcache authenticates before any socket \
+                 timeout is set there, so one lost reply would wedge the connection pool. \
+                 Use protocol=ascii (the default) or TCP"
+                    .to_string(),
+            ));
+        }
 
         // Budget: a connect plus a few socket timeouts' worth of I/O covers
         // the healthy path with slack while still failing a wedged server
@@ -1007,6 +1042,22 @@ mod tests {
             take("memcache://u:p@h:1?protocol=binary"),
             ("memcache://u:p@h:1?protocol=binary".to_string(), None)
         );
+    }
+
+    #[test]
+    fn untimed_authentication_is_binary_credentials_on_udp_or_unix() {
+        let untimed = |url: &str| {
+            MemcachedBackendBuilder::authenticates_untimed(&Url::parse(url).expect("url"))
+        };
+        assert!(untimed("memcache+udp://u:p@h:1?protocol=binary")); // pragma: allowlist secret
+        assert!(untimed("memcache://u:p@h:1?protocol=binary&udp=true")); // pragma: allowlist secret
+                                                                         // TCP and TLS sockets carry the URL's timeout from the connect on.
+        assert!(!untimed("memcache://u:p@h:1?protocol=binary")); // pragma: allowlist secret
+        assert!(!untimed("memcache+tls://u:p@h:1?protocol=binary")); // pragma: allowlist secret
+                                                                     // No credentials (or ASCII ones, already taken out): nothing untimed.
+        assert!(!untimed("memcache+udp://h:1?protocol=binary"));
+        assert!(!untimed("memcache+udp://u@h:1?protocol=binary"));
+        assert!(!untimed("memcache:///tmp/m.sock?protocol=binary"));
     }
 
     #[test]
