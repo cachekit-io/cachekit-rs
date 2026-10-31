@@ -261,13 +261,20 @@ impl Bench {
             _ => write(&bench.reader, bench.enc, &bench.keys[0], &bench.value).await?,
         }
         let parked = parked(mode);
-        for i in 0..parked {
-            let reader = bench.reader.clone();
-            tokio::spawn(async move { reader.delete(&format!("{PARKED}{i:08}")).await });
-        }
+        let deletes: Vec<_> = (0..parked)
+            .map(|i| {
+                let reader = bench.reader.clone();
+                tokio::spawn(async move { reader.delete(&format!("{PARKED}{i:08}")).await })
+            })
+            .collect();
         // Each spawned delete runs once the setup yields, and takes its lock
-        // before it reaches the backend.
+        // before it reaches the backend. One that returns never parks.
         while bench.backend.parked.load(Ordering::Relaxed) < parked {
+            if deletes.iter().any(tokio::task::JoinHandle::is_finished) {
+                return Err(CachekitError::Config(
+                    "a parked delete returned before reaching the backend".into(),
+                ));
+            }
             tokio::task::yield_now().await;
         }
         Ok(bench)
