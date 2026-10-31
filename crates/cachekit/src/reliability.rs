@@ -739,7 +739,9 @@ impl ConcurrencyLimiter {
 ///   ([`LockableBackend::__get_or_lock`]) is a read: it takes a limiter
 ///   permit and passes the breaker like `get`, but runs once. A retry after
 ///   a lost reply would find the lock its first attempt took and report it
-///   contested.
+///   contested. When the stack sheds it or the breaker fails it fast, the
+///   client reads and then locks as for a backend that does not combine, so
+///   the lock call still bypasses the stack.
 pub(crate) struct ReliableBackend {
     inner: SharedBackend,
     retry: Option<RetryPolicy>,
@@ -766,6 +768,12 @@ impl ReliableBackend {
                 .map(|config| Arc::new(CircuitBreaker::new(config))),
             limiter: config.backpressure.map(ConcurrencyLimiter::new),
         }
+    }
+
+    fn inner_lockable(&self) -> Result<&dyn LockableBackend, BackendError> {
+        self.inner
+            .as_lockable()
+            .ok_or_else(|| BackendError::permanent("the inner backend has no distributed lock"))
     }
 
     /// Run `f` through the stack; `budget` is the retry deadline for this op, if any.
@@ -917,14 +925,6 @@ impl LockableBackend for ReliableBackend {
         let inner = self.inner_lockable()?;
         self.guarded_once(|| inner.__get_or_lock(key, timeout_ms))
             .await
-    }
-}
-
-impl ReliableBackend {
-    fn inner_lockable(&self) -> Result<&dyn LockableBackend, BackendError> {
-        self.inner
-            .as_lockable()
-            .ok_or_else(|| BackendError::permanent("the inner backend has no distributed lock"))
     }
 }
 

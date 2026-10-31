@@ -715,6 +715,22 @@ impl SingleFlight {
         flight
     }
 
+    /// A cold miss's flight after its lock attempt, under the cold-miss
+    /// policy ([`LockAttempt::cold_role`]).
+    #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+    fn lead(
+        map: &crate::client::SharedFlight,
+        local: tokio::sync::OwnedMutexGuard<KeyState>,
+        attempt: LockAttempt,
+        backend: &SharedBackend,
+        full_key: &str,
+    ) -> Self {
+        let (role, lock_id) = attempt.cold_role();
+        let mut flight = Self::new(map, local, role, backend, full_key);
+        flight.lock_id = lock_id;
+        flight
+    }
+
     /// Cold-miss entry: lead (attempting cross-process suppression via the
     /// backend's distributed lock, when available and `distributed` is set),
     /// or queue behind a local holder.
@@ -745,12 +761,8 @@ impl SingleFlight {
         };
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         if distributed {
-            let (role, lock_id) = LockAttempt::run(&mut local, backend, full_key)
-                .await
-                .cold_role();
-            let mut flight = Self::new(map, local, role, backend, full_key);
-            flight.lock_id = lock_id;
-            return flight;
+            let attempt = LockAttempt::run(&mut local, backend, full_key).await;
+            return Self::lead(map, local, attempt, backend, full_key);
         }
         let mut flight = Self::new(map, local, Role::Leader, backend, full_key);
         // `new` just cleared the note for this leader. A leader that never
@@ -816,14 +828,20 @@ pub(crate) struct ColdLead {
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
 pub(crate) enum ColdRead {
     /// The key holds a value. No lock was attempted, and the in-process
-    /// flight is free again, its stand-down note as it was.
+    /// flight is free again.
     Hit(Vec<u8>, crate::backend::Freshness),
     /// The key was absent: the flight, as [`SingleFlight::acquire`] returns
     /// it to a leader after its lock attempt.
     Miss(SingleFlight),
-    /// The call failed: the read's error, and the flight leading without the
-    /// lock, as after a failed lock call.
+    /// The call timed out or lost its connection, so it may have taken the
+    /// lock: the read's error, and the flight leading without the lock, as
+    /// after a failed lock call. Never retried.
     Failed(crate::error::BackendError, SingleFlight),
+    /// The call took no lock: the server refused it (a full or read-only
+    /// server, a denied script), or the reliability stack did not send it.
+    /// The in-process flight is free again; the caller reads, then
+    /// [`SingleFlight::acquire`]s, as for a backend that does not combine.
+    Unanswered,
 }
 
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
@@ -853,40 +871,61 @@ impl ColdLead {
     /// Read the key and, only if it is absent, try its distributed lock. A
     /// pending detached unlock is sent first, as before any lock attempt.
     pub(crate) async fn read(mut self) -> ColdRead {
+        use crate::backend::GetOrLock;
+        use crate::error::BackendErrorKind;
+
         settle_pending_release(&mut self.local, &self.backend, &self.full_key).await;
         let deadline = LockAttempt::deadline();
-        let read = match self.backend.as_lockable() {
-            Some(lockable) => {
-                lockable
-                    .__get_or_lock(&self.full_key, FILL_LOCK_TIMEOUT_MS)
-                    .await
-            }
-            // `try_take` found it lockable; a backend that changed its mind
-            // gets the read's own error path.
-            None => Err(crate::error::BackendError::permanent(
-                "the backend no longer has a distributed lock",
-            )),
+        let Some(lockable) = self.backend.as_lockable() else {
+            self.stand_down();
+            return ColdRead::Unanswered;
         };
-        match read {
-            Ok(crate::backend::GetOrLock::Value(bytes, freshness)) => {
-                ColdRead::Hit(bytes, freshness)
+        let attempt = match lockable
+            .__get_or_lock(&self.full_key, FILL_LOCK_TIMEOUT_MS)
+            .await
+        {
+            Ok(GetOrLock::Value(bytes, freshness)) => {
+                self.stand_down();
+                return ColdRead::Hit(bytes, freshness);
             }
-            Ok(crate::backend::GetOrLock::Locked(lock_id)) => {
-                ColdRead::Miss(self.lead(LockAttempt::Granted(lock_id)))
+            Ok(GetOrLock::Locked(lock_id)) => LockAttempt::Granted(lock_id),
+            Ok(GetOrLock::Contested) => LockAttempt::Contested { deadline },
+            Err(err)
+                if matches!(
+                    err.kind,
+                    BackendErrorKind::Transient | BackendErrorKind::Timeout
+                ) =>
+            {
+                crate::metrics::trace_lock_error(&self.full_key, "get_or_lock", &err);
+                let flight = SingleFlight::lead(
+                    &self.map,
+                    self.local,
+                    LockAttempt::Failed,
+                    &self.backend,
+                    &self.full_key,
+                );
+                return ColdRead::Failed(err, flight);
             }
-            Ok(crate::backend::GetOrLock::Contested) => {
-                ColdRead::Miss(self.lead(LockAttempt::Contested { deadline }))
+            Err(_) => {
+                self.stand_down();
+                return ColdRead::Unanswered;
             }
-            Err(err) => ColdRead::Failed(err, self.lead(LockAttempt::Failed)),
-        }
+        };
+        ColdRead::Miss(SingleFlight::lead(
+            &self.map,
+            self.local,
+            attempt,
+            &self.backend,
+            &self.full_key,
+        ))
     }
 
-    fn lead(self, attempt: LockAttempt) -> SingleFlight {
-        let (role, lock_id) = attempt.cold_role();
-        let mut flight =
-            SingleFlight::new(&self.map, self.local, role, &self.backend, &self.full_key);
-        flight.lock_id = lock_id;
-        flight
+    /// Free the in-process flight without leading. It made no lock attempt,
+    /// so it cannot vouch that no other process holds the lease: it sets the
+    /// stand-down note (see [`FlightMap`]), and a cold miss that queued behind
+    /// it and misses contests the lease before computing.
+    fn stand_down(mut self) {
+        self.local.stand_down = true;
     }
 }
 
@@ -942,6 +981,8 @@ mod tests {
     #[derive(Default)]
     struct Locks {
         unlocks: AtomicUsize,
+        /// Reads and locks in one call, which finds this value.
+        combined_value: Option<Vec<u8>>,
     }
 
     #[async_trait]
@@ -989,6 +1030,39 @@ mod tests {
             self.unlocks.fetch_add(1, Ordering::SeqCst);
             Ok(true)
         }
+
+        fn __combines_get_and_lock(&self) -> bool {
+            self.combined_value.is_some()
+        }
+
+        async fn __get_or_lock(
+            &self,
+            _key: &str,
+            _timeout_ms: u64,
+        ) -> Result<crate::backend::GetOrLock, BackendError> {
+            Ok(crate::backend::GetOrLock::Value(
+                self.combined_value.clone().unwrap_or_default(),
+                crate::backend::Freshness::default(),
+            ))
+        }
+    }
+
+    /// A combined call that finds a value frees the flight with the
+    /// stand-down note set: it made no lock attempt, so a cold miss queued
+    /// behind it whose re-check misses (the value expired meanwhile) contests
+    /// the lease before computing.
+    #[tokio::test]
+    async fn a_combined_hit_leaves_a_stand_down_note() {
+        let backend: SharedBackend = Arc::new(Locks {
+            combined_value: Some(b"v".to_vec()),
+            ..Locks::default()
+        });
+        let map: crate::client::SharedFlight = Arc::default();
+        let held = map.handle("k");
+
+        let lead = ColdLead::try_take(&map, &backend, "k").unwrap();
+        assert!(matches!(lead.read().await, ColdRead::Hit(..)));
+        assert!(held.try_lock().unwrap().stand_down);
     }
 
     /// A backend that does not override the combined call is never asked to
@@ -1002,7 +1076,9 @@ mod tests {
 
         assert!(ColdLead::try_take(&map, &backend, "k").is_none());
         assert_eq!(
-            locks.__get_or_lock("k", 1).await.unwrap(),
+            crate::backend::get_then_lock(&*locks, "k", 1)
+                .await
+                .unwrap(),
             crate::backend::GetOrLock::Locked("lease".to_owned())
         );
     }

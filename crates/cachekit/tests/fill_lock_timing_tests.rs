@@ -28,7 +28,7 @@ use tokio::time::Instant;
 
 use cachekit::backend::{Backend, Freshness, GetOrLock, HealthStatus, LockableBackend};
 use cachekit::client::SharedBackend;
-use cachekit::error::BackendError;
+use cachekit::error::{BackendError, BackendErrorKind};
 use cachekit::interop::{interop_key, serialize_value, InteropValue};
 use cachekit::{cachekit, CacheKit, CachekitError};
 
@@ -76,6 +76,8 @@ struct Timed {
     /// Reads and locks in one round trip (`get_or_lock`, a GET's latency),
     /// as a single-node Redis does.
     combines: bool,
+    /// The combined call fails with this kind after its round trip.
+    combined_fails: Option<BackendErrorKind>,
 }
 
 impl Timed {
@@ -87,6 +89,7 @@ impl Timed {
             hang_after_gets: None,
             instant: false,
             combines: false,
+            combined_fails: None,
         }
     }
 
@@ -232,6 +235,13 @@ impl LockableBackend for Timed {
 
     async fn __get_or_lock(&self, key: &str, _timeout_ms: u64) -> Result<GetOrLock, BackendError> {
         self.leg("get_or_lock", GET).await;
+        if let Some(kind) = &self.combined_fails {
+            return Err(BackendError {
+                kind: kind.clone(),
+                message: "scripted failure".to_owned(),
+                source: None,
+            });
+        }
         let mut st = self.st();
         if let Some(value) = st.store.get(key) {
             return Ok(GetOrLock::Value(value.clone(), Freshness::default()));
@@ -841,6 +851,39 @@ async fn combined_local_follower_reads_plainly_and_queues() {
     assert_eq!(backend.count(&["get"]), 1 + recheck, "the follower's");
     assert_eq!(backend.count(&["lock"]), 0);
     assert_eq!(backend.count(&["set"]), 1, "one fill");
+}
+
+/// A combined call the server refuses took no lock (a full or read-only
+/// server, scripting denied): the cold miss reads and locks in two calls, as
+/// on a backend that does not combine, instead of failing the call.
+#[tokio::test(start_paused = true)]
+async fn refused_combined_call_falls_back_to_a_read_and_a_lock_call() {
+    let mut backend = Timed::combining();
+    backend.combined_fails = Some(BackendErrorKind::Permanent);
+    let cache = backend.client();
+
+    assert_eq!(fill(&cache, 26).await.unwrap(), 260);
+    let returned = Instant::now();
+    let want: &[&str] = if DETACHED {
+        &["get_or_lock", "get", "lock", "set"]
+    } else {
+        &["get_or_lock", "get", "lock", "set", "unlock"]
+    };
+    assert_eq!(backend.ops_by(returned), want);
+}
+
+/// A combined call that timed out may have taken the lock, so it is neither
+/// retried nor followed by a lock call: the plain path fails open and leads
+/// without the lock.
+#[tokio::test(start_paused = true)]
+async fn timed_out_combined_call_leads_without_the_lock() {
+    let mut backend = Timed::combining();
+    backend.combined_fails = Some(BackendErrorKind::Timeout);
+    let cache = backend.client();
+
+    assert_eq!(fill(&cache, 27).await.unwrap(), 270);
+    tokio::time::sleep(ms(FILL_LOCK_TIMEOUT)).await;
+    assert_eq!(backend.ops_by(Instant::now()), ["get_or_lock", "set"]);
 }
 
 /// `distributed_lock = false` reads with a plain GET even where the backend

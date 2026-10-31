@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use fred::clients::WithOptions;
 use fred::interfaces::{EventInterface, LuaInterface};
 use fred::prelude::*;
-use fred::types::{ConnectHandle, Options};
+use fred::types::{ClusterHash, ConnectHandle, CustomCommand, Options};
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::task::{AbortHandle, JoinHandle};
 
@@ -461,13 +461,27 @@ impl LockableBackend for RedisBackend {
             return get_then_lock(self, key, timeout_ms).await;
         }
         let (lock_id, px) = new_lock(timeout_ms);
-        let reply: RedisValue = self
-            .redis()?
-            .eval(
-                GET_OR_LOCK_SCRIPT,
-                vec![key.to_owned(), lock_key(key)],
-                vec![RedisValue::from(lock_id.as_str()), RedisValue::from(px)],
-            )
+        // Sent once: fred re-sends a command in flight when its connection
+        // drops, and a re-sent script finds the lock the first one took. EVAL
+        // goes through `custom` because fred's `eval` skips the options (see
+        // `client`), and this keeps their `fail_fast` too.
+        let client = self.redis()?;
+        let once = Options {
+            max_attempts: Some(1),
+            ..client.options().clone()
+        };
+        let eval = CustomCommand::new_static("EVAL", ClusterHash::FirstKey, false);
+        let args: Vec<RedisValue> = vec![
+            GET_OR_LOCK_SCRIPT.into(),
+            2.into(),
+            key.into(),
+            lock_key(key).into(),
+            lock_id.as_str().into(),
+            px.into(),
+        ];
+        let reply: RedisValue = std::ops::Deref::deref(client)
+            .with_options(&once)
+            .custom(eval, args)
             .await
             .map_err(redis_err)?;
         match reply {

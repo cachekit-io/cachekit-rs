@@ -805,6 +805,9 @@ impl CacheKit {
                     *slot = Some(flight);
                     return Err(err.into());
                 }
+                crate::flight::ColdRead::Unanswered => {
+                    self.backend.get_with_freshness(full_key).await?
+                }
             },
             None => self.backend.get_with_freshness(full_key).await?,
         };

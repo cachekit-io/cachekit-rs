@@ -1290,7 +1290,9 @@ async fn the_combined_read_and_lock_is_never_retried() {
 }
 
 /// The combined call is a read to the breaker: its failures open it, and an
-/// open breaker fails it fast without reaching the backend.
+/// open breaker fails it fast without reaching the backend. The cold miss then
+/// takes the plain path, which leaves the flight to `single_flight` and its
+/// lock call, as for a backend that does not combine.
 #[tokio::test(start_paused = true)]
 async fn the_combined_read_and_lock_passes_the_breaker() {
     let backend = FailingCombined::default();
@@ -1322,5 +1324,5 @@ async fn the_combined_read_and_lock_passes_the_breaker() {
         .expect_err("the open breaker fails it");
     assert_eq!(backend_kind(&err), Some(&BackendErrorKind::CircuitOpen));
     assert_eq!(backend.combined(), 2, "the open breaker let it through");
-    assert!(lead.is_some(), "the flight leads without a lock");
+    assert!(lead.is_none(), "the plain path takes the flight");
 }
