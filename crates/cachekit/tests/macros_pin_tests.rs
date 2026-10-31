@@ -18,10 +18,11 @@
 const ROOT: &str = include_str!("../../../Cargo.toml");
 const MEMBER: &str = include_str!("../Cargo.toml");
 
-/// The `cachekit-macros = ...` line in `[section]` of `manifest`.
-fn macros_line<'a>(manifest: &'a str, section: &str) -> &'a str {
+/// The `cachekit-macros = ...` line in `[section]` of `manifest`, split into
+/// its TOML and its trailing comment, so a comment can never stand in for TOML.
+fn macros_line<'a>(manifest: &'a str, section: &str) -> (&'a str, &'a str) {
     let header = format!("[{section}]");
-    manifest
+    let line = manifest
         .lines()
         .map(str::trim)
         .skip_while(|line| *line != header)
@@ -32,27 +33,26 @@ fn macros_line<'a>(manifest: &'a str, section: &str) -> &'a str {
             panic!(
                 "no `cachekit-macros = ...` line in [{section}]; did the manifest format change?"
             )
-        })
+        });
+    line.split_once('#').unwrap_or((line, ""))
 }
 
 fn check(root: &str, member: &str, version: &str) {
-    let line = macros_line(member, "dependencies");
-    // The TOML before any trailing comment, so a comment cannot satisfy the check.
-    let toml = line.split('#').next().unwrap_or_default();
+    let (toml, _) = macros_line(member, "dependencies");
     assert!(
         toml.contains("workspace = true") && !toml.contains("version"),
-        "crates/cachekit/Cargo.toml: `{line}` must inherit the root requirement (`workspace = true`, no `version`); release-please drops the `=` from a requirement declared here"
+        "crates/cachekit/Cargo.toml: `{toml}` must inherit the root requirement (`workspace = true`, no `version`); release-please drops the `=` from a requirement declared here"
     );
-    let line = macros_line(root, "workspace.dependencies");
+    let (toml, comment) = macros_line(root, "workspace.dependencies");
     assert!(
-        line.contains("x-release-please-version"),
-        "Cargo.toml: `{line}` lost its x-release-please-version marker, so no release will bump it"
+        comment.contains("x-release-please-version"),
+        "Cargo.toml: `{toml}` lost its x-release-please-version marker, so no release will bump it"
     );
-    let requirement = line
+    let requirement = toml
         .split("version = \"")
         .nth(1)
         .and_then(|rest| rest.split('"').next())
-        .unwrap_or_else(|| panic!("Cargo.toml: `{line}` has no inline `version = \"...\"`"));
+        .unwrap_or_else(|| panic!("Cargo.toml: `{toml}` has no inline `version = \"...\"`"));
     assert_eq!(
         requirement,
         format!("={version}"),
@@ -96,6 +96,13 @@ fn stale_exact_requirement_fails() {
 fn member_declaring_its_own_requirement_fails() {
     let member = "[dependencies]\ncachekit-macros = { version = \"=0.14.0\", path = \"../cachekit-macros\", optional = true }\n";
     check(&root("=0.14.0"), member, "0.14.0");
+}
+
+#[test]
+#[should_panic(expected = "has no inline `version")]
+fn version_in_a_root_comment_fails() {
+    let root = "[workspace.dependencies]\ncachekit-macros = { path = \"crates/cachekit-macros\" } # version = \"=0.14.0\" x-release-please-version\n";
+    check(root, INHERITING_MEMBER, "0.14.0");
 }
 
 #[test]
