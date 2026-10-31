@@ -814,15 +814,21 @@ both builds run one workload, build the example there, copy its
 `target/release/examples/bench_hot_path` outside `target/`, and pass it as
 `BASE`. The example copies both builds to paths of equal length
 before it measures them, because the length of a binary's path moves its
-counts (by 6 instructions per `exists` op). The runs interleave ABBA, a delta
-counts only when it beats `max(3 × spread, 0.5%)`, and the target exits 1 when
-a case got slower by more than that, or 2 when it measured nothing (an unknown
-flag, a filter that matches no case, a valgrind failure). Most cases repeat
-exactly; the `l2_hit` cases spread by up to about 1.2%, and the `delete` cases
-by up to about 10%, from the single-flight and per-key mutation lock maps,
-hash tables seeded afresh in each process. Their floors are wider, and
-`delete` is reported but never fails the comparison: a floor that wide would
-hide any regression worth catching.
+counts (by 6 instructions per `exists` op). The runs interleave ABBA, and a
+delta counts only when it beats the case's floor, which comes from the base's
+runs alone, so a change that makes a case noisy cannot widen its own floor.
+Most cases repeat exactly; their floor is 0.5%, and they also fail when the
+head's runs disagree by more than that, because new nondeterminism on a hot
+path is itself a finding. The `l2_hit` cases spread by up to about 2% in CI,
+and the `delete` cases by up to about 10%, from the single-flight and per-key
+mutation lock maps, hash tables seeded afresh in each process. A case like
+that gets a floor of 3 × its base spread, and never less than 2% (in CI, an
+unchanged build moved `l2_hit`'s median by at most 0.52%). `delete` is
+reported but never fails the comparison: a floor that wide would hide any
+regression worth catching. The example exits 1 when a gated case got slower
+or noisier, and 2 when nothing was measured or the run stopped part way (an
+unknown flag, a filter that matches no case, a valgrind failure); `make`
+reports either one as exit 2.
 
 CI runs this comparison on every pull request (the **Instruction counts vs
 base** check): it builds the pull request and the commit it merges into, each

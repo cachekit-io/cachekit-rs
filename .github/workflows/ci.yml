@@ -253,7 +253,7 @@ jobs:
       - name: Start with no verdict
         run: |
           mkdir -p "$RUNNER_TEMP/ir"
-          printf '### Instruction counts: INCOMPLETE\n\nThe gate wrote no report: the job stopped before measuring. See the job log.\n' \
+          printf '### Instruction counts: INCOMPLETE\n\nThe gate wrote no report: the job stopped before the gate wrote its verdict. See the job log.\n' \
             > "$RUNNER_TEMP/ir/report.md"
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -361,15 +361,21 @@ jobs:
 
   # perf-ir's report as one PR comment, edited in place on every run. This job
   # holds the write token and never checks out the repository. Fork PRs are
-  # skipped: their token cannot write to the PR. A run whose head is no longer
-  # the PR's head posts nothing, so a slow older run cannot overwrite a newer
-  # run's comment.
+  # skipped: their token cannot write to the PR. It runs even when perf-ir was
+  # cancelled, so the comment reads INCOMPLETE rather than keeping an older
+  # head's verdict; a run whose head is no longer the PR's head posts nothing,
+  # so a slow older run cannot overwrite a newer run's comment. One comment
+  # job per PR runs at a time, so two runs cannot both find no comment and
+  # each post one.
   perf-ir-comment:
     name: Instruction counts comment
     needs: perf-ir
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    if: ${{ always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    concurrency:
+      group: perf-ir-comment-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     permissions:
       pull-requests: write # enough for a PR's issue comments
     steps:
