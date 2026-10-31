@@ -364,9 +364,12 @@ jobs:
   # skipped: their token cannot write to the PR. It runs even when perf-ir was
   # cancelled, so the comment reads INCOMPLETE rather than keeping an older
   # head's verdict; a run whose head is no longer the PR's head posts nothing,
-  # so a slow older run cannot overwrite a newer run's comment. One comment
-  # job per PR runs at a time, so two runs cannot both find no comment and
-  # each post one.
+  # so a slow older run cannot overwrite a newer run's comment. Comment jobs
+  # for one head of one PR run one at a time, so two runs of that head cannot
+  # both find no comment and each post one. The group names the head because
+  # GitHub keeps one pending job per group and cancels it when another
+  # queues: keyed by PR alone, an older head's job could cancel the newest
+  # head's and then post nothing.
   perf-ir-comment:
     name: Instruction counts comment
     needs: perf-ir
@@ -374,7 +377,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     concurrency:
-      group: perf-ir-comment-${{ github.event.pull_request.number }}
+      group: perf-ir-comment-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
       cancel-in-progress: false
     permissions:
       pull-requests: write # enough for a PR's issue comments
