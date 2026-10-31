@@ -885,6 +885,8 @@ MessagePack, is the smallest case, where per-call fixed costs dominate). Two mor
 `prev` reads, L1 and L2 hits, on a client holding one previous key, of entries
 written under that key; `oneshot` builds an encrypting client (`enc` or `prev`)
 and reads one L2 hit, the cost a one-read process pays beyond its start-up.
+`ns` and `nsenc` run `l1_hit`, `l2_hit` and `set` as `plain` and `enc` on a
+client with a `.namespace()`, which builds `{namespace}:{key}` on every op.
 
 ```bash
 make bench                                  # wall ns/op: indicative only
@@ -959,6 +961,25 @@ keeping the job name green. Two properties make that visible:
   body contains the exact, case-sensitive string `[gate-change-approved]` (add
   it after human sign-off, *then* push a commit — the marker is read from the
   push-time event, so a body edit alone does not re-trigger).
+
+### Why cachekit-macros is pinned exactly
+
+`cachekit-rs` requires `cachekit-macros` with `=`, never a caret, so each
+runtime release that carries the pin only ever meets the macros released with
+it; releases published before the pin require a caret. `#[cachekit]`
+expands to calls into `#[doc(hidden)]` items of `cachekit-rs`, and a patch
+release of the macros can call one that an older runtime lacks. Under a caret,
+a project that holds `cachekit-rs` at an exact older patch would still resolve
+the newest macros in that minor line, and stop compiling at every
+`#[cachekit]` site.
+
+The requirement lives in the root `Cargo.toml` under `[workspace.dependencies]`,
+and `crates/cachekit/Cargo.toml` inherits it. release-please rewrites a
+dependency version in a member manifest to the bare new version, dropping the
+`=`, so the root line carries a release-please version marker instead, and a
+generic `extra-files` entry in `release-please-config.json` bumps only the
+number. `crates/cachekit/tests/macros_pin_tests.rs` fails if the requirement
+is not `=` this crate's version.
 
 ## Minimum Supported Rust Version
 

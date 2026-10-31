@@ -49,7 +49,9 @@ const OPS: [&str; 7] = [
     "exists",
     "oneshot",
 ];
-const MODES: [&str; 4] = ["plain", "rel", "enc", "prev"];
+/// `ns` and `nsenc` are `plain` and `enc` on a client with a namespace, so
+/// every op builds `{namespace}:{key}`.
+const MODES: [&str; 6] = ["plain", "rel", "enc", "prev", "ns", "nsenc"];
 /// The current master key of every encrypting reader and every writer but
 /// `prev`'s.
 const KEY: [u8; 32] = [0x42; 32];
@@ -60,6 +62,8 @@ const PREV_KEY: [u8; 32] = [0x41; 32];
 /// Every encrypting client's tenant: a `prev` reader decrypts only what a
 /// writer of the same tenant wrote.
 const TENANT: &str = "bench";
+/// The `ns` and `nsenc` clients' namespace.
+const NAMESPACE: &str = "myapp";
 /// Value length in characters. The value is a `String` of `x`, so its stored
 /// MessagePack is 2 bytes longer from 32 to 255 characters: 40 stores 42 B,
 /// the smallest case, where per-call fixed costs dominate; 64 stores 66 B.
@@ -211,6 +215,8 @@ fn client(
         "rel" => b.reliability(ReliabilityConfig::default()),
         "enc" => b.encryption_from_bytes(&KEY, TENANT)?,
         "prev" => b.encryption_from_bytes_with_previous(&KEY, &[&PREV_KEY], TENANT)?,
+        "ns" => b.namespace(NAMESPACE),
+        "nsenc" => b.namespace(NAMESPACE).encryption_from_bytes(&KEY, TENANT)?,
         _ => b,
     }
     .build()
@@ -231,7 +237,8 @@ fn writer(backend: &Arc<MemBackend>, mode: &str) -> Result<CacheKit, CachekitErr
 
 /// Whether `<op>/<mode>` is a case. `prev` is the rotation read path, so it
 /// pairs only with reads; `oneshot` prices building an encrypting client, so
-/// it pairs only with the encrypted modes.
+/// it pairs only with the encrypted modes. A namespace adds the same key build
+/// to every op, so `ns` and `nsenc` price it on the reads and `set` only.
 fn is_case(op: &str, mode: &str) -> bool {
     match op {
         "oneshot" => matches!(mode, "enc" | "prev"),
@@ -239,7 +246,8 @@ fn is_case(op: &str, mode: &str) -> bool {
         // A plaintext decode: the encrypted modes decode decrypted plaintext,
         // which is walked on every read.
         "l1_hit_row" => mode == "plain",
-        _ => mode != "prev",
+        "set" => mode != "prev",
+        _ => !matches!(mode, "prev" | "ns" | "nsenc"),
     }
 }
 
@@ -272,7 +280,7 @@ impl Bench {
         let bench = Self {
             op,
             mode,
-            enc: matches!(mode, "enc" | "prev"),
+            enc: matches!(mode, "enc" | "prev" | "nsenc"),
             reader,
             backend,
             keys,
