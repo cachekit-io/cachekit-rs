@@ -51,7 +51,7 @@ jobs:
           rustup default stable
 
       - name: Restore pinned security tools
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           # Tool binaries and cargo's install ledger only. No project build
           # artifacts, and deliberately no advisory database — that must be
