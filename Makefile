@@ -50,10 +50,11 @@ test-wasm:
 # `bench` prints wall time per op, which is indicative only. `bench-instr`
 # counts instructions per op under valgrind's callgrind: the number a change is
 # judged on. BASE=<a copy of the example built at the base commit, from this
-# tree's bench_hot_path.rs so both run one workload> compares two
-# builds and exits 1 when a case regresses past its noise floor (2 when it
-# measured nothing: bad flag, empty filter, valgrind failure); FILTER=<text>
-# narrows the cases (e.g. FILTER=l2_hit); JOBS=<n> measures n cases at a time.
+# tree's bench_hot_path.rs so both run one workload> compares two builds and
+# exits 1 when a gated case (any but delete) regresses past its noise floor (2
+# when it measured nothing: bad flag, empty filter, valgrind failure);
+# FILTER=<text> narrows the cases (e.g. FILTER=l2_hit); JOBS=<n> measures n
+# cases at a time.
 # CI's `perf-ir` job runs the same comparison on every PR.
 bench:
 	$(CARGO) run --release --example bench_hot_path -- wall $(if $(FILTER),'$(FILTER)')

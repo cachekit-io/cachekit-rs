@@ -613,7 +613,8 @@ impl Compared {
 }
 
 /// Run `f` on every case, `jobs` cases at a time. `progress` sees the results
-/// so far after each case lands. The first error stops new cases from
+/// so far after each case lands. It runs under the results lock, so its calls
+/// never overlap: `--report` writes one shared `.part` file and relies on it. The first error stops new cases from
 /// starting; it comes back with every result measured before the stop.
 fn each_case<T: Send>(
     all: &[(String, usize)],
@@ -833,11 +834,11 @@ fn instr(args: &[String]) -> Result<bool, String> {
             }
         },
     );
-    if let Some(e) = &error {
-        // Printed here as well, so a failed report write cannot hide it.
-        eprintln!("bench_hot_path: {e}");
-    }
-    write(&rows, error.as_deref())?;
+    // A failed report write must not hide why the run stopped.
+    write(&rows, error.as_deref()).map_err(|w| match &error {
+        Some(e) => format!("{e}; {w}"),
+        None => w,
+    })?;
     match error {
         Some(e) => Err(e),
         None => Ok(!rows.iter().flatten().any(|c| c.verdict == SLOWER)),
