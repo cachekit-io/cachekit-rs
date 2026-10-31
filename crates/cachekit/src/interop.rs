@@ -366,16 +366,16 @@ fn push_args_hash(mut key: String, args: &[InteropValue]) -> Result<String, Cach
 ///
 /// No argument is kept: the prefix depends on the function alone.
 #[doc(hidden)]
-pub struct __KeyPrefix {
-    namespace: &'static str,
-    operation: &'static str,
+pub struct __KeyPrefix<'a> {
+    namespace: &'a str,
+    operation: &'a str,
     prefix: OnceLock<String>,
 }
 
-impl __KeyPrefix {
+impl<'a> __KeyPrefix<'a> {
     /// A prefix for `namespace` and `operation`, validated on first use.
     #[must_use]
-    pub const fn new(namespace: &'static str, operation: &'static str) -> Self {
+    pub const fn new(namespace: &'a str, operation: &'a str) -> Self {
         Self {
             namespace,
             operation,
@@ -848,6 +848,60 @@ mod tests {
                 "{ok:?} should be accepted"
             );
         }
+    }
+
+    /// The drift guard behind `#[cachekit]`'s compile-time segment check: a
+    /// segment the macro's mirror wrongly accepted fails every call with
+    /// `interop_key`'s error, and no prefix is kept.
+    #[test]
+    fn key_prefix_rejects_an_invalid_segment_on_every_call() {
+        for (namespace, operation) in [
+            ("ns", "get_user"),
+            ("nsapi", "get_user"),
+            ("Users", "get_user"),
+            ("users", "get user"),
+            ("a..b", "get_user"),
+            ("users", "x.."),
+            ("users\n", "get_user"),
+            ("", "get_user"),
+            ("users", ""),
+        ] {
+            let prefix = __KeyPrefix::new(namespace, operation);
+            let expected = interop_key(namespace, operation, &[]).unwrap_err();
+            for call in 0..3 {
+                let err = prefix.key(&[]).unwrap_err();
+                assert!(
+                    matches!(err, CachekitError::InvalidKey(_)),
+                    "{namespace:?}/{operation:?} call {call}: {err}"
+                );
+                assert_eq!(err.to_string(), expected.to_string());
+            }
+            assert!(prefix.prefix.get().is_none(), "{namespace:?}/{operation:?}");
+        }
+    }
+
+    /// A valid prefix is joined once and reused, and an argument error leaves
+    /// it in place.
+    #[test]
+    fn key_prefix_keeps_a_valid_prefix() {
+        let prefix = __KeyPrefix::new("users", "get_user");
+        let args = [InteropValue::from(42i64)];
+        assert_eq!(
+            prefix.key(&args).unwrap(),
+            interop_key("users", "get_user", &args).unwrap()
+        );
+        assert_eq!(
+            prefix.prefix.get().map(String::as_str),
+            Some("users:get_user:")
+        );
+        assert!(matches!(
+            prefix.key(&[InteropValue::from(f64::NAN)]),
+            Err(CachekitError::Serialization(_))
+        ));
+        assert_eq!(
+            prefix.key(&args).unwrap(),
+            interop_key("users", "get_user", &args).unwrap()
+        );
     }
 
     #[test]

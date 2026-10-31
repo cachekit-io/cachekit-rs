@@ -287,10 +287,11 @@ async fn macro_self_heals_undecodable_entry() {
 #[tokio::test]
 async fn macro_key_delegates_to_interop_key() {
     // The macro must mint EXACTLY interop_key(namespace, operation, args),
-    // operation being the `interop` attribute — this delegation is what
-    // makes the 48 protocol interop vectors
-    // (interop_vector_tests.rs) transitively cover #[cachekit] keys, and
-    // what makes the same entry addressable from the Python/TS SDKs.
+    // operation being the `interop` attribute: that is what makes the same
+    // entry addressable from the Python/TS SDKs. The macro calls
+    // `interop::__KeyPrefix::key`, which interop_vector_tests.rs runs
+    // against every key and error vector and against interop_key on random
+    // input; this test ties the macro expansion to it.
     let (cache, backend) = mock_client_counting();
     get_user_multi_args(&cache, "acme".to_owned(), 7)
         .await

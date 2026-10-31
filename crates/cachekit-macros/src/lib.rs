@@ -562,7 +562,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             // a deliberate reference copy — hence the allows.
             #[allow(clippy::clone_on_copy, noop_method_call)]
             let __ck_key = {
-                static __CK_KEY_PREFIX: cachekit::interop::__KeyPrefix =
+                static __CK_KEY_PREFIX: cachekit::interop::__KeyPrefix<'static> =
                     cachekit::interop::__KeyPrefix::new(#namespace, #operation);
                 __CK_KEY_PREFIX.key(&[#(#interop_args),*])?
             };

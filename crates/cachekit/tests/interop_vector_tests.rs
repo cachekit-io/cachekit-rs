@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use cachekit::interop::{canonical_args, interop_key, serialize_value, InteropValue};
+use cachekit::interop::{__KeyPrefix, canonical_args, interop_key, serialize_value, InteropValue};
 use serde_json::Value as Json;
 
 const VECTORS_JSON: &str = include_str!("vectors/interop-mode.json");
@@ -267,6 +267,20 @@ fn key_vectors_all_pass() {
             vector["args_hash"].as_str().expect("args_hash"),
             "[{name}] args_hash mismatch"
         );
+
+        // 4. `#[cachekit]`'s key: its per-function prefix mints the same
+        //    bytes on the call that builds the prefix and on one that reuses it.
+        let prefix = __KeyPrefix::new(namespace, operation);
+        for call in ["first", "reused"] {
+            let macro_key = prefix
+                .key(&args)
+                .unwrap_or_else(|e| panic!("[{name}] __KeyPrefix::key ({call}): {e}"));
+            assert_eq!(
+                macro_key,
+                vector["expected_key"].as_str().expect("expected_key"),
+                "[{name}] #[cachekit] key mismatch ({call} call)"
+            );
+        }
     }
 }
 
@@ -496,6 +510,13 @@ fn error_vectors_all_reject() {
                     result.is_err(),
                     "[{name}] MUST be rejected, but produced key: {result:?}"
                 );
+                // `#[cachekit]`'s key rejects it with the same error.
+                let macro_result = __KeyPrefix::new(namespace, operation).key(&args);
+                assert_eq!(
+                    macro_result.map_err(|e| e.to_string()),
+                    result.map_err(|e| e.to_string()),
+                    "[{name}] #[cachekit] key must reject as interop_key does"
+                );
             }
         }
     }
@@ -588,4 +609,187 @@ fn non_utc_offset_matches_utc_instant() {
     let a = iso8601_to_unix_micros("2024-01-01T18:00:45.123456+05:30").unwrap();
     let b = iso8601_to_unix_micros("2024-01-01T12:30:45.123456+00:00").unwrap();
     assert_eq!(a, b);
+}
+
+// ── #[cachekit]'s key against interop_key, on random input ──────────────────
+
+/// SplitMix64 from a fixed seed: no new dependency, and a failure replays.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in `0..n`.
+    fn below(&mut self, n: usize) -> usize {
+        usize::try_from(self.next() % n as u64).unwrap()
+    }
+
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        items[self.below(items.len())]
+    }
+}
+
+/// A segment drawn mostly from the interop grammar, sometimes outside it
+/// (bad first byte, `..`, a reserved namespace, too long, empty).
+fn random_segment(rng: &mut Rng) -> String {
+    const FIRST: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    const REST: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789._-";
+    match rng.below(20) {
+        0 => rng
+            .pick(&["ns", "nsapi", "", "A", ".x", "a..b", "x\n"])
+            .to_owned(),
+        1 => "a".repeat(65),
+        _ => {
+            let len = 1 + rng.below(64);
+            let mut s = String::from(char::from(rng.pick(FIRST)));
+            (1..len).for_each(|_| s.push(char::from(rng.pick(REST))));
+            s
+        }
+    }
+}
+
+/// Integers at every msgpack width boundary, random ones, and the two just
+/// outside the interop range.
+fn random_int(rng: &mut Rng) -> i128 {
+    const EDGES: [i128; 16] = [
+        0,
+        -1,
+        127,
+        128,
+        -32,
+        -33,
+        255,
+        256,
+        65_535,
+        65_536,
+        -129,
+        -32_769,
+        i64::MIN as i128,
+        u64::MAX as i128,
+        u64::MAX as i128 + 1,
+        i64::MIN as i128 - 1,
+    ];
+    match rng.below(3) {
+        0 => rng.pick(&EDGES),
+        1 => i128::from(rng.next()),
+        _ => i128::from(i64::from_ne_bytes(rng.next().to_ne_bytes())),
+    }
+}
+
+/// Integral floats (which collapse to ints), arbitrary finite floats, and the
+/// values the encoder rejects or must not collapse.
+fn random_float(rng: &mut Rng) -> f64 {
+    match rng.below(4) {
+        0 => rng.pick(&[
+            0.0,
+            -0.0,
+            2.0,
+            -9_223_372_036_854_775_808.0,
+            18_446_744_073_709_551_616.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ]),
+        1 => f64::from(u32::try_from(rng.next() >> 32).unwrap()),
+        _ => {
+            let f = f64::from_bits(rng.next());
+            if f.is_finite() {
+                f
+            } else {
+                0.5
+            }
+        }
+    }
+}
+
+fn random_value(rng: &mut Rng, depth: u32) -> InteropValue {
+    let kinds = if depth == 0 { 8 } else { 11 };
+    let items = |rng: &mut Rng| -> Vec<InteropValue> {
+        (0..rng.below(4))
+            .map(|_| random_value(rng, depth - 1))
+            .collect()
+    };
+    match rng.below(kinds) {
+        0 => InteropValue::Null,
+        1 => InteropValue::Bool(rng.below(2) == 1),
+        2 => InteropValue::Int(random_int(rng)),
+        3 => InteropValue::Float(random_float(rng)),
+        4 => {
+            // ASCII, 2-, 3- and 4-byte UTF-8, past the fixstr and str8 limits.
+            let len = rng.pick(&[0, 1, 5, 31, 32, 100, 300]);
+            InteropValue::Str(
+                (0..len)
+                    .map(|_| rng.pick(&['a', 'Z', '0', 'é', '日', '😀']))
+                    .collect(),
+            )
+        }
+        5 => InteropValue::bytes(
+            (0..rng.pick(&[0, 3, 255, 256]))
+                .map(|_| rng.next().to_ne_bytes()[0])
+                .collect::<Vec<u8>>(),
+        ),
+        6 => InteropValue::datetime_from_unix_micros(i64::from_ne_bytes(rng.next().to_ne_bytes())),
+        7 => InteropValue::Uuid(uuid::Uuid::from_u64_pair(rng.next(), rng.next())),
+        8 => InteropValue::Array(items(rng)),
+        9 => InteropValue::Map(
+            items(rng)
+                .into_iter()
+                .map(|v| (format!("k{}", rng.below(5)), v))
+                .collect(),
+        ),
+        _ => InteropValue::Set(items(rng)),
+    }
+}
+
+/// `interop_key` as it was before the fast path: `format!` over `hex::encode`.
+fn reference_key(namespace: &str, operation: &str, args: &[InteropValue]) -> String {
+    use blake2::{digest::consts::U32, Blake2b, Digest};
+    let encoded = canonical_args(args).expect("reference encodes only what interop_key did");
+    let args_hash = hex::encode(Blake2b::<U32>::digest(&encoded));
+    format!("{namespace}:{operation}:{args_hash}")
+}
+
+/// One prefix per segment pair serves many argument lists, as the static in
+/// each `#[cachekit]` function does. Every key it mints, and every error,
+/// matches `interop_key`'s, and every key matches the pre-fast-path formula.
+#[test]
+fn macro_key_matches_interop_key_on_random_input() {
+    let mut rng = Rng(0x1210_4c0d_e5ee_d000);
+    let (mut keys, mut errors) = (0, 0);
+    for _ in 0..400 {
+        let (namespace, operation) = (random_segment(&mut rng), random_segment(&mut rng));
+        let prefix = __KeyPrefix::new(&namespace, &operation);
+        for _ in 0..10 {
+            let args: Vec<InteropValue> = (0..rng.below(5))
+                .map(|_| random_value(&mut rng, 2))
+                .collect();
+            let fresh = interop_key(&namespace, &operation, &args);
+            let kept = prefix.key(&args);
+            let case = format!("{namespace:?}/{operation:?} {args:?}");
+            match (&fresh, &kept) {
+                (Ok(fresh), Ok(kept)) => {
+                    assert_eq!(kept, fresh, "{case}");
+                    assert_eq!(
+                        *fresh,
+                        reference_key(&namespace, &operation, &args),
+                        "{case}"
+                    );
+                    keys += 1;
+                }
+                (Err(fresh), Err(kept)) => {
+                    assert_eq!(kept.to_string(), fresh.to_string(), "{case}");
+                    errors += 1;
+                }
+                _ => panic!("{case}: interop_key {fresh:?}, #[cachekit] key {kept:?}"),
+            }
+        }
+    }
+    // Both outcomes must be well exercised, or the comparison proves little.
+    assert!(keys > 2_000 && errors > 300, "keys {keys}, errors {errors}");
 }
