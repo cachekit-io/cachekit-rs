@@ -20,17 +20,20 @@
 //! so only the timed loop is counted and setup needs no differencing. It
 //! reports the median instructions per op and the run-to-run spread. With
 //! `--base`, it runs a second build of this example interleaved (ABBA) and
-//! calls a delta only when it beats `max(3 x spread, 0.5%)`. Exit codes: 1 when
-//! any case got slower by that much; 2 when nothing was measured (an unknown
-//! flag, a filter matching no case, or valgrind failing). Wall time is printed
-//! for orientation and is never a measured saving.
+//! calls a delta only when it beats `max(3 x spread, 0.5%)`. A case the base
+//! build does not list (one added since) is named as skipped, not compared.
+//! Exit codes: 1 when any case got slower by that much; 2 when nothing was
+//! measured (an unknown flag, a filter matching no case, a base that runs none
+//! of them, or valgrind failing). Wall time is printed for orientation and is
+//! never a measured saving.
 
 #![allow(clippy::print_stdout)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::hint::black_box;
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,7 +46,16 @@ use cachekit::{BackendError, CacheKit, CachekitError};
 const OPS: [&str; 6] = ["l1_hit", "l2_hit", "set", "delete", "exists", "oneshot"];
 /// `ns` and `nsenc` are `plain` and `enc` on a client with a namespace, so
 /// every op builds `{namespace}:{key}`.
-const MODES: [&str; 6] = ["plain", "rel", "enc", "prev", "ns", "nsenc"];
+const MODES: [&str; 8] = [
+    "plain",
+    "rel",
+    "enc",
+    "prev",
+    "ns",
+    "nsenc",
+    "parked256",
+    "parked1024",
+];
 /// The current master key of every encrypting reader and every writer but
 /// `prev`'s.
 const KEY: [u8; 32] = [0x42; 32];
@@ -64,6 +76,11 @@ const TTL: Duration = Duration::from_secs(300);
 const WARM: usize = 16;
 /// Demangled name of the function callgrind counts (see [`measured`]).
 const MEASURED: &str = "bench_hot_path::measured";
+/// Key prefix whose backend delete never returns (see [`parked`]).
+const PARKED: &str = "bench:parked:";
+/// The one value size a `parked<N>` case runs at: the map it prices never
+/// sees the value.
+const PARKED_SIZE: usize = 64;
 
 // ── In-memory backend ────────────────────────────────────────────────────────
 
@@ -77,6 +94,8 @@ type FixedMap = HashMap<String, Bytes, BuildHasherDefault<DefaultHasher>>;
 #[derive(Default)]
 struct MemBackend {
     store: Mutex<FixedMap>,
+    /// Deletes of [`PARKED`] keys that have reached the backend and wait forever.
+    parked: AtomicUsize,
 }
 
 impl MemBackend {
@@ -111,6 +130,10 @@ impl Backend for MemBackend {
         Ok(())
     }
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
+        if key.starts_with(PARKED) {
+            self.parked.fetch_add(1, Ordering::Relaxed);
+            std::future::pending::<()>().await;
+        }
         Ok(self.map().remove(key).is_some())
     }
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
@@ -171,11 +194,25 @@ fn writer(backend: &Arc<MemBackend>, mode: &str) -> Result<CacheKit, CachekitErr
         .build()
 }
 
-/// Whether `<op>/<mode>` is a case. `prev` is the rotation read path, so it
-/// pairs only with reads; `oneshot` prices building an encrypting client, so
-/// it pairs only with the encrypted modes. A namespace adds the same key build
-/// to every op, so `ns` and `nsenc` price it on the reads and `set` only.
-fn is_case(op: &str, mode: &str) -> bool {
+/// How many deletes a `parked<N>` mode parks: `N` deletes of other keys,
+/// spawned before the timed loop, that never return. Each holds its key's
+/// mutation lock, as a delete waiting on a slow backend does, so the timed
+/// deletes run with `N` keys mid-mutation. 0 for every other mode.
+fn parked(mode: &str) -> usize {
+    mode.strip_prefix("parked")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Whether `<op>/<mode>/<size>` is a case. `prev` is the rotation read path,
+/// so it pairs only with reads; `oneshot` prices building an encrypting
+/// client, so it pairs only with the encrypted modes; `parked<N>` pairs only
+/// with `delete`, at [`PARKED_SIZE`]. A namespace adds the same key build to
+/// every op, so `ns` and `nsenc` price it on the reads and `set` only.
+fn is_case(op: &str, mode: &str, size: usize) -> bool {
+    if parked(mode) > 0 {
+        return op == "delete" && size == PARKED_SIZE;
+    }
     match op {
         "oneshot" => matches!(mode, "enc" | "prev"),
         "l1_hit" | "l2_hit" => true,
@@ -197,7 +234,7 @@ impl Bench {
             .into_iter()
             .find(|m| *m == mode)
             .ok_or_else(|| CachekitError::Config(format!("unknown mode in case {case:?}")))?;
-        if !is_case(op, mode) {
+        if !is_case(op, mode, size) {
             return Err(CachekitError::Config(format!(
                 "{case:?} is not a case; `bench_hot_path list` names them"
             )));
@@ -241,6 +278,23 @@ impl Bench {
                 write(&writer, true, &bench.keys[0], &bench.value).await?;
             }
             _ => write(&bench.reader, bench.enc, &bench.keys[0], &bench.value).await?,
+        }
+        let parked = parked(mode);
+        let deletes: Vec<_> = (0..parked)
+            .map(|i| {
+                let reader = bench.reader.clone();
+                tokio::spawn(async move { reader.delete(&format!("{PARKED}{i:08}")).await })
+            })
+            .collect();
+        // Each spawned delete runs once the setup yields, and takes its lock
+        // before it reaches the backend. One that returns never parks.
+        while bench.backend.parked.load(Ordering::Relaxed) < parked {
+            if deletes.iter().any(tokio::task::JoinHandle::is_finished) {
+                return Err(CachekitError::Config(
+                    "a parked delete returned before reaching the backend".into(),
+                ));
+            }
+            tokio::task::yield_now().await;
         }
         Ok(bench)
     }
@@ -350,8 +404,8 @@ fn measured_warm(
 fn cases(filter: Option<&str>) -> Result<Vec<(String, usize)>, String> {
     let mut out = Vec::new();
     for op in OPS {
-        for mode in MODES.into_iter().filter(|m| is_case(op, m)) {
-            for size in SIZES {
+        for mode in MODES {
+            for size in SIZES.into_iter().filter(|s| is_case(op, mode, *s)) {
                 let case = format!("{op}/{mode}");
                 if filter.is_none_or(|f| format!("{case}/{size}").contains(f)) {
                     out.push((case, size));
@@ -490,6 +544,22 @@ fn instructions(
     Ok(total as f64 / iters as f64)
 }
 
+/// Every `<op>/<mode>/<size>` the build at `bin` runs, from its `list`.
+fn listed(bin: &str) -> Result<HashSet<String>, String> {
+    let out = Command::new(bin)
+        .arg("list")
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("cannot start {bin}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("{bin} list failed: {}", out.status));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
 fn median(v: &[f64]) -> f64 {
     let mut s = v.to_vec();
     s.sort_by(f64::total_cmp);
@@ -529,7 +599,18 @@ fn instr(args: &[String]) -> Result<bool, String> {
         .map_err(|e| e.to_string())?
         .display()
         .to_string();
-    let all = cases(filter.as_deref())?;
+    let mut all = cases(filter.as_deref())?;
+    // A base built before a case was added cannot run it.
+    let mut skipped = Vec::new();
+    if let Some(base) = &base {
+        let known = listed(base)?;
+        (all, skipped) = all
+            .into_iter()
+            .partition(|(case, size)| known.contains(&format!("{case}/{size}")));
+        if all.is_empty() {
+            return Err(format!("{base} runs none of the selected cases"));
+        }
+    }
     let mut regressed = false;
     let mut seq = 0;
     match &base {
@@ -587,6 +668,9 @@ fn instr(args: &[String]) -> Result<bool, String> {
             100.0 * delta,
             100.0 * floor
         );
+    }
+    for (case, size) in skipped {
+        println!("{case:16} {size:>6}  skipped: not a case in the base build");
     }
     Ok(!regressed)
 }

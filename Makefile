@@ -51,8 +51,9 @@ test-wasm:
 # counts instructions per op under valgrind's callgrind: the number a change is
 # judged on. BASE=<a copy of the example built at the base commit> compares two
 # builds and exits 1 when a case regresses past its noise floor (2 when it
-# measured nothing: bad flag, empty filter, valgrind failure); FILTER=<text>
-# narrows the cases (e.g. FILTER=l2_hit).
+# measured nothing: bad flag, empty filter, a base that runs none of the cases,
+# valgrind failure); cases the base build lacks are named as skipped.
+# FILTER=<text> narrows the cases (e.g. FILTER=l2_hit).
 bench:
 	$(CARGO) run --release --example bench_hot_path -- wall $(if $(FILTER),'$(FILTER)')
 

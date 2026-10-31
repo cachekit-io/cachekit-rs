@@ -887,6 +887,10 @@ written under that key; `oneshot` builds an encrypting client (`enc` or `prev`)
 and reads one L2 hit, the cost a one-read process pays beyond its start-up.
 `ns` and `nsenc` run `l1_hit`, `l2_hit` and `set` as `plain` and `enc` on a
 client with a `.namespace()`, which builds `{namespace}:{key}` on every op.
+`delete/parked256` and `delete/parked1024` run the plain 64 B `delete` while
+256 or 1,024 other deletes wait on the backend, each holding its key's
+mutation lock as a delete on a slow backend does: the cost of many keys in
+flight at once.
 
 ```bash
 make bench                                  # wall ns/op: indicative only
@@ -904,7 +908,9 @@ the base commit, copy `target/release/examples/bench_hot_path` outside
 `target/`, and pass it as `BASE`; the runs interleave ABBA, a delta counts only
 when it beats `max(3 × spread, 0.5%)`, and the target exits 1 when a case got
 slower by more than that, or 2 when it measured nothing (an unknown flag, a
-filter that matches no case, a valgrind failure). Most cases repeat within 0.8%; the `delete` cases
+filter that matches no case, a base that runs none of them, a valgrind
+failure). A case the base build does not list, because it was added since, is
+named as skipped rather than compared. Most cases repeat within 0.8%; the `delete` cases
 spread more (up to about 10%, from the per-key mutation lock map, a hash table seeded afresh in
 each process), so their floor is wider.
 

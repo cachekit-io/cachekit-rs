@@ -376,21 +376,36 @@ impl MutationState {
 #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
 #[derive(Default)]
 pub(crate) struct MutationMap {
-    entries: Mutex<HashMap<String, Weak<MutationState>>>,
+    entries: Mutex<MutationEntries>,
+}
+
+#[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
+#[derive(Default)]
+struct MutationEntries {
+    states: HashMap<String, Weak<MutationState>>,
+    /// Sweep dead states once the map grows past this: twice what the last
+    /// sweep left, as in [`FlightMap`], so many keys mid-mutation (each holds
+    /// its state across a backend call) do not make every op O(n).
+    sweep_above: usize,
 }
 
 #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
 impl MutationMap {
     pub(crate) fn state(&self, key: &str) -> Arc<MutationState> {
-        let mut map = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        if map.len() > SWEEP_THRESHOLD {
-            map.retain(|_, weak| weak.strong_count() > 0);
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let MutationEntries {
+            states,
+            sweep_above,
+        } = &mut *entries;
+        if states.len() > SWEEP_THRESHOLD && states.len() > *sweep_above {
+            states.retain(|_, weak| weak.strong_count() > 0);
+            *sweep_above = 2 * states.len();
         }
-        if let Some(existing) = map.get(key).and_then(Weak::upgrade) {
+        if let Some(existing) = states.get(key).and_then(Weak::upgrade) {
             return existing;
         }
         let fresh = Arc::new(MutationState::new());
-        map.insert(key.to_owned(), Arc::downgrade(&fresh));
+        states.insert(key.to_owned(), Arc::downgrade(&fresh));
         fresh
     }
 
@@ -910,6 +925,36 @@ mod tests {
             map.entries.lock().unwrap().slots.len() <= 2,
             "dead slots retained"
         );
+    }
+
+    /// Keys mid-mutation do not make every lookup sweep: dead states pile up
+    /// until the map doubles past what the last sweep kept, then go. Live
+    /// states survive every sweep, and once none are left the map empties.
+    #[test]
+    fn mutation_map_sweeps_on_growth_and_keeps_live_states() {
+        let map = MutationMap::default();
+        let len = || map.entries.lock().unwrap().states.len();
+        let live: Vec<_> = (0..200).map(|i| map.state(&format!("live:{i}"))).collect();
+
+        let mut peak = 0;
+        for i in 0..4 * live.len() {
+            map.state(&format!("dead:{i}"));
+            peak = peak.max(len());
+        }
+        assert!(peak > live.len() + 1, "swept on every lookup");
+        assert!(peak <= 2 * live.len() + 1, "dead states retained");
+        for (i, state) in live.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(&map.state(&format!("live:{i}")), state),
+                "live state swept"
+            );
+        }
+
+        drop(live);
+        for i in 0..=peak {
+            map.state(&format!("gone:{i}"));
+        }
+        assert!(len() <= SWEEP_THRESHOLD + 1, "dead states retained");
     }
 
     /// While something else holds the key's entry, so it survives the unpin, a
