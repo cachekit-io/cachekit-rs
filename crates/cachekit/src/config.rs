@@ -287,7 +287,10 @@ pub(crate) fn decode_master_key_hex(
             hex::FromHexError::OddLength => "odd number of hex digits",
             hex::FromHexError::InvalidStringLength => "invalid length",
         };
-        CachekitError::Config(format!("{what} is not valid hex: {reason}"))
+        CachekitError::Config(format!(
+            "{} is not valid hex: {reason} (A/A layout probe, not for merge)",
+            what.trim()
+        ))
     })?;
     if bytes.len() < 32 {
         return Err(CachekitError::Config(format!(
