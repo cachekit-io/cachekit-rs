@@ -437,6 +437,77 @@ async fn secure_namespace_is_bound_in_aad() {
     );
 }
 
+/// A namespaced client stores under `{namespace}:{key}` byte for byte, and
+/// that string is the AAD's key input on the write and on both read paths
+/// (L2 hit, then L1 hit). Entries written before any change to how the key is
+/// built must stay addressable and authentic after it.
+#[tokio::test]
+async fn namespaced_key_and_aad_bytes_are_pinned() {
+    // Colons and multi-byte UTF-8 in the key: it is copied as bytes, unparsed.
+    const KEY: &str = "user:42:ключ";
+    const FULL_KEY: &str = "app1:user:42:ключ";
+    // v0x03: 03 | len "test-tenant" | len FULL_KEY | len "msgpack" | len "False".
+    const AAD_HEX: &str = concat!(
+        "03",
+        "0000000b",
+        "746573742d74656e616e74",
+        "00000015",
+        "617070313a757365723a34323ad0bad0bbd18ed187", // pragma: allowlist secret
+        "00000007",
+        "6d73677061636b",
+        "00000005",
+        "46616c7365",
+    );
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = || {
+        CacheKit::builder()
+            .backend(shared.clone())
+            .namespace("app1")
+            .encryption_from_bytes(TEST_MASTER_KEY, "test-tenant")
+            .unwrap()
+            .build()
+            .unwrap()
+    };
+    let layer = cachekit::EncryptionLayer::new(TEST_MASTER_KEY, "test-tenant").unwrap();
+    assert_eq!(hex::encode(layer.build_aad(FULL_KEY, false)), AAD_HEX);
+
+    // Write: the one stored key is FULL_KEY, and its ciphertext authenticates
+    // under that key's AAD and no other.
+    client()
+        .secure_cache()
+        .unwrap()
+        .set(KEY, &"v")
+        .await
+        .unwrap();
+    let stored = {
+        let store = backend.store.lock().await;
+        let keys: Vec<&String> = store.keys().collect();
+        assert_eq!(keys, [FULL_KEY]);
+        store[FULL_KEY].clone()
+    };
+    let plaintext = layer.decrypt(&stored, FULL_KEY).unwrap();
+    assert!(layer.decrypt(&stored, KEY).is_err());
+
+    // Read: ciphertext sealed outside the client under FULL_KEY's AAD decrypts
+    // on a fresh client's L2 hit and again on its L1 hit.
+    let resealed = layer.encrypt(&plaintext, FULL_KEY).unwrap();
+    backend
+        .store
+        .lock()
+        .await
+        .insert(FULL_KEY.to_owned(), resealed);
+    let reader = client();
+    let secure = reader.secure_cache().unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            secure.get::<String>(KEY).await.unwrap().as_deref(),
+            Some("v")
+        );
+    }
+    let stats = reader.stats();
+    assert_eq!((stats.l2_hits, stats.l1_hits), (1, 1));
+}
+
 #[tokio::test]
 async fn secure_set_rejects_payload_whose_ciphertext_exceeds_limit() {
     // The get paths size-check the STORED ciphertext (plaintext + 28 bytes of

@@ -147,6 +147,19 @@ fn has_control_byte(bytes: &[u8]) -> bool {
     blocks.iter().any(|block| any_control(block)) || any_control(&bytes[bytes.len() - 16..])
 }
 
+/// `prefix` then `key` in one allocation of the final length, where `format!`
+/// starts from an estimate and grows its buffer as it writes. Out of line so
+/// that [`CacheKit::namespaced_key`] stays small enough to inline: with this
+/// body in it, it was not inlined, and every op of a client without a
+/// namespace paid for the call.
+#[inline(never)]
+fn prefixed_key(prefix: &str, key: &str) -> String {
+    let mut full_key = String::with_capacity(prefix.len() + key.len());
+    full_key.push_str(prefix);
+    full_key.push_str(key);
+    full_key
+}
+
 // ── Stale-while-revalidate ───────────────────────────────────────────────────
 //
 // SWR needs an L1 to age entries in and a spawnable (`Send`) runtime for the
@@ -229,7 +242,9 @@ impl Eq for SwrToken {}
 pub struct CacheKit {
     backend: SharedBackend,
     default_ttl: Duration,
-    namespace: Option<String>,
+    /// `"{namespace}:"`, built once at construction so that resolving a key
+    /// costs one exactly-sized allocation; `None` without a namespace.
+    key_prefix: Option<String>,
     max_payload_bytes: usize,
     flight: SharedFlight,
     /// Read counters behind [`Self::stats`]; the backend holds a
@@ -338,8 +353,8 @@ impl CacheKit {
     /// storage key is `key` itself, borrowed: an L1 hit then allocates
     /// nothing for its key.
     fn namespaced_key<'k>(&self, key: &'k str) -> Cow<'k, str> {
-        match &self.namespace {
-            Some(ns) => Cow::Owned(format!("{ns}:{key}")),
+        match &self.key_prefix {
+            Some(prefix) => Cow::Owned(prefixed_key(prefix, key)),
             None => Cow::Borrowed(key),
         }
     }
@@ -502,7 +517,8 @@ impl CacheKit {
         if let Some(secure) = self.encrypting() {
             return secure.get(key).await;
         }
-        match self.get_bytes(key).await? {
+        let full_key = self.resolve_key(key)?;
+        match self.get_bytes(&full_key).await? {
             Some(bytes) => Ok(Some(serializer::deserialize(&bytes)?)),
             None => Ok(None),
         }
@@ -552,7 +568,8 @@ impl CacheKit {
             return secure.interop_get(key).await;
         }
         self.reject_namespaced_interop()?;
-        match self.get_bytes(key).await? {
+        let full_key = self.resolve_key(key)?;
+        match self.get_bytes(&full_key).await? {
             Some(bytes) => Ok(Some(crate::interop::deserialize(&bytes)?)),
             None => Ok(None),
         }
@@ -561,7 +578,7 @@ impl CacheKit {
     /// Interop keys must reach the backend verbatim; a client namespace prefix
     /// would silently produce storage keys no other SDK computes.
     fn reject_namespaced_interop(&self) -> Result<(), CachekitError> {
-        match self.namespace {
+        match self.key_prefix {
             None => Ok(()),
             Some(_) => Err(CachekitError::Config(
                 "interop reads require a client without a namespace prefix: .namespace() \
@@ -617,7 +634,8 @@ impl CacheKit {
             return secure.interop_get_swr(key).await;
         }
         self.reject_namespaced_interop()?;
-        match self.get_bytes_swr(key).await? {
+        let full_key = self.resolve_key(key)?;
+        match self.get_bytes_swr(&full_key).await? {
             SwrRead::Fresh(b) => Ok(SwrRead::Fresh(crate::interop::deserialize(&b)?)),
             SwrRead::Stale(b, token) => Ok(SwrRead::Stale(crate::interop::deserialize(&b)?, token)),
             SwrRead::Miss => Ok(SwrRead::Miss),
@@ -625,32 +643,34 @@ impl CacheKit {
     }
 
     /// Fetch raw payload bytes with SWR classification and count the read:
-    /// one outcome, by the layer that served it, or one miss.
-    async fn get_bytes_swr(&self, key: &str) -> Result<SwrRead<Bytes>, CachekitError> {
-        let full_key = self.resolve_key(key)?;
-        Ok(match self.read_bytes_swr(&full_key).await? {
+    /// one outcome, by the layer that served it, or one miss. `full_key` comes
+    /// from [`Self::resolve_key`], so an encrypted read can bind the same key
+    /// in its AAD without resolving it again.
+    async fn get_bytes_swr(&self, full_key: &str) -> Result<SwrRead<Bytes>, CachekitError> {
+        Ok(match self.read_bytes_swr(full_key).await? {
             SwrRead::Fresh((bytes, by)) => {
-                self.counters.record(by, &full_key);
+                self.counters.record(by, full_key);
                 SwrRead::Fresh(bytes)
             }
             SwrRead::Stale((bytes, by), token) => {
-                self.counters.record(by, &full_key);
+                self.counters.record(by, full_key);
                 SwrRead::Stale(bytes, token)
             }
             SwrRead::Miss => {
-                self.counters.record(ReadOutcome::Miss, &full_key);
+                self.counters.record(ReadOutcome::Miss, full_key);
                 SwrRead::Miss
             }
         })
     }
 
-    /// Fetch raw payload bytes for `key` (L1, then L2 with L1 backfill) and
-    /// count the read: one outcome, by the layer that served it, or one miss.
-    async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, CachekitError> {
-        let full_key = self.resolve_key(key)?;
-        let read = self.read_bytes(&full_key).await?;
+    /// Fetch raw payload bytes for `full_key` (L1, then L2 with L1 backfill)
+    /// and count the read: one outcome, by the layer that served it, or one
+    /// miss. `full_key` comes from [`Self::resolve_key`], as for
+    /// [`Self::get_bytes_swr`].
+    async fn get_bytes(&self, full_key: &str) -> Result<Option<Bytes>, CachekitError> {
+        let read = self.read_bytes(full_key).await?;
         let by = read.as_ref().map_or(ReadOutcome::Miss, |(_, by)| *by);
-        self.counters.record(by, &full_key);
+        self.counters.record(by, full_key);
         Ok(read.map(|(bytes, _)| bytes))
     }
 
@@ -1216,11 +1236,15 @@ impl SecureCache<'_> {
     /// passes to its backend (`.namespace()` prefix included) with the
     /// ciphertext. Every write encrypts here, so the AAD binds that key and an
     /// entry copied to another namespace fails to decrypt.
-    fn seal<T: Serialize>(&self, key: &str, value: &T) -> Result<(String, Vec<u8>), CachekitError> {
+    fn seal<'k, T: Serialize>(
+        &self,
+        key: &'k str,
+        value: &T,
+    ) -> Result<(Cow<'k, str>, Vec<u8>), CachekitError> {
         let full_key = self.client.resolve_key(key)?;
         let plaintext = serializer::serialize(value)?;
         let ciphertext = self.encryption.encrypt(&plaintext, &full_key)?;
-        Ok((full_key.into_owned(), ciphertext))
+        Ok((full_key, ciphertext))
     }
 
     /// Retrieve, decrypt, and deserialize a value stored under `key`.
@@ -1286,13 +1310,14 @@ impl SecureCache<'_> {
         key: &str,
     ) -> Result<SwrRead<T>, CachekitError> {
         self.client.reject_namespaced_interop()?;
-        match self.client.get_bytes_swr(key).await? {
+        let full_key = self.client.resolve_key(key)?;
+        match self.client.get_bytes_swr(&full_key).await? {
             SwrRead::Fresh(ct) => Ok(SwrRead::Fresh(redact_decode(crate::interop::deserialize(
-                &self.decrypt_or_evict(&ct, key)?,
+                &self.decrypt_or_evict(&ct, &full_key)?,
             ))?)),
             SwrRead::Stale(ct, token) => Ok(SwrRead::Stale(
                 redact_decode(crate::interop::deserialize(
-                    &self.decrypt_or_evict(&ct, key)?,
+                    &self.decrypt_or_evict(&ct, &full_key)?,
                 ))?,
                 token,
             )),
@@ -1311,7 +1336,7 @@ impl SecureCache<'_> {
         match self.client.read_bytes(&full_key).await? {
             Some((ct, by)) => Ok(Some((
                 redact_decode(crate::interop::deserialize(
-                    &self.decrypt_or_evict(&ct, key)?,
+                    &self.decrypt_or_evict(&ct, &full_key)?,
                 ))?,
                 by,
             ))),
@@ -1329,7 +1354,7 @@ impl SecureCache<'_> {
         let full_key = self.client.resolve_key(key)?;
         let decode = |ct: &[u8]| -> Result<T, CachekitError> {
             redact_decode(crate::interop::deserialize(
-                &self.decrypt_or_evict(ct, key)?,
+                &self.decrypt_or_evict(ct, &full_key)?,
             ))
         };
         Ok(match self.client.read_bytes_swr(&full_key).await? {
@@ -1345,27 +1370,32 @@ impl SecureCache<'_> {
     /// the stored bytes untransformed — for a secure cache exactly the AES-GCM
     /// ciphertext, so decrypt receives the same bytes the backend holds.
     async fn get_plaintext(&self, key: &str) -> Result<Option<Vec<u8>>, CachekitError> {
-        match self.client.get_bytes(key).await? {
-            Some(ciphertext) => Ok(Some(self.decrypt_or_evict(&ciphertext, key)?)),
+        let full_key = self.client.resolve_key(key)?;
+        match self.client.get_bytes(&full_key).await? {
+            Some(ciphertext) => Ok(Some(self.decrypt_or_evict(&ciphertext, &full_key)?)),
             None => Ok(None),
         }
     }
 
-    /// Decrypt ciphertext read for `key` against the key this client passes to
-    /// its backend (`.namespace()` prefix included); on failure, drop the key's L1 copy before propagating the
-    /// error.
+    /// Decrypt ciphertext read for `full_key`, the key this client passed to
+    /// its backend (`.namespace()` prefix included, from
+    /// [`CacheKit::resolve_key`]), which the AAD binds; on failure, drop the
+    /// key's L1 copy before propagating the error.
     ///
     /// An L2 hit is backfilled into L1 before it is decrypted, so an entry
     /// that fails authentication would otherwise keep failing from L1 after
     /// the backend entry is fixed or deleted. The backend entry itself is
     /// left untouched as evidence.
-    fn decrypt_or_evict(&self, ciphertext: &[u8], key: &str) -> Result<Vec<u8>, CachekitError> {
-        let full_key = self.client.resolve_key(key)?;
+    fn decrypt_or_evict(
+        &self,
+        ciphertext: &[u8],
+        full_key: &str,
+    ) -> Result<Vec<u8>, CachekitError> {
         self.encryption
-            .decrypt(ciphertext, &full_key)
+            .decrypt(ciphertext, full_key)
             .inspect_err(|_| {
                 #[cfg(feature = "l1")]
-                self.client.l1_delete(&full_key);
+                self.client.l1_delete(full_key);
             })
     }
 
@@ -1896,7 +1926,7 @@ impl CacheKitBuilder {
         Ok(CacheKit {
             backend,
             default_ttl: self.default_ttl.unwrap_or(Duration::from_secs(300)),
-            namespace: self.namespace,
+            key_prefix: self.namespace.map(|ns| ns + ":"),
             max_payload_bytes: self.max_payload_bytes.unwrap_or(5 * 1024 * 1024),
             flight: SharedFlight::default(),
             counters,

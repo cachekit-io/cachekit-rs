@@ -885,6 +885,8 @@ MessagePack, is the smallest case, where per-call fixed costs dominate). Two mor
 `prev` reads, L1 and L2 hits, on a client holding one previous key, of entries
 written under that key; `oneshot` builds an encrypting client (`enc` or `prev`)
 and reads one L2 hit, the cost a one-read process pays beyond its start-up.
+`ns` and `nsenc` run `l1_hit`, `l2_hit` and `set` as `plain` and `enc` on a
+client with a `.namespace()`, which builds `{namespace}:{key}` on every op.
 
 ```bash
 make bench                                  # wall ns/op: indicative only
