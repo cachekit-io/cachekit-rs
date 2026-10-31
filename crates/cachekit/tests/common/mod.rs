@@ -93,6 +93,13 @@ impl Backend for MockBackend {
 /// One untrusted read: the path's name and what it decoded.
 pub type Read<T> = (&'static str, Result<T, CachekitError>);
 
+/// One path read twice: from the backend, then from L1.
+pub type ReadTwice<T> = (
+    &'static str,
+    Result<T, CachekitError>,
+    Result<T, CachekitError>,
+);
+
 /// Both untrusted decode entry points: auto-mode `get` and interop `interop_get`.
 pub fn decode_both<T: DeserializeOwned>(bytes: &[u8]) -> [Read<T>; 2] {
     [
@@ -180,6 +187,82 @@ pub fn read_every_path<T: DeserializeOwned>(bytes: &[u8]) -> Vec<Read<T>> {
         }
     });
     reads
+}
+
+/// The client reads that decode an L1 entry without decrypting it.
+#[cfg(feature = "l1")]
+pub const L1_READS: [&str; 5] = [
+    "CacheKit::get",
+    "CacheKit::interop_get",
+    "CacheKit::interop_get_swr",
+    "CacheKit::__interop_read",
+    "CacheKit::__interop_read_swr",
+];
+
+/// One read of `key` by the [`L1_READS`] path `path`, flattened to the value
+/// or a miss.
+#[cfg(feature = "l1")]
+async fn read_by<T: DeserializeOwned>(
+    client: &CacheKit,
+    path: &str,
+    key: &str,
+) -> Result<Option<T>, CachekitError> {
+    let swr = |read: SwrRead<T>| match read {
+        SwrRead::Fresh(v) | SwrRead::Stale(v, _) => Some(v),
+        SwrRead::Miss => None,
+    };
+    match path {
+        "CacheKit::get" => client.get(key).await,
+        "CacheKit::interop_get" => client.interop_get(key).await,
+        "CacheKit::interop_get_swr" => client.interop_get_swr(key).await.map(swr),
+        "CacheKit::__interop_read" => client
+            .__interop_read(key)
+            .await
+            .map(|read| read.map(|(v, _)| v)),
+        "CacheKit::__interop_read_swr" => client.__interop_read_swr(key).await.map(|read| {
+            swr(match read {
+                SwrRead::Fresh((v, _)) => SwrRead::Fresh(v),
+                SwrRead::Stale((v, _), token) => SwrRead::Stale(v, token),
+                SwrRead::Miss => SwrRead::Miss,
+            })
+        }),
+        other => panic!("not an L1 read path: {other}"),
+    }
+}
+
+/// Every [`L1_READS`] path of a client with L1 on, each reading a backend
+/// entry holding exactly `bytes` twice under a key of its own. The first read
+/// reaches the backend, which backfills L1 before anything decodes. The
+/// backend entry is then removed, so the second read is served by L1 or it is
+/// a miss, and a miss panics here. Returns `(path, first, second)`.
+#[cfg(feature = "l1")]
+pub fn read_every_path_twice_through_l1<T: DeserializeOwned>(bytes: &[u8]) -> Vec<ReadTwice<T>> {
+    let runtime = runtime();
+    let (backend, handle) = MockBackend::new_with_handle();
+    let client = CacheKit::builder()
+        .backend(backend)
+        .l1_capacity(64)
+        .build()
+        .expect("client builds");
+    let found = |r: Result<Option<T>, CachekitError>| {
+        r.map(|v| v.expect("the forged entry must be found, not missed"))
+    };
+    runtime.block_on(async {
+        let mut reads = Vec::new();
+        for path in L1_READS {
+            let key = format!("forged:{path}");
+            handle
+                .store
+                .lock()
+                .await
+                .insert(key.clone(), bytes.to_vec());
+            let first = found(read_by::<T>(&client, path, &key).await);
+            handle.store.lock().await.remove(&key);
+            let second = found(read_by::<T>(&client, path, &key).await);
+            reads.push((path, first, second));
+        }
+        reads
+    })
 }
 
 /// An encrypting client, L1 off so every read reaches the backend, holding
