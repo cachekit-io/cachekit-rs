@@ -355,7 +355,10 @@ impl CacheKit {
     /// Try L1 cache first. Returns Some(bytes) on hit.
     #[cfg(feature = "l1")]
     fn l1_get(&self, full_key: &str) -> Option<Bytes> {
-        self.l1.as_ref().and_then(|l1| l1.get_shared(full_key))
+        self.l1
+            .as_ref()
+            .and_then(|l1| l1.get_shared(full_key))
+            .map(|b| Bytes::copy_from_slice(&b))
     }
 
     /// Populate L1 from an L2 hit, for no longer than [`l1_backfill_ttl`] allows.
