@@ -885,6 +885,10 @@ MessagePack, is the smallest case, where per-call fixed costs dominate). Two mor
 `prev` reads, L1 and L2 hits, on a client holding one previous key, of entries
 written under that key; `oneshot` builds an encrypting client (`enc` or `prev`)
 and reads one L2 hit, the cost a one-read process pays beyond its start-up.
+`macro_hit` reads an L1 hit through a `#[cachekit]` function (`plain`, `rel`,
+or `enc` through a `secure` function) whose interop key is 120 B, so it prices
+the macro's key derivation; it needs the `macros` feature, which the `make`
+targets turn on.
 
 ```bash
 make bench                                  # wall ns/op: indicative only
@@ -898,7 +902,7 @@ Wall time on a shared machine moves by tens of percent between runs, so
 `bench-instr` is the number a change is judged on. It counts only the timed
 loop (`--toggle-collect`), on a single-threaded tokio runtime, five runs per
 case, and reports the median and the spread. For an A/B, build the example at
-the base commit, copy `target/release/examples/bench_hot_path` outside
+the base commit with `--features macros`, copy `target/release/examples/bench_hot_path` outside
 `target/`, and pass it as `BASE`; the runs interleave ABBA, a delta counts only
 when it beats `max(3 × spread, 0.5%)`, and the target exits 1 when a case got
 slower by more than that, or 2 when it measured nothing (an unknown flag, a
