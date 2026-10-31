@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use cachekit_core::msgpack_document_len;
 use rmp_serde::decode::ReadRefReader;
 use serde::{de::DeserializeOwned, Serialize};
@@ -18,7 +19,9 @@ use crate::error::CachekitError;
 /// required `32..=1024` window (`spec/interop-mode.md` → Decode bounds).
 ///
 /// Enforced by cachekit-core's `msgpack_document_len`, which runs before
-/// every decode in [`deserialize`] and [`crate::interop::deserialize`]. Depth
+/// every decode in [`deserialize`] and [`crate::interop::deserialize`], and
+/// once per backend read for a payload an L1 hit then decodes without it
+/// (see `Payload`). Depth
 /// counts every array and map header on the deepest path, empty ones included;
 /// scalars, str, bin and ext are leaves.
 /// Exactly `MAX_DECODE_DEPTH` levels are accepted, and one more is rejected
@@ -32,8 +35,9 @@ pub(crate) type SliceDeserializer<'a> = rmp_serde::Deserializer<ReadRefReader<'a
 /// `bytes`, which must hold exactly one MessagePack document.
 ///
 /// Every decode of backend-supplied bytes (auto-mode [`deserialize`] and
-/// [`crate::interop::deserialize`]) MUST go through here so the bounds cannot
-/// drift between paths. It runs cachekit-core's header-only
+/// [`crate::interop::deserialize`]) MUST go through here, or through
+/// `Payload::walk` before a backend read hands its bytes on, so the bounds
+/// cannot drift between paths: both run the same checks. It runs cachekit-core's header-only
 /// `msgpack_document_len` walk first. The walk proves that a complete
 /// document lies within `bytes`, that it nests no deeper than
 /// [`MAX_DECODE_DEPTH`], and that no header declares more elements or bytes
@@ -72,6 +76,21 @@ pub(crate) type SliceDeserializer<'a> = rmp_serde::Deserializer<ReadRefReader<'a
 /// only an ext's type byte leaves the body unread and is accepted. No value
 /// this SDK writes contains ext.
 pub(crate) fn bounded_deserializer(bytes: &[u8]) -> Result<SliceDeserializer<'_>, CachekitError> {
+    walk(bytes)?;
+    let mut de = rmp_serde::Deserializer::from_read_ref(bytes);
+    // rmp-serde decrements its counter on entry and errors when it reaches 0, so
+    // `set_max_depth(n)` admits n - 1 levels, and it counts an ext value as a
+    // level where the walk (and the spec) count it as a leaf. Ext is always a
+    // leaf, so +2 admits every document the walk admits, including an ext at the
+    // bound, and the walk's error is the one callers see for anything deeper
+    // (both pinned by tests/decode_bounds_tests.rs).
+    de.set_max_depth(MAX_DECODE_DEPTH + 2);
+    Ok(de)
+}
+
+/// The checks [`bounded_deserializer`] runs before it decodes: cachekit-core's
+/// header walk, then the single-document rule.
+fn walk(bytes: &[u8]) -> Result<(), CachekitError> {
     let len = msgpack_document_len(bytes, MAX_DECODE_DEPTH)
         .map_err(|e| CachekitError::Serialization(format!("decode bound: {e}")))?;
     // The error names no byte: on the secure path these bytes are decrypted
@@ -83,15 +102,92 @@ pub(crate) fn bounded_deserializer(bytes: &[u8]) -> Result<SliceDeserializer<'_>
             bytes.len() - len
         )));
     }
-    let mut de = rmp_serde::Deserializer::from_read_ref(bytes);
-    // rmp-serde decrements its counter on entry and errors when it reaches 0, so
-    // `set_max_depth(n)` admits n - 1 levels, and it counts an ext value as a
-    // level where the walk (and the spec) count it as a leaf. Ext is always a
-    // leaf, so +2 admits every document the walk admits, including an ext at the
-    // bound, and the walk's error is the one callers see for anything deeper
-    // (both pinned by tests/decode_bounds_tests.rs).
-    de.set_max_depth(MAX_DECODE_DEPTH + 2);
-    Ok(de)
+    Ok(())
+}
+
+/// Stored value bytes, and whether a plaintext decode of them may skip the
+/// bounds walk in [`bounded_deserializer`].
+///
+/// The walk guards a decode against bytes the backend controls. Bytes need it
+/// once, not on every read: an L1 entry keeps this mark for its lifetime, so a
+/// hit on bytes this process wrote, or already walked, decodes without it.
+/// Two constructors set the mark. [`Self::walk`] sets it only when the bytes
+/// pass the walk, and is the only way backend bytes get it. [`Self::written`]
+/// sets it on this process's own [`serialize`] output. Ciphertext is
+/// [`Self::unwalked`]: the secure path decodes the decrypted plaintext, which
+/// it always walks.
+///
+/// A marked decode is not unbounded. It keeps `rmp-serde`'s depth limit at
+/// exactly [`MAX_DECODE_DEPTH`] levels, so no input can overflow the stack.
+/// When it fails for any reason, the bytes go through the full walked decode,
+/// whose result, error text included, is the one the caller sees. So a value
+/// this process wrote deeper than the bound fails from L1 with the same
+/// `decode bound:` error as from the backend.
+#[derive(Clone, Debug)]
+pub(crate) struct Payload {
+    pub(crate) bytes: Bytes,
+    walked: bool,
+}
+
+impl Payload {
+    /// Bytes every decode walks.
+    #[cfg_attr(not(any(feature = "l1", feature = "encryption")), allow(dead_code))]
+    pub(crate) fn unwalked(bytes: Bytes) -> Self {
+        Self {
+            bytes,
+            walked: false,
+        }
+    }
+
+    /// Bytes from a backend: marked only if they pass the walk now. A failure
+    /// is not reported here; the caller's decode walks them again and reports
+    /// it.
+    pub(crate) fn walk(bytes: Bytes) -> Self {
+        let walked = walk(&bytes).is_ok();
+        Self { bytes, walked }
+    }
+
+    /// Bytes [`serialize`] produced in this process, never bytes read back
+    /// from anywhere. They hold one document with exact headers, so the walk
+    /// would find nothing the marked decode does not. The exception is a
+    /// `Serialize` impl that declares one length and writes another: rmp-serde
+    /// writes the header it is given. Such bytes decode from L1 as the
+    /// declared length reads them, and fail the walk from the backend.
+    pub(crate) fn written(bytes: Bytes) -> Self {
+        Self {
+            bytes,
+            walked: true,
+        }
+    }
+
+    /// Whether a decode may skip the walk.
+    #[cfg(all(test, feature = "l1", not(feature = "unsync")))]
+    pub(crate) fn is_walked(&self) -> bool {
+        self.walked
+    }
+
+    /// Decode a marked payload without the walk: `None` when it is unmarked
+    /// or the decode fails, and the caller then runs its full decoder.
+    pub(crate) fn decode_walked<T: DeserializeOwned>(&self) -> Option<T> {
+        if !self.walked {
+            return None;
+        }
+        let mut de = rmp_serde::Deserializer::from_read_ref(&self.bytes[..]);
+        // Admits exactly MAX_DECODE_DEPTH levels (see bounded_deserializer).
+        // An ext leaf at the bound fails here and decodes on the full path.
+        de.set_max_depth(MAX_DECODE_DEPTH + 1);
+        T::deserialize(&mut de).ok()
+    }
+}
+
+/// [`deserialize`] for a payload a read returned: a marked payload skips the
+/// walk (see [`Payload`]).
+pub(crate) fn deserialize_payload<T: DeserializeOwned>(
+    payload: &Payload,
+) -> Result<T, CachekitError> {
+    payload
+        .decode_walked()
+        .map_or_else(|| deserialize(&payload.bytes), Ok)
 }
 
 /// Serialize `value` to MessagePack bytes using named fields (map format).

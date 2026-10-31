@@ -11,7 +11,7 @@ use crate::backend::Backend;
 use crate::backend::{ttl_wire_secs, Freshness};
 use crate::error::CachekitError;
 use crate::metrics::{CacheCounters, L1Stats, ReadOutcome};
-use crate::serializer;
+use crate::serializer::{self, Payload};
 
 // ── SharedBackend type alias ──────────────────────────────────────────────────
 
@@ -352,18 +352,34 @@ impl CacheKit {
 
     // ── L1 helpers ───────────────────────────────────────────────────────────
 
-    /// Try L1 cache first. Returns Some(bytes) on hit.
+    /// Try L1 cache first. Returns Some(payload) on hit.
     #[cfg(feature = "l1")]
-    fn l1_get(&self, full_key: &str) -> Option<Bytes> {
+    fn l1_get(&self, full_key: &str) -> Option<Payload> {
         self.l1.as_ref().and_then(|l1| l1.get_shared(full_key))
     }
 
     /// Populate L1 from an L2 hit, for no longer than [`l1_backfill_ttl`] allows.
+    /// `payload` comes from [`Self::admit_backend_bytes`], so it is marked
+    /// walked only if it passed the walk.
     #[cfg(feature = "l1")]
-    fn l1_backfill(&self, full_key: &str, bytes: Bytes, freshness: Freshness) {
+    fn l1_backfill(&self, full_key: &str, payload: Payload, freshness: Freshness) {
         if let (Some(l1), Some(ttl)) = (&self.l1, l1_backfill_ttl(self.default_ttl, freshness)) {
-            l1.set_shared(full_key, bytes, ttl);
+            l1.set_shared(full_key, payload, ttl);
         }
+    }
+
+    /// Bytes a backend returned, as a read admits them. A client without
+    /// encryption walks them here, before the L1 backfill, so the backfilled
+    /// copy is marked walked only if they pass, and the caller's decode of
+    /// this read skips a second walk. An encrypting client's bytes are
+    /// ciphertext: they are not MessagePack, and nothing walks them.
+    #[cfg_attr(not(feature = "encryption"), allow(clippy::unused_self))]
+    fn admit_backend_bytes(&self, bytes: Bytes) -> Payload {
+        #[cfg(feature = "encryption")]
+        if self.encryption.is_some() {
+            return Payload::unwalked(bytes);
+        }
+        Payload::walk(bytes)
     }
 
     /// Write-through to L1 after a write the backend accepted. The entry lives
@@ -373,14 +389,14 @@ impl CacheKit {
     /// `None`, from [`Self::share_with_l1`] on a client without an L1, does
     /// nothing.
     #[cfg_attr(not(feature = "l1"), allow(clippy::unused_self))]
-    fn l1_set(&self, full_key: &str, bytes: Option<Bytes>, ttl: Duration) {
+    fn l1_set(&self, full_key: &str, payload: Option<Payload>, ttl: Duration) {
         #[cfg(feature = "l1")]
-        if let (Some(l1), Some(bytes)) = (&self.l1, bytes) {
+        if let (Some(l1), Some(payload)) = (&self.l1, payload) {
             let wire = Duration::from_secs(ttl_wire_secs(ttl));
-            l1.set_shared(full_key, bytes, ttl.min(wire));
+            l1.set_shared(full_key, payload, ttl.min(wire));
         }
         #[cfg(not(feature = "l1"))]
-        let _ = (full_key, bytes, ttl);
+        let _ = (full_key, payload, ttl);
     }
 
     /// Wrap a write's payload for the backend, plus a handle to the same
@@ -431,6 +447,7 @@ impl CacheKit {
         bytes: Vec<u8>,
         ttl: Duration,
         token: SwrToken,
+        admit: fn(Bytes) -> Payload,
     ) -> Result<bool, CachekitError> {
         Self::validate_ttl(ttl)?;
         self.check_payload_size(bytes.len())?;
@@ -447,7 +464,7 @@ impl CacheKit {
         }
         let (bytes, l1_bytes) = self.share_with_l1(bytes);
         self.backend.set_bytes(&full_key, bytes, Some(ttl)).await?;
-        self.l1_set(&full_key, l1_bytes, ttl);
+        self.l1_set(&full_key, l1_bytes.map(admit), ttl);
         mutation.advance();
         crate::metrics::trace_write(&full_key, ttl);
         Ok(true)
@@ -460,6 +477,7 @@ impl CacheKit {
         _bytes: Vec<u8>,
         _ttl: Duration,
         _token: SwrToken,
+        _admit: fn(Bytes) -> Payload,
     ) -> Result<bool, CachekitError> {
         // `SwrRead::Stale` is unreachable on this build, so there is no
         // versioned entry a caller could legitimately complete.
@@ -503,7 +521,7 @@ impl CacheKit {
             return secure.get(key).await;
         }
         match self.get_bytes(key).await? {
-            Some(bytes) => Ok(Some(serializer::deserialize(&bytes)?)),
+            Some(payload) => Ok(Some(serializer::deserialize_payload(&payload)?)),
             None => Ok(None),
         }
     }
@@ -553,7 +571,7 @@ impl CacheKit {
         }
         self.reject_namespaced_interop()?;
         match self.get_bytes(key).await? {
-            Some(bytes) => Ok(Some(crate::interop::deserialize(&bytes)?)),
+            Some(payload) => Ok(Some(crate::interop::deserialize_payload(&payload)?)),
             None => Ok(None),
         }
     }
@@ -618,15 +636,18 @@ impl CacheKit {
         }
         self.reject_namespaced_interop()?;
         match self.get_bytes_swr(key).await? {
-            SwrRead::Fresh(b) => Ok(SwrRead::Fresh(crate::interop::deserialize(&b)?)),
-            SwrRead::Stale(b, token) => Ok(SwrRead::Stale(crate::interop::deserialize(&b)?, token)),
+            SwrRead::Fresh(p) => Ok(SwrRead::Fresh(crate::interop::deserialize_payload(&p)?)),
+            SwrRead::Stale(p, token) => Ok(SwrRead::Stale(
+                crate::interop::deserialize_payload(&p)?,
+                token,
+            )),
             SwrRead::Miss => Ok(SwrRead::Miss),
         }
     }
 
     /// Fetch raw payload bytes with SWR classification and count the read:
     /// one outcome, by the layer that served it, or one miss.
-    async fn get_bytes_swr(&self, key: &str) -> Result<SwrRead<Bytes>, CachekitError> {
+    async fn get_bytes_swr(&self, key: &str) -> Result<SwrRead<Payload>, CachekitError> {
         let full_key = self.resolve_key(key)?;
         Ok(match self.read_bytes_swr(&full_key).await? {
             SwrRead::Fresh((bytes, by)) => {
@@ -646,7 +667,7 @@ impl CacheKit {
 
     /// Fetch raw payload bytes for `key` (L1, then L2 with L1 backfill) and
     /// count the read: one outcome, by the layer that served it, or one miss.
-    async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, CachekitError> {
+    async fn get_bytes(&self, key: &str) -> Result<Option<Payload>, CachekitError> {
         let full_key = self.resolve_key(key)?;
         let read = self.read_bytes(&full_key).await?;
         let by = read.as_ref().map_or(ReadOutcome::Miss, |(_, by)| *by);
@@ -661,14 +682,14 @@ impl CacheKit {
     async fn read_bytes_swr(
         &self,
         full_key: &str,
-    ) -> Result<SwrRead<(Bytes, ReadOutcome)>, CachekitError> {
+    ) -> Result<SwrRead<(Payload, ReadOutcome)>, CachekitError> {
         #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
         if self.swr_enabled {
             if let Some(ref l1) = self.l1 {
                 match l1.get_with_swr_shared(full_key, self.swr_threshold_ratio) {
-                    crate::l1::SharedSwrRead::Fresh(bytes) => {
-                        self.check_payload_size(bytes.len())?;
-                        return Ok(SwrRead::Fresh((bytes, ReadOutcome::L1Hit)));
+                    crate::l1::SharedSwrRead::Fresh(payload) => {
+                        self.check_payload_size(payload.bytes.len())?;
+                        return Ok(SwrRead::Fresh((payload, ReadOutcome::L1Hit)));
                     }
                     crate::l1::SharedSwrRead::Stale(_) => {
                         // Token capture and the stale snapshot must be atomic
@@ -677,15 +698,15 @@ impl CacheKit {
                         // between the optimistic classification and here.
                         let mutation = self.mutations.lock(full_key).await;
                         match l1.get_with_swr_shared(full_key, self.swr_threshold_ratio) {
-                            crate::l1::SharedSwrRead::Fresh(bytes) => {
-                                self.check_payload_size(bytes.len())?;
-                                return Ok(SwrRead::Fresh((bytes, ReadOutcome::L1Hit)));
+                            crate::l1::SharedSwrRead::Fresh(payload) => {
+                                self.check_payload_size(payload.bytes.len())?;
+                                return Ok(SwrRead::Fresh((payload, ReadOutcome::L1Hit)));
                             }
-                            crate::l1::SharedSwrRead::Stale(bytes) => {
-                                self.check_payload_size(bytes.len())?;
+                            crate::l1::SharedSwrRead::Stale(payload) => {
+                                self.check_payload_size(payload.bytes.len())?;
                                 let (state, version) = mutation.snapshot();
                                 return Ok(SwrRead::Stale(
-                                    (bytes, ReadOutcome::L1Stale),
+                                    (payload, ReadOutcome::L1Stale),
                                     SwrToken { state, version },
                                 ));
                             }
@@ -711,12 +732,12 @@ impl CacheKit {
     async fn read_bytes(
         &self,
         full_key: &str,
-    ) -> Result<Option<(Bytes, ReadOutcome)>, CachekitError> {
+    ) -> Result<Option<(Payload, ReadOutcome)>, CachekitError> {
         // L1 hit
         #[cfg(feature = "l1")]
-        if let Some(bytes) = self.l1_get(full_key) {
-            self.check_payload_size(bytes.len())?;
-            return Ok(Some((bytes, ReadOutcome::L1Hit)));
+        if let Some(payload) = self.l1_get(full_key) {
+            self.check_payload_size(payload.bytes.len())?;
+            return Ok(Some((payload, ReadOutcome::L1Hit)));
         }
 
         // Serialize an L2 read/backfill with same-key writes. Re-check L1
@@ -726,9 +747,9 @@ impl CacheKit {
         let _mutation = self.lock_l1_mutation(full_key).await;
 
         #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
-        if let Some(bytes) = self.l1_get(full_key) {
-            self.check_payload_size(bytes.len())?;
-            return Ok(Some((bytes, ReadOutcome::L1Hit)));
+        if let Some(payload) = self.l1_get(full_key) {
+            self.check_payload_size(payload.bytes.len())?;
+            return Ok(Some((payload, ReadOutcome::L1Hit)));
         }
 
         // L2 backend
@@ -738,15 +759,16 @@ impl CacheKit {
 
         self.check_payload_size(bytes.len())?;
         // Takes over the Vec's allocation: no copy, and L1 shares it below.
-        let bytes = Bytes::from(bytes);
+        // Walked before the backfill, which runs before any decode.
+        let payload = self.admit_backend_bytes(Bytes::from(bytes));
 
         // Populate L1 on L2 hit, bounded by the cap and the server's freshness
         #[cfg(feature = "l1")]
-        self.l1_backfill(full_key, bytes.clone(), freshness);
+        self.l1_backfill(full_key, payload.clone(), freshness);
         #[cfg(not(feature = "l1"))]
         let _ = freshness;
 
-        Ok(Some((bytes, ReadOutcome::L2Hit)))
+        Ok(Some((payload, ReadOutcome::L2Hit)))
     }
 
     /// Serialize and store `value` under `key` using the client's default TTL.
@@ -824,7 +846,7 @@ impl CacheKit {
 
         let (bytes, l1_bytes) = self.share_with_l1(bytes);
         self.backend.set_bytes(&full_key, bytes, Some(ttl)).await?;
-        self.l1_set(&full_key, l1_bytes, ttl);
+        self.l1_set(&full_key, l1_bytes.map(Payload::written), ttl);
 
         crate::metrics::trace_write(&full_key, ttl);
         Ok(())
@@ -846,7 +868,8 @@ impl CacheKit {
             return secure.__complete_swr_refresh(key, value, ttl, token).await;
         }
         let bytes = serializer::serialize(value)?;
-        self.complete_swr_bytes(key, bytes, ttl, token).await
+        self.complete_swr_bytes(key, bytes, ttl, token, Payload::written)
+            .await
     }
 
     /// Delete `key` and return `true` if it existed.
@@ -1007,7 +1030,7 @@ impl CacheKit {
         self.reject_namespaced_interop()?;
         let full_key = self.resolve_key(key)?;
         match self.read_bytes(&full_key).await? {
-            Some((bytes, by)) => Ok(Some((crate::interop::deserialize(&bytes)?, by))),
+            Some((payload, by)) => Ok(Some((crate::interop::deserialize_payload(&payload)?, by))),
             None => Ok(None),
         }
     }
@@ -1027,11 +1050,11 @@ impl CacheKit {
         self.reject_namespaced_interop()?;
         let full_key = self.resolve_key(key)?;
         Ok(match self.read_bytes_swr(&full_key).await? {
-            SwrRead::Fresh((bytes, by)) => {
-                SwrRead::Fresh((crate::interop::deserialize(&bytes)?, by))
+            SwrRead::Fresh((payload, by)) => {
+                SwrRead::Fresh((crate::interop::deserialize_payload(&payload)?, by))
             }
-            SwrRead::Stale((bytes, by), token) => {
-                SwrRead::Stale((crate::interop::deserialize(&bytes)?, by), token)
+            SwrRead::Stale((payload, by), token) => {
+                SwrRead::Stale((crate::interop::deserialize_payload(&payload)?, by), token)
             }
             SwrRead::Miss => SwrRead::Miss,
         })
@@ -1190,7 +1213,8 @@ impl SecureCache<'_> {
             .backend
             .set_bytes(&full_key, ciphertext, Some(ttl))
             .await?;
-        self.client.l1_set(&full_key, l1_bytes, ttl);
+        self.client
+            .l1_set(&full_key, l1_bytes.map(Payload::unwalked), ttl);
 
         crate::metrics::trace_write(&full_key, ttl);
         Ok(())
@@ -1208,7 +1232,7 @@ impl SecureCache<'_> {
     ) -> Result<bool, CachekitError> {
         let (_, ciphertext) = self.seal(key, value)?;
         self.client
-            .complete_swr_bytes(key, ciphertext, ttl, token)
+            .complete_swr_bytes(key, ciphertext, ttl, token, Payload::unwalked)
             .await
     }
 
@@ -1288,11 +1312,11 @@ impl SecureCache<'_> {
         self.client.reject_namespaced_interop()?;
         match self.client.get_bytes_swr(key).await? {
             SwrRead::Fresh(ct) => Ok(SwrRead::Fresh(redact_decode(crate::interop::deserialize(
-                &self.decrypt_or_evict(&ct, key)?,
+                &self.decrypt_or_evict(&ct.bytes, key)?,
             ))?)),
             SwrRead::Stale(ct, token) => Ok(SwrRead::Stale(
                 redact_decode(crate::interop::deserialize(
-                    &self.decrypt_or_evict(&ct, key)?,
+                    &self.decrypt_or_evict(&ct.bytes, key)?,
                 ))?,
                 token,
             )),
@@ -1311,7 +1335,7 @@ impl SecureCache<'_> {
         match self.client.read_bytes(&full_key).await? {
             Some((ct, by)) => Ok(Some((
                 redact_decode(crate::interop::deserialize(
-                    &self.decrypt_or_evict(&ct, key)?,
+                    &self.decrypt_or_evict(&ct.bytes, key)?,
                 ))?,
                 by,
             ))),
@@ -1333,8 +1357,8 @@ impl SecureCache<'_> {
             ))
         };
         Ok(match self.client.read_bytes_swr(&full_key).await? {
-            SwrRead::Fresh((ct, by)) => SwrRead::Fresh((decode(&ct)?, by)),
-            SwrRead::Stale((ct, by), token) => SwrRead::Stale((decode(&ct)?, by), token),
+            SwrRead::Fresh((ct, by)) => SwrRead::Fresh((decode(&ct.bytes)?, by)),
+            SwrRead::Stale((ct, by), token) => SwrRead::Stale((decode(&ct.bytes)?, by), token),
             SwrRead::Miss => SwrRead::Miss,
         })
     }
@@ -1346,7 +1370,7 @@ impl SecureCache<'_> {
     /// ciphertext, so decrypt receives the same bytes the backend holds.
     async fn get_plaintext(&self, key: &str) -> Result<Option<Vec<u8>>, CachekitError> {
         match self.client.get_bytes(key).await? {
-            Some(ciphertext) => Ok(Some(self.decrypt_or_evict(&ciphertext, key)?)),
+            Some(ciphertext) => Ok(Some(self.decrypt_or_evict(&ciphertext.bytes, key)?)),
             None => Ok(None),
         }
     }
@@ -2099,7 +2123,9 @@ mod secure_l1_tests {
             .unwrap();
         client.l1_set(
             "poisoned-stale",
-            Some(bytes::Bytes::from_static(b"not ciphertext")),
+            Some(crate::serializer::Payload::unwalked(
+                bytes::Bytes::from_static(b"not ciphertext"),
+            )),
             Duration::from_secs(60),
         );
         // Real time, not tokio's paused clock: L1 ages entries by std
@@ -2229,7 +2255,7 @@ mod shared_write_buffer_tests {
         let buffers = backend.buffers.lock().unwrap().clone();
         assert_eq!(buffers.len(), 3, "two transient failures, then a success");
         let l1 = client.l1_get("k").expect("written through to L1");
-        let l1 = l1.as_ptr() as usize;
+        let l1 = l1.bytes.as_ptr() as usize;
         assert!(
             buffers.iter().all(|&b| b == l1),
             "a copy reached the backend or the L1: attempts {buffers:x?}, L1 {l1:x}"
@@ -2253,5 +2279,97 @@ mod shared_write_buffer_tests {
             .build()
             .unwrap();
         assert_one_buffer(&client, &backend).await;
+    }
+}
+
+/// Which L1 entries carry the walked mark: a plain client's own writes, and
+/// backend bytes only once they pass the walk. Ciphertext never does.
+#[cfg(all(test, feature = "l1", not(feature = "unsync")))]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test-only: a failed setup step should panic loudly
+mod walked_mark_tests {
+    use super::{CacheKit, SharedBackend};
+    use crate::backend::{Backend, MemoryBackend};
+    use crate::error::CachekitError;
+
+    fn plain_client() -> (CacheKit, MemoryBackend) {
+        let backend = MemoryBackend::default();
+        let shared: SharedBackend = std::sync::Arc::new(backend.clone());
+        let client = CacheKit::builder()
+            .backend(shared)
+            .l1_capacity(16)
+            .build()
+            .unwrap();
+        (client, backend)
+    }
+
+    fn walked(client: &CacheKit, key: &str) -> bool {
+        client.l1_get(key).expect("an L1 entry").is_walked()
+    }
+
+    #[tokio::test]
+    async fn a_plain_write_is_walked() {
+        let (client, _) = plain_client();
+        client.set("k", &vec![1u32, 2, 3]).await.unwrap();
+        assert!(walked(&client, "k"));
+        assert_eq!(
+            client.get::<Vec<u32>>("k").await.unwrap(),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backfill_is_walked_only_if_it_passes_the_walk() {
+        let (client, backend) = plain_client();
+        let good = crate::serializer::serialize(&"v").unwrap();
+        // One complete document (fixint 1), then a trailing byte.
+        let trailing = vec![0x01, 0x01];
+        backend.set("good", good, None).await.unwrap();
+        backend.set("trailing", trailing, None).await.unwrap();
+
+        assert_eq!(
+            client.get::<String>("good").await.unwrap().as_deref(),
+            Some("v")
+        );
+        assert!(walked(&client, "good"), "a document that passes is marked");
+
+        for read in 0..2 {
+            let err = client.get::<u8>("trailing").await.unwrap_err();
+            assert!(
+                matches!(err, CachekitError::Serialization(ref m) if m.contains("trailing byte")),
+                "read {read}: {err:?}"
+            );
+            assert!(
+                !walked(&client, "trailing"),
+                "read {read}: hostile bytes marked"
+            );
+        }
+        let stats = client.stats();
+        assert_eq!((stats.l1_hits, stats.l2_hits), (1, 2), "{stats:?}");
+    }
+
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn ciphertext_is_never_walked() {
+        let backend = MemoryBackend::default();
+        let shared: SharedBackend = std::sync::Arc::new(backend.clone());
+        let encrypting = || {
+            CacheKit::builder()
+                .backend(shared.clone())
+                .l1_capacity(16)
+                .encryption_from_bytes(&[7u8; 32], "t")
+                .unwrap()
+                .build()
+                .unwrap()
+        };
+        let writer = encrypting();
+        writer.set("k", &"v").await.unwrap();
+        assert!(!walked(&writer, "k"), "write-through");
+
+        let reader = encrypting();
+        assert_eq!(
+            reader.get::<String>("k").await.unwrap().as_deref(),
+            Some("v")
+        );
+        assert!(!walked(&reader, "k"), "backfill");
     }
 }

@@ -402,6 +402,17 @@ pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError
         .map_err(|e| CachekitError::Serialization(format!("interop decode: {e}")))
 }
 
+/// [`deserialize`] for a payload a read returned: a marked payload skips the
+/// walk (see `crate::serializer::Payload`). Marked bytes are never a CK frame:
+/// its `0x43` is a complete document, so the frame fails the walk.
+pub(crate) fn deserialize_payload<T: DeserializeOwned>(
+    payload: &crate::serializer::Payload,
+) -> Result<T, CachekitError> {
+    payload
+        .decode_walked()
+        .map_or_else(|| deserialize(&payload.bytes), Ok)
+}
+
 // ── Canonical encoder ────────────────────────────────────────────────────────
 
 /// Which canonicalization profile to encode with. The profiles differ in

@@ -1,3 +1,4 @@
+use crate::serializer::Payload;
 use bytes::Bytes;
 use quick_cache::sync::{Cache, DefaultLifecycle};
 use quick_cache::{OptionsBuilder, UnitWeighter};
@@ -9,7 +10,9 @@ use std::time::{Duration, Instant};
 struct L1Entry {
     // Bytes, not Vec: quick_cache's `get` clones the entry, and a refcount
     // bump is cheaper than a deep copy of a payload of up to the 5 MiB cap.
-    data: Bytes,
+    // The payload's walked mark is fixed by whoever admits the entry; a read
+    // hands it back unchanged.
+    data: Payload,
     ttl: Duration,
     created_at: Instant,
     /// `created_at + ttl`, so a read compares one `Instant` instead of
@@ -64,8 +67,8 @@ pub enum L1SwrRead {
 
 /// [`L1SwrRead`] over a shared buffer: the client's copy-free read path.
 pub(crate) enum SharedSwrRead {
-    Fresh(Bytes),
-    Stale(Bytes),
+    Fresh(Payload),
+    Stale(Payload),
     Miss,
 }
 
@@ -118,11 +121,12 @@ impl L1Cache {
 
     /// Retrieve cached bytes by key, or `None` if absent or expired.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
-        self.get_shared(key).map(|data| data.to_vec())
+        self.get_shared(key).map(|data| data.bytes.to_vec())
     }
 
-    /// [`Self::get`] without the copy: the stored buffer, by refcount.
-    pub(crate) fn get_shared(&self, key: &str) -> Option<Bytes> {
+    /// [`Self::get`] without the copy: the stored buffer, by refcount, with
+    /// its walked mark.
+    pub(crate) fn get_shared(&self, key: &str) -> Option<Payload> {
         let entry = self.store.get(key)?;
         let now = Instant::now();
         if entry.is_live(now) {
@@ -167,8 +171,8 @@ impl L1Cache {
     /// `CacheKit::single_flight`).
     pub fn get_with_swr(&self, key: &str, threshold_ratio: f64) -> L1SwrRead {
         match self.get_with_swr_shared(key, threshold_ratio) {
-            SharedSwrRead::Fresh(data) => L1SwrRead::Fresh(data.to_vec()),
-            SharedSwrRead::Stale(data) => L1SwrRead::Stale(data.to_vec()),
+            SharedSwrRead::Fresh(data) => L1SwrRead::Fresh(data.bytes.to_vec()),
+            SharedSwrRead::Stale(data) => L1SwrRead::Stale(data.bytes.to_vec()),
             SharedSwrRead::Miss => L1SwrRead::Miss,
         }
     }
@@ -195,12 +199,14 @@ impl L1Cache {
     /// Insert or overwrite an entry with the given TTL.
     ///
     /// An overwrite is a new entry: its TTL and freshness window start now.
+    /// The entry is unwalked, so a client decode of it runs the bounds walk.
     pub fn set(&self, key: &str, value: &[u8], ttl: Duration) {
-        self.set_shared(key, Bytes::copy_from_slice(value), ttl);
+        self.set_shared(key, Payload::unwalked(Bytes::copy_from_slice(value)), ttl);
     }
 
-    /// [`Self::set`] without the copy: L1 keeps `value`'s buffer.
-    pub(crate) fn set_shared(&self, key: &str, value: Bytes, ttl: Duration) {
+    /// [`Self::set`] without the copy: L1 keeps `value`'s buffer and its
+    /// walked mark.
+    pub(crate) fn set_shared(&self, key: &str, value: Payload, ttl: Duration) {
         let created_at = Instant::now();
         self.store.insert(
             key.to_owned(),
@@ -254,6 +260,7 @@ impl L1Cache {
 #[allow(clippy::expect_used)] // test-only: a failed thread or fixture should panic loudly
 mod tests {
     use super::{shard_count, L1Cache, L1Entry, L1SwrRead};
+    use crate::serializer::Payload;
     use bytes::Bytes;
     use std::time::{Duration, Instant};
 
@@ -365,7 +372,7 @@ mod tests {
         let cache = L1Cache::new(16);
         let stamp = Instant::now();
         let written = |ttl| L1Entry {
-            data: Bytes::new(),
+            data: Payload::unwalked(Bytes::new()),
             ttl,
             created_at: stamp,
             expires_at: stamp.checked_add(ttl),
@@ -408,7 +415,7 @@ mod tests {
                 .checked_sub(ago)
                 .expect("the monotonic clock has run for more than 11 s");
             L1Entry {
-                data: Bytes::from_static(b"v"),
+                data: Payload::unwalked(Bytes::from_static(b"v")),
                 ttl,
                 created_at,
                 expires_at: created_at.checked_add(ttl),
