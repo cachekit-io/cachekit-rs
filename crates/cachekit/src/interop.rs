@@ -52,6 +52,7 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use blake2::{digest::consts::U32, Blake2b, Digest};
 use serde::de::DeserializeOwned;
@@ -321,12 +322,86 @@ pub fn interop_key(
     validate_segment("namespace", namespace)?;
     validate_segment("operation", operation)?;
 
-    let encoded = canonical_args(args)?;
-    let mut hasher = Blake2b256::new();
-    hasher.update(&encoded);
-    let args_hash = hex::encode(hasher.finalize());
+    let mut key = String::with_capacity(namespace.len() + operation.len() + 2 + ARGS_HASH_LEN);
+    key.push_str(namespace);
+    key.push(':');
+    key.push_str(operation);
+    key.push(':');
+    push_args_hash(key, args)
+}
 
-    Ok(format!("{namespace}:{operation}:{args_hash}"))
+/// Length of `args_hash`: a 32-byte digest in hex.
+const ARGS_HASH_LEN: usize = 64;
+
+/// Append `args_hash` to `key`, which holds `{namespace}:{operation}:` and
+/// room for the hash. The one implementation of the hash segment, shared by
+/// [`interop_key`] and [`__KeyPrefix::key`], so both mint the same bytes.
+fn push_args_hash(mut key: String, args: &[InteropValue]) -> Result<String, CachekitError> {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let digest = Blake2b256::digest(canonical_args(args)?);
+    let mut hex = [0u8; ARGS_HASH_LEN];
+    for (pair, byte) in hex.as_chunks_mut::<2>().0.iter_mut().zip(digest) {
+        *pair = [
+            HEX_DIGITS[usize::from(byte >> 4)],
+            HEX_DIGITS[usize::from(byte & 0x0f)],
+        ];
+    }
+    // Every byte is an ASCII hex digit, so this cannot fail.
+    let hex = std::str::from_utf8(&hex)
+        .map_err(|e| CachekitError::Serialization(format!("args_hash is not hex: {e}")))?;
+    key.push_str(hex);
+    Ok(key)
+}
+
+/// One `#[cachekit]` function's key prefix, `{namespace}:{operation}:`, which
+/// the macro keeps in a `static`: its segments are validated and joined on the
+/// first call that passes validation, and each call after that only hashes its
+/// arguments. Keys are byte-identical to [`interop_key`]'s.
+///
+/// The macro validates both segments at compile time against a mirror of
+/// [`validate_segment`]; this runtime check is the drift guard behind that
+/// mirror. Only a valid prefix is kept, so a segment the mirror wrongly
+/// accepts fails every call with [`CachekitError::InvalidKey`], not just the
+/// first.
+///
+/// No argument is kept: the prefix depends on the function alone.
+#[doc(hidden)]
+pub struct __KeyPrefix {
+    namespace: &'static str,
+    operation: &'static str,
+    prefix: OnceLock<String>,
+}
+
+impl __KeyPrefix {
+    /// A prefix for `namespace` and `operation`, validated on first use.
+    #[must_use]
+    pub const fn new(namespace: &'static str, operation: &'static str) -> Self {
+        Self {
+            namespace,
+            operation,
+            prefix: OnceLock::new(),
+        }
+    }
+
+    /// The interop/v1 key for `args`: `interop_key(namespace, operation, args)`.
+    ///
+    /// # Errors
+    ///
+    /// As [`interop_key`].
+    pub fn key(&self, args: &[InteropValue]) -> Result<String, CachekitError> {
+        let prefix = match self.prefix.get() {
+            Some(prefix) => prefix,
+            None => {
+                validate_segment("namespace", self.namespace)?;
+                validate_segment("operation", self.operation)?;
+                self.prefix
+                    .get_or_init(|| format!("{}:{}:", self.namespace, self.operation))
+            }
+        };
+        let mut key = String::with_capacity(prefix.len() + ARGS_HASH_LEN);
+        key.push_str(prefix);
+        push_args_hash(key, args)
+    }
 }
 
 /// Encode the flat argument array to canonical MessagePack (argument profile:
@@ -339,7 +414,9 @@ pub fn interop_key(
 ///
 /// [`CachekitError::Serialization`] for out-of-model values (see [`interop_key`]).
 pub fn canonical_args(args: &[InteropValue]) -> Result<Vec<u8>, CachekitError> {
-    let mut buf = Vec::new();
+    // Most argument lists encode in under 64 bytes: one allocation, where
+    // growing from empty took three.
+    let mut buf = Vec::with_capacity(64);
     encode_array_header(&mut buf, args.len())?;
     for arg in args {
         encode(&mut buf, arg, Profile::Args)?;
