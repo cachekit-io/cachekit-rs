@@ -908,7 +908,9 @@ the base commit, copy `target/release/examples/bench_hot_path` outside
 `target/`, and pass it as `BASE`; the runs interleave ABBA, a delta counts only
 when it beats `max(3 × spread, 0.5%)`, and the target exits 1 when a case got
 slower by more than that, or 2 when it measured nothing (an unknown flag, a
-filter that matches no case, a valgrind failure). Most cases repeat within 0.8%; the `delete` cases
+filter that matches no case, a base that runs none of them, a valgrind
+failure). A case the base build does not list, because it was added since, is
+named as skipped rather than compared. Most cases repeat within 0.8%; the `delete` cases
 spread more (up to about 10%, from the per-key mutation lock map, a hash table seeded afresh in
 each process), so their floor is wider.
 

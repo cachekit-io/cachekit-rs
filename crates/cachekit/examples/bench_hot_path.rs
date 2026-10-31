@@ -20,14 +20,16 @@
 //! so only the timed loop is counted and setup needs no differencing. It
 //! reports the median instructions per op and the run-to-run spread. With
 //! `--base`, it runs a second build of this example interleaved (ABBA) and
-//! calls a delta only when it beats `max(3 x spread, 0.5%)`. Exit codes: 1 when
-//! any case got slower by that much; 2 when nothing was measured (an unknown
-//! flag, a filter matching no case, or valgrind failing). Wall time is printed
-//! for orientation and is never a measured saving.
+//! calls a delta only when it beats `max(3 x spread, 0.5%)`. A case the base
+//! build does not list (one added since) is named as skipped, not compared.
+//! Exit codes: 1 when any case got slower by that much; 2 when nothing was
+//! measured (an unknown flag, a filter matching no case, a base that runs none
+//! of them, or valgrind failing). Wall time is printed for orientation and is
+//! never a measured saving.
 
 #![allow(clippy::print_stdout)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::hint::black_box;
 use std::process::{Command, ExitCode, Stdio};
@@ -542,6 +544,22 @@ fn instructions(
     Ok(total as f64 / iters as f64)
 }
 
+/// Every `<op>/<mode>/<size>` the build at `bin` runs, from its `list`.
+fn listed(bin: &str) -> Result<HashSet<String>, String> {
+    let out = Command::new(bin)
+        .arg("list")
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("cannot start {bin}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("{bin} list failed: {}", out.status));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
 fn median(v: &[f64]) -> f64 {
     let mut s = v.to_vec();
     s.sort_by(f64::total_cmp);
@@ -581,7 +599,18 @@ fn instr(args: &[String]) -> Result<bool, String> {
         .map_err(|e| e.to_string())?
         .display()
         .to_string();
-    let all = cases(filter.as_deref())?;
+    let mut all = cases(filter.as_deref())?;
+    // A base built before a case was added cannot run it.
+    let mut skipped = Vec::new();
+    if let Some(base) = &base {
+        let known = listed(base)?;
+        (all, skipped) = all
+            .into_iter()
+            .partition(|(case, size)| known.contains(&format!("{case}/{size}")));
+        if all.is_empty() {
+            return Err(format!("{base} runs none of the selected cases"));
+        }
+    }
     let mut regressed = false;
     let mut seq = 0;
     match &base {
@@ -639,6 +668,9 @@ fn instr(args: &[String]) -> Result<bool, String> {
             100.0 * delta,
             100.0 * floor
         );
+    }
+    for (case, size) in skipped {
+        println!("{case:16} {size:>6}  skipped: not a case in the base build");
     }
     Ok(!regressed)
 }
