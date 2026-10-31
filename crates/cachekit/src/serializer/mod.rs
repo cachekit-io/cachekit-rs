@@ -18,7 +18,7 @@ use crate::error::CachekitError;
 /// every profile and target (wasm32 included), and sits inside the protocol's
 /// required `32..=1024` window (`spec/interop-mode.md` → Decode bounds).
 ///
-/// Enforced by [`check_bounds`] (cachekit-core's `msgpack_document_len`). It
+/// Enforced by cachekit-core's `msgpack_document_len` walk. It
 /// runs before every decode in [`deserialize`] and
 /// [`crate::interop::deserialize`]. A client without encryption also runs it
 /// once when a backend read or its own write admits bytes, and a decode of
