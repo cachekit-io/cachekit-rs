@@ -902,7 +902,9 @@ Wall time on a shared machine moves by tens of percent between runs, so
 `bench-instr` is the number a change is judged on. It counts only the timed
 loop (`--toggle-collect`), on a single-threaded tokio runtime, five runs per
 case, and reports the median and the spread. For an A/B, build the example at
-the base commit with `--features macros`, copy `target/release/examples/bench_hot_path` outside
+the base commit with `--features macros`, from this tree's `examples/bench_hot_path.rs`
+so both builds run the same cases (a base without one, such as `macro_hit`,
+fails that case and the run exits 2), copy `target/release/examples/bench_hot_path` outside
 `target/`, and pass it as `BASE`; the runs interleave ABBA, a delta counts only
 when it beats `max(3 × spread, 0.5%)`, and the target exits 1 when a case got
 slower by more than that, or 2 when it measured nothing (an unknown flag, a

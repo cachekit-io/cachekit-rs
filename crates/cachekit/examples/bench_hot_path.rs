@@ -12,7 +12,7 @@
 //! build without it lists no `macro_hit` case.
 //!
 //! ```text
-//! bench_hot_path list                         every case name
+//! bench_hot_path list                          every case name
 //! bench_hot_path run <case> <size> <iters>     one case; indicative wall ns/op
 //! bench_hot_path wall [filter]                 every case; indicative wall ns/op
 //! bench_hot_path readme                        the README's Performance table

@@ -510,13 +510,17 @@ fn error_vectors_all_reject() {
                     result.is_err(),
                     "[{name}] MUST be rejected, but produced key: {result:?}"
                 );
-                // `#[cachekit]`'s key rejects it with the same error.
-                let macro_result = __KeyPrefix::new(namespace, operation).key(&args);
-                assert_eq!(
-                    macro_result.map_err(|e| e.to_string()),
-                    result.map_err(|e| e.to_string()),
-                    "[{name}] #[cachekit] key must reject as interop_key does"
-                );
+                // `#[cachekit]`'s key rejects it with the same error, on a
+                // fresh prefix and on one an argument error left in place.
+                let expected = result.map_err(|e| e.to_string());
+                let prefix = __KeyPrefix::new(namespace, operation);
+                for call in ["first", "reused"] {
+                    assert_eq!(
+                        prefix.key(&args).map_err(|e| e.to_string()),
+                        expected,
+                        "[{name}] #[cachekit] key must reject as interop_key does ({call} call)"
+                    );
+                }
             }
         }
     }
@@ -761,9 +765,12 @@ fn reference_key(namespace: &str, operation: &str, args: &[InteropValue]) -> Str
 #[test]
 fn macro_key_matches_interop_key_on_random_input() {
     let mut rng = Rng(0x1210_4c0d_e5ee_d000);
-    let (mut keys, mut errors) = (0, 0);
+    // Errors from an argument on a built prefix, and from a bad segment and a
+    // bad argument at once (the segment error must win).
+    let (mut keys, mut arg_errors, mut both_errors) = (0, 0, 0);
     for _ in 0..400 {
         let (namespace, operation) = (random_segment(&mut rng), random_segment(&mut rng));
+        let segments_ok = interop_key(&namespace, &operation, &[]).is_ok();
         let prefix = __KeyPrefix::new(&namespace, &operation);
         for _ in 0..10 {
             let args: Vec<InteropValue> = (0..rng.below(5))
@@ -784,12 +791,21 @@ fn macro_key_matches_interop_key_on_random_input() {
                 }
                 (Err(fresh), Err(kept)) => {
                     assert_eq!(kept.to_string(), fresh.to_string(), "{case}");
-                    errors += 1;
+                    if canonical_args(&args).is_err() {
+                        if segments_ok {
+                            arg_errors += 1;
+                        } else {
+                            both_errors += 1;
+                        }
+                    }
                 }
                 _ => panic!("{case}: interop_key {fresh:?}, #[cachekit] key {kept:?}"),
             }
         }
     }
-    // Both outcomes must be well exercised, or the comparison proves little.
-    assert!(keys > 2_000 && errors > 300, "keys {keys}, errors {errors}");
+    // Every outcome must be well exercised, or the comparison proves little.
+    assert!(
+        keys > 2_000 && arg_errors > 50 && both_errors > 10,
+        "keys {keys}, argument errors {arg_errors}, segment and argument errors {both_errors}"
+    );
 }

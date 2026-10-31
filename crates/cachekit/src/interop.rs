@@ -347,8 +347,9 @@ fn push_args_hash(mut key: String, args: &[InteropValue]) -> Result<String, Cach
         ];
     }
     // Every byte is an ASCII hex digit, so this cannot fail.
-    let hex = std::str::from_utf8(&hex)
-        .map_err(|e| CachekitError::Serialization(format!("args_hash is not hex: {e}")))?;
+    let hex = std::str::from_utf8(&hex).map_err(|e| {
+        CachekitError::Serialization(format!("args_hash digits are not UTF-8: {e}"))
+    })?;
     key.push_str(hex);
     Ok(key)
 }
@@ -868,8 +869,10 @@ mod tests {
         ] {
             let prefix = __KeyPrefix::new(namespace, operation);
             let expected = interop_key(namespace, operation, &[]).unwrap_err();
-            for call in 0..3 {
-                let err = prefix.key(&[]).unwrap_err();
+            // An invalid argument too: the segment error still comes first.
+            let nan = [InteropValue::from(f64::NAN)];
+            for (call, args) in [&[][..], &nan, &[]].into_iter().enumerate() {
+                let err = prefix.key(args).unwrap_err();
                 assert!(
                     matches!(err, CachekitError::InvalidKey(_)),
                     "{namespace:?}/{operation:?} call {call}: {err}"
