@@ -389,6 +389,20 @@ pub fn serialize_value(value: &InteropValue) -> Result<Vec<u8>, CachekitError> {
 /// [`CachekitError::Serialization`] if the payload is a CK frame, is not valid
 /// MessagePack, or has trailing bytes after the first document.
 pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError> {
+    reject_ck_frame(bytes)?;
+    decode(crate::serializer::bounded_deserializer(bytes)?)
+}
+
+/// [`deserialize`] for a payload a read returned: a marked payload skips the
+/// walk (see `crate::serializer::Payload`).
+pub(crate) fn deserialize_payload<T: DeserializeOwned>(
+    payload: &crate::serializer::Payload,
+) -> Result<T, CachekitError> {
+    reject_ck_frame(payload.bytes())?;
+    decode(payload.deserializer()?)
+}
+
+fn reject_ck_frame(bytes: &[u8]) -> Result<(), CachekitError> {
     if bytes.starts_with(b"CK") {
         return Err(CachekitError::Serialization(
             "payload starts with 0x43 0x4B (\"CK\"): this is a Python-SDK-internal auto-mode \
@@ -396,8 +410,12 @@ pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError
                 .to_owned(),
         ));
     }
+    Ok(())
+}
 
-    let mut de = crate::serializer::bounded_deserializer(bytes)?;
+fn decode<T: DeserializeOwned>(
+    mut de: crate::serializer::SliceDeserializer<'_>,
+) -> Result<T, CachekitError> {
     T::deserialize(&mut de)
         .map_err(|e| CachekitError::Serialization(format!("interop decode: {e}")))
 }

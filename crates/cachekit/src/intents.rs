@@ -512,6 +512,7 @@ mod secure_tests {
                 .as_ref()
                 .expect("secure preset enables L1")
                 .get_shared(CACHE_KEY)
+                .map(|payload| payload.bytes().clone())
                 .as_deref(),
             Some(stored.as_slice()),
             "L1 holds the same ciphertext as the backend"
