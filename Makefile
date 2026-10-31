@@ -52,13 +52,14 @@ test-wasm:
 # judged on. BASE=<a copy of the example built at the base commit> compares two
 # builds and exits 1 when a case regresses past its noise floor (2 when it
 # measured nothing: bad flag, empty filter, valgrind failure); FILTER=<text>
-# narrows the cases (e.g. FILTER=l2_hit).
+# narrows the cases (e.g. FILTER=l2_hit); JOBS=<n> measures n cases at a time.
+# CI's `perf-ir` job runs the same comparison on every PR.
 bench:
 	$(CARGO) run --release --example bench_hot_path -- wall $(if $(FILTER),'$(FILTER)')
 
 bench-instr:
 	$(CARGO) build --release --example bench_hot_path
-	target/release/examples/bench_hot_path instr $(if $(BASE),--base '$(BASE)') $(if $(FILTER),'$(FILTER)')
+	target/release/examples/bench_hot_path instr $(if $(JOBS),--jobs '$(JOBS)') $(if $(BASE),--base '$(BASE)') $(if $(FILTER),'$(FILTER)')
 
 # Supply-chain gate — deny is identical to CI's; audit runs the strict form
 # (`--deny yanked`, which CI applies only on the weekly schedule run), so a

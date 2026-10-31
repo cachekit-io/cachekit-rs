@@ -227,3 +227,176 @@ jobs:
         # summary reports every test passed, because the runner can exit 0
         # when a test never completes (see the Makefile).
         run: make test-wasm
+
+  # Instruction counts of the client hot path (`make bench-instr`,
+  # examples/bench_hot_path.rs) on every PR, against the commit it merges
+  # into. Counts move with the CPU, rustc and valgrind, so nothing committed
+  # is compared: this job builds the PR (the merge commit checked out here)
+  # and its base side by side and measures both on this runner. A
+  # release-please PR is measured against the last release tag instead: it
+  # is rebased onto main on every push, so against main it would measure
+  # only a version bump. Each tree builds into its own target dir: in a
+  # shared one, cargo's mtime check can reuse one tree's build for the other
+  # and compare a binary against itself. Both trees build the PR's copy of
+  # the example, so both sides run one workload; a PR whose example calls
+  # API the base lacks cannot be compared and reads INCOMPLETE.
+  perf-ir:
+    name: Instruction counts vs base
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      report: ${{ steps.report.outputs.report }}
+    steps:
+      # The report reads INCOMPLETE until the gate writes its own over it, so
+      # a job that dies before measuring never reads as a pass.
+      - name: Start with no verdict
+        run: |
+          mkdir -p "$RUNNER_TEMP/ir"
+          printf '### Instruction counts: INCOMPLETE\n\nThe gate wrote no report: the job stopped before measuring. See the job log.\n' \
+            > "$RUNNER_TEMP/ir/report.md"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 2 # the merge commit and its first parent, the base tip
+
+      - name: Pick the base
+        id: base
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [[ $HEAD_REF != release-please--* ]]; then
+            sha=$(git rev-parse HEAD^1)
+            label="$sha"
+          else
+            version=$(git show HEAD^1:.release-please-manifest.json | jq -er '."crates/cachekit"') || {
+              echo "::error::release PR: no crates/cachekit version in the base's .release-please-manifest.json"
+              exit 1
+            }
+            tag="cachekit-rs-v$version"
+            # Never fall back to main: that would measure nothing and pass.
+            git fetch --quiet --no-tags --depth=1 origin "refs/tags/$tag:refs/tags/$tag" || {
+              echo "::error::release PR: cannot fetch the last release tag $tag"
+              exit 1
+            }
+            sha=$(git rev-parse "$tag^{commit}")
+            label="$tag ($sha), the last release"
+          fi
+          echo "Base: $label"
+          {
+            echo "sha=$sha"
+            echo "label=$label"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the PR and its base
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/ir/head" HEAD
+          git worktree add --detach "$RUNNER_TEMP/ir/base" "$BASE_SHA"
+          cp "$RUNNER_TEMP/ir/head/crates/cachekit/examples/bench_hot_path.rs" \
+            "$RUNNER_TEMP/ir/base/crates/cachekit/examples/bench_hot_path.rs"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          key: perf-ir
+          workspaces: |
+            ${{ runner.temp }}/ir/head -> ../head-target
+            ${{ runner.temp }}/ir/base -> ../base-target
+
+      - name: Install valgrind
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends valgrind
+          valgrind --version
+
+      - name: Build the PR and its base
+        env:
+          BASE_LABEL: ${{ steps.base.outputs.label }}
+        run: |
+          (cd "$RUNNER_TEMP/ir/head" && CARGO_TARGET_DIR=../head-target cargo build --locked --release --example bench_hot_path)
+          (cd "$RUNNER_TEMP/ir/base" && CARGO_TARGET_DIR=../base-target cargo build --locked --release --example bench_hot_path) || {
+            {
+              echo '### Instruction counts: INCOMPLETE'
+              echo
+              echo "Not comparable: the PR's \`examples/bench_hot_path.rs\` does not build against the base, $BASE_LABEL. It may call API the base lacks."
+            } > "$RUNNER_TEMP/ir/report.md"
+            exit 1
+          }
+
+      - name: Gate the PR against its base
+        run: |
+          "$RUNNER_TEMP/ir/head-target/release/examples/bench_hot_path" instr --jobs "$(nproc)" \
+            --base "$RUNNER_TEMP/ir/base-target/release/examples/bench_hot_path" --report "$RUNNER_TEMP/ir/report.md"
+
+      # The report for perf-ir-comment, and for the run summary, where a fork
+      # PR (which gets no comment) can read it.
+      - name: Hand over the report
+        id: report
+        if: always()
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_LABEL: ${{ steps.base.outputs.label }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body="$RUNNER_TEMP/ir/body.md"
+          {
+            cat "$RUNNER_TEMP/ir/report.md"
+            echo
+            echo "PR head \`$HEAD_SHA\` merged into its base, measured against \`${BASE_LABEL:-no base}\` on the same runner. [Workflow run]($RUN_URL)"
+          } > "$body"
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+          delimiter="EOF_$(openssl rand -hex 16)"
+          {
+            echo "report<<$delimiter"
+            cat "$body"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+  # perf-ir's report as one PR comment, edited in place on every run. This job
+  # holds the write token and never checks out the repository. Fork PRs are
+  # skipped: their token cannot write to the PR. A run whose head is no longer
+  # the PR's head posts nothing, so a slow older run cannot overwrite a newer
+  # run's comment.
+  perf-ir-comment:
+    name: Instruction counts comment
+    needs: perf-ir
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write # enough for a PR's issue comments
+    steps:
+      - name: Post or update the PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ needs.perf-ir.outputs.report }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          current=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .head.sha)
+          if [[ $current != "$HEAD_SHA" ]]; then
+            echo "The PR head moved to $current; the run for that head owns the comment."
+            exit 0
+          fi
+          if [[ -z $REPORT ]]; then
+            REPORT=$(printf '### Instruction counts: INCOMPLETE\n\nThe gate job handed over no report. [Workflow run](%s)' "$RUN_URL")
+          fi
+          # Only the bot's own comment that opens with the marker is edited.
+          marker='<!-- cachekit-instruction-counts -->'
+          body=$(printf '%s\n%s\n' "$marker" "$REPORT")
+          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id")
+          id=${ids%%$'\n'*}
+          if [[ -n $id ]]; then
+            jq -n --arg body "$body" '{body: $body}' | gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" --input - > /dev/null
+          else
+            jq -n --arg body "$body" '{body: $body}' | gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --input - > /dev/null
+          fi

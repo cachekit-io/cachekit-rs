@@ -12,7 +12,7 @@
 //! bench_hot_path run <case> <size> <iters>     one case; indicative wall ns/op
 //! bench_hot_path wall [filter]                 every case; indicative wall ns/op
 //! bench_hot_path readme                        the README's Performance table
-//! bench_hot_path instr [--runs N] [--base BIN] [filter]
+//! bench_hot_path instr [--runs N] [--jobs N] [--base BIN [--report FILE]] [filter]
 //! ```
 //!
 //! `instr` runs each case `N` times (default 5) under
@@ -20,18 +20,23 @@
 //! so only the timed loop is counted and setup needs no differencing. It
 //! reports the median instructions per op and the run-to-run spread. With
 //! `--base`, it runs a second build of this example interleaved (ABBA) and
-//! calls a delta only when it beats `max(3 x spread, 0.5%)`. Exit codes: 1 when
-//! any case got slower by that much; 2 when nothing was measured (an unknown
-//! flag, a filter matching no case, or valgrind failing). Wall time is printed
-//! for orientation and is never a measured saving.
+//! calls a delta only when it beats `max(3 x spread, 0.5%)`; `delete` cases
+//! are reported but never fail (see [`UNGATED`]). `--report` writes the
+//! verdict as Markdown, for CI's PR comment, and `--jobs` measures that many
+//! cases at a time. Exit codes: 1 when any gated case got slower by that much;
+//! 2 when nothing was measured or the run stopped part way (an unknown flag, a
+//! filter matching no case, or valgrind failing). Wall time is printed for
+//! orientation and is never a measured saving.
 
 #![allow(clippy::print_stdout)]
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::hint::black_box;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -440,6 +445,22 @@ fn readme() -> Result<bool, String> {
 
 // ── Instruction counting ─────────────────────────────────────────────────────
 
+/// The smallest delta `instr --base` calls. A case whose runs disagree gets
+/// `3 x` its spread instead, when that is larger.
+const MIN_FLOOR: f64 = 0.005;
+
+/// Ops measured and reported but never failed. A delete takes the per-key
+/// mutation lock, whose map is seeded afresh in each process, so its count
+/// spreads by up to about 10% between runs of one build and its floor would
+/// hide any regression worth catching.
+const UNGATED: [&str; 1] = ["delete"];
+
+/// `instr --base` verdicts, in the order `--report` lists them.
+const SLOWER: &str = "SLOWER";
+const SLOWER_UNGATED: &str = "slower, not gated";
+const FASTER: &str = "faster";
+const NOISE: &str = "within noise";
+
 fn instructions(
     bin: &str,
     case: &str,
@@ -496,9 +517,229 @@ fn spread(v: &[f64]) -> f64 {
     (hi - lo) / median(v)
 }
 
+/// Ir/op of `runs` runs of one case under each of `bins`. Runs interleave ABBA,
+/// alternating which build goes first, so drift cancels.
+fn measure(
+    bins: &[&str],
+    case: &str,
+    size: usize,
+    runs: usize,
+    seq: &AtomicUsize,
+) -> Result<Vec<Vec<f64>>, String> {
+    let iters = instr_iters(size);
+    let mut out = vec![Vec::new(); bins.len()];
+    for r in 0..runs {
+        let mut order: Vec<usize> = (0..bins.len()).collect();
+        if r % 2 == 1 {
+            order.reverse();
+        }
+        for i in order {
+            let n = seq.fetch_add(1, Ordering::Relaxed);
+            out[i].push(instructions(bins[i], case, size, iters, n)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Copies of the base and head builds at paths of equal length, removed on
+/// drop. The path is the measured process's `argv[0]`, and its length moves
+/// the stack and heap layout: the same binary run from a shorter path counted
+/// 6 instructions more per `exists` op (+0.8%), every run.
+struct Staged {
+    dir: PathBuf,
+    base: String,
+    head: String,
+}
+
+impl Staged {
+    fn new(base: &str, head: &str) -> Result<Self, String> {
+        let dir = std::env::temp_dir().join(format!("bench_hot_path.{}", std::process::id()));
+        let stage = Self {
+            base: dir.join("base/bench_hot_path").display().to_string(),
+            head: dir.join("head/bench_hot_path").display().to_string(),
+            dir,
+        };
+        for (from, to) in [(base, &stage.base), (head, &stage.head)] {
+            let to = Path::new(to);
+            std::fs::create_dir_all(to.parent().unwrap_or(&stage.dir))
+                .and_then(|()| std::fs::copy(from, to))
+                .map_err(|e| format!("cannot copy {from} to {}: {e}", to.display()))?;
+        }
+        Ok(stage)
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// One case of `instr --base`.
+struct Compared {
+    case: String,
+    size: usize,
+    base: f64,
+    head: f64,
+    delta: f64,
+    floor: f64,
+    verdict: &'static str,
+}
+
+impl Compared {
+    fn new(case: &str, size: usize, base: &[f64], head: &[f64]) -> Self {
+        let (mb, mh) = (median(base), median(head));
+        let delta = (mh - mb) / mb;
+        let floor = (3.0 * spread(base).max(spread(head))).max(MIN_FLOOR);
+        let op = case.split('/').next().unwrap_or(case);
+        let verdict = if delta.abs() < floor {
+            NOISE
+        } else if delta < 0.0 {
+            FASTER
+        } else if UNGATED.contains(&op) {
+            SLOWER_UNGATED
+        } else {
+            SLOWER
+        };
+        Self {
+            case: case.to_owned(),
+            size,
+            base: mb,
+            head: mh,
+            delta,
+            floor,
+            verdict,
+        }
+    }
+}
+
+/// Run `f` on every case, `jobs` cases at a time. `progress` sees the results
+/// so far after each case lands. The first error stops new cases from
+/// starting; it comes back with every result measured before the stop.
+fn each_case<T: Send>(
+    all: &[(String, usize)],
+    jobs: usize,
+    f: impl Fn(&str, usize) -> Result<T, String> + Sync,
+    progress: impl Fn(&[Option<T>]) + Sync,
+) -> (Vec<Option<T>>, Option<String>) {
+    let next = AtomicUsize::new(0);
+    let error: Mutex<Option<String>> = Mutex::new(None);
+    let results: Mutex<Vec<Option<T>>> = Mutex::new(all.iter().map(|_| None).collect());
+    std::thread::scope(|s| {
+        for _ in 0..jobs {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= all.len() || lock(&error).is_some() {
+                    break;
+                }
+                let (case, size) = &all[i];
+                match f(case, *size) {
+                    Ok(v) => {
+                        let mut r = lock(&results);
+                        r[i] = Some(v);
+                        progress(&r);
+                    }
+                    Err(e) => {
+                        lock(&error).get_or_insert(e);
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let results = results.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let error = error.into_inner().unwrap_or_else(PoisonError::into_inner);
+    (results, error)
+}
+
+/// A worker that panicked poisons the lock; the scope re-raises its panic, so
+/// the run ends either way.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `instr --report`: the verdict, and every case that needs a look, as
+/// Markdown for a PR comment. A case not measured, because the run is still
+/// going or stopped, reads "no result" and makes the verdict INCOMPLETE: a
+/// missing case can hide a regression, so it never reads as PASS.
+fn render(all: &[(String, usize)], rows: &[Option<Compared>], error: Option<&str>) -> String {
+    let measured: Vec<&Compared> = rows.iter().flatten().collect();
+    let verdict = if measured.iter().any(|c| c.verdict == SLOWER) {
+        "FAIL"
+    } else if measured.len() < all.len() {
+        "INCOMPLETE"
+    } else {
+        "PASS"
+    };
+    let mut out = format!(
+        "### Instruction counts: {verdict}\n\n{} of {} cases measured.",
+        measured.len(),
+        all.len()
+    );
+    if let Some(e) = error {
+        out += &format!(" The run stopped: {e}.");
+    }
+    out += &format!(
+        " A case fails when it is slower than the base by its floor or more: the larger of \
+         {:.1}% and 3 x the run-to-run spread either build showed. `{}` cases are reported, \
+         never failed: their count moves with a hash seed drawn in each process.\n\n",
+        100.0 * MIN_FLOOR,
+        UNGATED.join("`, `")
+    );
+    let head =
+        "| Verdict | Case | Base Ir/op | Head Ir/op | Delta | Floor |\n|---|---|--:|--:|--:|--:|\n";
+    let line = |c: &Compared| {
+        let v = if c.verdict == SLOWER {
+            "**SLOWER**"
+        } else {
+            c.verdict
+        };
+        format!(
+            "| {v} | `{}/{}` | {:.0} | {:.0} | {:+.2}% | {:.2}% |\n",
+            c.case,
+            c.size,
+            c.base,
+            c.head,
+            100.0 * c.delta,
+            100.0 * c.floor
+        )
+    };
+    let mut look = String::new();
+    for c in measured.iter().filter(|c| c.verdict == SLOWER) {
+        look += &line(c);
+    }
+    for ((case, size), _) in all.iter().zip(rows).filter(|(_, r)| r.is_none()) {
+        look += &format!("| **no result** | `{case}/{size}` | | | | |\n");
+    }
+    for v in [SLOWER_UNGATED, FASTER] {
+        for c in measured.iter().filter(|c| c.verdict == v) {
+            look += &line(c);
+        }
+    }
+    if !look.is_empty() {
+        out += head;
+        out += &look;
+        out += "\n";
+    }
+    let quiet: Vec<_> = measured.iter().filter(|c| c.verdict == NOISE).collect();
+    if !quiet.is_empty() {
+        out += &format!(
+            "<details><summary>{} cases within noise</summary>\n\n{head}",
+            quiet.len()
+        );
+        for c in quiet {
+            out += &line(c);
+        }
+        out += "\n</details>\n";
+    }
+    out
+}
+
 fn instr(args: &[String]) -> Result<bool, String> {
     let mut runs = 5usize;
+    let mut jobs = 1usize;
     let mut base: Option<String> = None;
+    let mut report: Option<String> = None;
     let mut filter: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -509,7 +750,15 @@ fn instr(args: &[String]) -> Result<bool, String> {
                     .and_then(|v| v.parse().ok())
                     .ok_or("--runs needs a number")?
             }
+            "--jobs" => {
+                jobs = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| *n > 0)
+                    .ok_or("--jobs needs a number above 0")?
+            }
             "--base" => base = Some(it.next().ok_or("--base needs a binary path")?.clone()),
+            "--report" => report = Some(it.next().ok_or("--report needs a file path")?.clone()),
             f if f.starts_with("--") => return Err(format!("unknown flag {f}")),
             f => filter = Some(f.to_owned()),
         }
@@ -522,69 +771,78 @@ fn instr(args: &[String]) -> Result<bool, String> {
         .display()
         .to_string();
     let all = cases(filter.as_deref())?;
-    let mut regressed = false;
-    let mut seq = 0;
-    match &base {
-        None => println!("{:16} {:>6} {:>12} {:>9}", "case", "size", "Ir/op", "A/A"),
-        Some(_) => println!(
-            "{:16} {:>6} {:>12} {:>12} {:>8} {:>8}  verdict",
-            "case", "size", "base Ir/op", "cand Ir/op", "delta", "floor"
-        ),
-    }
-    for (case, size) in all {
-        let iters = instr_iters(size);
-        let (mut a, mut b) = (Vec::new(), Vec::new());
-        for r in 0..runs {
-            seq += 1;
-            let Some(base) = &base else {
-                b.push(instructions(&me, &case, size, iters, seq)?);
-                continue;
-            };
-            // ABBA: alternate which build goes first, so drift cancels.
-            let order = if r % 2 == 0 {
-                [base.as_str(), me.as_str()]
-            } else {
-                [me.as_str(), base.as_str()]
-            };
-            for bin in order {
-                let v = instructions(bin, &case, size, iters, seq)?;
-                if bin == base.as_str() {
-                    a.push(v)
-                } else {
-                    b.push(v)
-                }
-            }
+    let seq = AtomicUsize::new(0);
+    // Rows print as cases finish, so with --jobs above 1 they come out of order.
+    let Some(base) = base else {
+        if report.is_some() {
+            return Err("--report needs --base: it reports a comparison".into());
         }
-        if base.is_none() {
-            println!(
-                "{case:16} {size:>6} {:>12.0} {:>8.3}%",
-                median(&b),
-                100.0 * spread(&b)
-            );
-            continue;
-        }
-        let (ma, mb) = (median(&a), median(&b));
-        let delta = (mb - ma) / ma;
-        let floor = (3.0 * spread(&a).max(spread(&b))).max(0.005);
-        let verdict = if delta.abs() < floor {
-            "within noise"
-        } else if delta < 0.0 {
-            "faster"
-        } else {
-            regressed = true;
-            "SLOWER"
-        };
-        println!(
-            "{case:16} {size:>6} {ma:>12.0} {mb:>12.0} {:>+7.2}% {:>7.2}%  {verdict}",
-            100.0 * delta,
-            100.0 * floor
+        println!("{:16} {:>6} {:>12} {:>9}", "case", "size", "Ir/op", "A/A");
+        let (_, error) = each_case(
+            &all,
+            jobs,
+            |case, size| {
+                let v = measure(&[&me], case, size, runs, &seq)?;
+                let (m, s) = (median(&v[0]), spread(&v[0]));
+                println!("{case:16} {size:>6} {m:>12.0} {:>8.3}%", 100.0 * s);
+                Ok(())
+            },
+            |_| {},
         );
+        return error.map_or(Ok(true), Err);
+    };
+    let stage = Staged::new(&base, &me)?;
+    let (base, me) = (stage.base.as_str(), stage.head.as_str());
+    let write = |rows: &[Option<Compared>], error: Option<&str>| match &report {
+        // Write then rename, so a run killed mid-write leaves the last whole
+        // report rather than an empty file.
+        Some(path) => {
+            let part = format!("{path}.part");
+            std::fs::write(&part, render(&all, rows, error))
+                .and_then(|()| std::fs::rename(&part, path))
+                .map_err(|e| format!("cannot write the report to {path}: {e}"))
+        }
+        None => Ok(()),
+    };
+    // Written before the first case and after each one, so a run killed part
+    // way (a timeout) leaves a report that reads INCOMPLETE.
+    let none: Vec<Option<Compared>> = all.iter().map(|_| None).collect();
+    write(&none, None)?;
+    println!(
+        "{:16} {:>6} {:>12} {:>12} {:>8} {:>8}  verdict",
+        "case", "size", "base Ir/op", "cand Ir/op", "delta", "floor"
+    );
+    let (rows, error) = each_case(
+        &all,
+        jobs,
+        |case, size| {
+            let v = measure(&[base, me], case, size, runs, &seq)?;
+            let c = Compared::new(case, size, &v[0], &v[1]);
+            println!(
+                "{case:16} {size:>6} {:>12.0} {:>12.0} {:>+7.2}% {:>7.2}%  {}",
+                c.base,
+                c.head,
+                100.0 * c.delta,
+                100.0 * c.floor,
+                c.verdict
+            );
+            Ok(c)
+        },
+        |rows| {
+            if let Err(e) = write(rows, None) {
+                eprintln!("bench_hot_path: {e}");
+            }
+        },
+    );
+    write(&rows, error.as_deref())?;
+    match error {
+        Some(e) => Err(e),
+        None => Ok(!rows.iter().flatten().any(|c| c.verdict == SLOWER)),
     }
-    Ok(!regressed)
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: bench_hot_path list | run <case> <size> <iters> | wall [filter] | readme | instr [--runs N] [--base BIN] [filter]");
+    eprintln!("usage: bench_hot_path list | run <case> <size> <iters> | wall [filter] | readme | instr [--runs N] [--jobs N] [--base BIN [--report FILE]] [filter]");
     ExitCode::from(2)
 }
 

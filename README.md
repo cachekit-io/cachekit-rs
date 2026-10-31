@@ -807,14 +807,28 @@ make bench-instr BASE=../bench-base FILTER=l2_hit   # A/B against another build
 Wall time on a shared machine moves by tens of percent between runs, so
 `bench-instr` is the number a change is judged on. It counts only the timed
 loop (`--toggle-collect`), on a single-threaded tokio runtime, five runs per
-case, and reports the median and the spread. For an A/B, build the example at
-the base commit, copy `target/release/examples/bench_hot_path` outside
-`target/`, and pass it as `BASE`; the runs interleave ABBA, a delta counts only
-when it beats `max(3 × spread, 0.5%)`, and the target exits 1 when a case got
-slower by more than that, or 2 when it measured nothing (an unknown flag, a
-filter that matches no case, a valgrind failure). Most cases repeat within 0.8%; the `delete` cases
-spread more (up to about 10%, from the per-key mutation lock map, a hash table seeded afresh in
-each process), so their floor is wider.
+case, and reports the median and the spread. `JOBS=<n>` measures n cases at a
+time; counts do not depend on it. For an A/B, build the example at the base
+commit, copy `target/release/examples/bench_hot_path` outside `target/`, and
+pass it as `BASE`. The example copies both builds to paths of equal length
+before it measures them, because the length of a binary's path moves its
+counts (by 6 instructions per `exists` op). The runs interleave ABBA, a delta
+counts only when it beats `max(3 × spread, 0.5%)`, and the target exits 1 when
+a case got slower by more than that, or 2 when it measured nothing (an unknown
+flag, a filter that matches no case, a valgrind failure). Most cases repeat
+exactly; the `l2_hit` cases spread by up to about 1.2%, and the `delete` cases
+by up to about 10%, from the single-flight and per-key mutation lock maps,
+hash tables seeded afresh in each process. Their floors are wider, and
+`delete` is reported but never fails the comparison: a floor that wide would
+hide any regression worth catching.
+
+CI runs this comparison on every pull request (the **Instruction counts vs
+base** check): it builds the pull request and the commit it merges into, each
+in its own target directory, measures both on the same runner, and posts the
+verdict as one comment it edits in place. A case it did not measure reads
+INCOMPLETE, never PASS. A release pull request is measured against the last
+release tag instead. The check is not required: a deliberate cost increase is
+accepted at review.
 
 **Client wall time** — `examples/wall_time_probe.rs` times `CacheKit` calls
 against the cachekit.io dev endpoint and writes one JSON object per request. It runs
