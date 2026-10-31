@@ -285,7 +285,7 @@ async fn macro_self_heals_undecodable_entry() {
 }
 
 #[tokio::test]
-async fn macro_key_delegates_to_interop_key() {
+async fn macro_key_matches_interop_key() {
     // The macro must mint EXACTLY interop_key(namespace, operation, args),
     // operation being the `interop` attribute: that is what makes the same
     // entry addressable from the Python/TS SDKs. The macro calls

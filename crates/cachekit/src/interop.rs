@@ -319,23 +319,29 @@ pub fn interop_key(
     operation: &str,
     args: &[InteropValue],
 ) -> Result<String, CachekitError> {
-    validate_segment("namespace", namespace)?;
-    validate_segment("operation", operation)?;
-
-    let mut key = String::with_capacity(namespace.len() + operation.len() + 2 + ARGS_HASH_LEN);
-    key.push_str(namespace);
-    key.push(':');
-    key.push_str(operation);
-    key.push(':');
-    push_args_hash(key, args)
+    push_args_hash(checked_prefix(namespace, operation)?, args)
 }
 
 /// Length of `args_hash`: a 32-byte digest in hex.
 const ARGS_HASH_LEN: usize = 64;
 
-/// Append `args_hash` to `key`, which holds `{namespace}:{operation}:` and
-/// room for the hash. The one implementation of the hash segment, shared by
-/// [`interop_key`] and [`__KeyPrefix::key`], so both mint the same bytes.
+/// `{namespace}:{operation}:` once both segments pass [`validate_segment`],
+/// with room for the hash. With [`push_args_hash`], the one implementation of
+/// the key, shared by [`interop_key`] and [`__KeyPrefix::key`], so both mint
+/// the same bytes and the same errors.
+fn checked_prefix(namespace: &str, operation: &str) -> Result<String, CachekitError> {
+    validate_segment("namespace", namespace)?;
+    validate_segment("operation", operation)?;
+    let mut prefix = String::with_capacity(namespace.len() + operation.len() + 2 + ARGS_HASH_LEN);
+    prefix.push_str(namespace);
+    prefix.push(':');
+    prefix.push_str(operation);
+    prefix.push(':');
+    Ok(prefix)
+}
+
+/// Append `args_hash` to `key`, which holds a [`checked_prefix`] and room for
+/// the hash.
 fn push_args_hash(mut key: String, args: &[InteropValue]) -> Result<String, CachekitError> {
     const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
     let digest = Blake2b256::digest(canonical_args(args)?);
@@ -346,10 +352,11 @@ fn push_args_hash(mut key: String, args: &[InteropValue]) -> Result<String, Cach
             HEX_DIGITS[usize::from(byte & 0x0f)],
         ];
     }
-    // Every byte is an ASCII hex digit, so this cannot fail.
-    let hex = std::str::from_utf8(&hex).map_err(|e| {
-        CachekitError::Serialization(format!("args_hash digits are not UTF-8: {e}"))
-    })?;
+    // Every byte is an ASCII hex digit, so this cannot fail. Kept as an error,
+    // not a panic or a lossy conversion: a key with a broken hash must never
+    // be minted.
+    let hex = std::str::from_utf8(&hex)
+        .map_err(|e| CachekitError::InvalidKey(format!("args_hash digits are not UTF-8: {e}")))?;
     key.push_str(hex);
     Ok(key)
 }
@@ -393,10 +400,8 @@ impl<'a> __KeyPrefix<'a> {
         let prefix = match self.prefix.get() {
             Some(prefix) => prefix,
             None => {
-                validate_segment("namespace", self.namespace)?;
-                validate_segment("operation", self.operation)?;
-                self.prefix
-                    .get_or_init(|| format!("{}:{}:", self.namespace, self.operation))
+                let checked = checked_prefix(self.namespace, self.operation)?;
+                self.prefix.get_or_init(|| checked)
             }
         };
         let mut key = String::with_capacity(prefix.len() + ARGS_HASH_LEN);
@@ -416,7 +421,7 @@ impl<'a> __KeyPrefix<'a> {
 /// [`CachekitError::Serialization`] for out-of-model values (see [`interop_key`]).
 pub fn canonical_args(args: &[InteropValue]) -> Result<Vec<u8>, CachekitError> {
     // Most argument lists encode in under 64 bytes: one allocation, where
-    // growing from empty took three.
+    // growing from empty took up to four (8, 16, 32, 64 bytes).
     let mut buf = Vec::with_capacity(64);
     encode_array_header(&mut buf, args.len())?;
     for arg in args {
