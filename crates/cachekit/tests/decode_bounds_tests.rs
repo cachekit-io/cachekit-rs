@@ -147,11 +147,9 @@ fn every_reject_vector_is_rejected_by_the_guard_on_every_read_path() {
 /// hostile entry must never be marked: the read that fetches it fails, and so
 /// does the next read of the key, which L1 serves.
 ///
-/// The reject vectors alone cannot catch a wrong mark: a marked decode keeps
-/// rmp-serde's depth limit and falls back to the walked decode when it fails,
-/// so a depth or overclaim vector still ends in the guard's error. A document
-/// with a trailing byte is the case a skipped walk would accept, so it is the
-/// one that proves the mark.
+/// A marked decode skips the walk, so a wrong mark shows as a reject vector
+/// that decodes, or fails with rmp-serde's error instead of the guard's. A
+/// document with a trailing byte would decode outright.
 #[cfg(feature = "l1")]
 #[test]
 fn a_hostile_entry_fails_from_the_backend_and_again_from_l1() {
@@ -197,10 +195,9 @@ fn every_accept_vector_decodes_from_the_backend_and_from_l1() {
     });
 }
 
-/// A value this process writes is marked walked in L1 without being walked,
-/// so the marked decode must enforce the depth bound itself: one level past
-/// it fails from L1 with the guard's error, exactly as it does from the
-/// backend, and the bound itself decodes.
+/// A value this process writes is walked when L1 admits it, so one level past
+/// the bound is never marked and fails from L1 with the guard's error, as it
+/// does from the backend, and the bound itself decodes.
 #[cfg(feature = "l1")]
 #[test]
 fn an_own_write_past_the_depth_bound_fails_from_l1() {
@@ -229,6 +226,42 @@ fn an_own_write_past_the_depth_bound_fails_from_l1() {
                     assert_guard_rejected("own write", "CacheKit::get (L1)", read);
                 }
             }
+        });
+    });
+}
+
+/// rmp-serde's depth limit does not count an enum's variant map, so it does
+/// not bound a recursive enum: only the walk does. A value this process wrote
+/// gets no pass on that. 60 levels of `List` are 120 MessagePack levels, which
+/// the walk rejects from L1 as from the backend; rmp-serde alone counts 60
+/// arrays and would decode them, and a few thousand levels overflow the stack.
+#[cfg(feature = "l1")]
+#[test]
+fn an_own_write_of_a_deep_recursive_enum_fails_from_l1() {
+    #[derive(serde::Serialize, Deserialize)]
+    enum Node {
+        Leaf(i64),
+        List(Vec<Node>),
+    }
+    on_default_stack(|| {
+        let client = cachekit::CacheKit::builder()
+            .backend(common::MockBackend::shared())
+            .l1_capacity(16)
+            .build()
+            .expect("client builds");
+        let mut value = Node::Leaf(0);
+        for _ in 0..60 {
+            value = Node::List(vec![value]);
+        }
+        common::runtime().block_on(async {
+            client.set("enum", &value).await.expect("set");
+            let read = client
+                .get::<Node>("enum")
+                .await
+                .map(|v| v.expect("written"))
+                .map(|_| Json::Null);
+            assert_eq!(client.stats().l1_hits, 1, "L1 served it");
+            assert_guard_rejected("own enum write", "CacheKit::get (L1)", read);
         });
     });
 }

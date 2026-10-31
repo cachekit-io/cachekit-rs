@@ -359,8 +359,6 @@ impl CacheKit {
     }
 
     /// Populate L1 from an L2 hit, for no longer than [`l1_backfill_ttl`] allows.
-    /// `payload` comes from [`Self::admit_backend_bytes`], so it is marked
-    /// walked only if it passed the walk.
     #[cfg(feature = "l1")]
     fn l1_backfill(&self, full_key: &str, payload: Payload, freshness: Freshness) {
         if let (Some(l1), Some(ttl)) = (&self.l1, l1_backfill_ttl(self.default_ttl, freshness)) {
@@ -368,13 +366,14 @@ impl CacheKit {
         }
     }
 
-    /// Bytes a backend returned, as a read admits them. A client without
-    /// encryption walks them here, before the L1 backfill, so the backfilled
-    /// copy is marked walked only if they pass, and the caller's decode of
-    /// this read skips a second walk. An encrypting client's bytes are
-    /// ciphertext: they are not MessagePack, and nothing walks them.
+    /// Value bytes as this client admits them, from a backend read or its own
+    /// write to L1. A client without encryption walks them here: a read's
+    /// before the L1 backfill, which runs before any decode, so an L1 copy is
+    /// marked only if it passed, and the read's own decode skips a second
+    /// walk. An encrypting client's bytes are ciphertext: they are not
+    /// MessagePack, and the decrypted plaintext is walked on every read.
     #[cfg_attr(not(feature = "encryption"), allow(clippy::unused_self))]
-    fn admit_backend_bytes(&self, bytes: Bytes) -> Payload {
+    fn admit(&self, bytes: Bytes) -> Payload {
         #[cfg(feature = "encryption")]
         if self.encryption.is_some() {
             return Payload::unwalked(bytes);
@@ -389,14 +388,14 @@ impl CacheKit {
     /// `None`, from [`Self::share_with_l1`] on a client without an L1, does
     /// nothing.
     #[cfg_attr(not(feature = "l1"), allow(clippy::unused_self))]
-    fn l1_set(&self, full_key: &str, payload: Option<Payload>, ttl: Duration) {
+    fn l1_set(&self, full_key: &str, bytes: Option<Bytes>, ttl: Duration) {
         #[cfg(feature = "l1")]
-        if let (Some(l1), Some(payload)) = (&self.l1, payload) {
+        if let (Some(l1), Some(bytes)) = (&self.l1, bytes) {
             let wire = Duration::from_secs(ttl_wire_secs(ttl));
-            l1.set_shared(full_key, payload, ttl.min(wire));
+            l1.set_shared(full_key, self.admit(bytes), ttl.min(wire));
         }
         #[cfg(not(feature = "l1"))]
-        let _ = (full_key, payload, ttl);
+        let _ = (full_key, bytes, ttl);
     }
 
     /// Wrap a write's payload for the backend, plus a handle to the same
@@ -447,7 +446,6 @@ impl CacheKit {
         bytes: Vec<u8>,
         ttl: Duration,
         token: SwrToken,
-        admit: fn(Bytes) -> Payload,
     ) -> Result<bool, CachekitError> {
         Self::validate_ttl(ttl)?;
         self.check_payload_size(bytes.len())?;
@@ -464,7 +462,7 @@ impl CacheKit {
         }
         let (bytes, l1_bytes) = self.share_with_l1(bytes);
         self.backend.set_bytes(&full_key, bytes, Some(ttl)).await?;
-        self.l1_set(&full_key, l1_bytes.map(admit), ttl);
+        self.l1_set(&full_key, l1_bytes, ttl);
         mutation.advance();
         crate::metrics::trace_write(&full_key, ttl);
         Ok(true)
@@ -477,7 +475,6 @@ impl CacheKit {
         _bytes: Vec<u8>,
         _ttl: Duration,
         _token: SwrToken,
-        _admit: fn(Bytes) -> Payload,
     ) -> Result<bool, CachekitError> {
         // `SwrRead::Stale` is unreachable on this build, so there is no
         // versioned entry a caller could legitimately complete.
@@ -760,7 +757,7 @@ impl CacheKit {
         self.check_payload_size(bytes.len())?;
         // Takes over the Vec's allocation: no copy, and L1 shares it below.
         // Walked before the backfill, which runs before any decode.
-        let payload = self.admit_backend_bytes(Bytes::from(bytes));
+        let payload = self.admit(Bytes::from(bytes));
 
         // Populate L1 on L2 hit, bounded by the cap and the server's freshness
         #[cfg(feature = "l1")]
@@ -846,7 +843,7 @@ impl CacheKit {
 
         let (bytes, l1_bytes) = self.share_with_l1(bytes);
         self.backend.set_bytes(&full_key, bytes, Some(ttl)).await?;
-        self.l1_set(&full_key, l1_bytes.map(Payload::written), ttl);
+        self.l1_set(&full_key, l1_bytes, ttl);
 
         crate::metrics::trace_write(&full_key, ttl);
         Ok(())
@@ -868,8 +865,7 @@ impl CacheKit {
             return secure.__complete_swr_refresh(key, value, ttl, token).await;
         }
         let bytes = serializer::serialize(value)?;
-        self.complete_swr_bytes(key, bytes, ttl, token, Payload::written)
-            .await
+        self.complete_swr_bytes(key, bytes, ttl, token).await
     }
 
     /// Delete `key` and return `true` if it existed.
@@ -1213,8 +1209,7 @@ impl SecureCache<'_> {
             .backend
             .set_bytes(&full_key, ciphertext, Some(ttl))
             .await?;
-        self.client
-            .l1_set(&full_key, l1_bytes.map(Payload::unwalked), ttl);
+        self.client.l1_set(&full_key, l1_bytes, ttl);
 
         crate::metrics::trace_write(&full_key, ttl);
         Ok(())
@@ -1232,7 +1227,7 @@ impl SecureCache<'_> {
     ) -> Result<bool, CachekitError> {
         let (_, ciphertext) = self.seal(key, value)?;
         self.client
-            .complete_swr_bytes(key, ciphertext, ttl, token, Payload::unwalked)
+            .complete_swr_bytes(key, ciphertext, ttl, token)
             .await
     }
 
@@ -2123,9 +2118,7 @@ mod secure_l1_tests {
             .unwrap();
         client.l1_set(
             "poisoned-stale",
-            Some(crate::serializer::Payload::unwalked(
-                bytes::Bytes::from_static(b"not ciphertext"),
-            )),
+            Some(bytes::Bytes::from_static(b"not ciphertext")),
             Duration::from_secs(60),
         );
         // Real time, not tokio's paused clock: L1 ages entries by std
@@ -2282,14 +2275,15 @@ mod shared_write_buffer_tests {
     }
 }
 
-/// Which L1 entries carry the walked mark: a plain client's own writes, and
-/// backend bytes only once they pass the walk. Ciphertext never does.
+/// A plain client's L1 entries carry the walked mark once their bytes pass the
+/// walk, whether its own write or a backend read put them there. That a
+/// hostile backend entry stays unmarked is pinned on every read path by
+/// `tests/decode_bounds_tests.rs`.
 #[cfg(all(test, feature = "l1", not(feature = "unsync")))]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // test-only: a failed setup step should panic loudly
 mod walked_mark_tests {
     use super::{CacheKit, SharedBackend};
     use crate::backend::{Backend, MemoryBackend};
-    use crate::error::CachekitError;
 
     fn plain_client() -> (CacheKit, MemoryBackend) {
         let backend = MemoryBackend::default();
@@ -2318,58 +2312,14 @@ mod walked_mark_tests {
     }
 
     #[tokio::test]
-    async fn a_backfill_is_walked_only_if_it_passes_the_walk() {
+    async fn a_backfill_that_passes_the_walk_is_walked() {
         let (client, backend) = plain_client();
         let good = crate::serializer::serialize(&"v").unwrap();
-        // One complete document (fixint 1), then a trailing byte.
-        let trailing = vec![0x01, 0x01];
         backend.set("good", good, None).await.unwrap();
-        backend.set("trailing", trailing, None).await.unwrap();
-
         assert_eq!(
             client.get::<String>("good").await.unwrap().as_deref(),
             Some("v")
         );
-        assert!(walked(&client, "good"), "a document that passes is marked");
-
-        for read in 0..2 {
-            let err = client.get::<u8>("trailing").await.unwrap_err();
-            assert!(
-                matches!(err, CachekitError::Serialization(ref m) if m.contains("trailing byte")),
-                "read {read}: {err:?}"
-            );
-            assert!(
-                !walked(&client, "trailing"),
-                "read {read}: hostile bytes marked"
-            );
-        }
-        let stats = client.stats();
-        assert_eq!((stats.l1_hits, stats.l2_hits), (1, 2), "{stats:?}");
-    }
-
-    #[cfg(feature = "encryption")]
-    #[tokio::test]
-    async fn ciphertext_is_never_walked() {
-        let backend = MemoryBackend::default();
-        let shared: SharedBackend = std::sync::Arc::new(backend.clone());
-        let encrypting = || {
-            CacheKit::builder()
-                .backend(shared.clone())
-                .l1_capacity(16)
-                .encryption_from_bytes(&[7u8; 32], "t")
-                .unwrap()
-                .build()
-                .unwrap()
-        };
-        let writer = encrypting();
-        writer.set("k", &"v").await.unwrap();
-        assert!(!walked(&writer, "k"), "write-through");
-
-        let reader = encrypting();
-        assert_eq!(
-            reader.get::<String>("k").await.unwrap().as_deref(),
-            Some("v")
-        );
-        assert!(!walked(&reader, "k"), "backfill");
+        assert!(walked(&client, "good"));
     }
 }

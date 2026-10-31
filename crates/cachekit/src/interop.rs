@@ -389,6 +389,20 @@ pub fn serialize_value(value: &InteropValue) -> Result<Vec<u8>, CachekitError> {
 /// [`CachekitError::Serialization`] if the payload is a CK frame, is not valid
 /// MessagePack, or has trailing bytes after the first document.
 pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError> {
+    reject_ck_frame(bytes)?;
+    decode(crate::serializer::bounded_deserializer(bytes)?)
+}
+
+/// [`deserialize`] for a payload a read returned: a marked payload skips the
+/// walk (see `crate::serializer::Payload`).
+pub(crate) fn deserialize_payload<T: DeserializeOwned>(
+    payload: &crate::serializer::Payload,
+) -> Result<T, CachekitError> {
+    reject_ck_frame(&payload.bytes)?;
+    decode(payload.deserializer()?)
+}
+
+fn reject_ck_frame(bytes: &[u8]) -> Result<(), CachekitError> {
     if bytes.starts_with(b"CK") {
         return Err(CachekitError::Serialization(
             "payload starts with 0x43 0x4B (\"CK\"): this is a Python-SDK-internal auto-mode \
@@ -396,21 +410,14 @@ pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CachekitError
                 .to_owned(),
         ));
     }
-
-    let mut de = crate::serializer::bounded_deserializer(bytes)?;
-    T::deserialize(&mut de)
-        .map_err(|e| CachekitError::Serialization(format!("interop decode: {e}")))
+    Ok(())
 }
 
-/// [`deserialize`] for a payload a read returned: a marked payload skips the
-/// walk (see `crate::serializer::Payload`). Marked bytes are never a CK frame:
-/// its `0x43` is a complete document, so the frame fails the walk.
-pub(crate) fn deserialize_payload<T: DeserializeOwned>(
-    payload: &crate::serializer::Payload,
+fn decode<T: DeserializeOwned>(
+    mut de: crate::serializer::SliceDeserializer<'_>,
 ) -> Result<T, CachekitError> {
-    payload
-        .decode_walked()
-        .map_or_else(|| deserialize(&payload.bytes), Ok)
+    T::deserialize(&mut de)
+        .map_err(|e| CachekitError::Serialization(format!("interop decode: {e}")))
 }
 
 // ── Canonical encoder ────────────────────────────────────────────────────────

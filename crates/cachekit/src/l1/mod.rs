@@ -10,8 +10,6 @@ use std::time::{Duration, Instant};
 struct L1Entry {
     // Bytes, not Vec: quick_cache's `get` clones the entry, and a refcount
     // bump is cheaper than a deep copy of a payload of up to the 5 MiB cap.
-    // The payload's walked mark is fixed by whoever admits the entry; a read
-    // hands it back unchanged.
     data: Payload,
     ttl: Duration,
     created_at: Instant,
