@@ -10,9 +10,9 @@ readme = "../../README.md"
 homepage = "https://cachekit.io"
 keywords = ["cache", "redis", "encryption", "ttl", "cloudflare-workers"]
 categories = ["caching", "web-programming", "cryptography"]
-# Reads the workspace READMEs from outside this directory, so it cannot build
-# from the published package.
-exclude = ["tests/readme_pin_tests.rs"]
+# Read the workspace READMEs and root Cargo.toml from outside this directory,
+# so they cannot build from the published package.
+exclude = ["tests/readme_pin_tests.rs", "tests/macros_pin_tests.rs"]
 
 # docs.rs builds with default features only unless told otherwise; without this
 # the Redis intent presets (minimal/production/secure) and the optional
@@ -110,8 +110,8 @@ worker = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
 getrandom = { version = "0.2", optional = true, features = ["js"] }
 
-# Optional: proc-macro decorator
-cachekit-macros = { version = "0.13.1", path = "../cachekit-macros", optional = true }
+# Optional: proc-macro decorator. Pinned exactly in the root Cargo.toml.
+cachekit-macros = { workspace = true, optional = true }
 
 # Optional: structured events. `std` only — no `attributes`: the crate uses no
 # `#[instrument]`, so users don't pay for the proc-macro build. Already in the

@@ -8,6 +8,14 @@ rust-version = "1.91"
 license = "MIT"
 repository = "https://github.com/cachekit-io/cachekit-rs"
 
+# Exact, so each cachekit-rs release only ever meets the macros released with
+# it (README: "Why cachekit-macros is pinned exactly"). Declared here because
+# release-please rewrites a member manifest's dependency version to a bare one,
+# dropping the `=`; the marker has the release bump only the number instead
+# (`extra-files` in release-please-config.json).
+[workspace.dependencies]
+cachekit-macros = { version = "=0.13.1", path = "crates/cachekit-macros" } # x-release-please-version
+
 # ── Workspace lints ──────────────────────────────────────────────────────────
 [workspace.lints.rust]
 unsafe_code = "forbid"

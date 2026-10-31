@@ -44,8 +44,9 @@ use cachekit::backend::{Backend, HealthStatus};
 use cachekit::reliability::ReliabilityConfig;
 use cachekit::{BackendError, CacheKit, CachekitError};
 
-const OPS: [&str; 7] = [
+const OPS: [&str; 8] = [
     "l1_hit",
+    "l1_hit_row",
     "l2_hit",
     "set",
     "delete",
@@ -83,6 +84,61 @@ const MACRO_NAMESPACE: &str = "bench.accounts.v2";
 const MACRO_OPERATION: &str = "users.fetch_profile_by_email_and_size";
 const MACRO_EMAIL: &str = "alice@example.com";
 const MACRO_ID: u64 = 42;
+
+/// The value of `l1_hit_row`: a struct of 20 named fields, stored as a
+/// MessagePack map of 20 entries, so a bounds walk, where one runs, covers 41
+/// headers where a `String` value has one. `name` holds the case's `x` string, so the size
+/// still scales the payload.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Row {
+    id: u64,
+    name: String,
+    email: String,
+    active: bool,
+    score: f64,
+    created_at: u64,
+    updated_at: u64,
+    region: String,
+    plan: String,
+    seats: u32,
+    owner_id: u64,
+    org_id: u64,
+    locale: String,
+    timezone: String,
+    verified: bool,
+    mfa: bool,
+    logins: u32,
+    balance: i64,
+    tags: Vec<String>,
+    notes: Option<String>,
+}
+
+impl Row {
+    fn new(name: String) -> Self {
+        Self {
+            id: 42,
+            name,
+            email: "user@example.com".into(),
+            active: true,
+            score: 0.75,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_600,
+            region: "us-east-1".into(),
+            plan: "pro".into(),
+            seats: 12,
+            owner_id: 7,
+            org_id: 9,
+            locale: "en-AU".into(),
+            timezone: "Australia/Sydney".into(),
+            verified: true,
+            mfa: false,
+            logins: 311,
+            balance: -1250,
+            tags: vec!["beta".into(), "eu".into()],
+            notes: None,
+        }
+    }
+}
 
 // ── In-memory backend ────────────────────────────────────────────────────────
 
@@ -191,6 +247,7 @@ struct Bench {
     backend: Arc<MemBackend>,
     keys: Vec<String>,
     value: String,
+    row: Row,
 }
 
 fn client(
@@ -237,6 +294,9 @@ fn is_case(op: &str, mode: &str) -> bool {
         "oneshot" => matches!(mode, "enc" | "prev"),
         "macro_hit" => cfg!(feature = "macros") && !matches!(mode, "prev" | "ns" | "nsenc"),
         "l1_hit" | "l2_hit" => true,
+        // A plaintext decode: the encrypted modes decode decrypted plaintext,
+        // which is walked on every read.
+        "l1_hit_row" => mode == "plain",
         "set" => mode != "prev",
         _ => !matches!(mode, "prev" | "ns" | "nsenc"),
     }
@@ -285,6 +345,7 @@ impl Bench {
             backend,
             keys,
             value: "x".repeat(size),
+            row: Row::new("x".repeat(size)),
         };
         match op {
             // L2 hits need the value in the backend but not in the reader's
@@ -306,6 +367,12 @@ impl Bench {
             _ if mode == "prev" => {
                 let writer = writer(&bench.backend, mode)?;
                 write(&writer, true, &bench.keys[0], &bench.value).await?;
+            }
+            "l1_hit_row" => {
+                bench
+                    .reader
+                    .set_with_ttl(&bench.keys[0], &bench.row, TTL)
+                    .await?;
             }
             _ => write(&bench.reader, bench.enc, &bench.keys[0], &bench.value).await?,
         }
@@ -348,6 +415,12 @@ impl Bench {
                 };
                 drop(black_box(got));
                 Ok(())
+            }
+            "l1_hit_row" => {
+                let got: Option<Row> = self.reader.get(key).await?;
+                got.map(|v| drop(black_box(v))).ok_or_else(|| {
+                    CachekitError::Config(format!("{key}: expected a hit, got a miss"))
+                })
             }
             _ => read(&self.reader, self.enc, key).await,
         }
