@@ -290,6 +290,42 @@ async fn interop_get_fails_closed_on_namespaced_client() {
     );
 }
 
+/// Every operation of a namespaced client addresses `{namespace}:{key}` byte
+/// for byte, so entries written before any change to how the key is built
+/// stay addressable after it. The plain-path twin of `encryption_tests`'
+/// `namespaced_key_and_aad_bytes_are_pinned`.
+#[tokio::test]
+async fn namespaced_key_bytes_are_pinned() {
+    // Colons and multi-byte UTF-8 in the key: it is copied as bytes, unparsed.
+    const KEY: &str = "user:42:ключ";
+    const FULL_KEY: &str = "app1:user:42:ключ";
+    let (shared, backend) = MockBackend::new_with_handle();
+    let client = CacheKit::builder()
+        .backend(shared)
+        .namespace("app1")
+        .no_l1()
+        .build()
+        .expect("client builds");
+
+    client.set(KEY, &1u32).await.expect("set");
+    assert_eq!(
+        backend.store.lock().await.keys().collect::<Vec<_>>(),
+        [FULL_KEY]
+    );
+
+    // A value planted under FULL_KEY is what the client reads.
+    let planted = cachekit::serializer::serialize(&2u32).expect("serialize");
+    backend
+        .store
+        .lock()
+        .await
+        .insert(FULL_KEY.to_owned(), planted);
+    assert_eq!(client.get::<u32>(KEY).await.expect("get"), Some(2));
+    assert!(client.exists(KEY).await.expect("exists"));
+    assert!(client.delete(KEY).await.expect("delete"));
+    assert!(backend.store.lock().await.is_empty());
+}
+
 // ── Write TTL bounds (spec/saas-api.md, TTL Validation Rules) ────────────────
 
 /// A positive sub-second TTL is accepted (the wire ceils it to 1 s); zero is
