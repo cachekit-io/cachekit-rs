@@ -23,7 +23,7 @@ struct MacroArgs {
 /// Compile-time mirror of the interop/v1 segment grammar
 /// (`^[a-z0-9][a-z0-9._-]{0,63}$` — see `cachekit::interop`'s
 /// `validate_segment`, the canonical implementation). Duplicated because a
-/// proc-macro crate cannot depend on the runtime crate; `interop_key`
+/// proc-macro crate cannot depend on the runtime crate; `__KeyPrefix`
 /// re-validates at runtime, so drift fails loudly, never silently. The `..`
 /// ban and the reserved-namespace check are mirrored in `parse_segment`.
 fn segment_is_valid(segment: &str) -> bool {
@@ -555,15 +555,23 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
         {
             // interop/v1 key: {namespace}:{operation}:{args_hash} — the same
             // key is computable from any SDK (protocol spec/interop-mode.md).
+            // The prefix is validated and joined once per function, so a call
+            // only hashes its arguments; the bytes equal `interop_key`'s.
+            // The arguments are evaluated outside the block that declares the
+            // static: an item is visible throughout its block, so a parameter
+            // with the static's name would otherwise resolve to the static.
             // The generated `.clone()` per argument keeps the binding usable
             // by the body; for Copy types it is a copy and for `&str` it is
             // a deliberate reference copy — hence the allows.
             #[allow(clippy::clone_on_copy, noop_method_call)]
-            let __ck_key = cachekit::interop::interop_key(
-                #namespace,
-                #operation,
-                &[#(#interop_args),*],
-            )?;
+            let __ck_key = {
+                let __ck_args: &[cachekit::interop::InteropValue] = &[#(#interop_args),*];
+                {
+                    static __CK_KEY_PREFIX: cachekit::interop::__KeyPrefix<'static> =
+                        cachekit::interop::__KeyPrefix::new(#namespace, #operation);
+                    __CK_KEY_PREFIX.key(__ck_args)?
+                }
+            };
 
             // Try cache hit, classified against the stale-while-revalidate
             // freshness window. A Serialization error means the stored entry
