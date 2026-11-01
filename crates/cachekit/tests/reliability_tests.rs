@@ -1182,6 +1182,8 @@ async fn a_custom_backend_gets_no_retry_deadline() {
 struct FailingCombined {
     combined: Arc<AtomicU32>,
     gets: Arc<AtomicU32>,
+    /// The combined call's error kind; `Transient` when `None`.
+    combined_kind: Option<BackendErrorKind>,
 }
 
 impl FailingCombined {
@@ -1258,7 +1260,14 @@ impl LockableBackend for FailingCombined {
 
     async fn __get_or_lock(&self, _key: &str, _timeout_ms: u64) -> Result<GetOrLock, BackendError> {
         self.combined.fetch_add(1, Ordering::SeqCst);
-        Err(BackendError::transient("scripted failure"))
+        Err(BackendError {
+            kind: self
+                .combined_kind
+                .clone()
+                .unwrap_or(BackendErrorKind::Transient),
+            message: "scripted failure".to_owned(),
+            source: None,
+        })
     }
 }
 
@@ -1325,5 +1334,35 @@ async fn the_combined_read_and_lock_passes_the_breaker() {
     assert_eq!(backend_kind(&err), Some(&BackendErrorKind::CircuitOpen));
     assert_eq!(backend.combined(), 2, "the open breaker let it through");
     assert!(lead.is_none(), "single_flight takes the flight");
-    assert_eq!(backend.gets.load(Ordering::SeqCst), 0, "no fallback read");
+}
+
+/// A combined call the stack shed fails the read with that error, with no
+/// second read: one would only re-join the queue that shed it. No
+/// reliability stack here, so a fallback read would reach the backend and
+/// be counted.
+#[tokio::test]
+async fn a_shed_combined_call_fails_the_read_without_a_second_read() {
+    let backend = FailingCombined {
+        combined_kind: Some(BackendErrorKind::Backpressure),
+        ..FailingCombined::default()
+    };
+    let client = CacheKit::builder()
+        .backend(backend.shared())
+        .no_l1()
+        .build()
+        .expect("client builds");
+
+    let mut lead = None;
+    let err = client
+        .__interop_read_swr_leading::<u64>("k", &mut lead)
+        .await
+        .expect_err("the read fails");
+    assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Backpressure));
+    assert_eq!(backend.combined(), 1);
+    assert_eq!(
+        backend.gets.load(Ordering::SeqCst),
+        0,
+        "a fallback read was sent"
+    );
+    assert!(lead.is_none(), "single_flight takes the flight");
 }
