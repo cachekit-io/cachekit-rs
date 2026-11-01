@@ -15,9 +15,9 @@ use crate::backend::{
 #[cfg(not(target_arch = "wasm32"))]
 use crate::backend::{nonzero_timeout, READ_TIMEOUT, WRITE_TIMEOUT};
 use crate::error::{BackendError, BackendErrorKind};
-#[cfg(target_arch = "wasm32")]
-use crate::metrics::Switch;
-use crate::metrics::{metrics_headers_named, telemetry_on, MetricsProvider, METRICS_HEADER_NAMES};
+use crate::metrics::{
+    metrics_headers_named, telemetry_on, MetricsProvider, Switch, METRICS_HEADER_NAMES,
+};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::metrics::{L1Latency, DEFAULT_ONE_IN, LATENCY_HEADER_NAMES};
 use crate::session::session_headers;
@@ -658,6 +658,17 @@ impl CachekitIOBuilder {
     ///   [`validate_cachekitio_url`](crate::url_validator::validate_cachekitio_url)).
     /// - the read or write timeout is zero.
     pub fn build(self) -> Result<CachekitIO, crate::error::CachekitError> {
+        // wasm32 has no process environment; there, only the setting applies.
+        #[cfg(not(target_arch = "wasm32"))]
+        let env = crate::metrics::telemetry_env();
+        #[cfg(target_arch = "wasm32")]
+        let env = Switch::Unset;
+        self.build_with_env(env)
+    }
+
+    /// [`Self::build`] with `CACHEKIT_TELEMETRY` already read, so tests can
+    /// drive every reading without touching the process environment.
+    fn build_with_env(self, env: Switch) -> Result<CachekitIO, crate::error::CachekitError> {
         use crate::error::CachekitError;
 
         let api_key = self
@@ -680,11 +691,6 @@ impl CachekitIOBuilder {
         let client = http_client()
             .map_err(|e| CachekitError::Config(format!("failed to build HTTP client: {e}")))?;
 
-        // wasm32 has no process environment; there, only the setting applies.
-        #[cfg(not(target_arch = "wasm32"))]
-        let env = crate::metrics::telemetry_env();
-        #[cfg(target_arch = "wasm32")]
-        let env = Switch::Unset;
         let telemetry = telemetry_on(self.telemetry, env);
 
         let static_headers = static_headers(&api_key, telemetry)?;
@@ -1268,6 +1274,9 @@ mod http_client_tests {
 
     const OK: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
 
+    /// A reply that closes the connection instead of answering.
+    const CLOSE: &[u8] = b"";
+
     fn stub() -> Stub {
         stub_with(|_| Some(OK))
     }
@@ -1324,6 +1333,11 @@ mod http_client_tests {
                                 std::thread::park();
                             }
                         };
+                        if reply == CLOSE {
+                            // Drop the connection with the request read and
+                            // unanswered: the request may have been delivered.
+                            return;
+                        }
                         if stream.write_all(reply).is_err() {
                             return;
                         }
@@ -1722,6 +1736,31 @@ mod http_client_tests {
             );
         }
 
+        /// API-86: each retry builds its request again, so only the first
+        /// attempt carries the report; a later one never re-sends it.
+        #[tokio::test]
+        async fn api_86_a_retry_does_not_resend_the_report() {
+            let stub = stub_with(|_| Some(RATE_LIMITED));
+            let mut raw = backend_at(&stub);
+            let report = Arc::new(crate::metrics::L1Latency::new(1));
+            report.record(Duration::from_nanos(300));
+            raw.latency = Some(report);
+            let backend = reliable(raw);
+
+            backend.get("k").await.expect_err("rate limited");
+
+            let requests = stub.requests.lock().expect("lock");
+            assert_eq!(requests.len(), 3, "every attempt is sent");
+            let carries = |head: &Vec<String>| {
+                head.iter().any(|h| {
+                    h.to_ascii_lowercase()
+                        .starts_with("x-cachekit-l1-latency-sum-ns:")
+                })
+            };
+            assert!(carries(&requests[0]), "{:?}", requests[0]);
+            assert!(!carries(&requests[1]) && !carries(&requests[2]));
+        }
+
         #[tokio::test]
         async fn a_rate_limit_429_still_retries() {
             let stub = stub_with(|_| Some(RATE_LIMITED));
@@ -1736,6 +1775,250 @@ mod http_client_tests {
                 3,
                 "every attempt is sent"
             );
+        }
+    }
+
+    // ── Telemetry: the switch and the L1 hit-latency report ──────────────────
+    //
+    // Each test names the spec/saas-api.md requirement it pins (API-NN).
+
+    mod telemetry {
+        use super::*;
+        use crate::metrics::{L1Latency, L1Stats, MetricsProvider, Switch};
+
+        const OPTIONAL: [&str; 9] = [
+            "x-cachekit-session-id",
+            "x-cachekit-session-start",
+            "x-cachekit-l1-hits",
+            "x-cachekit-l2-hits",
+            "x-cachekit-misses",
+            "x-cachekit-l1-hit-rate",
+            "x-cachekit-l1-latency-buckets",
+            "x-cachekit-l1-latency-sum-ns",
+            "x-cachekit-l1-latency-one-in",
+        ];
+        const LATENCY: [&str; 3] = [
+            "x-cachekit-l1-latency-buckets",
+            "x-cachekit-l1-latency-sum-ns",
+            "x-cachekit-l1-latency-one-in",
+        ];
+
+        /// The value of header `name` in a recorded request, if sent.
+        fn value(head: &[String], name: &str) -> Option<String> {
+            head.iter().find_map(|line| {
+                let (n, v) = line.split_once(':')?;
+                n.eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+            })
+        }
+
+        fn request(stub: &Stub, n: usize) -> Vec<String> {
+            stub.requests.lock().expect("lock")[n].clone()
+        }
+
+        fn l1_on() -> MetricsProvider {
+            Arc::new(|| {
+                Some(L1Stats {
+                    l1_hits: 3,
+                    l2_hits: 2,
+                    misses: 5,
+                    l1_enabled: true,
+                })
+            })
+        }
+
+        /// A backend at `stub` built under `env`, with live counters attached
+        /// and, with telemetry on, a report holding one timed 300 ns hit
+        /// sampled at one in one.
+        fn backend_with(
+            stub: &Stub,
+            builder: super::super::CachekitIOBuilder,
+            env: Switch,
+        ) -> CachekitIO {
+            let mut backend = builder
+                .api_key("ck_test_key")
+                .build_with_env(env)
+                .expect("builder succeeds");
+            backend.client = client();
+            backend.api_url = stub.url.trim_end_matches('/').to_owned();
+            backend.attach_metrics(l1_on());
+            if backend.latency.is_some() {
+                let latency = Arc::new(L1Latency::new(1));
+                latency.record(Duration::from_nanos(300));
+                backend.latency = Some(latency);
+            }
+            backend
+        }
+
+        /// API-94 / API-96: on by default, a request carries every optional
+        /// header, the latency set included.
+        #[tokio::test]
+        async fn api_94_on_by_default_sends_every_optional_header() {
+            let stub = stub();
+            let backend = backend_with(&stub, CachekitIO::builder(), Switch::Unset);
+            backend.exists("k").await.expect("HEAD");
+
+            let head = request(&stub, 0);
+            for name in OPTIONAL {
+                assert!(value(&head, name).is_some(), "{name} missing from {head:?}");
+            }
+            assert_eq!(
+                value(&head, "x-cachekit-l1-status").as_deref(),
+                Some("miss")
+            );
+            assert_eq!(
+                value(&head, "x-cachekit-l1-latency-buckets").as_deref(),
+                Some("0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0")
+            );
+            assert_eq!(
+                value(&head, "x-cachekit-l1-latency-sum-ns").as_deref(),
+                Some("300")
+            );
+            assert_eq!(
+                value(&head, "x-cachekit-l1-latency-one-in").as_deref(),
+                Some("1")
+            );
+        }
+
+        /// API-96: with telemetry off, no optional metrics header is sent;
+        /// L1-Status and the User-Agent still are, and no report accumulates.
+        #[tokio::test]
+        async fn api_96_off_sends_no_optional_header() {
+            let stub = stub();
+            let backend =
+                backend_with(&stub, CachekitIO::builder().telemetry(false), Switch::Unset);
+            assert!(
+                backend.l1_latency().is_none(),
+                "no accumulator with telemetry off"
+            );
+            backend.exists("k").await.expect("HEAD");
+            backend.set("k", b"v".to_vec(), None).await.expect("PUT");
+
+            for n in 0..2 {
+                let head = request(&stub, n);
+                for name in OPTIONAL {
+                    assert!(
+                        value(&head, name).is_none(),
+                        "{name} sent with telemetry off: {head:?}"
+                    );
+                }
+                assert_eq!(
+                    value(&head, "x-cachekit-l1-status").as_deref(),
+                    Some("miss")
+                );
+                assert_eq!(
+                    value(&head, "user-agent"),
+                    Some(format!("cachekit-rs/{}", env!("CARGO_PKG_VERSION")))
+                );
+                assert!(value(&head, "authorization").is_some());
+            }
+        }
+
+        /// API-95: every cell of the truth table, resolved on the built
+        /// backend: off from either control wins.
+        #[test]
+        fn api_95_truth_table_on_the_built_backend() {
+            let cells = [
+                (None, Switch::Unset, true),
+                (None, Switch::On, true),
+                (None, Switch::Off, false),
+                (Some(true), Switch::Unset, true),
+                (Some(true), Switch::On, true),
+                (Some(true), Switch::Off, false),
+                (Some(false), Switch::Unset, false),
+                (Some(false), Switch::On, false),
+                (Some(false), Switch::Off, false),
+            ];
+            for (setting, env, on) in cells {
+                let mut builder = CachekitIO::builder().api_key("ck_test_key");
+                if let Some(setting) = setting {
+                    builder = builder.telemetry(setting);
+                }
+                let backend = builder.build_with_env(env).expect("builds");
+                let cell = format!("setting {setting:?}, environment {env:?}");
+                assert_eq!(backend.telemetry, on, "{cell}");
+                assert_eq!(backend.l1_latency().is_some(), on, "{cell}");
+                let session = backend
+                    .static_headers
+                    .iter()
+                    .any(|(name, _)| name == "x-cachekit-session-id");
+                assert_eq!(session, on, "{cell}");
+            }
+        }
+
+        /// API-84: the health check never carries a report; the report stays
+        /// for the next request.
+        #[tokio::test]
+        async fn api_84_health_carries_no_report() {
+            let stub = stub();
+            let backend = backend_with(&stub, CachekitIO::builder(), Switch::Unset);
+            backend.health().await.expect("health");
+            backend.exists("k").await.expect("HEAD");
+
+            let health = request(&stub, 0);
+            assert!(health[0].starts_with("GET /v1/cache/health "), "{health:?}");
+            for name in LATENCY {
+                assert!(value(&health, name).is_none(), "{name} on the health check");
+            }
+            let next = request(&stub, 1);
+            assert_eq!(
+                value(&next, "x-cachekit-l1-latency-sum-ns").as_deref(),
+                Some("300")
+            );
+        }
+
+        /// API-77: the metrics headers go only to the API the backend was
+        /// built with: a redirect is an error, never followed with them.
+        #[tokio::test]
+        async fn api_77_a_redirect_is_not_followed() {
+            const MOVED: &[u8] = b"HTTP/1.1 307 Temporary Redirect\r\n\
+                location: /elsewhere\r\ncontent-length: 0\r\n\r\n";
+            let stub = stub_with(|_| Some(MOVED));
+            let backend = backend_with(&stub, CachekitIO::builder(), Switch::Unset);
+
+            backend.exists("k").await.expect_err("a 307 is an error");
+
+            let requests = stub.requests.lock().expect("lock");
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert!(
+                requests[0][0].starts_with("HEAD /v1/cache/k "),
+                "{requests:?}"
+            );
+        }
+
+        /// API-86: a report rides one attempt. One that reached the server is
+        /// consumed even though the request failed: it is not added back, and
+        /// reqwest does not resend the request on its own.
+        #[tokio::test]
+        async fn api_86_a_delivered_report_is_consumed() {
+            let stub = stub_with(|n| Some(if n == 1 { CLOSE } else { OK }));
+            let backend = backend_with(&stub, CachekitIO::builder(), Switch::Unset);
+            let report = backend.latency.clone().expect("telemetry on");
+            // Pool a connection; this request takes the first report, so
+            // time a fresh hit for the request that will fail.
+            backend.exists("warm").await.expect("warm");
+            report.record(Duration::from_nanos(700));
+
+            backend
+                .exists("k")
+                .await
+                .expect_err("the stub drops the connection unanswered");
+            backend.exists("k").await.expect("HEAD");
+
+            assert_eq!(
+                recorded(&stub, 3),
+                3,
+                "the dropped request was not resent: {:?}",
+                stub.requests.lock().expect("lock")
+            );
+            let failed = request(&stub, 1);
+            assert_eq!(
+                value(&failed, "x-cachekit-l1-latency-sum-ns").as_deref(),
+                Some("700")
+            );
+            let after = request(&stub, 2);
+            for name in LATENCY {
+                assert!(value(&after, name).is_none(), "{name} re-sent: {after:?}");
+            }
         }
     }
 }

@@ -779,6 +779,49 @@ mod tests {
         assert_eq!(L1Stats::default().l1_hit_rate(), 0.0);
     }
 
+    /// API-78: L1-Hits / (L1-Hits + L2-Hits + Misses) from the counters on
+    /// the same request, written as `0.` or `1.` and exactly three digits,
+    /// never above `1.000`; `0.000` while all three are 0. Not the share of
+    /// hits alone.
+    #[test]
+    fn api_78_hit_rate_formula_and_format() {
+        let rate = |l1, l2, misses| {
+            let headers = metrics_headers(Some(&provider(l1, l2, misses, true)));
+            header(&headers, "X-CacheKit-L1-Hit-Rate").to_owned()
+        };
+        assert_eq!(rate(0, 0, 0), "0.000");
+        assert_eq!(rate(2, 1, 0), "0.667");
+        assert_eq!(rate(1, 1, 1), "0.333");
+        assert_eq!(rate(7, 0, 0), "1.000");
+        assert_eq!(rate(999_999, 0, 1), "1.000");
+        assert_eq!(rate(1, 0, 999_999), "0.000");
+        assert_eq!(rate(1, 1, 2), "0.250", "not l1 / (l1 + l2) = 0.500");
+        for (l1, l2, misses) in [(3, 2, 5), (u64::from(u32::MAX), 17, 1), (1, 7, 0)] {
+            let value = rate(l1, l2, misses);
+            assert_eq!(value.len(), 5, "{value}");
+            assert!(value.starts_with("0.") || value == "1.000", "{value}");
+            assert!(value[2..].bytes().all(|b| b.is_ascii_digit()), "{value}");
+        }
+    }
+
+    /// API-96: with telemetry off only `X-CacheKit-L1-Status` is built, still
+    /// `miss` with an L1 and `disabled` without.
+    #[test]
+    fn api_96_telemetry_off_builds_only_the_status() {
+        let on =
+            metrics_headers_named(Some(&provider(3, 2, 5, true)), &METRICS_HEADER_NAMES, false);
+        assert_eq!(on, vec![("X-CacheKit-L1-Status", "miss".to_string())]);
+        let no_l1 = metrics_headers_named(
+            Some(&provider(0, 0, 0, false)),
+            &METRICS_HEADER_NAMES,
+            false,
+        );
+        assert_eq!(
+            no_l1,
+            vec![("X-CacheKit-L1-Status", "disabled".to_string())]
+        );
+    }
+
     #[test]
     fn disabled_when_provider_panics() {
         #[allow(clippy::panic)]
@@ -822,5 +865,325 @@ mod tests {
             "bcb35ae6f64fa65b2770ab3af631b1ce" // pragma: allowlist secret
         );
         assert_eq!(key_hash("").len(), 32);
+    }
+}
+
+// ── Telemetry switch and L1 hit-latency report tests ─────────────────────────
+//
+// Each test names the spec/saas-api.md requirement it pins (API-NN).
+
+#[cfg(all(test, feature = "cachekitio"))]
+mod switch_tests {
+    use super::{telemetry_on, Switch};
+
+    fn read(value: &str) -> Switch {
+        Switch::from_env_value(Some(Ok(value)))
+    }
+
+    /// API-95: `CACHEKIT_TELEMETRY` is parsed by the spec's rule alone:
+    /// case-insensitive after trimming white space; unset or empty is unset.
+    #[test]
+    fn api_95_env_value_rule() {
+        for off in ["false", "0", "off", "no", "FALSE", " Off\t", "No"] {
+            assert_eq!(read(off), Switch::Off, "{off:?}");
+        }
+        for on in ["true", "1", "on", "yes", "TRUE", "\tOn ", "Yes"] {
+            assert_eq!(read(on), Switch::On, "{on:?}");
+        }
+        for unset in ["", "  ", "\t\n"] {
+            assert_eq!(read(unset), Switch::Unset, "{unset:?}");
+        }
+        assert_eq!(Switch::from_env_value(None), Switch::Unset);
+    }
+
+    /// API-95: any other value, including one a loader's boolean parser would
+    /// read as true, and a value that is not Unicode, is off.
+    #[test]
+    fn api_95_unknown_values_are_off() {
+        for other in ["enabled", "y", "t", "2", "true!", "on off", "nope", "ſ"] {
+            assert_eq!(read(other), Switch::Off, "{other:?}");
+        }
+        assert_eq!(Switch::from_env_value(Some(Err(()))), Switch::Off);
+    }
+
+    /// API-95: every cell of the truth table. Off from either control wins;
+    /// with neither off, telemetry is on.
+    #[test]
+    fn api_95_truth_table() {
+        let cells = [
+            (None, Switch::Unset, true),
+            (None, Switch::On, true),
+            (None, Switch::Off, false),
+            (Some(true), Switch::Unset, true),
+            (Some(true), Switch::On, true),
+            (Some(true), Switch::Off, false),
+            (Some(false), Switch::Unset, false),
+            (Some(false), Switch::On, false),
+            (Some(false), Switch::Off, false),
+        ];
+        for (setting, env, on) in cells {
+            assert_eq!(telemetry_on(setting, env), on, "{setting:?} / {env:?}");
+        }
+    }
+
+    /// API-94: on Workers, the process environment and the bindings are both
+    /// read, and off from either wins.
+    #[test]
+    fn api_94_off_from_either_source_wins() {
+        use Switch::{Off, On, Unset};
+        assert_eq!(Off.either(On), Off);
+        assert_eq!(On.either(Off), Off);
+        assert_eq!(Unset.either(Off), Off);
+        assert_eq!(Unset.either(On), On);
+        assert_eq!(On.either(Unset), On);
+        assert_eq!(Unset.either(Unset), Unset);
+    }
+}
+
+#[cfg(all(test, feature = "l1", not(target_arch = "wasm32")))]
+#[allow(clippy::expect_used)] // test-only: a missing report should panic loudly
+mod latency_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{bucket_index, L1Latency, ReadOutcome, BUCKET_BOUNDS_NS, MAX_WIRE_INT};
+
+    fn ns(n: u64) -> Duration {
+        Duration::from_nanos(n)
+    }
+
+    fn take(latency: &L1Latency) -> [String; 3] {
+        latency.take().expect("a report")
+    }
+
+    /// API-87: the spec's own example.
+    #[test]
+    fn api_87_spec_example() {
+        let latency = L1Latency::new(1);
+        for d in [90, 300, 300, 40_000] {
+            latency.record(ns(d));
+        }
+        assert_eq!(
+            take(&latency),
+            ["1,0,2,0,0,0,0,0,0,1,0,0,0,0,0,0", "40690", "1"]
+        );
+    }
+
+    /// API-87: each bucket holds durations above the previous bound up to and
+    /// including its own; bucket 1 holds 0.
+    #[test]
+    fn api_87_bucket_bounds() {
+        assert_eq!(bucket_index(0), 0);
+        assert_eq!(bucket_index(1), 0);
+        let mut previous = 0;
+        for (i, &bound) in BUCKET_BOUNDS_NS.iter().enumerate() {
+            assert_eq!(bucket_index(previous + 1), i, "{}", previous + 1);
+            assert_eq!(bucket_index(bound), i, "{bound}");
+            previous = bound;
+        }
+        assert_eq!(bucket_index(2_097_153), 15);
+    }
+
+    /// API-87: a duration above 60 s is discarded, not counted; 60 s itself
+    /// is the last bucket's bound.
+    #[test]
+    fn api_87_over_60_s_is_discarded() {
+        let latency = L1Latency::new(1);
+        latency.record(Duration::from_secs(60) + ns(1));
+        latency.record(Duration::from_secs(3_600));
+        assert_eq!(latency.take(), None);
+        latency.record(Duration::from_secs(60));
+        let [buckets, sum, _] = take(&latency);
+        assert_eq!(buckets, "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1");
+        assert_eq!(sum, "60000000000");
+    }
+
+    /// API-87: no value passes 2^53 − 1. A hit that would take the sum past
+    /// it is dropped, so the report stays valid.
+    #[test]
+    fn api_87_values_stay_within_2_pow_53() {
+        let latency = L1Latency::new(1);
+        let per_hit = Duration::from_secs(60);
+        let fits = MAX_WIRE_INT / 60_000_000_000;
+        {
+            let mut report = latency.lock();
+            report.sum_ns = fits * 60_000_000_000;
+            report.buckets[15] = fits;
+        }
+        latency.record(per_hit);
+        let [buckets, sum, _] = take(&latency);
+        assert_eq!(sum.parse::<u64>().expect("sum"), fits * 60_000_000_000);
+        assert!(sum.parse::<u64>().expect("sum") <= MAX_WIRE_INT);
+        assert!(buckets.ends_with(&fits.to_string()));
+    }
+
+    /// API-87: the wire grammar — sixteen integers, no white space, at least
+    /// one not 0; a sum of at least 1; N from 1 to 1,000,000.
+    #[test]
+    fn api_87_grammar() {
+        let integer = |v: &str| {
+            !v.is_empty()
+                && v.len() <= 16
+                && v.bytes().all(|b| b.is_ascii_digit())
+                && (v == "0" || !v.starts_with('0'))
+        };
+        let latency = L1Latency::new(128);
+        latency.record(ns(1));
+        latency.record(ns(5_000));
+        let [buckets, sum, one_in] = take(&latency);
+        let counts: Vec<&str> = buckets.split(',').collect();
+        assert_eq!(counts.len(), 16);
+        assert!(counts.iter().all(|c| integer(c)));
+        assert!(counts.iter().any(|c| *c != "0"));
+        assert!(integer(&sum) && sum != "0");
+        assert_eq!(one_in, "128");
+        assert_eq!(L1Latency::new(0).one_in(), 1);
+        assert_eq!(L1Latency::new(2_000_000).one_in(), 1_000_000);
+    }
+
+    /// API-84 / API-87: a report whose sum is 0 is not attached and stays in
+    /// the accumulator.
+    #[test]
+    fn a_zero_sum_report_stays() {
+        let latency = L1Latency::new(1);
+        latency.record(ns(0));
+        assert_eq!(latency.take(), None);
+        latency.record(ns(200));
+        assert_eq!(
+            take(&latency),
+            ["1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0", "200", "1"]
+        );
+        assert_eq!(latency.take(), None, "taking resets the accumulator");
+    }
+
+    /// API-79: only an L1 hit's duration is added; an L2 hit or a miss adds
+    /// nothing.
+    #[test]
+    fn api_79_only_l1_hits_count() {
+        let latency = L1Latency::new(1);
+        let start = std::time::Instant::now() - ns(500);
+        latency.record_hit(start, ReadOutcome::L2Hit);
+        latency.record_hit(start, ReadOutcome::Miss);
+        assert_eq!(latency.take(), None);
+        latency.record_hit(start, ReadOutcome::L1Hit);
+        latency.record_hit(start, ReadOutcome::L1Stale);
+        let [buckets, _, _] = take(&latency);
+        let timed: u64 = buckets
+            .split(',')
+            .map(|c| c.parse::<u64>().expect("count"))
+            .sum();
+        assert_eq!(timed, 2);
+    }
+
+    /// API-83: a report built in another process (before a fork) is never
+    /// sent: the child starts empty.
+    #[test]
+    fn api_83_a_forked_child_starts_empty() {
+        let latency = L1Latency::new(1);
+        latency.record(ns(300));
+        let child = std::process::id().wrapping_add(1);
+        assert_eq!(
+            latency.take_in(child),
+            None,
+            "the parent's report is dropped"
+        );
+        latency.record(ns(400));
+        assert_eq!(
+            latency.take_in(child),
+            Some([
+                "0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0".to_owned(),
+                "400".to_owned(),
+                "1".to_owned()
+            ])
+        );
+    }
+
+    /// API-85: values are taken and reset in one step, so with hits recorded
+    /// and reports taken concurrently, no hit is sent twice or lost, and each
+    /// report's sum matches its buckets.
+    #[test]
+    fn api_85_take_is_atomic() {
+        const THREADS: u64 = 4;
+        const HITS: u64 = 20_000;
+        let latency = Arc::new(L1Latency::new(1));
+        let recorders: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let latency = latency.clone();
+                std::thread::spawn(move || {
+                    for i in 0..HITS {
+                        // 129 ns lands in bucket 2, 300 ns in bucket 3.
+                        latency.record(ns(if (i + t) % 2 == 0 { 129 } else { 300 }));
+                    }
+                })
+            })
+            .collect();
+        let mut reports = Vec::new();
+        while recorders.iter().any(|r| !r.is_finished()) {
+            reports.extend(latency.take());
+        }
+        for r in recorders {
+            r.join().expect("recorder");
+        }
+        reports.extend(latency.take());
+
+        let (mut b2, mut b3) = (0, 0);
+        for [buckets, sum, _] in &reports {
+            let counts: Vec<u64> = buckets
+                .split(',')
+                .map(|c| c.parse().expect("count"))
+                .collect();
+            assert_eq!(counts.iter().sum::<u64>(), counts[1] + counts[2]);
+            assert_eq!(
+                sum.parse::<u64>().expect("sum"),
+                counts[1] * 129 + counts[2] * 300,
+                "a report's sum describes its own buckets"
+            );
+            b2 += counts[1];
+            b3 += counts[2];
+        }
+        assert_eq!(b2 + b3, THREADS * HITS, "every hit sent exactly once");
+        assert_eq!(b2, THREADS * HITS / 2);
+    }
+
+    /// API-81: the draw times each call with chance 1/N, independently of the
+    /// calls around it: two keys read alternately are timed alike, and a call
+    /// being timed says nothing about the next.
+    #[test]
+    fn api_81_draw_is_independent_with_chance_one_in_n() {
+        const N: u32 = 8;
+        const CALLS: u32 = 400_000;
+        let latency = L1Latency::new(N);
+        let (mut a, mut b, mut pairs, mut previous) = (0u32, 0u32, 0u32, false);
+        for i in 0..CALLS {
+            let drawn = latency.draw();
+            if drawn {
+                if i % 2 == 0 {
+                    a += 1;
+                } else {
+                    b += 1;
+                }
+                if previous {
+                    pairs += 1;
+                }
+            }
+            previous = drawn;
+        }
+        let per_key = f64::from(CALLS / 2) / f64::from(N);
+        for (key, timed) in [("A", a), ("B", b)] {
+            let off = (f64::from(timed) - per_key).abs() / per_key;
+            assert!(
+                off < 0.05,
+                "key {key}: {timed} timed, expected about {per_key}"
+            );
+        }
+        let expected_pairs = f64::from(CALLS) / f64::from(N * N);
+        let off = (f64::from(pairs) - expected_pairs).abs() / expected_pairs;
+        assert!(
+            off < 0.1,
+            "{pairs} back-to-back draws, expected about {expected_pairs}"
+        );
+
+        let every = L1Latency::new(1);
+        assert!((0..1_000).all(|_| every.draw()), "N = 1 times every call");
     }
 }

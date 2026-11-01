@@ -712,6 +712,7 @@ impl CacheKit {
     /// or `None` on an L1 miss (always, without the `l1` feature), which
     /// counts nothing yet. Synchronous, so a read serves an L1 hit without
     /// building or polling a read future.
+    #[cfg_attr(not(feature = "l1"), allow(clippy::unused_self))]
     #[inline]
     fn get_l1(&self, full_key: &str) -> Result<Option<Payload>, CachekitError> {
         #[cfg(feature = "l1")]
@@ -749,6 +750,10 @@ impl CacheKit {
 
     /// Draw whether to time this call, before anything about its outcome is
     /// known, and start its clock if so.
+    #[cfg_attr(
+        not(all(feature = "l1", not(target_arch = "wasm32"))),
+        allow(clippy::unused_self)
+    )]
     #[inline]
     fn l1_clock(&self) -> L1Sample {
         #[cfg(all(feature = "l1", not(target_arch = "wasm32")))]
@@ -762,6 +767,10 @@ impl CacheKit {
 
     /// Stop `clock` where the call has produced its value; the duration
     /// counts only for a drawn call that L1 served (`by`).
+    #[cfg_attr(
+        not(all(feature = "l1", not(target_arch = "wasm32"))),
+        allow(clippy::unused_self)
+    )]
     #[inline]
     fn l1_timed(&self, clock: L1Sample, by: ReadOutcome) {
         #[cfg(all(feature = "l1", not(target_arch = "wasm32")))]

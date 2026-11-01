@@ -452,6 +452,8 @@ async fn macro_secure_fails_closed_when_backend_down() {
 }
 
 // ── Counters: a warm call counts one hit by the layer that served it ────────
+//
+// API-76: a wrapped call counts one outcome, however many reads it makes.
 
 #[cachekit(client = cache, ttl = 60, interop = "warm_plain", namespace = "counts")]
 async fn warm_plain(cache: &CacheKit, id: u64) -> Result<u64, CachekitError> {
