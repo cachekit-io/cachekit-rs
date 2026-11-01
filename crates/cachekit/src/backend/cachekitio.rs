@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -13,7 +15,11 @@ use crate::backend::{
 #[cfg(not(target_arch = "wasm32"))]
 use crate::backend::{nonzero_timeout, READ_TIMEOUT, WRITE_TIMEOUT};
 use crate::error::{BackendError, BackendErrorKind};
-use crate::metrics::{metrics_headers_named, MetricsProvider, METRICS_HEADER_NAMES};
+use crate::metrics::{
+    metrics_headers_named, telemetry_on, MetricsProvider, Switch, METRICS_HEADER_NAMES,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::metrics::{L1Latency, DEFAULT_ONE_IN};
 use crate::session::session_headers;
 use crate::url_validator::cachekitio_base_url;
 
@@ -24,13 +30,20 @@ pub struct CachekitIO {
     client: reqwest::Client,
     api_key: Zeroizing<String>,
     api_url: String,
-    /// `Authorization` and the session headers, built once so no request
-    /// re-formats or re-parses them. The bearer value is marked sensitive, so
-    /// a request's `Debug` output redacts it, and its buffer is wiped when the
-    /// last clone drops.
-    static_headers: [(HeaderName, HeaderValue); 3],
+    /// `Authorization` and, with telemetry on, the session headers, built
+    /// once so no request re-formats or re-parses them. The bearer value is
+    /// marked sensitive, so a request's `Debug` output redacts it, and its
+    /// buffer is wiped when the last clone drops.
+    static_headers: Box<[(HeaderName, HeaderValue)]>,
     /// The telemetry header names, parsed once, in [`METRICS_HEADER_NAMES`] order.
     metrics_header_names: [HeaderName; 5],
+    /// Whether this backend sends the optional metrics headers
+    /// ([`CachekitIOBuilder::telemetry`]), resolved once at build.
+    telemetry: bool,
+    /// The L1 hit-latency report the client times into and the next request
+    /// carries; `None` with telemetry off.
+    #[cfg(not(target_arch = "wasm32"))]
+    latency: Option<Arc<L1Latency>>,
     /// Source of the `X-CacheKit-*` telemetry headers. Set once: by the
     /// builder when the user supplies one, otherwise by the client at build
     /// time via [`Backend::attach_metrics`] (first writer wins).
@@ -107,24 +120,58 @@ impl CachekitIO {
         format!("{}/v1/cache/health", self.api_url)
     }
 
-    /// Apply the read budget and the bearer token, session and metrics headers
-    /// to a request builder. A write sets its own budget afterwards.
+    /// Apply the read budget and the bearer token, session, metrics and
+    /// latency headers to a request builder. A write sets its own budget
+    /// afterwards.
     pub(crate) fn with_standard_headers(
         &self,
+        req: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        self.with_headers(req, true)
+    }
+
+    /// [`Self::with_standard_headers`], taking the L1 latency report only when
+    /// `report` is set: the health check never carries one, because the
+    /// server does not record it (spec/saas-api.md, API-84).
+    ///
+    /// Taking the report consumes it, whatever becomes of the request: a
+    /// request may reach the server and fail after, and nothing deduplicates
+    /// a report sent twice (API-86). reqwest never resends a request that
+    /// may have been delivered: its own retries cover only protocol refusals
+    /// and requests it never started, and a reliability-layer retry builds
+    /// the request again, taking whatever report has accumulated since.
+    fn with_headers(
+        &self,
         mut req: reqwest::RequestBuilder,
+        report: bool,
     ) -> reqwest::RequestBuilder {
         #[cfg(not(target_arch = "wasm32"))]
         {
             req = req.timeout(self.read_timeout);
         }
-        for (name, value) in &self.static_headers {
+        for (name, value) in self.static_headers.iter() {
             req = req.header(name.clone(), value.clone());
         }
-        for (name, value) in
-            metrics_headers_named(self.metrics_provider.get(), &self.metrics_header_names)
-        {
+        for (name, value) in metrics_headers_named(
+            self.metrics_provider.get(),
+            &self.metrics_header_names,
+            self.telemetry,
+        ) {
             req = req.header(name, value);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(values) = self
+            .latency
+            .as_ref()
+            .filter(|_| report)
+            .and_then(|l| l.take())
+        {
+            for (name, value) in LATENCY_HEADERS.iter().zip(values) {
+                req = req.header(name.clone(), value);
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = report;
         req
     }
 
@@ -242,6 +289,10 @@ impl Backend for CachekitIO {
         self.metrics_provider.get_or_init(|| provider);
     }
 
+    fn l1_latency(&self) -> Option<Arc<L1Latency>> {
+        self.latency.clone()
+    }
+
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
         Ok(self.get_with_freshness(key).await?.map(|(bytes, _)| bytes))
     }
@@ -341,7 +392,7 @@ impl Backend for CachekitIO {
     async fn health(&self) -> Result<HealthStatus, BackendError> {
         let start = std::time::Instant::now();
 
-        let req = self.with_standard_headers(self.client.get(self.health_url()));
+        let req = self.with_headers(self.client.get(self.health_url()), false);
 
         let resp = req
             .send()
@@ -373,9 +424,10 @@ impl Backend for CachekitIO {
 // ── Prebuilt headers ──────────────────────────────────────────────────────────
 
 /// Build the per-client constant headers: `Authorization: Bearer <key>`,
-/// marked sensitive as `bearer_auth` would, and the process's session headers.
-/// The bearer outlives every request and each request clones it, so its buffer
-/// is a zeroising owner those clones share: the last drop wipes the key.
+/// marked sensitive as `bearer_auth` would, and, with `telemetry` on, the
+/// process's session headers. The bearer outlives every request and each
+/// request clones it, so its buffer is a zeroising owner those clones share:
+/// the last drop wipes the key.
 ///
 /// # Errors
 ///
@@ -383,7 +435,8 @@ impl Backend for CachekitIO {
 /// holds bytes an HTTP header cannot carry. The message never echoes the key.
 fn static_headers(
     api_key: &str,
-) -> Result<[(HeaderName, HeaderValue); 3], crate::error::CachekitError> {
+    telemetry: bool,
+) -> Result<Box<[(HeaderName, HeaderValue)]>, crate::error::CachekitError> {
     use crate::error::CachekitError;
 
     let mut bearer = Zeroizing::new(Vec::with_capacity("Bearer ".len() + api_key.len()));
@@ -403,11 +456,12 @@ fn static_headers(
                 .map_err(|e| CachekitError::Config(format!("header {name}: {e}")))?,
         ))
     };
-    Ok([
-        (reqwest::header::AUTHORIZATION, auth),
-        header(id_name, id)?,
-        header(start_name, start)?,
-    ])
+    let mut headers = vec![(reqwest::header::AUTHORIZATION, auth)];
+    if telemetry {
+        headers.push(header(id_name, id)?);
+        headers.push(header(start_name, start)?);
+    }
+    Ok(headers.into_boxed_slice())
 }
 
 /// A header value over `owner`'s buffer, not a copy of it: clones share the
@@ -420,12 +474,23 @@ fn header_over<T: AsRef<[u8]> + Send + 'static>(
 
 /// Parse [`METRICS_HEADER_NAMES`] once per client.
 fn metrics_header_names() -> Result<[HeaderName; 5], crate::error::CachekitError> {
-    let [a, b, c, d, e] = METRICS_HEADER_NAMES.map(|name| {
-        HeaderName::from_bytes(name.as_bytes())
-            .map_err(|e| crate::error::CachekitError::Config(format!("header name {name}: {e}")))
-    });
+    let [a, b, c, d, e] = METRICS_HEADER_NAMES.map(parse_header_name);
     Ok([a?, b?, c?, d?, e?])
 }
+
+fn parse_header_name(name: &str) -> Result<HeaderName, crate::error::CachekitError> {
+    HeaderName::from_bytes(name.as_bytes())
+        .map_err(|e| crate::error::CachekitError::Config(format!("header name {name}: {e}")))
+}
+
+/// The L1 hit-latency headers, in the order [`L1Latency`] reports their
+/// values: buckets, sum, one-in.
+#[cfg(not(target_arch = "wasm32"))]
+const LATENCY_HEADERS: [HeaderName; 3] = [
+    HeaderName::from_static("x-cachekit-l1-latency-buckets"),
+    HeaderName::from_static("x-cachekit-l1-latency-sum-ns"),
+    HeaderName::from_static("x-cachekit-l1-latency-one-in"),
+];
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
@@ -484,6 +549,7 @@ pub struct CachekitIOBuilder {
     api_url: Option<String>,
     allow_custom_host: bool,
     metrics_provider: Option<MetricsProvider>,
+    telemetry: Option<bool>,
     #[cfg(not(target_arch = "wasm32"))]
     read_timeout: Option<Duration>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -516,6 +582,26 @@ impl CachekitIOBuilder {
     /// to report numbers from somewhere else; it takes precedence.
     pub fn metrics_provider(mut self, provider: MetricsProvider) -> Self {
         self.metrics_provider = Some(provider);
+        self
+    }
+
+    /// Turn this backend's telemetry on or off. Unset by default.
+    ///
+    /// Telemetry is the optional `X-CacheKit-*` headers the backend sends to
+    /// cachekit.io, and nowhere else: the session ID and start time, the
+    /// client's L1 hit, L2 hit and miss counts with its L1 hit rate, and a
+    /// sampled histogram of L1 hit latency. With telemetry off none of them
+    /// is sent and no L1 hit is timed. `X-CacheKit-L1-Status`, which the
+    /// service requires on every request, and the `User-Agent` still are.
+    ///
+    /// The environment variable `CACHEKIT_TELEMETRY` is the other control:
+    /// `false`, `0`, `off` or `no` (any case, surrounding white space
+    /// ignored) turns telemetry off, `true`, `1`, `on` or `yes` on, and any
+    /// other non-empty value off. Off from either control wins; with neither
+    /// set telemetry is on during the closed beta. `build` reads both, once:
+    /// changing the variable later does not change a built backend.
+    pub fn telemetry(mut self, on: bool) -> Self {
+        self.telemetry = Some(on);
         self
     }
 
@@ -571,6 +657,17 @@ impl CachekitIOBuilder {
     ///   [`validate_cachekitio_url`](crate::url_validator::validate_cachekitio_url)).
     /// - the read or write timeout is zero.
     pub fn build(self) -> Result<CachekitIO, crate::error::CachekitError> {
+        // wasm32 has no process environment; there, only the setting applies.
+        #[cfg(not(target_arch = "wasm32"))]
+        let env = crate::metrics::telemetry_env();
+        #[cfg(target_arch = "wasm32")]
+        let env = Switch::Unset;
+        self.build_with_env(env)
+    }
+
+    /// [`Self::build`] with `CACHEKIT_TELEMETRY` already read, so tests can
+    /// drive every reading without touching the process environment.
+    fn build_with_env(self, env: Switch) -> Result<CachekitIO, crate::error::CachekitError> {
         use crate::error::CachekitError;
 
         let api_key = self
@@ -593,7 +690,9 @@ impl CachekitIOBuilder {
         let client = http_client()
             .map_err(|e| CachekitError::Config(format!("failed to build HTTP client: {e}")))?;
 
-        let static_headers = static_headers(&api_key)?;
+        let telemetry = telemetry_on(self.telemetry, env);
+
+        let static_headers = static_headers(&api_key, telemetry)?;
         let metrics_header_names = metrics_header_names()?;
 
         Ok(CachekitIO {
@@ -602,6 +701,9 @@ impl CachekitIOBuilder {
             api_url,
             static_headers,
             metrics_header_names,
+            telemetry,
+            #[cfg(not(target_arch = "wasm32"))]
+            latency: telemetry.then(|| Arc::new(L1Latency::new(DEFAULT_ONE_IN))),
             metrics_provider: self
                 .metrics_provider
                 .map_or_else(OnceLock::new, OnceLock::from),
@@ -1169,6 +1271,9 @@ mod http_client_tests {
 
     const OK: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
 
+    /// A reply that closes the connection instead of answering.
+    const CLOSE: &[u8] = b"";
+
     fn stub() -> Stub {
         stub_with(|_| Some(OK))
     }
@@ -1225,6 +1330,11 @@ mod http_client_tests {
                                 std::thread::park();
                             }
                         };
+                        if reply == CLOSE {
+                            // Drop the connection with the request read and
+                            // unanswered: the request may have been delivered.
+                            return;
+                        }
                         if stream.write_all(reply).is_err() {
                             return;
                         }
@@ -1623,6 +1733,32 @@ mod http_client_tests {
             );
         }
 
+        /// API-86: each retry builds its request again, so only the first
+        /// attempt carries the report; a later one never re-sends it.
+        #[cfg(feature = "l1")]
+        #[tokio::test]
+        async fn api_86_a_retry_does_not_resend_the_report() {
+            let stub = stub_with(|_| Some(RATE_LIMITED));
+            let mut raw = backend_at(&stub);
+            let report = Arc::new(crate::metrics::L1Latency::new(1));
+            report.record(Duration::from_nanos(300));
+            raw.latency = Some(report);
+            let backend = reliable(raw);
+
+            backend.get("k").await.expect_err("rate limited");
+
+            let requests = stub.requests.lock().expect("lock");
+            assert_eq!(requests.len(), 3, "every attempt is sent");
+            let carries = |head: &Vec<String>| {
+                head.iter().any(|h| {
+                    h.to_ascii_lowercase()
+                        .starts_with("x-cachekit-l1-latency-sum-ns:")
+                })
+            };
+            assert!(carries(&requests[0]), "{:?}", requests[0]);
+            assert!(!carries(&requests[1]) && !carries(&requests[2]));
+        }
+
         #[tokio::test]
         async fn a_rate_limit_429_still_retries() {
             let stub = stub_with(|_| Some(RATE_LIMITED));
@@ -1637,6 +1773,251 @@ mod http_client_tests {
                 3,
                 "every attempt is sent"
             );
+        }
+    }
+
+    // ── Telemetry: the switch and the L1 hit-latency report ──────────────────
+    //
+    // Each test names the spec/saas-api.md requirement it pins (API-NN).
+
+    #[cfg(all(feature = "l1", feature = "reliability"))]
+    mod telemetry {
+        use super::*;
+        use crate::metrics::{L1Latency, L1Stats, MetricsProvider, Switch};
+
+        const OPTIONAL: [&str; 9] = [
+            "x-cachekit-session-id",
+            "x-cachekit-session-start",
+            "x-cachekit-l1-hits",
+            "x-cachekit-l2-hits",
+            "x-cachekit-misses",
+            "x-cachekit-l1-hit-rate",
+            "x-cachekit-l1-latency-buckets",
+            "x-cachekit-l1-latency-sum-ns",
+            "x-cachekit-l1-latency-one-in",
+        ];
+        const LATENCY: [&str; 3] = [
+            "x-cachekit-l1-latency-buckets",
+            "x-cachekit-l1-latency-sum-ns",
+            "x-cachekit-l1-latency-one-in",
+        ];
+
+        /// The value of header `name` in a recorded request, if sent.
+        fn value(head: &[String], name: &str) -> Option<String> {
+            head.iter().find_map(|line| {
+                let (n, v) = line.split_once(':')?;
+                n.eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+            })
+        }
+
+        fn request(stub: &Stub, n: usize) -> Vec<String> {
+            stub.requests.lock().expect("lock")[n].clone()
+        }
+
+        fn l1_on() -> MetricsProvider {
+            Arc::new(|| {
+                Some(L1Stats {
+                    l1_hits: 3,
+                    l2_hits: 2,
+                    misses: 5,
+                    l1_enabled: true,
+                })
+            })
+        }
+
+        /// A backend at `stub` built under `env`, with live counters attached
+        /// and, with telemetry on, a report holding one timed 300 ns hit
+        /// sampled at one in one.
+        fn backend_with(
+            stub: &Stub,
+            builder: super::super::CachekitIOBuilder,
+            env: Switch,
+        ) -> CachekitIO {
+            let mut backend = builder
+                .api_key("ck_test_key")
+                .build_with_env(env)
+                .expect("builder succeeds");
+            backend.client = client();
+            backend.api_url = stub.url.trim_end_matches('/').to_owned();
+            backend.attach_metrics(l1_on());
+            if backend.latency.is_some() {
+                let latency = Arc::new(L1Latency::new(1));
+                latency.record(Duration::from_nanos(300));
+                backend.latency = Some(latency);
+            }
+            backend
+        }
+
+        /// API-94 / API-96: on by default, a request carries every optional
+        /// header, the latency set included.
+        #[tokio::test]
+        async fn api_94_on_by_default_sends_every_optional_header() {
+            let stub = stub();
+            let backend = backend_with(&stub, CachekitIO::builder(), Switch::Unset);
+            backend.exists("k").await.expect("HEAD");
+
+            let head = request(&stub, 0);
+            for name in OPTIONAL {
+                assert!(value(&head, name).is_some(), "{name} missing from {head:?}");
+            }
+            assert_eq!(
+                value(&head, "x-cachekit-l1-status").as_deref(),
+                Some("miss")
+            );
+            assert_eq!(
+                value(&head, "x-cachekit-l1-latency-buckets").as_deref(),
+                Some("0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0")
+            );
+            assert_eq!(
+                value(&head, "x-cachekit-l1-latency-sum-ns").as_deref(),
+                Some("300")
+            );
+            assert_eq!(
+                value(&head, "x-cachekit-l1-latency-one-in").as_deref(),
+                Some("1")
+            );
+        }
+
+        /// API-96: with telemetry off, no optional metrics header is sent;
+        /// L1-Status and the User-Agent still are, and no report accumulates.
+        #[tokio::test]
+        async fn api_96_off_sends_no_optional_header() {
+            let stub = stub();
+            let backend =
+                backend_with(&stub, CachekitIO::builder().telemetry(false), Switch::Unset);
+            assert!(
+                backend.l1_latency().is_none(),
+                "no accumulator with telemetry off"
+            );
+            backend.exists("k").await.expect("HEAD");
+            backend.set("k", b"v".to_vec(), None).await.expect("PUT");
+
+            for n in 0..2 {
+                let head = request(&stub, n);
+                for name in OPTIONAL {
+                    assert!(
+                        value(&head, name).is_none(),
+                        "{name} sent with telemetry off: {head:?}"
+                    );
+                }
+                assert_eq!(
+                    value(&head, "x-cachekit-l1-status").as_deref(),
+                    Some("miss")
+                );
+                assert_eq!(
+                    value(&head, "user-agent"),
+                    Some(format!("cachekit-rs/{}", env!("CARGO_PKG_VERSION")))
+                );
+                assert!(value(&head, "authorization").is_some());
+            }
+        }
+
+        /// API-95: every cell of the truth table, resolved on the built
+        /// backend: off from either control wins.
+        #[test]
+        fn api_95_truth_table_on_the_built_backend() {
+            let cells = [
+                (None, Switch::Unset, true),
+                (None, Switch::On, true),
+                (None, Switch::Off, false),
+                (Some(true), Switch::Unset, true),
+                (Some(true), Switch::On, true),
+                (Some(true), Switch::Off, false),
+                (Some(false), Switch::Unset, false),
+                (Some(false), Switch::On, false),
+                (Some(false), Switch::Off, false),
+            ];
+            for (setting, env, on) in cells {
+                let mut builder = CachekitIO::builder().api_key("ck_test_key");
+                if let Some(setting) = setting {
+                    builder = builder.telemetry(setting);
+                }
+                let backend = builder.build_with_env(env).expect("builds");
+                let cell = format!("setting {setting:?}, environment {env:?}");
+                assert_eq!(backend.telemetry, on, "{cell}");
+                assert_eq!(backend.l1_latency().is_some(), on, "{cell}");
+                let session = backend
+                    .static_headers
+                    .iter()
+                    .any(|(name, _)| name == "x-cachekit-session-id");
+                assert_eq!(session, on, "{cell}");
+            }
+        }
+
+        /// API-84: the health check never carries a report; the report stays
+        /// for the next request.
+        #[tokio::test]
+        async fn api_84_health_carries_no_report() {
+            let stub = stub();
+            let backend = backend_with(&stub, CachekitIO::builder(), Switch::Unset);
+            backend.health().await.expect("health");
+            backend.exists("k").await.expect("HEAD");
+
+            let health = request(&stub, 0);
+            assert!(health[0].starts_with("GET /v1/cache/health "), "{health:?}");
+            for name in LATENCY {
+                assert!(value(&health, name).is_none(), "{name} on the health check");
+            }
+            let next = request(&stub, 1);
+            assert_eq!(
+                value(&next, "x-cachekit-l1-latency-sum-ns").as_deref(),
+                Some("300")
+            );
+        }
+
+        /// API-77: the metrics headers go only to the API the backend was
+        /// built with: a redirect is an error, never followed with them.
+        #[tokio::test]
+        async fn api_77_a_redirect_is_not_followed() {
+            const MOVED: &[u8] = b"HTTP/1.1 307 Temporary Redirect\r\n\
+                location: /elsewhere\r\ncontent-length: 0\r\n\r\n";
+            let stub = stub_with(|_| Some(MOVED));
+            let backend = backend_with(&stub, CachekitIO::builder(), Switch::Unset);
+
+            backend.exists("k").await.expect_err("a 307 is an error");
+
+            let requests = stub.requests.lock().expect("lock");
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert!(
+                requests[0][0].starts_with("HEAD /v1/cache/k "),
+                "{requests:?}"
+            );
+        }
+
+        /// API-86: a report rides one attempt. One that reached the server is
+        /// consumed even though the request failed: it is not added back, and
+        /// reqwest does not resend the request on its own.
+        #[tokio::test]
+        async fn api_86_a_delivered_report_is_consumed() {
+            let stub = stub_with(|n| Some(if n == 1 { CLOSE } else { OK }));
+            let backend = backend_with(&stub, CachekitIO::builder(), Switch::Unset);
+            let report = backend.latency.clone().expect("telemetry on");
+            // Pool a connection; this request takes the first report, so
+            // time a fresh hit for the request that will fail.
+            backend.exists("warm").await.expect("warm");
+            report.record(Duration::from_nanos(700));
+
+            backend
+                .exists("k")
+                .await
+                .expect_err("the stub drops the connection unanswered");
+            backend.exists("k").await.expect("HEAD");
+
+            assert_eq!(
+                recorded(&stub, 3),
+                3,
+                "the dropped request was not resent: {:?}",
+                stub.requests.lock().expect("lock")
+            );
+            let failed = request(&stub, 1);
+            assert_eq!(
+                value(&failed, "x-cachekit-l1-latency-sum-ns").as_deref(),
+                Some("700")
+            );
+            let after = request(&stub, 2);
+            for name in LATENCY {
+                assert!(value(&after, name).is_none(), "{name} re-sent: {after:?}");
+            }
         }
     }
 }
