@@ -324,6 +324,13 @@ pub trait LockableBackend: Backend {
     /// the other. Never retry it: after a lost reply, a retry finds the lock
     /// the first attempt took and reports [`GetOrLock::Contested`].
     ///
+    /// The error kind decides what the cold miss does next. Report a call
+    /// that may have run, its reply lost, as retryable (`Transient` or
+    /// `Timeout`): the cold miss re-reads with [`Backend::get_with_freshness`]
+    /// and, on a miss, leads without the lock. Report a call the server
+    /// refused, which took no lock, as non-retryable: the cold miss reads,
+    /// then calls [`Self::acquire_lock`].
+    ///
     /// The default makes those two calls. Override it, and
     /// [`Self::__combines_get_and_lock`], when the backend can do both in one
     /// round trip.

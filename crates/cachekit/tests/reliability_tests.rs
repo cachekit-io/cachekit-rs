@@ -1272,8 +1272,9 @@ impl LockableBackend for FailingCombined {
 }
 
 /// A retry after a lost reply would find the lock the first attempt took and
-/// report it contested, so the combined call runs once where a plain read is
-/// retried. The failed read still leaves the flight, leading without a lock.
+/// report it contested, so the combined call runs once. The plain re-read
+/// that follows it is retried like any read. The failed read still leaves
+/// the flight, leading without a lock.
 #[tokio::test(start_paused = true)]
 async fn the_combined_read_and_lock_is_never_retried() {
     let backend = FailingCombined::default();
@@ -1286,22 +1287,21 @@ async fn the_combined_read_and_lock_is_never_retried() {
         .expect_err("the read fails");
     assert_eq!(backend_kind(&err), Some(&BackendErrorKind::Transient));
     assert_eq!(backend.combined(), 1, "the combined call was retried");
+    assert_eq!(
+        backend.gets.load(Ordering::SeqCst),
+        3,
+        "the re-read was not retried"
+    );
     let mut flight = lead.expect("a failed read leaves the key's flight");
     assert!(!flight.wait_for_fill().await, "the flight leads");
     flight.release().await;
-
-    // The same stack retries a plain read.
-    client
-        .__interop_read_swr::<u64>("k")
-        .await
-        .expect_err("the read fails");
-    assert_eq!(backend.gets.load(Ordering::SeqCst), 3);
 }
 
-/// The combined call is a read to the breaker: its failures open it, and an
-/// open breaker fails it fast without reaching the backend. The read then
-/// fails as a plain read would, without a second read, and leaves the flight
-/// to `single_flight` and its lock call.
+/// The combined call passes the breaker like a read: an open breaker fails
+/// it fast without reaching the backend. Its own failures are no health
+/// sample; the plain re-reads that follow them are, and open the breaker.
+/// Failed fast, the read fails as a plain read would, without a second read,
+/// and leaves the flight to `single_flight` and its lock call.
 #[tokio::test(start_paused = true)]
 async fn the_combined_read_and_lock_passes_the_breaker() {
     let backend = FailingCombined::default();

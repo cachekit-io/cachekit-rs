@@ -755,9 +755,12 @@ impl CacheKit {
     ///
     /// With `lead`, a `#[cachekit]` cold miss that takes the distributed fill
     /// lock, the L2 read also tries that lock when the backend can do both in
-    /// one round trip ([`crate::flight::ColdLead`]). Then a miss, or a failed
-    /// read, leaves the key's single-flight in `lead`, its lock attempt made.
-    /// A value it finds takes the same admission as any L2 hit.
+    /// one round trip and the key's flight is free
+    /// ([`crate::flight::ColdLead`]). `lead` is filled only then, on a miss,
+    /// or on a failed read after a lost combined call: the key's
+    /// single-flight, its lock attempt made. Otherwise it stays empty and the
+    /// caller calls [`Self::single_flight`]. A value it finds takes the same
+    /// admission as any L2 hit.
     async fn read_bytes(
         &self,
         full_key: &str,
@@ -800,21 +803,7 @@ impl CacheKit {
         // L2 backend
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
         let read = match cold {
-            Some((slot, cold)) => match cold.read().await {
-                crate::flight::ColdRead::Hit(bytes, freshness) => Some((bytes, freshness)),
-                crate::flight::ColdRead::Miss(flight) => {
-                    *slot = Some(flight);
-                    None
-                }
-                crate::flight::ColdRead::Failed(err, flight) => {
-                    *slot = Some(flight);
-                    return Err(err.into());
-                }
-                crate::flight::ColdRead::Unanswered => {
-                    self.backend.get_with_freshness(full_key).await?
-                }
-                crate::flight::ColdRead::Unsent(err) => return Err(err.into()),
-            },
+            Some((slot, cold)) => cold.read(slot).await?,
             None => self.backend.get_with_freshness(full_key).await?,
         };
         #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
@@ -1111,11 +1100,13 @@ impl CacheKit {
     }
 
     /// [`Self::__interop_read_swr`] for a cold miss that takes the
-    /// distributed fill lock. On a backend that reads and locks in one round
-    /// trip, an L2 miss or a failed L2 read also takes the key's
-    /// single-flight, its lock attempt made, and leaves it in `lead` for the
-    /// call to use in place of [`Self::single_flight`]. Any other read leaves
-    /// `lead` empty. Macro plumbing for `#[cachekit]` — not public API.
+    /// distributed fill lock. `lead` is filled only when this call took the
+    /// key's single-flight (a backend that reads and locks in one round
+    /// trip, the flight free) and its L2 read answered a miss, or failed
+    /// after the combined call was lost. The call then uses it in
+    /// place of [`Self::single_flight`], its lock attempt made. In every other
+    /// case `lead` is empty, and the caller must call [`Self::single_flight`].
+    /// Macro plumbing for `#[cachekit]` — not public API.
     #[doc(hidden)]
     pub async fn __interop_read_swr_leading<T: DeserializeOwned>(
         &self,

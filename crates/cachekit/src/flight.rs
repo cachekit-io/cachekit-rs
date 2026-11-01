@@ -841,31 +841,6 @@ pub(crate) struct ColdLead {
     full_key: String,
 }
 
-/// What a [`ColdLead`]'s read found.
-#[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-pub(crate) enum ColdRead {
-    /// The key holds a value. No lock was attempted, and the in-process
-    /// flight is free again.
-    Hit(Vec<u8>, crate::backend::Freshness),
-    /// The key was absent: the flight, as [`SingleFlight::acquire`] returns
-    /// it to a leader after its lock attempt.
-    Miss(SingleFlight),
-    /// The call timed out or lost its connection, so it may have taken the
-    /// lock: the read's error, and the flight leading without the lock, as
-    /// after a failed lock call. Never retried.
-    Failed(crate::error::BackendError, SingleFlight),
-    /// The server refused the call (a full or read-only server, a denied
-    /// script), so it took no lock. The in-process flight is free again; the
-    /// caller reads, then [`SingleFlight::acquire`]s, as for a backend that
-    /// does not combine.
-    Unanswered,
-    /// The reliability stack shed the call or failed it fast, so it was never
-    /// sent. The in-process flight is free again, and the read fails with
-    /// this error, as a plain read would: re-reading would only re-join the
-    /// queue that shed it.
-    Unsent(crate::error::BackendError),
-}
-
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
 impl ColdLead {
     /// Take `full_key`'s in-process flight without waiting, if the backend
@@ -905,57 +880,79 @@ impl ColdLead {
     }
 
     /// Read the key and, only if it is absent, try its distributed lock.
-    pub(crate) async fn read(self) -> ColdRead {
+    /// Answers as [`Backend::get_with_freshness`](crate::backend::Backend::get_with_freshness)
+    /// does. A miss leaves the key's flight in `lead`, its lock attempt made,
+    /// as [`SingleFlight::acquire`] returns it to a leader; every other exit
+    /// leaves `lead` empty and frees the flight.
+    ///
+    /// The combined call is never re-sent: a lost one may have taken the
+    /// lock, and a re-send would find that lock and report it contested. On
+    /// a retryable error the key is re-read with the guarded, retried GET,
+    /// which is idempotent. A value it finds is a hit; on a miss, or if that
+    /// read fails too, the flight leads without the lock (`lead` is filled),
+    /// as after a failed lock call.
+    pub(crate) async fn read(
+        self,
+        lead: &mut Option<SingleFlight>,
+    ) -> Result<Option<(Vec<u8>, crate::backend::Freshness)>, crate::error::BackendError> {
         use crate::backend::GetOrLock;
         use crate::error::BackendErrorKind;
 
         let deadline = LockAttempt::deadline();
         let Some(lockable) = self.backend.as_lockable() else {
-            return ColdRead::Unanswered;
+            drop(self.local);
+            return self.backend.get_with_freshness(&self.full_key).await;
         };
         let attempt = match lockable
             .__get_or_lock(&self.full_key, FILL_LOCK_TIMEOUT_MS)
             .await
         {
-            Ok(GetOrLock::Value(bytes, freshness)) => return ColdRead::Hit(bytes, freshness),
+            Ok(GetOrLock::Value(bytes, freshness)) => return Ok(Some((bytes, freshness))),
             Ok(GetOrLock::Locked(lock_id)) => LockAttempt::Granted(lock_id),
             Ok(GetOrLock::Contested) => LockAttempt::Contested { deadline },
-            Err(err)
-                if matches!(
-                    err.kind,
-                    BackendErrorKind::Transient | BackendErrorKind::Timeout
-                ) =>
-            {
+            // Lost in flight: the flight stays held across the re-read, and a
+            // hit frees it with the stand-down note still set.
+            Err(err) if err.kind.is_retryable() => {
                 crate::metrics::trace_lock_error(&self.full_key, "get_or_lock", &err);
-                let flight = SingleFlight::lead(
-                    &self.map,
-                    self.local,
-                    LockAttempt::Failed,
-                    &self.backend,
-                    &self.full_key,
-                );
-                return ColdRead::Failed(err, flight);
+                let read = self.backend.get_with_freshness(&self.full_key).await;
+                if !matches!(read, Ok(Some(_))) {
+                    *lead = Some(SingleFlight::lead(
+                        &self.map,
+                        self.local,
+                        LockAttempt::Failed,
+                        &self.backend,
+                        &self.full_key,
+                    ));
+                }
+                return read;
             }
+            // Never sent: the stack shed it or failed it fast. Re-reading
+            // would only re-join the queue that shed it.
             Err(err)
                 if matches!(
                     err.kind,
                     BackendErrorKind::CircuitOpen | BackendErrorKind::Backpressure
                 ) =>
             {
-                return ColdRead::Unsent(err);
+                return Err(err);
             }
+            // Refused (a full or read-only server, a denied script), so it
+            // took no lock: read, then let `single_flight` lock, as on a
+            // backend that does not combine.
             Err(err) => {
                 crate::metrics::trace_lock_error(&self.full_key, "get_or_lock", &err);
-                return ColdRead::Unanswered;
+                drop(self.local);
+                return self.backend.get_with_freshness(&self.full_key).await;
             }
         };
-        ColdRead::Miss(SingleFlight::lead(
+        *lead = Some(SingleFlight::lead(
             &self.map,
             self.local,
             attempt,
             &self.backend,
             &self.full_key,
-        ))
+        ));
+        Ok(None)
     }
 }
 
@@ -1013,12 +1010,16 @@ mod tests {
         unlocks: AtomicUsize,
         /// Reads and locks in one call, which finds this value.
         combined_value: Option<Vec<u8>>,
+        /// Reads and locks in one call, which is lost (`Transient`).
+        combined_lost: bool,
+        /// What a GET finds.
+        stored: Option<Vec<u8>>,
     }
 
     #[async_trait]
     impl Backend for Locks {
         async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, BackendError> {
-            Ok(None)
+            Ok(self.stored.clone())
         }
         async fn set(
             &self,
@@ -1062,7 +1063,7 @@ mod tests {
         }
 
         fn __combines_get_and_lock(&self) -> bool {
-            self.combined_value.is_some()
+            self.combined_value.is_some() || self.combined_lost
         }
 
         async fn __get_or_lock(
@@ -1070,6 +1071,9 @@ mod tests {
             key: &str,
             timeout_ms: u64,
         ) -> Result<crate::backend::GetOrLock, BackendError> {
+            if self.combined_lost {
+                return Err(BackendError::transient("connection reset"));
+            }
             match &self.combined_value {
                 Some(value) => Ok(crate::backend::GetOrLock::Value(
                     value.clone(),
@@ -1093,9 +1097,42 @@ mod tests {
         let map: crate::client::SharedFlight = Arc::default();
         let held = map.handle("k");
 
-        let lead = ColdLead::try_take(&map, &backend, "k").unwrap();
-        assert!(matches!(lead.read().await, ColdRead::Hit(..)));
+        let mut lead = None;
+        let cold = ColdLead::try_take(&map, &backend, "k").unwrap();
+        assert!(matches!(cold.read(&mut lead).await, Ok(Some(_))));
+        assert!(lead.is_none());
         assert!(held.try_lock().unwrap().stand_down);
+    }
+
+    /// A lost combined call re-reads with a plain GET. A value it finds is a
+    /// hit with the note left set, as for a combined hit; a miss leads
+    /// without the lock.
+    #[tokio::test]
+    async fn a_lost_combined_call_re_reads() {
+        for stored in [Some(b"v".to_vec()), None] {
+            let hit = stored.is_some();
+            let backend: SharedBackend = Arc::new(Locks {
+                combined_lost: true,
+                stored,
+                ..Locks::default()
+            });
+            let map: crate::client::SharedFlight = Arc::default();
+            let held = map.handle("k");
+
+            let mut lead = None;
+            let cold = ColdLead::try_take(&map, &backend, "k").unwrap();
+            let read = cold.read(&mut lead).await.unwrap();
+            assert_eq!(read.is_some(), hit);
+            if hit {
+                assert!(lead.is_none());
+                assert!(held.try_lock().unwrap().stand_down);
+                continue;
+            }
+            let mut flight = lead.unwrap();
+            assert!(!flight.wait_for_fill().await, "the flight leads");
+            assert_eq!(flight.lock_id, None, "without the lock");
+            assert!(!flight.local.stand_down, "a leader clears the note");
+        }
     }
 
     /// A taken flight dropped before its call answers (the caller was
