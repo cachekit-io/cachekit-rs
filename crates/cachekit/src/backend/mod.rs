@@ -104,6 +104,38 @@ pub trait Backend: Send + Sync {
         self.set(key, Vec::from(value), ttl).await
     }
 
+    /// Store `value` as [`Self::set_bytes`] does and return the store's bound
+    /// on the entry it wrote: the `X-CacheKit-Fresh-For` of the write's `2xx`
+    /// (`spec/saas-api.md` § Remaining Freshness, the writer's own copy).
+    ///
+    /// Client plumbing for the L1 write-through, not part of the documented
+    /// surface. `None` means the store reported no bound, so the copy keeps
+    /// the write's own TTL; `Some(Duration::ZERO)` means the copy must not be
+    /// kept. The default wraps [`Self::set_bytes`] and reports no bound, so a
+    /// backend without the signal keeps today's behaviour. A backend that
+    /// wraps another must forward this method and
+    /// [`Self::__reports_write_bound`], or the bound is lost.
+    #[doc(hidden)]
+    async fn set_bytes_with_freshness(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> Result<Option<Duration>, BackendError> {
+        self.set_bytes(key, value, ttl).await.map(|()| None)
+    }
+
+    /// Whether [`Self::set_bytes_with_freshness`] can report a bound. The
+    /// client asks once, at build, on the backend it was given, and writes
+    /// through that method only when this is `true` and it has an L1;
+    /// otherwise it calls [`Self::set_bytes`], which spares every write the
+    /// default's extra call. Override it together with that method. A backend
+    /// that wraps another forwards both. Default: `false`.
+    #[doc(hidden)]
+    fn __reports_write_bound(&self) -> bool {
+        false
+    }
+
     /// Remove `key` and return `true` if it existed.
     ///
     /// `CachekitIO` and `WorkersCachekitIO` return `true` on every successful
@@ -200,6 +232,38 @@ pub trait Backend {
         ttl: Option<Duration>,
     ) -> Result<(), BackendError> {
         self.set(key, Vec::from(value), ttl).await
+    }
+
+    /// Store `value` as [`Self::set_bytes`] does and return the store's bound
+    /// on the entry it wrote: the `X-CacheKit-Fresh-For` of the write's `2xx`
+    /// (`spec/saas-api.md` § Remaining Freshness, the writer's own copy).
+    ///
+    /// Client plumbing for the L1 write-through, not part of the documented
+    /// surface. `None` means the store reported no bound, so the copy keeps
+    /// the write's own TTL; `Some(Duration::ZERO)` means the copy must not be
+    /// kept. The default wraps [`Self::set_bytes`] and reports no bound, so a
+    /// backend without the signal keeps today's behaviour. A backend that
+    /// wraps another must forward this method and
+    /// [`Self::__reports_write_bound`], or the bound is lost.
+    #[doc(hidden)]
+    async fn set_bytes_with_freshness(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> Result<Option<Duration>, BackendError> {
+        self.set_bytes(key, value, ttl).await.map(|()| None)
+    }
+
+    /// Whether [`Self::set_bytes_with_freshness`] can report a bound. The
+    /// client asks once, at build, on the backend it was given, and writes
+    /// through that method only when this is `true` and it has an L1;
+    /// otherwise it calls [`Self::set_bytes`], which spares every write the
+    /// default's extra call. Override it together with that method. A backend
+    /// that wraps another forwards both. Default: `false`.
+    #[doc(hidden)]
+    fn __reports_write_bound(&self) -> bool {
+        false
     }
 
     /// Remove `key` and return `true` if it existed.

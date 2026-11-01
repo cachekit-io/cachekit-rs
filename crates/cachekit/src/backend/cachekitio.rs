@@ -203,22 +203,30 @@ pub(crate) fn freshness_from_headers(headers: &reqwest::header::HeaderMap) -> Fr
         .get_all("x-cachekit-freshness")
         .iter()
         .any(|value| value != "fresh");
+    Freshness {
+        is_stale,
+        fresh_for: fresh_for_from_headers(headers),
+    }
+}
+
+/// Read `X-CacheKit-Fresh-For` from a `GET 200` or a `PUT 2xx`: `None` when
+/// absent, otherwise [`parse_fresh_for`]. A repeated header has no single
+/// bound, so it counts as `0`.
+#[cfg(not(target_arch = "wasm32"))]
+fn fresh_for_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let mut fresh_for = headers.get_all("x-cachekit-fresh-for").iter();
-    let fresh_for = match (fresh_for.next(), fresh_for.next()) {
+    match (fresh_for.next(), fresh_for.next()) {
         (None, _) => None,
         (Some(value), None) => Some(parse_fresh_for(value.as_bytes())),
         (Some(_), Some(_)) => Some(Duration::ZERO),
-    };
-    Freshness {
-        is_stale,
-        fresh_for,
     }
 }
 
 /// `X-CacheKit-Fresh-For` must be 1–7 ASCII digits and at most 2,592,000 (the
-/// 30-day TTL cap); anything else counts as `0`. The length check runs first,
-/// so the range check never sees a value that a fixed-width parse could wrap
-/// back into range (`4297559296` as a `u32` is `2592000`).
+/// header's own 30-day cap, below the 90-day TTL range); anything else counts
+/// as `0`. The length check runs first, so the range check never sees a value
+/// that a fixed-width parse could wrap back into range (`4297559296` as a
+/// `u32` is `2592000`).
 #[cfg(not(target_arch = "wasm32"))]
 fn parse_fresh_for(value: &[u8]) -> Duration {
     const MAX_FRESH_FOR_SECS: u64 = 2_592_000;
@@ -289,6 +297,24 @@ impl Backend for CachekitIO {
         value: Bytes,
         ttl: Option<Duration>,
     ) -> Result<(), BackendError> {
+        self.set_bytes_with_freshness(key, value, ttl)
+            .await
+            .map(|_| ())
+    }
+
+    fn __reports_write_bound(&self) -> bool {
+        true
+    }
+
+    // The store reports the bound it applied (a plan maximum TTL can clamp
+    // the write) as `X-CacheKit-Fresh-For` on the `2xx`, read with the `GET`
+    // grammar: absent is no bound, malformed is `0`.
+    async fn set_bytes_with_freshness(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> Result<Option<Duration>, BackendError> {
         let resp = self
             .put_request(key, value, ttl)?
             .timeout(self.write_timeout)
@@ -298,7 +324,7 @@ impl Backend for CachekitIO {
 
         let status = resp.status().as_u16();
         if (200..300).contains(&status) {
-            Ok(())
+            Ok(fresh_for_from_headers(resp.headers()))
         } else {
             Err(self.error_from_response(resp).await)
         }
@@ -1478,6 +1504,161 @@ mod http_client_tests {
         let err = result.expect_err("an unanswered PUT times out");
         assert_eq!(err.kind, BackendErrorKind::Timeout);
         assert_budget(elapsed, WRITE_TIMEOUT);
+    }
+
+    // ── The writer's own copy (spec/saas-api.md API-103, API-104) ──────────
+
+    const PUT_FRESH_FOR_1: &[u8] =
+        b"HTTP/1.1 200 OK\r\nx-cachekit-fresh-for: 1\r\ncontent-length: 0\r\n\r\n";
+    const PUT_FRESH_FOR_MALFORMED: &[u8] =
+        b"HTTP/1.1 200 OK\r\nx-cachekit-fresh-for: +5\r\ncontent-length: 0\r\n\r\n";
+    const PUT_FRESH_FOR_ZERO: &[u8] =
+        b"HTTP/1.1 200 OK\r\nx-cachekit-fresh-for: 0\r\ncontent-length: 0\r\n\r\n";
+    const NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n";
+
+    /// A stub's reply to its `n`th request; see [`stub_with`].
+    type Answer = fn(usize) -> Option<&'static [u8]>;
+
+    #[tokio::test]
+    async fn put_reports_the_stores_fresh_for() {
+        let cases: [(Answer, Option<Duration>); 4] = [
+            (|_| Some(OK), None),
+            (|_| Some(PUT_FRESH_FOR_1), Some(Duration::from_secs(1))),
+            (|_| Some(PUT_FRESH_FOR_ZERO), Some(Duration::ZERO)),
+            // The GET grammar: a sign is not a digit, so it reads as `0`.
+            (|_| Some(PUT_FRESH_FOR_MALFORMED), Some(Duration::ZERO)),
+        ];
+        for (answer, want) in cases {
+            let stub = stub_with(answer);
+            let backend = backend_at(&stub);
+            assert!(backend.__reports_write_bound());
+            let got = backend
+                .set_bytes_with_freshness("k", bytes::Bytes::from_static(b"v"), None)
+                .await
+                .expect("PUT 200");
+            assert_eq!(got, want);
+        }
+    }
+
+    #[cfg(all(feature = "l1", not(feature = "unsync")))]
+    mod writer_l1_copy {
+        use super::*;
+        use crate::client::{CacheKit, SharedBackend};
+
+        /// A client with an L1 and the default reliability stack over `backend`.
+        fn client_over(backend: Arc<CachekitIO>) -> CacheKit {
+            let shared: SharedBackend = backend;
+            CacheKit::builder()
+                .backend(shared)
+                .l1_capacity(100)
+                .build()
+                .expect("client builds")
+        }
+
+        /// Write `key` for 300 s through a stub whose `PUT` replies `put`
+        /// and whose every later request is a `404`, and return the client.
+        async fn written(put: Answer) -> (Stub, CacheKit) {
+            let stub = stub_with(put);
+            let client = client_over(Arc::new(backend_at(&stub)));
+            client
+                .set_with_ttl("k", &"v".to_owned(), Duration::from_secs(300))
+                .await
+                .expect("set");
+            (stub, client)
+        }
+
+        /// Whether a read of `k` was served from L1: an L1 hit sends nothing,
+        /// anything else reaches the stub's `404`.
+        async fn served_from_l1(client: &CacheKit) -> bool {
+            let before = client.stats().l1_hits;
+            let value: Option<String> = client.get("k").await.expect("get");
+            let hit = client.stats().l1_hits > before;
+            assert_eq!(value.is_some(), hit, "only the L1 holds the value");
+            hit
+        }
+
+        #[tokio::test]
+        async fn without_fresh_for_the_copy_keeps_the_write_ttl() {
+            let (_stub, client) = written(|n| Some(if n == 0 { OK } else { NOT_FOUND })).await;
+            assert!(served_from_l1(&client).await);
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert!(served_from_l1(&client).await, "no header: 300 s bound");
+        }
+
+        #[tokio::test]
+        async fn a_smaller_fresh_for_bounds_the_copy() {
+            let (_stub, client) =
+                written(|n| Some(if n == 0 { PUT_FRESH_FOR_1 } else { NOT_FOUND })).await;
+            assert!(served_from_l1(&client).await, "kept for 1 s");
+            // Real time: L1 ages entries by std Instant.
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert!(!served_from_l1(&client).await, "served past Fresh-For");
+        }
+
+        #[tokio::test]
+        async fn a_malformed_fresh_for_keeps_no_copy() {
+            let (_stub, client) = written(|n| {
+                Some(if n == 0 {
+                    PUT_FRESH_FOR_MALFORMED
+                } else {
+                    NOT_FOUND
+                })
+            })
+            .await;
+            assert!(!served_from_l1(&client).await);
+        }
+
+        /// A zero bound also drops the key's older copy, which the write
+        /// supersedes and must not outlive it.
+        #[tokio::test]
+        async fn a_zero_fresh_for_drops_the_older_copy() {
+            let stub = stub_with(|n| {
+                Some(match n {
+                    0 => OK,
+                    1 => PUT_FRESH_FOR_ZERO,
+                    _ => NOT_FOUND,
+                })
+            });
+            let client = client_over(Arc::new(backend_at(&stub)));
+            let ttl = Duration::from_secs(300);
+            client
+                .set_with_ttl("k", &"old".to_owned(), ttl)
+                .await
+                .expect("set");
+            client
+                .set_with_ttl("k", &"new".to_owned(), ttl)
+                .await
+                .expect("set");
+            assert!(!served_from_l1(&client).await);
+        }
+
+        /// API-104: a `PATCH /ttl` reply never extends the writer's copy. The
+        /// copy is bounded to 1 s by the `PUT`; a 300 s refresh leaves it so.
+        #[tokio::test]
+        async fn refresh_ttl_never_extends_the_copy() {
+            use crate::backend::TtlInspectable;
+            let stub = stub_with(|n| {
+                Some(match n {
+                    0 => PUT_FRESH_FOR_1,
+                    1 => OK,
+                    _ => NOT_FOUND,
+                })
+            });
+            let backend = Arc::new(backend_at(&stub));
+            let client = client_over(backend.clone());
+            client
+                .set_with_ttl("k", &"v".to_owned(), Duration::from_secs(300))
+                .await
+                .expect("set");
+            assert!(backend
+                .refresh_ttl("k", Duration::from_secs(300))
+                .await
+                .expect("PATCH"));
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert!(!served_from_l1(&client).await, "PATCH extended the copy");
+            let requests = stub.requests.lock().expect("lock");
+            assert!(requests[1][0].starts_with("PATCH "), "{:?}", requests[1]);
+        }
     }
 
     #[cfg(feature = "reliability")]

@@ -260,6 +260,11 @@ pub struct CacheKit {
     #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
     breaker: Option<Arc<crate::reliability::CircuitBreaker>>,
 
+    /// The client has an L1 and the backend reports the store's bound on a
+    /// write ([`Backend::__reports_write_bound`]), so writes go through
+    /// [`Backend::set_bytes_with_freshness`] (`write_backend!`).
+    l1_write_bound: bool,
+
     #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
     mutations: SharedMutations,
 
@@ -274,6 +279,29 @@ pub struct CacheKit {
 
     #[cfg(feature = "encryption")]
     encryption: Option<SharedEncryption>,
+}
+
+/// Write `$bytes` through `$client`'s backend and evaluate to the store's
+/// bound for this writer's L1 copy: `None` for no bound, zero for no copy
+/// (API-103). Only a client with `l1_write_bound` set asks the backend for
+/// it; every other write goes through [`Backend::set_bytes`] and reports no
+/// bound. A macro, not an async helper: the nested future cost `set/plain`
+/// about 100 instructions per op, as [`CacheKit::share_with_l1`] found.
+macro_rules! write_backend {
+    ($client:expr, $full_key:expr, $bytes:expr, $ttl:expr) => {
+        if $client.l1_write_bound {
+            $client
+                .backend
+                .set_bytes_with_freshness($full_key, $bytes, Some($ttl))
+                .await?
+        } else {
+            $client
+                .backend
+                .set_bytes($full_key, $bytes, Some($ttl))
+                .await?;
+            None
+        }
+    };
 }
 
 impl CacheKit {
@@ -401,20 +429,39 @@ impl CacheKit {
     }
 
     /// Write-through to L1 after a write the backend accepted. The entry lives
-    /// no longer than the TTL the write sent on the wire ([`ttl_wire_secs`]):
-    /// `spec/saas-api.md` forbids serving it past `min(local_ttl, effective_ttl)`,
-    /// and the wire truncates a fractional TTL from 1 s up (1.5 s goes as 1).
-    /// `None`, from [`Self::share_with_l1`] on a client without an L1, does
-    /// nothing.
+    /// no longer than the TTL the write sent on the wire ([`ttl_wire_secs`])
+    /// nor than `fresh_for`, the store's bound from the write's `2xx`
+    /// ([`Backend::set_bytes_with_freshness`]): `spec/saas-api.md` forbids
+    /// serving it past `min(local_ttl, effective_ttl, fresh_for)` from receipt
+    /// (API-103), and the wire truncates a fractional TTL from 1 s up (1.5 s
+    /// goes as 1). A zero bound keeps no copy and drops the key's older one,
+    /// which would otherwise outlive the write. `None` bytes, from
+    /// [`Self::share_with_l1`] on a client without an L1, do nothing.
     #[cfg_attr(not(feature = "l1"), allow(clippy::unused_self))]
-    fn l1_set(&self, full_key: &str, bytes: Option<Bytes>, ttl: Duration) {
+    fn l1_set(
+        &self,
+        full_key: &str,
+        bytes: Option<Bytes>,
+        ttl: Duration,
+        fresh_for: Option<Duration>,
+    ) {
         #[cfg(feature = "l1")]
         if let (Some(l1), Some(bytes)) = (&self.l1, bytes) {
-            let wire = Duration::from_secs(ttl_wire_secs(ttl));
-            l1.set_shared(full_key, self.admit(bytes), ttl.min(wire));
+            // `ttl` is non-zero (`validate_ttl`), so only `fresh_for` can
+            // make the bound zero.
+            let bound = ttl.min(Duration::from_secs(ttl_wire_secs(ttl)));
+            let bound = match fresh_for {
+                None => bound,
+                Some(fresh_for) if fresh_for.is_zero() => {
+                    l1.delete(full_key);
+                    return;
+                }
+                Some(fresh_for) => bound.min(fresh_for),
+            };
+            l1.set_shared(full_key, self.admit(bytes), bound);
         }
         #[cfg(not(feature = "l1"))]
-        let _ = (full_key, bytes, ttl);
+        let _ = (full_key, bytes, ttl, fresh_for);
     }
 
     /// Wrap a write's payload for the backend, plus a handle to the same
@@ -480,8 +527,8 @@ impl CacheKit {
             return Ok(false);
         }
         let (bytes, l1_bytes) = self.share_with_l1(bytes);
-        self.backend.set_bytes(&full_key, bytes, Some(ttl)).await?;
-        self.l1_set(&full_key, l1_bytes, ttl);
+        let fresh_for = write_backend!(self, &full_key, bytes, ttl);
+        self.l1_set(&full_key, l1_bytes, ttl, fresh_for);
         mutation.advance();
         crate::metrics::trace_write(&full_key, ttl);
         Ok(true)
@@ -876,6 +923,10 @@ impl CacheKit {
     ///
     /// A positive sub-second `ttl` is sent to the backend as 1 second.
     ///
+    /// The L1 copy this write keeps lives no longer than the TTL sent. On
+    /// cachekit.io, the store's `X-CacheKit-Fresh-For` on the `PUT` response
+    /// bounds it further, from receipt; a malformed value or `0` keeps no copy.
+    ///
     /// Returns [`CachekitError::Config`] if `ttl` is zero.
     ///
     /// The client namespace is not checked here: an interop key written on a
@@ -910,8 +961,8 @@ impl CacheKit {
         }
 
         let (bytes, l1_bytes) = self.share_with_l1(bytes);
-        self.backend.set_bytes(&full_key, bytes, Some(ttl)).await?;
-        self.l1_set(&full_key, l1_bytes, ttl);
+        let fresh_for = write_backend!(self, &full_key, bytes, ttl);
+        self.l1_set(&full_key, l1_bytes, ttl, fresh_for);
 
         crate::metrics::trace_write(&full_key, ttl);
         Ok(())
@@ -1296,11 +1347,8 @@ impl SecureCache<'_> {
         }
 
         let (ciphertext, l1_bytes) = self.client.share_with_l1(ciphertext);
-        self.client
-            .backend
-            .set_bytes(&full_key, ciphertext, Some(ttl))
-            .await?;
-        self.client.l1_set(&full_key, l1_bytes, ttl);
+        let fresh_for = write_backend!(self.client, &full_key, ciphertext, ttl);
+        self.client.l1_set(&full_key, l1_bytes, ttl, fresh_for);
 
         crate::metrics::trace_write(&full_key, ttl);
         Ok(())
@@ -2001,6 +2049,7 @@ impl CacheKitBuilder {
         let l1_enabled = false;
         let counters = Arc::new(CacheCounters::new(l1_enabled));
         backend.attach_metrics(counters.provider());
+        let l1_write_bound = l1_enabled && backend.__reports_write_bound();
 
         // Apply the reliability stack last so it decorates the final backend.
         // A disabled config is the documented opt-out: skip the (no-op)
@@ -2022,6 +2071,7 @@ impl CacheKitBuilder {
             max_payload_bytes: self.max_payload_bytes.unwrap_or(5 * 1024 * 1024),
             flight: SharedFlight::default(),
             counters,
+            l1_write_bound,
 
             #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
             breaker,
@@ -2223,6 +2273,7 @@ mod secure_l1_tests {
             "poisoned-stale",
             Some(bytes::Bytes::from_static(b"not ciphertext")),
             Duration::from_secs(60),
+            None,
         );
         // Real time, not tokio's paused clock: L1 ages entries by std
         // Instant. threshold = 0.001 × 60 s = 60 ms (±10%); hard expiry 60 s.

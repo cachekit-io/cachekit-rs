@@ -234,7 +234,7 @@ impl ReliabilityConfig {
 pub(crate) struct RetryDeadlines {
     /// For `get`, `get_with_freshness` and `exists`.
     pub(crate) read: Duration,
-    /// For `set`, `set_bytes` and `delete`.
+    /// For `set`, `set_bytes`, `set_bytes_with_freshness` and `delete`.
     pub(crate) write: Duration,
 }
 
@@ -877,6 +877,24 @@ impl Backend for ReliableBackend {
             self.inner.set_bytes(key, value.clone(), ttl)
         })
         .await
+    }
+
+    // Forwarded, not defaulted: the default would call `self.set_bytes` and
+    // drop the inner backend's bound, unbounding the writer's L1 copy.
+    async fn set_bytes_with_freshness(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> Result<Option<Duration>, BackendError> {
+        self.guarded(self.deadlines.map(|d| d.write), || {
+            self.inner.set_bytes_with_freshness(key, value.clone(), ttl)
+        })
+        .await
+    }
+
+    fn __reports_write_bound(&self) -> bool {
+        self.inner.__reports_write_bound()
     }
 
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
