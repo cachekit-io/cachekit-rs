@@ -285,12 +285,13 @@ async fn macro_self_heals_undecodable_entry() {
 }
 
 #[tokio::test]
-async fn macro_key_delegates_to_interop_key() {
+async fn macro_key_matches_interop_key() {
     // The macro must mint EXACTLY interop_key(namespace, operation, args),
-    // operation being the `interop` attribute — this delegation is what
-    // makes the 48 protocol interop vectors
-    // (interop_vector_tests.rs) transitively cover #[cachekit] keys, and
-    // what makes the same entry addressable from the Python/TS SDKs.
+    // operation being the `interop` attribute: that is what makes the same
+    // entry addressable from the Python/TS SDKs. The macro calls
+    // `interop::__KeyPrefix::key`, which interop_vector_tests.rs runs
+    // against every key and error vector and against interop_key on random
+    // input; this test ties the macro expansion to it.
     let (cache, backend) = mock_client_counting();
     get_user_multi_args(&cache, "acme".to_owned(), 7)
         .await
@@ -300,6 +301,34 @@ async fn macro_key_delegates_to_interop_key() {
         "orgs",
         "get_user_multi_args",
         &[InteropValue::from("acme"), InteropValue::from(7u64)],
+    )
+    .unwrap();
+    let keys: Vec<String> = backend.inner.store.lock().await.keys().cloned().collect();
+    assert_eq!(keys, vec![expected]);
+}
+
+/// Parameters named like the macro's key-prefix static and its argument
+/// slice are still the parameters: the expansion evaluates the arguments
+/// outside the block that declares the static, before the slice is bound.
+#[cachekit(client = cache, ttl = 60, interop = "shadowed", namespace = "hygiene")]
+#[allow(non_snake_case)]
+async fn shadowed_prefix_name(
+    cache: &CacheKit,
+    __CK_KEY_PREFIX: u64,
+    __ck_args: u64,
+) -> Result<u64, CachekitError> {
+    Ok(__CK_KEY_PREFIX + __ck_args)
+}
+
+#[tokio::test]
+async fn parameter_named_like_the_key_prefix_static_keys_by_its_value() {
+    let (cache, backend) = mock_client_counting();
+    assert_eq!(shadowed_prefix_name(&cache, 7, 1).await.unwrap(), 8);
+
+    let expected = interop_key(
+        "hygiene",
+        "shadowed",
+        &[InteropValue::from(7u64), InteropValue::from(1u64)],
     )
     .unwrap();
     let keys: Vec<String> = backend.inner.store.lock().await.keys().cloned().collect();

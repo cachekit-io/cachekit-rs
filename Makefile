@@ -56,10 +56,10 @@ test-wasm:
 # (e.g. FILTER=l2_hit); JOBS=<n> measures n cases at a time.
 # CI's `perf-ir` job runs the same comparison on every PR.
 bench:
-	$(CARGO) run --release --example bench_hot_path -- wall $(if $(FILTER),'$(FILTER)')
+	$(CARGO) run --release --features macros --example bench_hot_path -- wall $(if $(FILTER),'$(FILTER)')
 
 bench-instr:
-	$(CARGO) build --release --example bench_hot_path
+	$(CARGO) build --release --features macros --example bench_hot_path
 	target/release/examples/bench_hot_path instr $(if $(JOBS),--jobs '$(JOBS)') $(if $(BASE),--base '$(BASE)') $(if $(FILTER),'$(FILTER)')
 
 # Supply-chain gate — deny is identical to CI's; audit runs the strict form

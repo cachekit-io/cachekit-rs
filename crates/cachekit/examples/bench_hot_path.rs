@@ -7,6 +7,10 @@
 //! valgrind's callgrind, which is deterministic on one thread. The runtime is
 //! tokio `current_thread`: work stealing would add scheduler noise.
 //!
+//! `macro_hit` reads through a `#[cachekit]` function, so it builds only with
+//! the `macros` feature (`make bench` and `make bench-instr` turn it on); a
+//! build without it lists no `macro_hit` case.
+//!
 //! ```text
 //! bench_hot_path list                          every case name
 //! bench_hot_path run <case> <size> <iters>     one case; indicative wall ns/op
@@ -45,7 +49,7 @@ use cachekit::backend::{Backend, HealthStatus};
 use cachekit::reliability::ReliabilityConfig;
 use cachekit::{BackendError, CacheKit, CachekitError};
 
-const OPS: [&str; 7] = [
+const OPS: [&str; 8] = [
     "l1_hit",
     "l1_hit_row",
     "l2_hit",
@@ -53,6 +57,7 @@ const OPS: [&str; 7] = [
     "delete",
     "exists",
     "oneshot",
+    "macro_hit",
 ];
 /// `ns` and `nsenc` are `plain` and `enc` on a client with a namespace, so
 /// every op builds `{namespace}:{key}`.
@@ -86,6 +91,13 @@ const TTL: Duration = Duration::from_secs(300);
 const WARM: usize = 16;
 /// Demangled name of the function callgrind counts (see [`measured`]).
 const MEASURED: &str = "bench_hot_path::measured";
+/// `macro_hit`'s interop segments and arguments. With the 64-hex hash, its
+/// key is 120 B, the length of a real interop key: a short bench key
+/// understates what a key-path change saves.
+const MACRO_NAMESPACE: &str = "bench.accounts.v2";
+const MACRO_OPERATION: &str = "users.fetch_profile_by_email_and_size";
+const MACRO_EMAIL: &str = "alice@example.com";
+const MACRO_ID: u64 = 42;
 /// Key prefix whose backend delete never returns (see [`parked`]).
 const PARKED: &str = "bench:parked:";
 /// The one value size a `parked<N>` case runs at: the map it prices never
@@ -216,6 +228,41 @@ impl Backend for MemBackend {
 
 // ── Cases ────────────────────────────────────────────────────────────────────
 
+/// `macro_hit/plain` and `macro_hit/rel`'s function. Setup writes its entry
+/// under the key the macro derives, so the body runs only on a miss, which
+/// fails the run.
+#[cfg(feature = "macros")]
+#[cachekit::cachekit(
+    client = cache,
+    ttl = 300,
+    interop = "users.fetch_profile_by_email_and_size",
+    namespace = "bench.accounts.v2"
+)]
+async fn macro_read(cache: &CacheKit, email: &str, id: u64) -> Result<String, CachekitError> {
+    Err(CachekitError::Config(format!(
+        "macro_hit: expected a hit for {email}/{id}, got a miss"
+    )))
+}
+
+/// `macro_hit/enc`'s function: [`macro_read`] with `secure`.
+#[cfg(feature = "macros")]
+#[cachekit::cachekit(
+    client = cache,
+    ttl = 300,
+    interop = "users.fetch_profile_by_email_and_size",
+    namespace = "bench.accounts.v2",
+    secure
+)]
+async fn macro_read_secure(
+    cache: &CacheKit,
+    email: &str,
+    id: u64,
+) -> Result<String, CachekitError> {
+    Err(CachekitError::Config(format!(
+        "macro_hit: expected a hit for {email}/{id}, got a miss"
+    )))
+}
+
 /// One bench case: `<op>/<mode>`, e.g. `l2_hit/enc`.
 struct Bench {
     op: &'static str,
@@ -273,14 +320,18 @@ fn parked(mode: &str) -> usize {
 /// Whether `<op>/<mode>/<size>` is a case. `prev` is the rotation read path,
 /// so it pairs only with reads; `oneshot` prices building an encrypting
 /// client, so it pairs only with the encrypted modes; `parked<N>` pairs only
-/// with `delete`, at [`PARKED_SIZE`]. A namespace adds the same key build to
-/// every op, so `ns` and `nsenc` price it on the reads and `set` only.
+/// with `delete`, at [`PARKED_SIZE`]; `macro_hit` exists only with the
+/// `macros` feature, and its `enc` mode reads through a `secure` function.
+/// A namespace adds the same key build to every op, so `ns` and `nsenc` price
+/// it on the reads and `set` only; not on `macro_hit`, whose interop read a
+/// namespaced client refuses.
 fn is_case(op: &str, mode: &str, size: usize) -> bool {
     if parked(mode) > 0 {
         return op == "delete" && size == PARKED_SIZE;
     }
     match op {
         "oneshot" => matches!(mode, "enc" | "prev"),
+        "macro_hit" => cfg!(feature = "macros") && !matches!(mode, "prev" | "ns" | "nsenc"),
         "l1_hit" | "l2_hit" => true,
         // A plaintext decode: the encrypted modes decode decrypted plaintext,
         // which is walked on every read.
@@ -313,9 +364,18 @@ impl Bench {
         // its capacity into shards, and a shard sized exactly to its keys
         // evicts a few of them when the hash spreads them unevenly.
         let reader = client(&backend, mode, 2 * (iters + WARM) + 8)?;
-        let keys: Vec<String> = (0..iters + WARM)
-            .map(|i| format!("bench:{op}:{i:08}"))
-            .collect();
+        let keys: Vec<String> = if op == "macro_hit" {
+            // The key `#[cachekit]` derives for `macro_read(MACRO_EMAIL, MACRO_ID)`.
+            vec![cachekit::interop::interop_key(
+                MACRO_NAMESPACE,
+                MACRO_OPERATION,
+                &[MACRO_EMAIL.into(), MACRO_ID.into()],
+            )?]
+        } else {
+            (0..iters + WARM)
+                .map(|i| format!("bench:{op}:{i:08}"))
+                .collect()
+        };
         let bench = Self {
             op,
             mode,
@@ -399,6 +459,19 @@ impl Bench {
             // backend: what a one-read process pays past start-up (the warm-up
             // has already paid first-use costs, and L1 holds 8 entries).
             "oneshot" => read(&client(&self.backend, self.mode, 8)?, true, key).await,
+            // An L1 hit through `#[cachekit]`: `l1_hit`'s read plus the key
+            // derivation, the freshness check and the hit count.
+            #[cfg(feature = "macros")]
+            "macro_hit" => {
+                let (email, id) = (black_box(MACRO_EMAIL), black_box(MACRO_ID));
+                let got = if self.enc {
+                    macro_read_secure(&self.reader, email, id).await?
+                } else {
+                    macro_read(&self.reader, email, id).await?
+                };
+                drop(black_box(got));
+                Ok(())
+            }
             "l1_hit_row" => {
                 let got: Option<Row> = self.reader.get(key).await?;
                 got.map(|v| drop(black_box(v))).ok_or_else(|| {
