@@ -181,13 +181,6 @@ async fn a_client_without_l1_times_nothing() {
     assert_eq!(backend.timed(), 0);
 }
 
-/// API-77: a backend that does not report to cachekit.io supplies no
-/// accumulator, so a client over it draws nothing and reads no clock.
-#[test]
-fn api_77_other_backends_supply_no_report() {
-    assert!(MockBackend::default().l1_latency().is_none());
-}
-
 #[cfg(feature = "encryption")]
 mod encrypted {
     use super::*;

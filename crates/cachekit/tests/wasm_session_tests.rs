@@ -539,6 +539,7 @@ async fn workers_api_82_telemetry_on_sends_no_latency_headers() {
     set_process_env(None);
     let backend = WorkersCachekitIO::builder()
         .api_key("test-key-never-sent")
+        .bindings(&bindings(&worker::wasm_bindgen::JsValue::UNDEFINED))
         .build()
         .expect("default URL is valid");
     backend.attach_metrics(l1_counters());
@@ -628,6 +629,7 @@ async fn workers_api_95_reads_process_env_and_bindings_once() {
     set_process_env(None);
     let built = WorkersCachekitIO::builder()
         .api_key("test-key-never-sent")
+        .bindings(&bindings(&JsValue::UNDEFINED))
         .build()
         .expect("default URL is valid");
     built.attach_metrics(l1_counters());
@@ -642,4 +644,39 @@ async fn workers_api_95_reads_process_env_and_bindings_once() {
     assert!(!off_in_one, "off from either source wins");
     assert!(on_in_both, "on in both is on");
     assert!(read_once, "the environment is read once, at build");
+}
+
+/// API-94: a backend built without its Worker's bindings cannot see a
+/// `CACHEKIT_TELEMETRY` binding, so it fails closed: telemetry is off unless
+/// the code turns it on.
+#[wasm_bindgen_test]
+async fn workers_api_94_without_bindings_telemetry_is_off() {
+    use cachekit::backend::workers::WorkersCachekitIO;
+    use cachekit::backend::Backend;
+
+    set_process_env(None);
+    let unset = WorkersCachekitIO::builder()
+        .api_key("test-key-never-sent")
+        .build()
+        .expect("default URL is valid");
+    unset.attach_metrics(l1_counters());
+    let unset_sends = sent_headers(&unset)
+        .await
+        .contains_key("x-cachekit-session-id");
+
+    let explicit = WorkersCachekitIO::builder()
+        .api_key("test-key-never-sent")
+        .telemetry(true)
+        .build()
+        .expect("default URL is valid");
+    explicit.attach_metrics(l1_counters());
+    let explicit_sends = sent_headers(&explicit)
+        .await
+        .contains_key("x-cachekit-session-id");
+
+    assert!(!unset_sends, "no bindings and no setting: off");
+    assert!(
+        explicit_sends,
+        ".telemetry(true) turns it on without bindings"
+    );
 }

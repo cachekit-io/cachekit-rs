@@ -19,7 +19,7 @@ use crate::metrics::{
     metrics_headers_named, telemetry_on, MetricsProvider, Switch, METRICS_HEADER_NAMES,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use crate::metrics::{L1Latency, DEFAULT_ONE_IN, LATENCY_HEADER_NAMES};
+use crate::metrics::{L1Latency, DEFAULT_ONE_IN};
 use crate::session::session_headers;
 use crate::url_validator::cachekitio_base_url;
 
@@ -44,9 +44,6 @@ pub struct CachekitIO {
     /// carries; `None` with telemetry off.
     #[cfg(not(target_arch = "wasm32"))]
     latency: Option<Arc<L1Latency>>,
-    /// The latency header names, parsed once, in [`LATENCY_HEADER_NAMES`] order.
-    #[cfg(not(target_arch = "wasm32"))]
-    latency_header_names: [HeaderName; 3],
     /// Source of the `X-CacheKit-*` telemetry headers. Set once: by the
     /// builder when the user supplies one, otherwise by the client at build
     /// time via [`Backend::attach_metrics`] (first writer wins).
@@ -169,7 +166,7 @@ impl CachekitIO {
             .filter(|_| report)
             .and_then(|l| l.take())
         {
-            for (name, value) in self.latency_header_names.iter().zip(values) {
+            for (name, value) in LATENCY_HEADERS.iter().zip(values) {
                 req = req.header(name.clone(), value);
             }
         }
@@ -481,17 +478,19 @@ fn metrics_header_names() -> Result<[HeaderName; 5], crate::error::CachekitError
     Ok([a?, b?, c?, d?, e?])
 }
 
-/// Parse [`LATENCY_HEADER_NAMES`] once per client.
-#[cfg(not(target_arch = "wasm32"))]
-fn latency_header_names() -> Result<[HeaderName; 3], crate::error::CachekitError> {
-    let [a, b, c] = LATENCY_HEADER_NAMES.map(parse_header_name);
-    Ok([a?, b?, c?])
-}
-
 fn parse_header_name(name: &str) -> Result<HeaderName, crate::error::CachekitError> {
     HeaderName::from_bytes(name.as_bytes())
         .map_err(|e| crate::error::CachekitError::Config(format!("header name {name}: {e}")))
 }
+
+/// The L1 hit-latency headers, in the order [`L1Latency`] reports their
+/// values: buckets, sum, one-in.
+#[cfg(not(target_arch = "wasm32"))]
+const LATENCY_HEADERS: [HeaderName; 3] = [
+    HeaderName::from_static("x-cachekit-l1-latency-buckets"),
+    HeaderName::from_static("x-cachekit-l1-latency-sum-ns"),
+    HeaderName::from_static("x-cachekit-l1-latency-one-in"),
+];
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
@@ -705,8 +704,6 @@ impl CachekitIOBuilder {
             telemetry,
             #[cfg(not(target_arch = "wasm32"))]
             latency: telemetry.then(|| Arc::new(L1Latency::new(DEFAULT_ONE_IN))),
-            #[cfg(not(target_arch = "wasm32"))]
-            latency_header_names: latency_header_names()?,
             metrics_provider: self
                 .metrics_provider
                 .map_or_else(OnceLock::new, OnceLock::from),
@@ -1782,6 +1779,7 @@ mod http_client_tests {
     //
     // Each test names the spec/saas-api.md requirement it pins (API-NN).
 
+    #[cfg(all(feature = "l1", feature = "reliability"))]
     mod telemetry {
         use super::*;
         use crate::metrics::{L1Latency, L1Stats, MetricsProvider, Switch};

@@ -595,7 +595,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             match #get_swr_expr {
                 Ok(cachekit::SwrRead::Fresh((__ck_cached, __ck_by))) => {
                     #client_ident.__count(&__ck_key, __ck_by);
-                    #client_ident.__l1_timed(__ck_sample, __ck_by);
+                    #client_ident.__l1_stop(__ck_sample, __ck_by);
                     return Ok(__ck_cached);
                 }
                 // Stale (past the freshness threshold, before hard expiry):
@@ -651,7 +651,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                     });
                     // The stale serve's own work, spawning the refresh
                     // included, is part of the call.
-                    #client_ident.__l1_timed(__ck_sample, __ck_by);
+                    #client_ident.__l1_stop(__ck_sample, __ck_by);
                     return Ok(__ck_cached);
                 }
                 Ok(cachekit::SwrRead::Miss) => {}

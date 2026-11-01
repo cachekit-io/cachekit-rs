@@ -442,7 +442,7 @@ let backend = FileBackend::builder()
 
 The Workers runtime's `fetch` has no timeout of its own and can hold a request for tens of seconds, so the backend bounds each request itself: 5 s for a read and 10 s for a write (`set`, `delete`), from send through the last byte of the response body. Past that the request is aborted and the call fails with `BackendErrorKind::Timeout`. The `reliability` feature is native-only, so a Workers call makes one attempt and does not retry.
 
-Pass the Worker's bindings with `.bindings(&env)` so a `CACHEKIT_TELEMETRY` variable or secret set there turns [telemetry](#telemetry-sent-to-cachekitio) off; `process.env` (with the `nodejs_compat` flag) is read as well.
+Pass the Worker's bindings with `.bindings(&env)`: the backend reads a `CACHEKIT_TELEMETRY` variable or secret there, and `process.env` (with the `nodejs_compat` flag) as well. Built without them, it cannot see the variable, so [telemetry](#telemetry-sent-to-cachekitio) is off unless `.telemetry(true)` turns it on.
 
 <!-- x-release-please-start-version -->
 ```toml
@@ -699,7 +699,7 @@ Only the cachekit.io backends, `CachekitIO` and `WorkersCachekitIO`, send teleme
 | `X-CacheKit-Session-Start` | When the process started its session, in milliseconds since the epoch |
 | `X-CacheKit-L1-Hits`, `X-CacheKit-L2-Hits`, `X-CacheKit-Misses` | The client's read counters, as `stats()` returns them, since the session started |
 | `X-CacheKit-L1-Hit-Rate` | `L1-Hits / (L1-Hits + L2-Hits + Misses)`, three decimals, `0.000` before any read |
-| `X-CacheKit-L1-Latency-Buckets` | The L1 hits timed since the previous report, counted into 16 duration buckets that double from 128 ns up to 2.1 ms, and a last one up to 60 s |
+| `X-CacheKit-L1-Latency-Buckets` | The L1 hits timed since the previous report, counted into 16 duration buckets: 15 that double from 128 ns to 2.1 ms, and a last one up to 60 s |
 | `X-CacheKit-L1-Latency-Sum-Ns` | The total duration of those hits, in nanoseconds |
 | `X-CacheKit-L1-Latency-One-In` | N: each call was timed with probability 1/N (128) |
 
@@ -708,7 +708,7 @@ One value read in 128, drawn at random before the read starts, is timed, from th
 Telemetry is on by default during the closed beta, and becomes opt-in when cachekit.io reaches general availability. Two controls turn it off, and off from either wins:
 
 - `.telemetry(false)` on `CachekitIO::builder()` or `WorkersCachekitIO::builder()`. The setting is unset by default.
-- `CACHEKIT_TELEMETRY=false` in the environment. `false`, `0`, `off` and `no` turn telemetry off and `true`, `1`, `on` and `yes` turn it on, in any case and ignoring surrounding white space. Unset or empty leaves the default. Any other value also turns telemetry off and, with the `tracing` feature, logs one warning. On Workers the variable is read from `process.env` and from the bindings passed to `.bindings(&env)`.
+- `CACHEKIT_TELEMETRY=false` in the environment. `false`, `0`, `off` and `no` turn telemetry off and `true`, `1`, `on` and `yes` turn it on, in any case and ignoring surrounding white space. Unset or empty leaves the default. Any other value also turns telemetry off and warns once: through `tracing` natively (with the `tracing` feature), and to the console on Workers. On Workers the variable is read from `process.env` and from the bindings passed to `.bindings(&env)`. A Workers backend built without `.bindings(&env)` cannot see a `CACHEKIT_TELEMETRY` binding, so its telemetry is off unless `.telemetry(true)` turns it on.
 
 Both controls are read once, when the backend is built. With telemetry off the backend sends none of the headers above and times no read. It still sends `X-CacheKit-L1-Status`, which the service requires on every request and which describes that request only, and, natively, `User-Agent: cachekit-rs/<version>`.
 

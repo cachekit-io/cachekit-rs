@@ -217,14 +217,6 @@ fn warn_unrecognised_telemetry_env() {
 // cachekit.io has an accumulator, so every other client pays one `None`
 // check per read.
 
-/// Names of the latency headers, in the order [`L1Latency`] reports them.
-#[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
-pub(crate) const LATENCY_HEADER_NAMES: [&str; 3] = [
-    "X-CacheKit-L1-Latency-Buckets",
-    "X-CacheKit-L1-Latency-Sum-Ns",
-    "X-CacheKit-L1-Latency-One-In",
-];
-
 /// Upper bound of each latency bucket, in nanoseconds: doubling from 128 ns,
 /// with the last bucket closed at 60 s. A change to the bounds needs a new
 /// header name.
@@ -254,9 +246,10 @@ const MAX_WIRE_INT: u64 = (1 << 53) - 1;
 
 /// The sampling denominator every CachekitIO backend uses: one call in 128
 /// is timed. Two clock reads and a locked add on every L1 hit would cost a
-/// visible share of a sub-microsecond hit; one in 128 costs about one
-/// instruction per hit and still times dozens of hits a second at a few
-/// thousand hits a second.
+/// visible share of a sub-microsecond hit. Every read still pays the draw, a
+/// few instructions; the clock reads and the locked add amortise to about one
+/// instruction per hit at one in 128, which still times dozens of hits a
+/// second at a few thousand hits a second.
 #[cfg(all(feature = "cachekitio", not(target_arch = "wasm32")))]
 pub(crate) const DEFAULT_ONE_IN: u32 = 128;
 
@@ -333,11 +326,6 @@ impl L1Latency {
         Self::new(one_in)
     }
 
-    /// The sampling denominator N sent as `X-CacheKit-L1-Latency-One-In`.
-    pub fn one_in(&self) -> u32 {
-        self.one_in
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, Report> {
         self.report
             .lock()
@@ -366,7 +354,7 @@ impl L1Latency {
     }
 
     /// Take the report and reset the accumulator in one step, as the three
-    /// header values in [`LATENCY_HEADER_NAMES`] order, or `None` when there
+    /// header values (buckets, sum, one-in), or `None` when there
     /// is nothing to send: no timed hit, or only hits that read 0 ns, which
     /// stay for a later request. A report built before this process forked
     /// is discarded, never sent twice.
@@ -396,9 +384,9 @@ impl L1Latency {
         self.take()
     }
 
-    /// Count a timed hit of `elapsed` without a client, so a probe can send
-    /// the latency headers through a backend whose requests all fail. Not
-    /// public API.
+    /// Count a timed hit of `elapsed` without a client, so an external probe
+    /// that checks the service's edge accepts the latency headers can send
+    /// them through a backend whose requests all fail. Not public API.
     #[cfg(all(feature = "l1", not(target_arch = "wasm32")))]
     #[doc(hidden)]
     pub fn __record(&self, elapsed: Duration) {
@@ -982,7 +970,7 @@ mod latency_tests {
     }
 
     /// API-87: each bucket holds durations above the previous bound up to and
-    /// including its own; bucket 1 holds 0.
+    /// including its own; the first (index 0) holds 0.
     #[test]
     fn api_87_bucket_bounds() {
         assert_eq!(bucket_index(0), 0);
@@ -1049,8 +1037,8 @@ mod latency_tests {
         assert!(counts.iter().any(|c| *c != "0"));
         assert!(integer(&sum) && sum != "0");
         assert_eq!(one_in, "128");
-        assert_eq!(L1Latency::new(0).one_in(), 1);
-        assert_eq!(L1Latency::new(2_000_000).one_in(), 1_000_000);
+        assert_eq!(L1Latency::new(0).one_in, 1);
+        assert_eq!(L1Latency::new(2_000_000).one_in, 1_000_000);
     }
 
     /// API-84 / API-87: a report whose sum is 0 is not attached and stays in
@@ -1123,7 +1111,7 @@ mod latency_tests {
                 let latency = latency.clone();
                 std::thread::spawn(move || {
                     for i in 0..HITS {
-                        // 129 ns lands in bucket 2, 300 ns in bucket 3.
+                        // 129 ns lands at index 1, 300 ns at index 2.
                         latency.record(ns(if (i + t) % 2 == 0 { 129 } else { 300 }));
                     }
                 })

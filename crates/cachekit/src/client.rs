@@ -219,6 +219,21 @@ impl PartialEq for SwrToken {
 
 impl Eq for SwrToken {}
 
+/// A value read's bytes and the layer that served them, or `None` on a miss,
+/// counted once: L1 first, synchronously, so a read L1 serves never builds or
+/// polls a read future (the L1 hit is the hot path), then
+/// [`CacheKit::get_bytes_past_l1`]. A macro rather than an async helper, which
+/// would bring that future back. Propagates errors with `?`, so it expands
+/// only inside a function returning `Result<_, CachekitError>`.
+macro_rules! read_l1_first {
+    ($client:expr, $full_key:expr) => {
+        match $client.get_l1($full_key)? {
+            Some(payload) => Some((payload, ReadOutcome::L1Hit)),
+            None => $client.get_bytes_past_l1($full_key).await?,
+        }
+    };
+}
+
 // ── CacheKit ─────────────────────────────────────────────────────────────────
 
 /// Cache client with optional L1 in-process cache layer.
@@ -539,19 +554,13 @@ impl CacheKit {
         if let Some(secure) = self.encrypting() {
             return secure.get(key).await;
         }
-        let clock = self.l1_clock();
+        let sample = self.l1_sample();
         let full_key = self.resolve_key(key)?;
-        // An L1 hit is served here, synchronously: no read future is built
-        // or polled for it.
-        let (payload, by) = match self.get_l1(&full_key)? {
-            Some(payload) => (payload, ReadOutcome::L1Hit),
-            None => match self.get_bytes_past_l1(&full_key).await? {
-                Some(read) => read,
-                None => return Ok(None),
-            },
+        let Some((payload, by)) = read_l1_first!(self, &full_key) else {
+            return Ok(None);
         };
         let value = serializer::deserialize_payload(&payload)?;
-        self.l1_timed(clock, by);
+        self.l1_stop(sample, by);
         Ok(Some(value))
     }
 
@@ -598,20 +607,14 @@ impl CacheKit {
         if let Some(secure) = self.encrypting() {
             return secure.interop_get(key).await;
         }
-        let clock = self.l1_clock();
+        let sample = self.l1_sample();
         self.reject_namespaced_interop()?;
         let full_key = self.resolve_key(key)?;
-        // An L1 hit is served here, synchronously: no read future is built
-        // or polled for it.
-        let (payload, by) = match self.get_l1(&full_key)? {
-            Some(payload) => (payload, ReadOutcome::L1Hit),
-            None => match self.get_bytes_past_l1(&full_key).await? {
-                Some(read) => read,
-                None => return Ok(None),
-            },
+        let Some((payload, by)) = read_l1_first!(self, &full_key) else {
+            return Ok(None);
         };
         let value = crate::interop::deserialize_payload(&payload)?;
-        self.l1_timed(clock, by);
+        self.l1_stop(sample, by);
         Ok(Some(value))
     }
 
@@ -673,7 +676,7 @@ impl CacheKit {
         if let Some(secure) = self.encrypting() {
             return secure.interop_get_swr(key).await;
         }
-        let clock = self.l1_clock();
+        let sample = self.l1_sample();
         self.reject_namespaced_interop()?;
         let full_key = self.resolve_key(key)?;
         let (read, by) = match self.get_bytes_swr(&full_key).await? {
@@ -686,7 +689,7 @@ impl CacheKit {
             ),
             SwrRead::Miss => return Ok(SwrRead::Miss),
         };
-        self.l1_timed(clock, by);
+        self.l1_stop(sample, by);
         Ok(read)
     }
 
@@ -743,7 +746,7 @@ impl CacheKit {
     // ── L1 hit latency ───────────────────────────────────────────────────────
     //
     // spec/saas-api.md, "L1 hit latency". Each public value read draws as its
-    // first step whether to time itself, by `l1_clock`; a drawn call's clock
+    // first step whether to time itself, by `l1_sample`; a drawn call's clock
     // stops where the call has produced its value, and only an L1 hit's
     // duration is kept. Without an accumulator (a backend that sends no
     // report) there is no draw.
@@ -755,7 +758,7 @@ impl CacheKit {
         allow(clippy::unused_self)
     )]
     #[inline]
-    fn l1_clock(&self) -> L1Sample {
+    fn l1_sample(&self) -> L1Sample {
         #[cfg(all(feature = "l1", not(target_arch = "wasm32")))]
         if let Some(latency) = &self.latency {
             if latency.draw() {
@@ -765,18 +768,18 @@ impl CacheKit {
         L1Sample::NONE
     }
 
-    /// Stop `clock` where the call has produced its value; the duration
+    /// Stop `sample`'s clock where the call has produced its value; the duration
     /// counts only for a drawn call that L1 served (`by`).
     #[cfg_attr(
         not(all(feature = "l1", not(target_arch = "wasm32"))),
         allow(clippy::unused_self)
     )]
     #[inline]
-    fn l1_timed(&self, clock: L1Sample, by: ReadOutcome) {
+    fn l1_stop(&self, sample: L1Sample, by: ReadOutcome) {
         #[cfg(all(feature = "l1", not(target_arch = "wasm32")))]
-        clock.stop(by, self.latency.as_deref());
+        sample.stop(by, self.latency.as_deref());
         #[cfg(not(all(feature = "l1", not(target_arch = "wasm32"))))]
-        let _ = (clock, by);
+        let _ = (sample, by);
     }
 
     /// The uncounted read behind [`Self::get_bytes_swr`]: an L1 hit is split
@@ -831,8 +834,9 @@ impl CacheKit {
         })
     }
 
-    /// The uncounted read behind [`Self::get_bytes`]: L1, then L2 with L1
-    /// backfill, with the layer that served the bytes.
+    /// The uncounted read behind [`Self::read_bytes_swr`] and
+    /// [`Self::__interop_read`]: L1, then [`Self::read_bytes_past_l1`], with
+    /// the layer that served the bytes.
     async fn read_bytes(
         &self,
         full_key: &str,
@@ -864,13 +868,12 @@ impl CacheKit {
     ) -> Result<Option<(Payload, ReadOutcome)>, CachekitError> {
         // Serialize an L2 read/backfill with same-key writes. Re-check L1
         // after taking the lock because another operation may have filled it
-        // between the optimistic read above and lock acquisition.
+        // between the caller's optimistic read and lock acquisition.
         #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
         let _mutation = self.lock_l1_mutation(full_key).await;
 
         #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
-        if let Some(payload) = self.l1_get(full_key) {
-            self.check_payload_size(payload.bytes().len())?;
+        if let Some(payload) = self.read_l1(full_key)? {
             return Ok(Some((payload, ReadOutcome::L1Hit)));
         }
 
@@ -1194,7 +1197,7 @@ impl CacheKit {
     #[doc(hidden)]
     #[inline]
     pub fn __l1_sample(&self) -> L1Sample {
-        self.l1_clock()
+        self.l1_sample()
     }
 
     /// Stop a `#[cachekit]` call's clock as it returns its value; the
@@ -1203,8 +1206,8 @@ impl CacheKit {
     /// `#[cachekit]` — not public API.
     #[doc(hidden)]
     #[inline]
-    pub fn __l1_timed(&self, sample: L1Sample, outcome: ReadOutcome) {
-        self.l1_timed(sample, outcome);
+    pub fn __l1_stop(&self, sample: L1Sample, outcome: ReadOutcome) {
+        self.l1_stop(sample, outcome);
     }
 
     // ── Secure cache ─────────────────────────────────────────────────────────
@@ -1403,20 +1406,14 @@ impl SecureCache<'_> {
     /// is [`CachekitError::Serialization`] naming only `T`: the decoder's own
     /// message would quote the plaintext.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, CachekitError> {
-        let clock = self.client.l1_clock();
+        let sample = self.client.l1_sample();
         let full_key = self.client.resolve_key(key)?;
-        // An L1 hit is served here, synchronously: no read future is built
-        // or polled for it.
-        let (ciphertext, by) = match self.client.get_l1(&full_key)? {
-            Some(ciphertext) => (ciphertext, ReadOutcome::L1Hit),
-            None => match self.client.get_bytes_past_l1(&full_key).await? {
-                Some(read) => read,
-                None => return Ok(None),
-            },
+        let Some((ciphertext, by)) = read_l1_first!(self.client, &full_key) else {
+            return Ok(None);
         };
         let plaintext = self.decrypt_or_evict(ciphertext.bytes(), &full_key)?;
         let value = redact_decode(serializer::deserialize(&plaintext))?;
-        self.client.l1_timed(clock, by);
+        self.client.l1_stop(sample, by);
         Ok(Some(value))
     }
 
@@ -1439,21 +1436,15 @@ impl SecureCache<'_> {
         &self,
         key: &str,
     ) -> Result<Option<T>, CachekitError> {
-        let clock = self.client.l1_clock();
+        let sample = self.client.l1_sample();
         self.client.reject_namespaced_interop()?;
         let full_key = self.client.resolve_key(key)?;
-        // An L1 hit is served here, synchronously: no read future is built
-        // or polled for it.
-        let (ciphertext, by) = match self.client.get_l1(&full_key)? {
-            Some(ciphertext) => (ciphertext, ReadOutcome::L1Hit),
-            None => match self.client.get_bytes_past_l1(&full_key).await? {
-                Some(read) => read,
-                None => return Ok(None),
-            },
+        let Some((ciphertext, by)) = read_l1_first!(self.client, &full_key) else {
+            return Ok(None);
         };
         let plaintext = self.decrypt_or_evict(ciphertext.bytes(), &full_key)?;
         let value = redact_decode(crate::interop::deserialize(&plaintext))?;
-        self.client.l1_timed(clock, by);
+        self.client.l1_stop(sample, by);
         Ok(Some(value))
     }
 
@@ -1471,7 +1462,7 @@ impl SecureCache<'_> {
         &self,
         key: &str,
     ) -> Result<SwrRead<T>, CachekitError> {
-        let clock = self.client.l1_clock();
+        let sample = self.client.l1_sample();
         self.client.reject_namespaced_interop()?;
         let full_key = self.client.resolve_key(key)?;
         let decode = |ct: &[u8]| -> Result<T, CachekitError> {
@@ -1484,7 +1475,7 @@ impl SecureCache<'_> {
             SwrRead::Stale((ct, by), token) => (SwrRead::Stale(decode(ct.bytes())?, token), by),
             SwrRead::Miss => return Ok(SwrRead::Miss),
         };
-        self.client.l1_timed(clock, by);
+        self.client.l1_stop(sample, by);
         Ok(read)
     }
 
