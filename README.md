@@ -887,6 +887,10 @@ written under that key; `oneshot` builds an encrypting client (`enc` or `prev`)
 and reads one L2 hit, the cost a one-read process pays beyond its start-up.
 `ns` and `nsenc` run `l1_hit`, `l2_hit` and `set` as `plain` and `enc` on a
 client with a `.namespace()`, which builds `{namespace}:{key}` on every op.
+`delete/parked256` and `delete/parked1024` run the plain 64 B `delete` while
+256 or 1,024 other deletes wait on the backend, each holding its key's
+mutation lock as a delete on a slow backend does: the cost of many keys in
+flight at once.
 
 ```bash
 make bench                                  # wall ns/op: indicative only
