@@ -396,6 +396,15 @@ impl L1Latency {
         self.take()
     }
 
+    /// Count a timed hit of `elapsed` without a client, so a probe can send
+    /// the latency headers through a backend whose requests all fail. Not
+    /// public API.
+    #[cfg(all(feature = "l1", not(target_arch = "wasm32")))]
+    #[doc(hidden)]
+    pub fn __record(&self, elapsed: Duration) {
+        self.record(elapsed);
+    }
+
     /// Add the duration of a timed call that started at `start` and has just
     /// produced its value, if `by` says L1 served it: the one outcome timed.
     #[cfg(all(feature = "l1", not(target_arch = "wasm32")))]

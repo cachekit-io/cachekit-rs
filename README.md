@@ -689,7 +689,7 @@ Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rus
 
 ### Telemetry sent to cachekit.io
 
-*Unreleased: the latency headers and the switch ship in the next release after 0.13.1.*
+**Unreleased.** The latency headers and the telemetry switch are on `main` and in no published release yet. Releases up to 0.13.1 send the session and counter headers with no way to turn them off.
 
 Only the cachekit.io backends, `CachekitIO` and `WorkersCachekitIO`, send telemetry, and only to the API they are built with; they never follow a redirect. A Redis, Memcached or File backend, or an L1-only client, sends none anywhere. While telemetry is on, each request carries these optional headers ([protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/saas-api.md#optional-metrics-headers)):
 
