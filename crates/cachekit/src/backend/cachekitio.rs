@@ -1545,7 +1545,7 @@ mod http_client_tests {
         use super::*;
         use crate::client::{CacheKit, SharedBackend};
 
-        /// A client with an L1 and the default reliability stack over `backend`.
+        /// A client with an L1 and no reliability stack over `backend`.
         fn client_over(backend: Arc<CachekitIO>) -> CacheKit {
             let shared: SharedBackend = backend;
             CacheKit::builder()
@@ -1692,6 +1692,33 @@ mod http_client_tests {
                 ..ReliabilityConfig::default()
             };
             wrap_reliable(shared, config, Some(CACHEKITIO_DEADLINES))
+        }
+
+        /// The writer's L1 copy keeps the store's `Fresh-For` through
+        /// `ReliableBackend`, which must forward both the write-bound flag and
+        /// `set_bytes_with_freshness`.
+        #[cfg(all(feature = "l1", not(feature = "unsync")))]
+        #[tokio::test]
+        async fn a_smaller_fresh_for_bounds_the_copy_through_the_stack() {
+            let stub = stub_with(|n| Some(if n == 0 { PUT_FRESH_FOR_1 } else { NOT_FOUND }));
+            let client = crate::client::CacheKit::builder()
+                .backend(reliable(backend_at(&stub)))
+                .l1_capacity(100)
+                .build()
+                .expect("client builds");
+            client
+                .set_with_ttl("k", &"v".to_owned(), Duration::from_secs(300))
+                .await
+                .expect("set");
+
+            let l1_hit = |client: &crate::client::CacheKit| client.stats().l1_hits;
+            let _: Option<String> = client.get("k").await.expect("get");
+            assert_eq!(l1_hit(&client), 1, "kept for 1 s");
+            // Real time: L1 ages entries by std Instant.
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let value: Option<String> = client.get("k").await.expect("get");
+            assert_eq!(l1_hit(&client), 1, "served past Fresh-For");
+            assert_eq!(value, None);
         }
 
         const QUOTA_DENY: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\n\
