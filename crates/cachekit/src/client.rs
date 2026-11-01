@@ -771,12 +771,17 @@ impl CacheKit {
         }
 
         // Taken before the mutation lock below, as a fill takes them: its
-        // leader holds the flight while it stores.
+        // leader holds the flight while it stores. A pending unlock goes out
+        // before that lock too, so same-key reads and writes never wait on it.
         #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
-        let cold = lead.and_then(|slot| {
+        let mut cold = lead.and_then(|slot| {
             crate::flight::ColdLead::try_take(&self.flight, &self.backend, full_key)
                 .map(|cold| (slot, cold))
         });
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        if let Some((_, cold)) = cold.as_mut() {
+            cold.settle().await;
+        }
         #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
         let _ = lead;
 

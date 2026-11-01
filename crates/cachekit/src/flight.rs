@@ -875,13 +875,18 @@ impl ColdLead {
         })
     }
 
-    /// Read the key and, only if it is absent, try its distributed lock. A
-    /// pending detached unlock is sent first, as before any lock attempt.
-    pub(crate) async fn read(mut self) -> ColdRead {
+    /// Send the key's pending detached unlock, if any, as before any lock
+    /// attempt. Call it before [`Self::read`], and before taking the key's
+    /// mutation lock, so same-key reads and writes do not wait on the unlock.
+    pub(crate) async fn settle(&mut self) {
+        settle_pending_release(&mut self.local, &self.backend, &self.full_key).await;
+    }
+
+    /// Read the key and, only if it is absent, try its distributed lock.
+    pub(crate) async fn read(self) -> ColdRead {
         use crate::backend::GetOrLock;
         use crate::error::BackendErrorKind;
 
-        settle_pending_release(&mut self.local, &self.backend, &self.full_key).await;
         let deadline = LockAttempt::deadline();
         let Some(lockable) = self.backend.as_lockable() else {
             self.stand_down();
