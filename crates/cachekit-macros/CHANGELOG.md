@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.14.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.13.1...cachekit-macros-v0.14.0) (2026-11-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **telemetry:** report sampled L1 hit latency and add a telemetry off switch (LAB-12081) ([#221](https://github.com/cachekit-io/cachekit-rs/issues/221))
+
+### Features
+
+* **macros:** let #[cachekit] opt out of the distributed fill lock (LAB-7171) ([#201](https://github.com/cachekit-io/cachekit-rs/issues/201)) ([2358ae6](https://github.com/cachekit-io/cachekit-rs/commit/2358ae6e1221f7ecb53aede590d7986da8e20606))
+* **telemetry:** report sampled L1 hit latency and add a telemetry off switch (LAB-12081) ([#221](https://github.com/cachekit-io/cachekit-rs/issues/221)) ([70c7ae9](https://github.com/cachekit-io/cachekit-rs/commit/70c7ae96f959246804b324a57f3a8e13e7113a29))
+
+
+### Bug Fixes
+
+* **macros:** reject parameters in the reserved __ck/__CK prefix (LAB-12171) ([#223](https://github.com/cachekit-io/cachekit-rs/issues/223)) ([7546322](https://github.com/cachekit-io/cachekit-rs/commit/754632271cba9180638ab55e7a6263cabf7f6111))
+
+
+### Performance Improvements
+
+* **macros:** build the #[cachekit] key prefix once per function (LAB-12104) ([#212](https://github.com/cachekit-io/cachekit-rs/issues/212)) ([a73e4a3](https://github.com/cachekit-io/cachekit-rs/commit/a73e4a36032798f6271d0bf4975e366ca2423443))
+* **redis:** read and take the fill lock in one round trip on a cold miss (LAB-12108) ([#217](https://github.com/cachekit-io/cachekit-rs/issues/217)) ([b14afb5](https://github.com/cachekit-io/cachekit-rs/commit/b14afb5745c4f0b43e3bf721ebf242d3ca94f5ab))
+
 ## [0.13.1](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-macros-v0.13.0...cachekit-macros-v0.13.1) (2026-10-27)
 
 

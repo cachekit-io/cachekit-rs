@@ -1,4 +1,4 @@
 {
-  "crates/cachekit": "0.13.1",
-  "crates/cachekit-macros": "0.13.1"
+  "crates/cachekit": "0.14.0",
+  "crates/cachekit-macros": "0.14.0"
 }
