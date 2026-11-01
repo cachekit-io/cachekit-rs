@@ -739,9 +739,11 @@ impl ConcurrencyLimiter {
 ///   ([`LockableBackend::__get_or_lock`]) is a read: it takes a limiter
 ///   permit and passes the breaker like `get`, but runs once. A retry after
 ///   a lost reply would find the lock its first attempt took and report it
-///   contested. When the stack sheds it or the breaker fails it fast, the
-///   read fails with that error as a plain read would, and the cold miss's
-///   lock call follows, bypassing the stack as before.
+///   contested. Its failure is no health sample: after a transient one the
+///   cold miss re-reads with the guarded, retried `get`, which is. When the
+///   stack sheds it or the breaker fails it fast, the read fails with that
+///   error as a plain read would, and the cold miss's lock call follows,
+///   bypassing the stack as before.
 pub(crate) struct ReliableBackend {
     inner: SharedBackend,
     retry: Option<RetryPolicy>,
@@ -801,13 +803,19 @@ impl ReliableBackend {
         result
     }
 
-    /// [`Self::guarded`] without the retry, for an op that a retry would get
-    /// wrong. A separate body, not `guarded` with a retry switch: routing
-    /// `guarded` through a shared helper added instructions to every guarded
-    /// op.
+    /// [`Self::guarded`] without the retry, for the combined read and lock,
+    /// which a retry would get wrong (`FnOnce` keeps it to one attempt). A
+    /// separate body, not `guarded` with a retry switch: routing `guarded`
+    /// through a shared helper added instructions to every guarded op.
+    ///
+    /// A failure is reported Neutral, not as a health sample: on a retryable
+    /// one the cold miss re-reads with the retried `get`, whose outcome is
+    /// the sample, so one connection reset under N concurrent cold reads
+    /// does not count N failures. A real outage still opens the breaker
+    /// through those reads.
     async fn guarded_once<T, F, Fut>(&self, f: F) -> Result<T, BackendError>
     where
-        F: Fn() -> Fut,
+        F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, BackendError>>,
     {
         let _permit = match &self.limiter {
@@ -819,7 +827,13 @@ impl ReliableBackend {
             None => None,
         };
         let result = f().await;
-        report(permit, &result);
+        if let Some(permit) = permit {
+            permit.complete(if result.is_ok() {
+                &Outcome::Success
+            } else {
+                &Outcome::Neutral
+            });
+        }
         result
     }
 }
