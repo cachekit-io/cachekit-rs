@@ -924,9 +924,10 @@ reports either one as exit 2.
 
 CI runs this comparison on every pull request (the **Instruction counts vs
 base** check): it builds the pull request and the commit it merges into, each
-in its own target directory, measures both on the same runner, and posts the
-verdict as one comment it edits in place (a pull request from a fork gets no
-comment; its verdict is in the run summary). A case it did not measure reads
+in its own target directory and with `--features macros` (the `#[cachekit]`
+cases need it), measures both on the same runner, and posts the verdict as
+one comment it edits in place (a pull request from a fork gets no comment; its
+verdict is in the run summary). A case it did not measure reads
 INCOMPLETE, never PASS. A release pull request is measured against the last
 release tag instead. The check is not required: a deliberate cost increase is
 accepted at review.

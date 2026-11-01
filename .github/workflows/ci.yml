@@ -239,7 +239,9 @@ jobs:
   # shared one, cargo's mtime check can reuse one tree's build for the other
   # and compare a binary against itself. Both trees build the PR's copy of
   # the example, so both sides run one workload; a PR whose example calls
-  # API the base lacks cannot be compared and reads INCOMPLETE.
+  # API the base lacks cannot be compared and reads INCOMPLETE. Both build
+  # with `--features macros`, so the cases behind it, the `#[cachekit]` path,
+  # are measured too.
   perf-ir:
     name: Instruction counts vs base
     if: github.event_name == 'pull_request'
@@ -320,8 +322,8 @@ jobs:
         env:
           BASE_LABEL: ${{ steps.base.outputs.label }}
         run: |
-          (cd "$RUNNER_TEMP/ir/head" && CARGO_TARGET_DIR=../head-target cargo build --locked --release --example bench_hot_path)
-          (cd "$RUNNER_TEMP/ir/base" && CARGO_TARGET_DIR=../base-target cargo build --locked --release --example bench_hot_path) || {
+          (cd "$RUNNER_TEMP/ir/head" && CARGO_TARGET_DIR=../head-target cargo build --locked --release --features macros --example bench_hot_path)
+          (cd "$RUNNER_TEMP/ir/base" && CARGO_TARGET_DIR=../base-target cargo build --locked --release --features macros --example bench_hot_path) || {
             {
               echo '### Instruction counts: INCOMPLETE'
               echo
