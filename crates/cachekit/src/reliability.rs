@@ -782,29 +782,6 @@ impl ReliableBackend {
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T, BackendError>>,
     {
-        self.run(self.retry.as_ref(), budget, f).await
-    }
-
-    /// Run `f` once, behind the limiter and the breaker: for an op that a
-    /// retry would get wrong.
-    async fn guarded_once<T, F, Fut>(&self, f: F) -> Result<T, BackendError>
-    where
-        F: Fn() -> Fut,
-        Fut: Future<Output = Result<T, BackendError>>,
-    {
-        self.run(None, None, f).await
-    }
-
-    async fn run<T, F, Fut>(
-        &self,
-        retry: Option<&RetryPolicy>,
-        budget: Option<Duration>,
-        f: F,
-    ) -> Result<T, BackendError>
-    where
-        F: Fn() -> Fut,
-        Fut: Future<Output = Result<T, BackendError>>,
-    {
         // Outermost layer: one permit per logical operation, held across the
         // whole breaker/retry sequence (see the module docs for why). A shed
         // call returns here — before touching breaker state.
@@ -816,19 +793,46 @@ impl ReliableBackend {
             Some(cb) => Some(cb.try_acquire()?),
             None => None,
         };
-        let result = match retry {
+        let result = match &self.retry {
             Some(retry) => retry.execute(budget, f).await,
             None => f().await,
         };
-        if let Some(permit) = permit {
-            let outcome = match &result {
-                Ok(_) => Outcome::Success,
-                Err(e) if e.kind.is_retryable() => Outcome::Failure,
-                Err(_) => Outcome::Neutral,
-            };
-            permit.complete(&outcome);
-        }
+        report(permit, &result);
         result
+    }
+
+    /// [`Self::guarded`] without the retry, for an op that a retry would get
+    /// wrong. A separate body, not `guarded` with a retry switch: routing
+    /// `guarded` through a shared helper added instructions to every guarded
+    /// op.
+    async fn guarded_once<T, F, Fut>(&self, f: F) -> Result<T, BackendError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<T, BackendError>>,
+    {
+        let _permit = match &self.limiter {
+            Some(limiter) => Some(limiter.acquire().await?),
+            None => None,
+        };
+        let permit = match &self.breaker {
+            Some(cb) => Some(cb.try_acquire()?),
+            None => None,
+        };
+        let result = f().await;
+        report(permit, &result);
+        result
+    }
+}
+
+/// Report a completed call to the breaker that admitted it, if any.
+fn report<T>(permit: Option<ProbePermit<'_>>, result: &Result<T, BackendError>) {
+    if let Some(permit) = permit {
+        let outcome = match result {
+            Ok(_) => Outcome::Success,
+            Err(e) if e.kind.is_retryable() => Outcome::Failure,
+            Err(_) => Outcome::Neutral,
+        };
+        permit.complete(&outcome);
     }
 }
 
