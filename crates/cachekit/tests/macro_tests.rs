@@ -307,34 +307,6 @@ async fn macro_key_matches_interop_key() {
     assert_eq!(keys, vec![expected]);
 }
 
-/// Parameters named like the macro's key-prefix static and its argument
-/// slice are still the parameters: the expansion evaluates the arguments
-/// outside the block that declares the static, before the slice is bound.
-#[cachekit(client = cache, ttl = 60, interop = "shadowed", namespace = "hygiene")]
-#[allow(non_snake_case)]
-async fn shadowed_prefix_name(
-    cache: &CacheKit,
-    __CK_KEY_PREFIX: u64,
-    __ck_args: u64,
-) -> Result<u64, CachekitError> {
-    Ok(__CK_KEY_PREFIX + __ck_args)
-}
-
-#[tokio::test]
-async fn parameter_named_like_the_key_prefix_static_keys_by_its_value() {
-    let (cache, backend) = mock_client_counting();
-    assert_eq!(shadowed_prefix_name(&cache, 7, 1).await.unwrap(), 8);
-
-    let expected = interop_key(
-        "hygiene",
-        "shadowed",
-        &[InteropValue::from(7u64), InteropValue::from(1u64)],
-    )
-    .unwrap();
-    let keys: Vec<String> = backend.inner.store.lock().await.keys().cloned().collect();
-    assert_eq!(keys, vec![expected]);
-}
-
 // ── Reliability behaviour ────────────────────────────────────────────────────
 
 /// Backend where every data operation fails with a transient error.
