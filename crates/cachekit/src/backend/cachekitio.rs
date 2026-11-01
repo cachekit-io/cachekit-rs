@@ -1654,6 +1654,7 @@ mod http_client_tests {
     mod writer_l1_copy {
         use super::*;
         use crate::client::{CacheKit, SharedBackend};
+        use crate::error::BackendError;
 
         /// A client with an L1 and no reliability stack over `backend`.
         fn client_over(backend: Arc<CachekitIO>) -> CacheKit {
@@ -1740,6 +1741,105 @@ mod http_client_tests {
                 .await
                 .expect("set");
             assert!(!served_from_l1(&client).await);
+        }
+
+        /// A wrapper that forwards the write bound, then holds the write for
+        /// [`Self::DELAY`] after the inner `PUT` returns: the gap between
+        /// receipt of the `2xx` and the L1 insertion.
+        struct SlowWriter(Arc<CachekitIO>);
+
+        impl SlowWriter {
+            const DELAY: Duration = Duration::from_millis(1200);
+        }
+
+        #[async_trait::async_trait]
+        impl Backend for SlowWriter {
+            async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+                self.0.get(key).await
+            }
+
+            async fn set(
+                &self,
+                key: &str,
+                value: Vec<u8>,
+                ttl: Option<Duration>,
+            ) -> Result<(), BackendError> {
+                self.0.set(key, value, ttl).await
+            }
+
+            async fn set_bytes_with_freshness(
+                &self,
+                key: &str,
+                value: bytes::Bytes,
+                ttl: Option<Duration>,
+            ) -> Result<Option<Duration>, BackendError> {
+                let bound = self.0.set_bytes_with_freshness(key, value, ttl).await;
+                tokio::time::sleep(Self::DELAY).await;
+                bound
+            }
+
+            fn __reports_write_bound(&self) -> bool {
+                self.0.__reports_write_bound()
+            }
+
+            async fn delete(&self, key: &str) -> Result<bool, BackendError> {
+                self.0.delete(key).await
+            }
+
+            async fn exists(&self, key: &str) -> Result<bool, BackendError> {
+                self.0.exists(key).await
+            }
+
+            async fn health(&self) -> Result<crate::backend::HealthStatus, BackendError> {
+                self.0.health().await
+            }
+        }
+
+        /// Write `key` for `ttl` through a [`SlowWriter`] over a stub whose
+        /// `PUT` replies `put` and whose every later request is a `404`.
+        async fn written_slowly(put: Answer, ttl: Duration) -> (Stub, CacheKit) {
+            let stub = stub_with(put);
+            let shared: SharedBackend = Arc::new(SlowWriter(Arc::new(backend_at(&stub))));
+            let client = CacheKit::builder()
+                .backend(shared)
+                .l1_capacity(100)
+                .build()
+                .expect("client builds");
+            client
+                .set_with_ttl("k", &"v".to_owned(), ttl)
+                .await
+                .expect("set");
+            (stub, client)
+        }
+
+        /// API-103 times the bound from receipt of the `2xx`, so a delay
+        /// after it shortens the copy instead of restarting its clock.
+        #[tokio::test]
+        async fn fresh_for_runs_from_receipt_not_insertion() {
+            let (_stub, client) = written_slowly(
+                |n| Some(if n == 0 { PUT_FRESH_FOR_1 } else { NOT_FOUND }),
+                Duration::from_secs(300),
+            )
+            .await;
+            assert!(
+                !served_from_l1(&client).await,
+                "served 1.2 s after a Fresh-For: 1 receipt"
+            );
+        }
+
+        /// The same with no header: the write's own TTL is the bound, and it
+        /// too runs from receipt.
+        #[tokio::test]
+        async fn the_write_ttl_runs_from_receipt_not_insertion() {
+            let (_stub, client) = written_slowly(
+                |n| Some(if n == 0 { OK } else { NOT_FOUND }),
+                Duration::from_secs(1),
+            )
+            .await;
+            assert!(
+                !served_from_l1(&client).await,
+                "served 1.2 s after receipt of a 1 s write"
+            );
         }
 
         /// API-104: a `PATCH /ttl` reply never extends the writer's copy. The
