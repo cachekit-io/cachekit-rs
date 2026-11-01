@@ -49,16 +49,18 @@ test-wasm:
 # Hot-path CPU cost (examples/bench_hot_path.rs; README "Measuring performance").
 # `bench` prints wall time per op, which is indicative only. `bench-instr`
 # counts instructions per op under valgrind's callgrind: the number a change is
-# judged on. BASE=<a copy of the example built at the base commit> compares two
-# builds and exits 1 when a case regresses past its noise floor (2 when it
-# measured nothing: bad flag, empty filter, valgrind failure); FILTER=<text>
-# narrows the cases (e.g. FILTER=l2_hit).
+# judged on. BASE=<a copy of the example built at the base commit, from this
+# tree's bench_hot_path.rs so both run one workload> compares two builds; the
+# floors and exit codes are in the README's "Measuring performance". make
+# reports a failing comparison as exit 2. FILTER=<text> narrows the cases
+# (e.g. FILTER=l2_hit); JOBS=<n> measures n cases at a time.
+# CI's `perf-ir` job runs the same comparison on every PR.
 bench:
 	$(CARGO) run --release --features macros --example bench_hot_path -- wall $(if $(FILTER),'$(FILTER)')
 
 bench-instr:
 	$(CARGO) build --release --features macros --example bench_hot_path
-	target/release/examples/bench_hot_path instr $(if $(BASE),--base '$(BASE)') $(if $(FILTER),'$(FILTER)')
+	target/release/examples/bench_hot_path instr $(if $(JOBS),--jobs '$(JOBS)') $(if $(BASE),--base '$(BASE)') $(if $(FILTER),'$(FILTER)')
 
 # Supply-chain gate — deny is identical to CI's; audit runs the strict form
 # (`--deny yanked`, which CI applies only on the weekly schedule run), so a

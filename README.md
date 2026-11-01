@@ -903,16 +903,38 @@ make bench-instr BASE=../bench-base FILTER=l2_hit   # A/B against another build
 Wall time on a shared machine moves by tens of percent between runs, so
 `bench-instr` is the number a change is judged on. It counts only the timed
 loop (`--toggle-collect`), on a single-threaded tokio runtime, five runs per
-case, and reports the median and the spread. For an A/B, build the example at
-the base commit with `--features macros`, from this tree's `examples/bench_hot_path.rs`
-so both builds run the same cases (a base without one, such as `macro_hit`,
-fails that case and the run exits 2), copy `target/release/examples/bench_hot_path` outside
-`target/`, and pass it as `BASE`; the runs interleave ABBA, a delta counts only
-when it beats `max(3 × spread, 0.5%)`, and the target exits 1 when a case got
-slower by more than that, or 2 when it measured nothing (an unknown flag, a
-filter that matches no case, a valgrind failure). Most cases repeat within 0.8%; the `delete` cases
-spread more (up to about 10%, from the per-key mutation lock map, a hash table seeded afresh in
-each process), so their floor is wider.
+case, and reports the median and the spread. `JOBS=<n>` measures n cases at a
+time; counts do not depend on it. For an A/B, check out the base commit, copy
+your working tree's `crates/cachekit/examples/bench_hot_path.rs` into it so
+both builds run one workload, build the example there with `--features macros`, copy its
+`target/release/examples/bench_hot_path` outside `target/`, and pass it as
+`BASE`. The example copies both builds to paths of equal length
+before it measures them, because the length of a binary's path moves its
+counts (by 6 instructions per `exists` op). The runs interleave ABBA, and a
+delta counts only when it beats the case's floor, which is fixed per op and
+never taken from a run's spread, so a change that makes a case noisy cannot
+widen its own floor. Every op's floor is 0.5%, new ops included, and its
+cases also fail when the head's runs spread by more than 0.5%, because new
+nondeterminism on a hot path is itself a finding. Two ops vary between runs
+of one build, from the single-flight and per-key mutation lock maps, hash
+tables seeded afresh in each process: `l2_hit` by up to about 2% in CI, and
+`delete` by up to about 10%. `l2_hit` gets a fixed 2% floor and no spread
+check (in CI, an unchanged build moved its median by at most 0.52%). `delete`
+is reported but never fails the comparison: a floor that wide would hide any
+regression worth catching. The example exits 1 when a gated case got slower
+or noisier, and 2 when nothing was measured or the run stopped part way (an
+unknown flag, a filter that matches no case, a valgrind failure); `make`
+reports either one as exit 2.
+
+CI runs this comparison on every pull request (the **Instruction counts vs
+base** check): it builds the pull request and the commit it merges into, each
+in its own target directory and with `--features macros` (the `#[cachekit]`
+cases need it), measures both on the same runner, and posts the verdict as
+one comment it edits in place (a pull request from a fork gets no comment; its
+verdict is in the run summary). A case it did not measure reads
+INCOMPLETE, never PASS. A release pull request is measured against the last
+release tag instead. The check is not required: a deliberate cost increase is
+accepted at review.
 
 **Client wall time** — `examples/wall_time_probe.rs` times `CacheKit` calls
 against the cachekit.io dev endpoint and writes one JSON object per request. It runs
