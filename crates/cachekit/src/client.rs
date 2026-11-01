@@ -808,6 +808,7 @@ impl CacheKit {
                 crate::flight::ColdRead::Unanswered => {
                     self.backend.get_with_freshness(full_key).await?
                 }
+                crate::flight::ColdRead::Unsent(err) => return Err(err.into()),
             },
             None => self.backend.get_with_freshness(full_key).await?,
         };

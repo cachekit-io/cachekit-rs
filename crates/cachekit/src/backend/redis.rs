@@ -60,8 +60,9 @@ fn redis_err(e: RedisError) -> BackendError {
 /// Call [`connect`](RedisBackend::connect) before issuing any cache operations.
 pub struct RedisBackend {
     /// Commands go through these options, which carry fred's `fail_fast`
-    /// when the offline queue is disabled. EVAL does not: fred implements
-    /// `LuaInterface` only on the bare client.
+    /// when the offline queue is disabled. fred implements `LuaInterface`
+    /// only on the bare client, so `release_lock`'s `eval` skips them; the
+    /// combined read and lock sends its EVAL through them with `custom`.
     client: WithOptions<RedisClient>,
     /// `Some` when built with
     /// [`disable_offline_queue`](RedisBackendBuilder::disable_offline_queue).

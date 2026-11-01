@@ -740,8 +740,8 @@ impl ConcurrencyLimiter {
 ///   permit and passes the breaker like `get`, but runs once. A retry after
 ///   a lost reply would find the lock its first attempt took and report it
 ///   contested. When the stack sheds it or the breaker fails it fast, the
-///   client reads and then locks as for a backend that does not combine, so
-///   the lock call still bypasses the stack.
+///   read fails with that error as a plain read would, and the cold miss's
+///   lock call follows, bypassing the stack as before.
 pub(crate) struct ReliableBackend {
     inner: SharedBackend,
     retry: Option<RetryPolicy>,

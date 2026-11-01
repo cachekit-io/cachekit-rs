@@ -111,7 +111,9 @@ const FILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// computing. A holder that leads clears the note: on acquire, or when its
 /// own lease contest makes it a leader. A leader that never asked for the
 /// lease (`#[cachekit(distributed_lock = false)]`) sets it instead: it cannot
-/// vouch that no other process holds the lease. (A leader whose lock call
+/// vouch that no other process holds the lease. So does a cold miss whose
+/// combined read and lock ([`ColdLead`]) frees the flight without a lock
+/// attempt: on a hit, or on a call that was refused or never sent. (A leader whose lock call
 /// failed, or whose backend cannot lock, clears it like any leader, so an
 /// outage does not make every queued follower send a lock call.) A follower
 /// leaves it as it found it,
@@ -837,11 +839,16 @@ pub(crate) enum ColdRead {
     /// lock: the read's error, and the flight leading without the lock, as
     /// after a failed lock call. Never retried.
     Failed(crate::error::BackendError, SingleFlight),
-    /// The call took no lock: the server refused it (a full or read-only
-    /// server, a denied script), or the reliability stack did not send it.
-    /// The in-process flight is free again; the caller reads, then
-    /// [`SingleFlight::acquire`]s, as for a backend that does not combine.
+    /// The server refused the call (a full or read-only server, a denied
+    /// script), so it took no lock. The in-process flight is free again; the
+    /// caller reads, then [`SingleFlight::acquire`]s, as for a backend that
+    /// does not combine.
     Unanswered,
+    /// The reliability stack shed the call or failed it fast, so it was never
+    /// sent. The in-process flight is free again, and the read fails with
+    /// this error, as a plain read would: re-reading would only re-join the
+    /// queue that shed it.
+    Unsent(crate::error::BackendError),
 }
 
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
@@ -906,7 +913,17 @@ impl ColdLead {
                 );
                 return ColdRead::Failed(err, flight);
             }
-            Err(_) => {
+            Err(err)
+                if matches!(
+                    err.kind,
+                    BackendErrorKind::CircuitOpen | BackendErrorKind::Backpressure
+                ) =>
+            {
+                self.stand_down();
+                return ColdRead::Unsent(err);
+            }
+            Err(err) => {
+                crate::metrics::trace_lock_error(&self.full_key, "get_or_lock", &err);
                 self.stand_down();
                 return ColdRead::Unanswered;
             }
@@ -1037,13 +1054,16 @@ mod tests {
 
         async fn __get_or_lock(
             &self,
-            _key: &str,
-            _timeout_ms: u64,
+            key: &str,
+            timeout_ms: u64,
         ) -> Result<crate::backend::GetOrLock, BackendError> {
-            Ok(crate::backend::GetOrLock::Value(
-                self.combined_value.clone().unwrap_or_default(),
-                crate::backend::Freshness::default(),
-            ))
+            match &self.combined_value {
+                Some(value) => Ok(crate::backend::GetOrLock::Value(
+                    value.clone(),
+                    crate::backend::Freshness::default(),
+                )),
+                None => crate::backend::get_then_lock(self, key, timeout_ms).await,
+            }
         }
     }
 
@@ -1076,9 +1096,7 @@ mod tests {
 
         assert!(ColdLead::try_take(&map, &backend, "k").is_none());
         assert_eq!(
-            crate::backend::get_then_lock(&*locks, "k", 1)
-                .await
-                .unwrap(),
+            locks.__get_or_lock("k", 1).await.unwrap(),
             crate::backend::GetOrLock::Locked("lease".to_owned())
         );
     }
