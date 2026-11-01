@@ -26,9 +26,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::time::Instant;
 
-use cachekit::backend::{Backend, HealthStatus, LockableBackend};
+use cachekit::backend::{Backend, Freshness, GetOrLock, HealthStatus, LockableBackend};
 use cachekit::client::SharedBackend;
-use cachekit::error::BackendError;
+use cachekit::error::{BackendError, BackendErrorKind};
 use cachekit::interop::{interop_key, serialize_value, InteropValue};
 use cachekit::{cachekit, CacheKit, CachekitError};
 
@@ -73,6 +73,11 @@ struct Timed {
     hang_after_gets: Option<u32>,
     /// Every call returns at once.
     instant: bool,
+    /// Reads and locks in one round trip (`get_or_lock`, a GET's latency),
+    /// as a single-node Redis does.
+    combines: bool,
+    /// The combined call fails with this kind after its round trip.
+    combined_fails: Option<BackendErrorKind>,
 }
 
 impl Timed {
@@ -83,6 +88,15 @@ impl Timed {
             set_fails: false,
             hang_after_gets: None,
             instant: false,
+            combines: false,
+            combined_fails: None,
+        }
+    }
+
+    fn combining() -> Self {
+        Self {
+            combines: true,
+            ..Self::new()
         }
     }
 
@@ -213,6 +227,29 @@ impl LockableBackend for Timed {
         self.leg("unlock", self.unlock_ms).await;
         self.st().held.remove(key);
         Ok(true)
+    }
+
+    fn __combines_get_and_lock(&self) -> bool {
+        self.combines
+    }
+
+    async fn __get_or_lock(&self, key: &str, _timeout_ms: u64) -> Result<GetOrLock, BackendError> {
+        self.leg("get_or_lock", GET).await;
+        if let Some(kind) = &self.combined_fails {
+            return Err(BackendError {
+                kind: kind.clone(),
+                message: "scripted failure".to_owned(),
+                source: None,
+            });
+        }
+        let mut st = self.st();
+        if let Some(value) = st.store.get(key) {
+            return Ok(GetOrLock::Value(value.clone(), Freshness::default()));
+        }
+        if st.remote_holds || !st.held.insert(key.to_owned()) {
+            return Ok(GetOrLock::Contested);
+        }
+        Ok(GetOrLock::Locked("lease".to_owned()))
     }
 }
 
@@ -683,6 +720,180 @@ async fn locking_follower_contests_the_lease_after_an_opted_out_leader_fails() {
         lock.is_some() && lock < set,
         "the follower computed without contesting the lease: {ops:?}"
     );
+}
+
+// ── One round trip: a backend that reads and locks together ─────────────────
+
+/// A locking cold miss on a backend that reads and locks in one round trip
+/// reaches the body after that one call, where a GET and then a lock call
+/// take two.
+#[tokio::test(start_paused = true)]
+async fn combined_cold_miss_reaches_the_body_after_one_round_trip() {
+    let backend = Timed::combining();
+    let cache = backend.client();
+    let t0 = Instant::now();
+
+    assert_eq!(fill(&cache, 20).await.unwrap(), 200);
+    let returned = Instant::now();
+    let started = origin_started();
+
+    println!(
+        "combined cold miss: body starts at {} ms ({} ms with a GET and a lock call)",
+        (started - t0).as_millis(),
+        GET + LOCK
+    );
+    assert_eq!(started - t0, ms(GET));
+    assert_eq!(backend.ops_by(started), ["get_or_lock"]);
+    let want: &[&str] = if DETACHED {
+        &["get_or_lock", "set"]
+    } else {
+        &["get_or_lock", "set", "unlock"]
+    };
+    assert_eq!(backend.ops_by(returned), want);
+
+    // The lock it took is still released.
+    tokio::time::sleep(ms(UNLOCK + 1)).await;
+    assert_eq!(backend.count(&["unlock"]), 1);
+    assert_eq!(backend.count(&["get", "lock"]), 0);
+}
+
+/// A hit is the one call: no lock is taken, and nothing is sent after it.
+#[tokio::test(start_paused = true)]
+async fn combined_hit_takes_no_lock() {
+    let backend = Timed::combining();
+    let bytes = serialize_value(&InteropValue::from(210_u64)).unwrap();
+    backend.st().store.insert(fill_key(21), bytes);
+    let cache = backend.client();
+    let t0 = Instant::now();
+
+    assert_eq!(fill(&cache, 21).await.unwrap(), 210);
+    assert_eq!(since(t0), GET);
+    assert!(ORIGIN_STARTED.get().is_none(), "a hit runs no body");
+    assert_eq!(outcomes(&cache), (0, 1, 0));
+
+    tokio::time::sleep(ms(FILL_LOCK_TIMEOUT)).await;
+    assert_eq!(backend.ops_by(Instant::now()), ["get_or_lock"]);
+}
+
+/// A detached unlock still pending when the key misses again is sent before
+/// the combined call, which is then granted instead of contesting this
+/// client's own lease.
+#[tokio::test(start_paused = true)]
+async fn combined_re_miss_sends_the_pending_unlock_first() {
+    let mut backend = Timed::combining();
+    backend.unlock_ms = 1_000;
+    let cache = backend.client();
+
+    assert_eq!(fill(&cache, 22).await.unwrap(), 220);
+    cache.delete(&fill_key(22)).await.unwrap();
+
+    let t1 = Instant::now();
+    assert_eq!(fill(&cache, 22).await.unwrap(), 220);
+    let took = since(t1);
+    let ops = backend.ops_between(t1, Instant::now());
+
+    // Detached: the re-call re-sends the unlock in flight, and both land
+    // before its combined call. Inline: the leader returned after its unlock.
+    let (want_ms, want_ops) = if DETACHED {
+        (
+            1_000 + GET + ORIGIN + SET,
+            vec!["unlock", "unlock", "get_or_lock", "set"],
+        )
+    } else {
+        (
+            GET + ORIGIN + SET + 1_000,
+            vec!["get_or_lock", "set", "unlock"],
+        )
+    };
+    assert_eq!(ops, want_ops);
+    assert_eq!(took, want_ms);
+}
+
+/// A contested combined call polls with plain GETs, like a contested lock
+/// call, until the lock timeout measured from its own start.
+#[tokio::test(start_paused = true)]
+async fn combined_contested_call_polls_until_the_deadline() {
+    let backend = Timed::combining();
+    backend.st().remote_holds = true; // another process leads and never fills
+    let cache = backend.client();
+    let t0 = Instant::now();
+
+    assert_eq!(fill(&cache, 23).await.unwrap(), 230);
+    let computed = origin_started() - t0;
+
+    println!(
+        "combined, contested, no fill: computes at {} ms with {} poll GETs",
+        computed.as_millis(),
+        backend.gets()
+    );
+    assert_eq!(computed, ms(FILL_LOCK_TIMEOUT));
+    assert_eq!(backend.count(&["get_or_lock"]), 1);
+    assert_eq!(backend.count(&["lock"]), 0);
+    assert!(backend.gets() > 0, "a contested call polls");
+}
+
+/// A same-key call that finds the flight held reads with a plain GET and
+/// queues behind it, as before: it never waits for the flight to read.
+#[tokio::test(start_paused = true)]
+async fn combined_local_follower_reads_plainly_and_queues() {
+    let backend = Timed::combining();
+    let cache = backend.client();
+
+    let follower = async {
+        tokio::task::yield_now().await;
+        fill(&cache, 25).await.unwrap()
+    };
+    let (leader, follower) = tokio::join!(fill(&cache, 25), follower);
+    assert_eq!((leader.unwrap(), follower), (250, 250));
+
+    let recheck = usize::from(!cfg!(feature = "l1"));
+    assert_eq!(backend.count(&["get_or_lock"]), 1, "the leader's");
+    assert_eq!(backend.count(&["get"]), 1 + recheck, "the follower's");
+    assert_eq!(backend.count(&["lock"]), 0);
+    assert_eq!(backend.count(&["set"]), 1, "one fill");
+}
+
+/// A combined call the server refuses took no lock (a full or read-only
+/// server, scripting denied): the cold miss reads and locks in two calls, as
+/// on a backend that does not combine, instead of failing the call.
+#[tokio::test(start_paused = true)]
+async fn refused_combined_call_falls_back_to_a_read_and_a_lock_call() {
+    let mut backend = Timed::combining();
+    backend.combined_fails = Some(BackendErrorKind::Permanent);
+    let cache = backend.client();
+
+    assert_eq!(fill(&cache, 26).await.unwrap(), 260);
+    let returned = Instant::now();
+    let want: &[&str] = if DETACHED {
+        &["get_or_lock", "get", "lock", "set"]
+    } else {
+        &["get_or_lock", "get", "lock", "set", "unlock"]
+    };
+    assert_eq!(backend.ops_by(returned), want);
+}
+
+/// A combined call that timed out may have taken the lock, so it is neither
+/// retried nor followed by a lock call: the plain path fails open and leads
+/// without the lock.
+#[tokio::test(start_paused = true)]
+async fn timed_out_combined_call_leads_without_the_lock() {
+    let mut backend = Timed::combining();
+    backend.combined_fails = Some(BackendErrorKind::Timeout);
+    let cache = backend.client();
+
+    assert_eq!(fill(&cache, 27).await.unwrap(), 270);
+    tokio::time::sleep(ms(FILL_LOCK_TIMEOUT)).await;
+    assert_eq!(backend.ops_by(Instant::now()), ["get_or_lock", "set"]);
+}
+
+/// `distributed_lock = false` reads with a plain GET even where the backend
+/// could combine, so it still sends no lock.
+#[tokio::test(start_paused = true)]
+async fn opted_out_cold_miss_never_combines() {
+    let backend = Timed::combining();
+    assert_eq!(fill_unlocked(&backend.client(), 24).await.unwrap(), 240);
+    tokio::time::sleep(ms(FILL_LOCK_TIMEOUT)).await;
+    assert_eq!(backend.ops_by(Instant::now()), ["get", "set"]);
 }
 
 // ── The leader's runtime idles or goes away before the unlock is sent ───────

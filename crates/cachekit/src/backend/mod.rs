@@ -302,6 +302,22 @@ pub trait TtlInspectable: Backend {
 
 // ── LockableBackend ─────────────────────────────────────────────────────────
 
+/// What [`LockableBackend::__get_or_lock`] found: the key's value, or, when
+/// the key was absent, the outcome of its lock attempt.
+///
+/// Client plumbing for the `#[cachekit]` cold miss, not part of the
+/// documented surface.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GetOrLock {
+    /// The key holds a value. No lock was attempted.
+    Value(Vec<u8>, Freshness),
+    /// The key was absent and the lock was granted; carries its id.
+    Locked(String),
+    /// The key was absent and another holder has the lock.
+    Contested,
+}
+
 /// Optional extension for backends that support distributed locking.
 #[cfg(not(any(target_arch = "wasm32", feature = "unsync")))]
 #[async_trait]
@@ -319,6 +335,28 @@ pub trait LockableBackend: Backend {
     /// unknown. The single-flight takes `Ok` as answered and never re-sends
     /// it, and re-sends after an `Err` on the key's next lock attempt.
     async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError>;
+
+    /// Whether [`Self::__get_or_lock`] answers in one round trip. The client
+    /// folds a cold miss's lock attempt into its read only when it does;
+    /// otherwise it reads, then locks, in two calls. Default: `false`.
+    #[doc(hidden)]
+    fn __combines_get_and_lock(&self) -> bool {
+        false
+    }
+
+    /// Read `key` as [`Backend::get_with_freshness`] does and, only if it is
+    /// absent, try its lock as [`Self::acquire_lock`] does: the same lock key,
+    /// token and expiry, so a holder that took the lock either way excludes
+    /// the other. Never retry it: after a lost reply, a retry finds the lock
+    /// the first attempt took and reports [`GetOrLock::Contested`].
+    ///
+    /// The default makes those two calls. Override it, and
+    /// [`Self::__combines_get_and_lock`], when the backend can do both in one
+    /// round trip.
+    #[doc(hidden)]
+    async fn __get_or_lock(&self, key: &str, timeout_ms: u64) -> Result<GetOrLock, BackendError> {
+        get_then_lock(self, key, timeout_ms).await
+    }
 }
 
 /// Optional extension for backends that support distributed locking (`?Send` variant).
@@ -338,6 +376,34 @@ pub trait LockableBackend: Backend {
     /// unknown. The single-flight takes `Ok` as answered and never re-sends
     /// it, and re-sends after an `Err` on the key's next lock attempt.
     async fn release_lock(&self, key: &str, lock_id: &str) -> Result<bool, BackendError>;
+
+    /// See the `Send` variant's `__combines_get_and_lock`.
+    #[doc(hidden)]
+    fn __combines_get_and_lock(&self) -> bool {
+        false
+    }
+
+    /// See the `Send` variant's `__get_or_lock`.
+    #[doc(hidden)]
+    async fn __get_or_lock(&self, key: &str, timeout_ms: u64) -> Result<GetOrLock, BackendError> {
+        get_then_lock(self, key, timeout_ms).await
+    }
+}
+
+/// [`LockableBackend::__get_or_lock`]'s default: a read, then a lock attempt
+/// only if the key is absent.
+pub(crate) async fn get_then_lock<B: LockableBackend + ?Sized>(
+    backend: &B,
+    key: &str,
+    timeout_ms: u64,
+) -> Result<GetOrLock, BackendError> {
+    if let Some((bytes, freshness)) = backend.get_with_freshness(key).await? {
+        return Ok(GetOrLock::Value(bytes, freshness));
+    }
+    Ok(match backend.acquire_lock(key, timeout_ms).await? {
+        Some(lock_id) => GetOrLock::Locked(lock_id),
+        None => GetOrLock::Contested,
+    })
 }
 
 // ── Blocking-pool bridge (file + memcached backends) ─────────────────────────

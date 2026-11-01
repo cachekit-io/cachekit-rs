@@ -402,6 +402,15 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
         quote_spanned! {id.span()=> cachekit::interop::InteropValue::from(#id.clone()) }
     });
 
+    // A locking cold miss's first read may take the key's single-flight with
+    // it (`__ck_lead`): on a backend that reads and locks in one round trip,
+    // the read carries the lock attempt.
+    let read_swr_call = if args.distributed_lock {
+        quote! { __interop_read_swr_leading::<#ok_type>(&__ck_key, &mut __ck_lead) }
+    } else {
+        quote! { __interop_read_swr::<#ok_type>(&__ck_key) }
+    };
+
     // Generate cache get/set calls depending on `secure` flag.
     let (get_expr, get_swr_expr, set_expr, complete_refresh_expr) = if args.secure {
         (
@@ -416,7 +425,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             quote! {
                 {
                     #client_ident.secure_cache()?;
-                    #client_ident.__interop_read_swr::<#ok_type>(&__ck_key).await
+                    #client_ident.#read_swr_call.await
                 }
             },
             quote! {
@@ -436,7 +445,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     } else {
         (
             quote! { #client_ident.__interop_read::<#ok_type>(&__ck_key).await },
-            quote! { #client_ident.__interop_read_swr::<#ok_type>(&__ck_key).await },
+            quote! { #client_ident.#read_swr_call.await },
             quote! {
                 #client_ident.set_with_ttl(&__ck_key, __ck_val, std::time::Duration::from_secs(#ttl_secs)).await
             },
@@ -530,10 +539,24 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     // drops its distributed fill lock: no lock or unlock round trip, and no
     // cross-process suppression. The SWR refresh keeps its lock either way;
     // it runs off the caller's path, so dropping it would save no latency.
-    let single_flight_expr = if args.distributed_lock {
-        quote! { #client_ident.single_flight(&__ck_key).await }
+    let (lead_decl, single_flight_expr) = if args.distributed_lock {
+        (
+            quote! {
+                let mut __ck_lead: ::std::option::Option<cachekit::flight::SingleFlight> =
+                    ::std::option::Option::None;
+            },
+            quote! {
+                match __ck_lead {
+                    ::std::option::Option::Some(__ck_led) => __ck_led,
+                    ::std::option::Option::None => #client_ident.single_flight(&__ck_key).await,
+                }
+            },
+        )
     } else {
-        quote! { #client_ident.__local_single_flight(&__ck_key).await }
+        (
+            quote! {},
+            quote! { #client_ident.__local_single_flight(&__ck_key).await },
+        )
     };
 
     // Capture the original function body.
@@ -592,6 +615,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             // headers: a hit by the layer that served its value, or a miss
             // when it runs the function. Its reads (this one, the
             // single-flight re-polls below) count nothing themselves.
+            #lead_decl
             match #get_swr_expr {
                 Ok(cachekit::SwrRead::Fresh((__ck_cached, __ck_by))) => {
                     #client_ident.__count(&__ck_key, __ck_by);
@@ -664,6 +688,8 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             // to one execution (misses are billable). While another worker is
             // filling, re-check the cache instead of recomputing. A re-check
             // still running at a contested flight's deadline counts as a miss.
+            // A flight the first read took (`__ck_lead`) has made its lock
+            // attempt already.
             let mut __ck_flight = #single_flight_expr;
             while __ck_flight.wait_for_fill().await {
                 let Some(__ck_read) = __ck_flight.__bounded_poll(async { #get_expr }).await else {

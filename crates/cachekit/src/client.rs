@@ -184,6 +184,10 @@ pub enum SwrRead<T> {
     Miss,
 }
 
+/// Where a read that may take the key's single-flight leaves it (see
+/// [`CacheKit::__interop_read_swr_leading`]); `None` for a plain read.
+type LeadSlot<'a> = Option<&'a mut Option<crate::flight::SingleFlight>>;
+
 /// Mutation version captured by an SWR stale read.
 ///
 /// Pass this back only through the `#[cachekit]`-generated refresh path. It
@@ -702,7 +706,7 @@ impl CacheKit {
         &self,
         full_key: &str,
     ) -> Result<SwrRead<(Payload, ReadOutcome)>, CachekitError> {
-        let read = self.read_bytes_swr(full_key).await?;
+        let read = self.read_bytes_swr(full_key, None).await?;
         let by = match &read {
             SwrRead::Fresh((_, by)) | SwrRead::Stale((_, by), _) => *by,
             SwrRead::Miss => ReadOutcome::Miss,
@@ -737,7 +741,7 @@ impl CacheKit {
         &self,
         full_key: &str,
     ) -> Result<Option<(Payload, ReadOutcome)>, CachekitError> {
-        let read = self.read_bytes_past_l1(full_key).await?;
+        let read = self.read_bytes_past_l1(full_key, None).await?;
         let by = read.as_ref().map_or(ReadOutcome::Miss, |(_, by)| *by);
         self.counters.record(by, full_key);
         Ok(read)
@@ -785,10 +789,12 @@ impl CacheKit {
     /// The uncounted read behind [`Self::get_bytes_swr`]: an L1 hit is split
     /// into fresh vs stale against the configured freshness window; on L1
     /// miss this defers to [`Self::read_bytes`] (L2 + backfill), whose hit is
-    /// always fresh. Each value comes with the layer that served it.
+    /// always fresh. Each value comes with the layer that served it. `lead`
+    /// is [`Self::read_bytes`]'s.
     async fn read_bytes_swr(
         &self,
         full_key: &str,
+        lead: LeadSlot<'_>,
     ) -> Result<SwrRead<(Payload, ReadOutcome)>, CachekitError> {
         #[cfg(all(feature = "l1", not(feature = "unsync"), not(target_arch = "wasm32")))]
         if self.swr_enabled {
@@ -828,7 +834,7 @@ impl CacheKit {
             }
         }
 
-        Ok(match self.read_bytes(full_key).await? {
+        Ok(match self.read_bytes(full_key, lead).await? {
             Some(read) => SwrRead::Fresh(read),
             None => SwrRead::Miss,
         })
@@ -837,15 +843,22 @@ impl CacheKit {
     /// The uncounted read behind [`Self::read_bytes_swr`] and
     /// [`Self::__interop_read`]: L1, then [`Self::read_bytes_past_l1`], with
     /// the layer that served the bytes.
+    ///
+    /// With `lead`, a `#[cachekit]` cold miss that takes the distributed fill
+    /// lock, the L2 read also tries that lock when the backend can do both in
+    /// one round trip ([`crate::flight::ColdLead`]). Then a miss, or a failed
+    /// read, leaves the key's single-flight in `lead`, its lock attempt made.
+    /// A value it finds takes the same admission as any L2 hit.
     async fn read_bytes(
         &self,
         full_key: &str,
+        lead: LeadSlot<'_>,
     ) -> Result<Option<(Payload, ReadOutcome)>, CachekitError> {
         #[cfg(feature = "l1")]
         if let Some(payload) = self.read_l1(full_key)? {
             return Ok(Some((payload, ReadOutcome::L1Hit)));
         }
-        self.read_bytes_past_l1(full_key).await
+        self.read_bytes_past_l1(full_key, lead).await
     }
 
     /// The optimistic L1 lookup every read starts with: the entry, checked
@@ -865,7 +878,23 @@ impl CacheKit {
     async fn read_bytes_past_l1(
         &self,
         full_key: &str,
+        lead: LeadSlot<'_>,
     ) -> Result<Option<(Payload, ReadOutcome)>, CachekitError> {
+        // Taken before the mutation lock below, as a fill takes them: its
+        // leader holds the flight while it stores. A pending unlock goes out
+        // before that lock too, so same-key reads and writes never wait on it.
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        let mut cold = lead.and_then(|slot| {
+            crate::flight::ColdLead::try_take(&self.flight, &self.backend, full_key)
+                .map(|cold| (slot, cold))
+        });
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        if let Some((_, cold)) = cold.as_mut() {
+            cold.settle().await;
+        }
+        #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
+        let _ = lead;
+
         // Serialize an L2 read/backfill with same-key writes. Re-check L1
         // after taking the lock because another operation may have filled it
         // between the caller's optimistic read and lock acquisition.
@@ -878,7 +907,28 @@ impl CacheKit {
         }
 
         // L2 backend
-        let Some((bytes, freshness)) = self.backend.get_with_freshness(full_key).await? else {
+        #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
+        let read = match cold {
+            Some((slot, cold)) => match cold.read().await {
+                crate::flight::ColdRead::Hit(bytes, freshness) => Some((bytes, freshness)),
+                crate::flight::ColdRead::Miss(flight) => {
+                    *slot = Some(flight);
+                    None
+                }
+                crate::flight::ColdRead::Failed(err, flight) => {
+                    *slot = Some(flight);
+                    return Err(err.into());
+                }
+                crate::flight::ColdRead::Unanswered => {
+                    self.backend.get_with_freshness(full_key).await?
+                }
+                crate::flight::ColdRead::Unsent(err) => return Err(err.into()),
+            },
+            None => self.backend.get_with_freshness(full_key).await?,
+        };
+        #[cfg(not(all(feature = "reliability", not(target_arch = "wasm32"))))]
+        let read = self.backend.get_with_freshness(full_key).await?;
+        let Some((bytes, freshness)) = read else {
             return Ok(None);
         };
 
@@ -1152,7 +1202,7 @@ impl CacheKit {
         }
         self.reject_namespaced_interop()?;
         let full_key = self.resolve_key(key)?;
-        match self.read_bytes(&full_key).await? {
+        match self.read_bytes(&full_key, None).await? {
             Some((payload, by)) => Ok(Some((crate::interop::deserialize_payload(&payload)?, by))),
             None => Ok(None),
         }
@@ -1166,13 +1216,36 @@ impl CacheKit {
         &self,
         key: &str,
     ) -> Result<SwrRead<(T, ReadOutcome)>, CachekitError> {
+        self.interop_read_swr(key, None).await
+    }
+
+    /// [`Self::__interop_read_swr`] for a cold miss that takes the
+    /// distributed fill lock. On a backend that reads and locks in one round
+    /// trip, an L2 miss or a failed L2 read also takes the key's
+    /// single-flight, its lock attempt made, and leaves it in `lead` for the
+    /// call to use in place of [`Self::single_flight`]. Any other read leaves
+    /// `lead` empty. Macro plumbing for `#[cachekit]` — not public API.
+    #[doc(hidden)]
+    pub async fn __interop_read_swr_leading<T: DeserializeOwned>(
+        &self,
+        key: &str,
+        lead: &mut Option<crate::flight::SingleFlight>,
+    ) -> Result<SwrRead<(T, ReadOutcome)>, CachekitError> {
+        self.interop_read_swr(key, Some(lead)).await
+    }
+
+    async fn interop_read_swr<T: DeserializeOwned>(
+        &self,
+        key: &str,
+        lead: LeadSlot<'_>,
+    ) -> Result<SwrRead<(T, ReadOutcome)>, CachekitError> {
         #[cfg(feature = "encryption")]
         if let Some(secure) = self.encrypting() {
-            return secure.__interop_read_swr(key).await;
+            return secure.__interop_read_swr(key, lead).await;
         }
         self.reject_namespaced_interop()?;
         let full_key = self.resolve_key(key)?;
-        Ok(match self.read_bytes_swr(&full_key).await? {
+        Ok(match self.read_bytes_swr(&full_key, lead).await? {
             SwrRead::Fresh((payload, by)) => {
                 SwrRead::Fresh((crate::interop::deserialize_payload(&payload)?, by))
             }
@@ -1487,7 +1560,7 @@ impl SecureCache<'_> {
     ) -> Result<Option<(T, ReadOutcome)>, CachekitError> {
         self.client.reject_namespaced_interop()?;
         let full_key = self.client.resolve_key(key)?;
-        match self.client.read_bytes(&full_key).await? {
+        match self.client.read_bytes(&full_key, None).await? {
             Some((ct, by)) => Ok(Some((
                 redact_decode(crate::interop::deserialize(
                     &self.decrypt_or_evict(ct.bytes(), &full_key)?,
@@ -1498,11 +1571,13 @@ impl SecureCache<'_> {
         }
     }
 
-    /// The secure twin of [`CacheKit::__interop_read_swr`], which hands an
-    /// encrypting client's reads here.
+    /// The secure twin of [`CacheKit::__interop_read_swr`] and
+    /// [`CacheKit::__interop_read_swr_leading`], which hand an encrypting
+    /// client's reads here.
     async fn __interop_read_swr<T: DeserializeOwned>(
         &self,
         key: &str,
+        lead: LeadSlot<'_>,
     ) -> Result<SwrRead<(T, ReadOutcome)>, CachekitError> {
         self.client.reject_namespaced_interop()?;
         let full_key = self.client.resolve_key(key)?;
@@ -1511,7 +1586,7 @@ impl SecureCache<'_> {
                 &self.decrypt_or_evict(ct, &full_key)?,
             ))
         };
-        Ok(match self.client.read_bytes_swr(&full_key).await? {
+        Ok(match self.client.read_bytes_swr(&full_key, lead).await? {
             SwrRead::Fresh((ct, by)) => SwrRead::Fresh((decode(ct.bytes())?, by)),
             SwrRead::Stale((ct, by), token) => SwrRead::Stale((decode(ct.bytes())?, by), token),
             SwrRead::Miss => SwrRead::Miss,
