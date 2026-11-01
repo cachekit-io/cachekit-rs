@@ -858,6 +858,12 @@ impl ColdLead {
     /// worker holds the flight: the caller reads, then
     /// [`SingleFlight::acquire`]s, as before. Never waiting keeps a hit from
     /// queueing behind another worker's fill or refresh.
+    ///
+    /// Sets the stand-down note (see [`FlightMap`]) at once: until a lock
+    /// attempt makes this a leader, it cannot vouch that no other process
+    /// holds the lease. Every exit that does not lead, cancellation included,
+    /// leaves the note set, and a cold miss queued behind it that misses
+    /// contests the lease before computing.
     pub(crate) fn try_take(
         map: &crate::client::SharedFlight,
         backend: &SharedBackend,
@@ -866,7 +872,8 @@ impl ColdLead {
         if !backend.as_lockable()?.__combines_get_and_lock() {
             return None;
         }
-        let local = map.handle(full_key).try_lock_owned().ok()?;
+        let mut local = map.handle(full_key).try_lock_owned().ok()?;
+        local.stand_down = true;
         Some(Self {
             map: map.clone(),
             local,
@@ -889,17 +896,13 @@ impl ColdLead {
 
         let deadline = LockAttempt::deadline();
         let Some(lockable) = self.backend.as_lockable() else {
-            self.stand_down();
             return ColdRead::Unanswered;
         };
         let attempt = match lockable
             .__get_or_lock(&self.full_key, FILL_LOCK_TIMEOUT_MS)
             .await
         {
-            Ok(GetOrLock::Value(bytes, freshness)) => {
-                self.stand_down();
-                return ColdRead::Hit(bytes, freshness);
-            }
+            Ok(GetOrLock::Value(bytes, freshness)) => return ColdRead::Hit(bytes, freshness),
             Ok(GetOrLock::Locked(lock_id)) => LockAttempt::Granted(lock_id),
             Ok(GetOrLock::Contested) => LockAttempt::Contested { deadline },
             Err(err)
@@ -924,12 +927,10 @@ impl ColdLead {
                     BackendErrorKind::CircuitOpen | BackendErrorKind::Backpressure
                 ) =>
             {
-                self.stand_down();
                 return ColdRead::Unsent(err);
             }
             Err(err) => {
                 crate::metrics::trace_lock_error(&self.full_key, "get_or_lock", &err);
-                self.stand_down();
                 return ColdRead::Unanswered;
             }
         };
@@ -940,14 +941,6 @@ impl ColdLead {
             &self.backend,
             &self.full_key,
         ))
-    }
-
-    /// Free the in-process flight without leading. It made no lock attempt,
-    /// so it cannot vouch that no other process holds the lease: it sets the
-    /// stand-down note (see [`FlightMap`]), and a cold miss that queued behind
-    /// it and misses contests the lease before computing.
-    fn stand_down(mut self) {
-        self.local.stand_down = true;
     }
 }
 
@@ -1087,6 +1080,21 @@ mod tests {
 
         let lead = ColdLead::try_take(&map, &backend, "k").unwrap();
         assert!(matches!(lead.read().await, ColdRead::Hit(..)));
+        assert!(held.try_lock().unwrap().stand_down);
+    }
+
+    /// A taken flight dropped before its call answers (the caller was
+    /// cancelled, or an L1 re-check hit) leaves the note set too.
+    #[tokio::test]
+    async fn a_dropped_cold_lead_leaves_a_stand_down_note() {
+        let backend: SharedBackend = Arc::new(Locks {
+            combined_value: Some(b"v".to_vec()),
+            ..Locks::default()
+        });
+        let map: crate::client::SharedFlight = Arc::default();
+        let held = map.handle("k");
+
+        drop(ColdLead::try_take(&map, &backend, "k").unwrap());
         assert!(held.try_lock().unwrap().stand_down);
     }
 
