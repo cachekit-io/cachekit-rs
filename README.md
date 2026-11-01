@@ -442,7 +442,7 @@ let backend = FileBackend::builder()
 
 The Workers runtime's `fetch` has no timeout of its own and can hold a request for tens of seconds, so the backend bounds each request itself: 5 s for a read and 10 s for a write (`set`, `delete`), from send through the last byte of the response body. Past that the request is aborted and the call fails with `BackendErrorKind::Timeout`. The `reliability` feature is native-only, so a Workers call makes one attempt and does not retry.
 
-Pass the Worker's bindings with `.bindings(&env)`: the backend reads a `CACHEKIT_TELEMETRY` variable or secret there, and `process.env` (with the `nodejs_compat` flag) as well. Built without them, it cannot see the variable, which could be off, so [telemetry](#telemetry-sent-to-cachekitio) is off even with `.telemetry(true)`.
+`WorkersCachekitIO::builder(&env)` takes the Worker's bindings (the `env` your fetch handler receives): the backend reads a `CACHEKIT_TELEMETRY` variable or secret there, and in `process.env` (with the `nodejs_compat` flag), to turn [telemetry](#telemetry-sent-to-cachekitio) off.
 
 <!-- x-release-please-start-version -->
 ```toml
@@ -689,7 +689,7 @@ Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rus
 
 ### Telemetry sent to cachekit.io
 
-**Unreleased.** The latency headers and the telemetry switch are on `main` and in no published release yet. Releases up to 0.13.1 send the session and counter headers with no way to turn them off.
+**Unreleased.** The latency headers and the telemetry switch are on `main` and in no published release yet. Releases up to 0.13.1 send the session and counter headers with no way to turn them off, and their `WorkersCachekitIO::builder()` takes no bindings.
 
 Only the cachekit.io backends, `CachekitIO` and `WorkersCachekitIO`, send telemetry, and only to the API they are built with; they never follow a redirect. A Redis, Memcached or File backend, or an L1-only client, sends none anywhere. While telemetry is on, each request carries these optional headers ([protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/saas-api.md#optional-metrics-headers)):
 
@@ -708,7 +708,7 @@ One value read in 128, drawn at random before the read starts, is timed, from th
 Telemetry is on by default during the closed beta, and becomes opt-in when cachekit.io reaches general availability. Two controls turn it off, and off from either wins:
 
 - `.telemetry(false)` on `CachekitIO::builder()` or `WorkersCachekitIO::builder()`. The setting is unset by default.
-- `CACHEKIT_TELEMETRY=false` in the environment. `false`, `0`, `off` and `no` turn telemetry off and `true`, `1`, `on` and `yes` turn it on, in any case and ignoring surrounding white space. Unset or empty leaves the default. Any other value also turns telemetry off and warns once: through `tracing` natively (with the `tracing` feature), and to the console on Workers. On Workers the variable is read from `process.env` and from the bindings passed to `.bindings(&env)`. A Workers backend built without `.bindings(&env)` cannot see a `CACHEKIT_TELEMETRY` binding, which could be off, so its telemetry is off even with `.telemetry(true)`.
+- `CACHEKIT_TELEMETRY=false` in the environment. `false`, `0`, `off` and `no` turn telemetry off and `true`, `1`, `on` and `yes` turn it on, in any case and ignoring surrounding white space. Unset or empty leaves the default. Any other value also turns telemetry off and warns once: through `tracing` natively (with the `tracing` feature), and to the console on Workers. On Workers the variable is read from the bindings passed to `WorkersCachekitIO::builder(&env)` and from `process.env`.
 
 Both controls are read once, when the backend is built. With telemetry off the backend sends none of the headers above and times no read. It still sends `X-CacheKit-L1-Status`, which the service requires on every request and which describes that request only, and, natively, `User-Agent: cachekit-rs/<version>`.
 

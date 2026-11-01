@@ -62,7 +62,9 @@ pub(crate) const METRICS_HEADER_NAMES: [&str; 5] = [
     "X-CacheKit-L1-Hit-Rate",
 ];
 
-/// Build `X-CacheKit-*` HTTP headers from the current L1 stats provider.
+/// Build `X-CacheKit-*` HTTP headers from the current L1 stats provider, as
+/// sent with telemetry on. A backend whose telemetry is off sends only
+/// `X-CacheKit-L1-Status` from them: this function does not read the switch.
 pub fn metrics_headers(provider: Option<&MetricsProvider>) -> Vec<(&'static str, String)> {
     metrics_headers_named(provider, &METRICS_HEADER_NAMES, true)
 }
@@ -290,8 +292,8 @@ impl Report {
 /// ([`Backend::l1_latency`](crate::backend::Backend::l1_latency)); the client
 /// times a sample of its L1 hits into it, and the backend's next request (any
 /// but the health check) takes the report and carries it as the
-/// `X-CacheKit-L1-Latency-*` headers. It has no public constructor: a backend
-/// that wraps another forwards the inner one's.
+/// `X-CacheKit-L1-Latency-*` headers. Its only constructor is a hidden one for
+/// tests and probes: a backend that wraps another forwards the inner one's.
 #[derive(Debug)]
 pub struct L1Latency {
     one_in: u32,

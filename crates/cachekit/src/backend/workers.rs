@@ -127,9 +127,18 @@ impl std::fmt::Debug for WorkersCachekitIO {
 }
 
 impl WorkersCachekitIO {
-    /// Start building a [`WorkersCachekitIO`] instance.
-    pub fn builder() -> WorkersCachekitIOBuilder {
-        WorkersCachekitIOBuilder::default()
+    /// Start building a [`WorkersCachekitIO`] over the Worker's bindings (the
+    /// `env` your handler receives). `build` reads a `CACHEKIT_TELEMETRY`
+    /// variable or secret from them ([`telemetry`](WorkersCachekitIOBuilder::telemetry)).
+    pub fn builder(env: &worker::Env) -> WorkersCachekitIOBuilder {
+        WorkersCachekitIOBuilder {
+            api_key: None,
+            api_url: None,
+            allow_custom_host: false,
+            metrics_provider: None,
+            telemetry: None,
+            bindings: env.clone(),
+        }
     }
 
     /// Return the configured API URL.
@@ -521,7 +530,10 @@ impl TtlInspectable for WorkersCachekitIO {
 // ── Builder ──────────────────────────────────────────────────────────────────
 
 /// Builder for [`WorkersCachekitIO`].
-#[derive(Default)]
+///
+/// Made only by [`WorkersCachekitIO::builder`], so every backend has the
+/// bindings it reads `CACHEKIT_TELEMETRY` from: a binding the SDK could not
+/// see might be off, and off wins.
 #[must_use]
 pub struct WorkersCachekitIOBuilder {
     api_key: Option<Zeroizing<String>>,
@@ -529,7 +541,7 @@ pub struct WorkersCachekitIOBuilder {
     allow_custom_host: bool,
     metrics_provider: Option<MetricsProvider>,
     telemetry: Option<bool>,
-    bindings: Option<worker::Env>,
+    bindings: worker::Env,
 }
 
 impl WorkersCachekitIOBuilder {
@@ -570,29 +582,15 @@ impl WorkersCachekitIOBuilder {
     /// service requires on every request, still is. This backend never sends
     /// L1 hit latency: the Workers clock advances only on I/O.
     ///
-    /// The variable `CACHEKIT_TELEMETRY` is the other control, read from
-    /// `process.env` (present with the `nodejs_compat` flag) and from the
-    /// bindings passed to [`bindings`](Self::bindings): `false`, `0`, `off` or
-    /// `no` (any case, surrounding white space ignored) turns telemetry off,
-    /// `true`, `1`, `on` or `yes` on, and any other non-empty value off. Off
-    /// from any source wins; with none set telemetry is on during the closed
-    /// beta. `build` reads them once.
-    ///
-    /// Without [`bindings`](Self::bindings), the SDK cannot see a
-    /// `CACHEKIT_TELEMETRY` binding, which could be off, so telemetry is off
-    /// whatever this setting says.
+    /// The variable `CACHEKIT_TELEMETRY` is the other control, read from the
+    /// bindings passed to [`WorkersCachekitIO::builder`] and from
+    /// `process.env` (present with the `nodejs_compat` flag): `false`, `0`,
+    /// `off` or `no` (any case, surrounding white space ignored) turns
+    /// telemetry off, `true`, `1`, `on` or `yes` on, and any other non-empty
+    /// value off. Off from any source wins; with none set telemetry is on
+    /// during the closed beta. `build` reads them once.
     pub fn telemetry(mut self, on: bool) -> Self {
         self.telemetry = Some(on);
-        self
-    }
-
-    /// The Worker's bindings (the `env` your handler receives), read once at
-    /// `build` for a `CACHEKIT_TELEMETRY` variable or secret
-    /// ([`telemetry`](Self::telemetry)). Without them telemetry is off, even
-    /// with `.telemetry(true)`: a `CACHEKIT_TELEMETRY` binding the SDK cannot
-    /// see could be off, and off wins.
-    pub fn bindings(mut self, env: &worker::Env) -> Self {
-        self.bindings = Some(env.clone());
         self
     }
 
@@ -623,18 +621,8 @@ impl WorkersCachekitIOBuilder {
         let process_env = Reflect::get(&js_sys::global(), &"process".into())
             .ok()
             .and_then(|process| Reflect::get(&process, &"env".into()).ok());
-        let bindings = match &self.bindings {
-            Some(env) => telemetry_var(Some(env.as_ref())),
-            // Bindings the SDK was not given may hold an off it cannot see.
-            // Off wins over every other control, the setting included, so an
-            // unread source reads as off: a missed off would send what the
-            // operator turned off.
-            None => {
-                warn_no_bindings();
-                Switch::Off
-            }
-        };
-        let env = telemetry_var(process_env.as_ref()).either(bindings);
+        let env =
+            telemetry_var(process_env.as_ref()).either(telemetry_var(Some(self.bindings.as_ref())));
 
         Ok(WorkersCachekitIO {
             api_key,
@@ -644,19 +632,6 @@ impl WorkersCachekitIOBuilder {
                 .map_or_else(OnceLock::new, OnceLock::from),
             telemetry: telemetry_on(self.telemetry, env),
         })
-    }
-}
-
-/// Warn, once per isolate, that a backend built without its Worker's bindings
-/// has telemetry off.
-fn warn_no_bindings() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        worker::console_warn!(
-            "cachekit: WorkersCachekitIO was built without .bindings(&env), so it cannot read \
-             CACHEKIT_TELEMETRY: telemetry is off. Pass the bindings to send telemetry."
-        );
     }
 }
 

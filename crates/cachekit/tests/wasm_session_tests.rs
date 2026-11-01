@@ -59,7 +59,7 @@ async fn workers_backend_get_reaches_fetch_without_trapping() {
     use cachekit::backend::workers::WorkersCachekitIO;
     use cachekit::backend::Backend;
 
-    let backend = WorkersCachekitIO::builder()
+    let backend = WorkersCachekitIO::builder(&no_bindings())
         .api_key("test-key-never-sent")
         .api_url("https://cachekit-wasm-clock.invalid")
         .allow_custom_host(true)
@@ -127,7 +127,7 @@ async fn workers_backend_does_not_follow_redirects() {
     use worker::wasm_bindgen::{JsCast, JsValue};
     use worker::wasm_bindgen_futures::JsFuture;
 
-    let backend = WorkersCachekitIO::builder()
+    let backend = WorkersCachekitIO::builder(&no_bindings())
         .api_key("test-key-never-sent")
         .build()
         .expect("default URL is valid");
@@ -200,7 +200,7 @@ async fn workers_backend_does_not_follow_redirects() {
 fn workers_backend_uses_the_validated_url_as_serialized() {
     use cachekit::backend::workers::WorkersCachekitIO;
 
-    let backend = WorkersCachekitIO::builder()
+    let backend = WorkersCachekitIO::builder(&no_bindings())
         .api_key("test-key-never-sent")
         .api_url("https://api.cachekit.io\\@evil.example")
         .build()
@@ -270,7 +270,7 @@ async fn workers_backend_times_out_a_stalled_request() {
     use worker::js_sys::{global, Array, Date, Function, Reflect};
     use worker::wasm_bindgen::{JsCast, JsValue};
 
-    let backend = WorkersCachekitIO::builder()
+    let backend = WorkersCachekitIO::builder(&no_bindings())
         .api_key("test-key-never-sent")
         .build()
         .expect("default URL is valid");
@@ -360,7 +360,7 @@ async fn workers_backend_frees_the_deadline_of_a_completed_request() {
     .call0(&JsValue::NULL)
     .expect("patch fetch")
     .unchecked_into();
-    let backend = WorkersCachekitIO::builder()
+    let backend = WorkersCachekitIO::builder(&no_bindings())
         .api_key("test-key-never-sent")
         .build()
         .expect("default URL is valid");
@@ -408,7 +408,7 @@ async fn workers_backend_aborts_a_dropped_request() {
     .call0(&JsValue::NULL)
     .expect("patch fetch")
     .unchecked_into();
-    let backend = WorkersCachekitIO::builder()
+    let backend = WorkersCachekitIO::builder(&no_bindings())
         .api_key("test-key-never-sent")
         .build()
         .expect("default URL is valid");
@@ -519,6 +519,12 @@ fn set_process_env(value: Option<&str>) {
     }
 }
 
+/// A `worker::Env` with no bindings.
+fn no_bindings() -> worker::Env {
+    use worker::wasm_bindgen::JsCast;
+    worker::js_sys::Object::new().unchecked_into()
+}
+
 /// A `worker::Env` holding one `CACHEKIT_TELEMETRY` binding.
 fn bindings(value: &worker::wasm_bindgen::JsValue) -> worker::Env {
     use worker::js_sys::{Object, Reflect};
@@ -537,9 +543,8 @@ async fn workers_api_82_telemetry_on_sends_no_latency_headers() {
     use cachekit::backend::Backend;
 
     set_process_env(None);
-    let backend = WorkersCachekitIO::builder()
+    let backend = WorkersCachekitIO::builder(&no_bindings())
         .api_key("test-key-never-sent")
-        .bindings(&bindings(&worker::wasm_bindgen::JsValue::UNDEFINED))
         .build()
         .expect("default URL is valid");
     backend.attach_metrics(l1_counters());
@@ -569,7 +574,7 @@ async fn workers_api_96_telemetry_off_sends_only_the_status() {
     use cachekit::backend::Backend;
 
     set_process_env(None);
-    let backend = WorkersCachekitIO::builder()
+    let backend = WorkersCachekitIO::builder(&no_bindings())
         .api_key("test-key-never-sent")
         .telemetry(false)
         .build()
@@ -611,25 +616,27 @@ async fn workers_api_95_reads_process_env_and_bindings_once() {
     };
 
     set_process_env(Some(" Off "));
-    let off_in_env = session_sent(WorkersCachekitIO::builder().telemetry(true)).await;
+    let off_in_env = session_sent(WorkersCachekitIO::builder(&no_bindings()).telemetry(true)).await;
     set_process_env(None);
 
-    let off_in_bindings =
-        session_sent(WorkersCachekitIO::builder().bindings(&bindings(&JsValue::from_bool(false))))
-            .await;
+    let off_in_bindings = session_sent(WorkersCachekitIO::builder(&bindings(&JsValue::from_bool(
+        false,
+    ))))
+    .await;
 
     set_process_env(Some("on"));
-    let off_in_one =
-        session_sent(WorkersCachekitIO::builder().bindings(&bindings(&JsValue::from_str("no"))))
-            .await;
-    let on_in_both =
-        session_sent(WorkersCachekitIO::builder().bindings(&bindings(&JsValue::from_f64(1.0))))
-            .await;
+    let off_in_one = session_sent(WorkersCachekitIO::builder(&bindings(&JsValue::from_str(
+        "no",
+    ))))
+    .await;
+    let on_in_both = session_sent(WorkersCachekitIO::builder(&bindings(&JsValue::from_f64(
+        1.0,
+    ))))
+    .await;
 
     set_process_env(None);
-    let built = WorkersCachekitIO::builder()
+    let built = WorkersCachekitIO::builder(&no_bindings())
         .api_key("test-key-never-sent")
-        .bindings(&bindings(&JsValue::UNDEFINED))
         .build()
         .expect("default URL is valid");
     built.attach_metrics(l1_counters());
@@ -646,37 +653,39 @@ async fn workers_api_95_reads_process_env_and_bindings_once() {
     assert!(read_once, "the environment is read once, at build");
 }
 
-/// API-94 / API-95: a backend built without its Worker's bindings cannot see
-/// a `CACHEKIT_TELEMETRY` binding, which could be off, so it fails closed:
-/// telemetry is off even when the code turns it on, because off wins.
+/// API-95: the bindings the backend is built with take part in the truth
+/// table like any other control: with nothing set telemetry is on, an on in
+/// `process.env` is on, and a binding off wins over the setting on.
 #[wasm_bindgen_test]
-async fn workers_api_94_without_bindings_telemetry_is_off() {
+async fn workers_api_95_bindings_join_the_truth_table() {
     use cachekit::backend::workers::WorkersCachekitIO;
     use cachekit::backend::Backend;
+    use worker::wasm_bindgen::JsValue;
+
+    let sends = |builder: cachekit::backend::workers::WorkersCachekitIOBuilder| async move {
+        let backend = builder
+            .api_key("test-key-never-sent")
+            .build()
+            .expect("default URL is valid");
+        backend.attach_metrics(l1_counters());
+        sent_headers(&backend)
+            .await
+            .contains_key("x-cachekit-session-id")
+    };
 
     set_process_env(None);
-    let unset = WorkersCachekitIO::builder()
-        .api_key("test-key-never-sent")
-        .build()
-        .expect("default URL is valid");
-    unset.attach_metrics(l1_counters());
-    let unset_sends = sent_headers(&unset)
-        .await
-        .contains_key("x-cachekit-session-id");
+    let nothing_set = sends(WorkersCachekitIO::builder(&no_bindings())).await;
+    set_process_env(Some("1"));
+    let env_on = sends(WorkersCachekitIO::builder(&no_bindings())).await;
+    set_process_env(None);
+    let binding_off_setting_on =
+        sends(WorkersCachekitIO::builder(&bindings(&JsValue::from_str("off"))).telemetry(true))
+            .await;
 
-    let explicit = WorkersCachekitIO::builder()
-        .api_key("test-key-never-sent")
-        .telemetry(true)
-        .build()
-        .expect("default URL is valid");
-    explicit.attach_metrics(l1_counters());
-    let explicit_sends = sent_headers(&explicit)
-        .await
-        .contains_key("x-cachekit-session-id");
-
-    assert!(!unset_sends, "no bindings and no setting: off");
+    assert!(nothing_set, "unset everywhere: on during the closed beta");
+    assert!(env_on, "process.env on: on");
     assert!(
-        !explicit_sends,
-        "an unread binding could be off, and off wins over .telemetry(true)"
+        !binding_off_setting_on,
+        "a binding off wins over .telemetry(true)"
     );
 }
