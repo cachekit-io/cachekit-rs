@@ -269,10 +269,12 @@ pub(crate) fn trace_delete(full_key: &str, existed: bool) {
     let _ = (full_key, existed);
 }
 
-/// Emit the event for a failed fill-lock call (`op` is `lock` or `unlock`).
-/// The call bypasses the circuit breaker, so this is the only signal of a
-/// failing lock endpoint: refreshes stand down, cold misses fill without the
-/// lease, and an unreleased lease is left to expire. It carries the error's
+/// Emit the event for a failed fill-lock call (`op` is `lock`, `unlock`, or
+/// `get_or_lock` for a cold miss's combined read and lock attempt that timed
+/// out, lost its connection, or was refused by the server). Lock and unlock calls bypass the circuit
+/// breaker, so this is the only signal of a failing lock endpoint: refreshes
+/// stand down, cold misses fill without the lease, and an unreleased lease is
+/// left to expire. It carries the error's
 /// kind, never its message: a transport error names the request URL, and the
 /// URL holds the key (CWE-532).
 #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
