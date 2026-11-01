@@ -346,7 +346,7 @@ Interop mode in production: [Skyline](https://github.com/cachekit-io/bluesky-thi
 
 ### cachekit.io SaaS (default)
 
-HTTP backend targeting [api.cachekit.io](https://api.cachekit.io) with session tracking, L1 metrics headers, SSRF-safe URL validation, distributed locking, and TTL inspection.
+HTTP backend targeting [api.cachekit.io](https://api.cachekit.io) with SSRF-safe URL validation, distributed locking, TTL inspection, and [telemetry](#telemetry-sent-to-cachekitio) you can turn off.
 
 ```rust
 use cachekit::backend::cachekitio::CachekitIO;
@@ -354,6 +354,7 @@ use cachekit::backend::cachekitio::CachekitIO;
 let backend = CachekitIO::builder()
     .api_key("ck_live_...")
     .api_url("https://api.cachekit.io")  // optional, this is the default
+    .telemetry(false)                    // optional; on by default during the beta
     .build()?;
 ```
 
@@ -441,6 +442,8 @@ let backend = FileBackend::builder()
 
 The Workers runtime's `fetch` has no timeout of its own and can hold a request for tens of seconds, so the backend bounds each request itself: 5 s for a read and 10 s for a write (`set`, `delete`), from send through the last byte of the response body. Past that the request is aborted and the call fails with `BackendErrorKind::Timeout`. The `reliability` feature is native-only, so a Workers call makes one attempt and does not retry.
 
+Pass the Worker's bindings with `.bindings(&env)` so a `CACHEKIT_TELEMETRY` variable or secret set there turns [telemetry](#telemetry-sent-to-cachekitio) off; `process.env` (with the `nodejs_compat` flag) is read as well.
+
 <!-- x-release-please-start-version -->
 ```toml
 cachekit-rs = { version = "0.13.1", default-features = false, features = ["workers", "encryption"] }
@@ -470,7 +473,7 @@ impl Backend for MyBackend {
 }
 ```
 
-Optional extension traits: `TtlInspectable` (TTL queries), `LockableBackend` (distributed locking).
+Optional extension traits: `TtlInspectable` (TTL queries), `LockableBackend` (distributed locking). A backend that wraps the cachekit.io backend and passes its requests through should forward `attach_metrics` and `l1_latency` to it, so its [telemetry](#telemetry-sent-to-cachekitio) keeps working.
 
 The client writes through `async fn set_bytes(&self, key: &str, value: bytes::Bytes, ttl: Option<Duration>)`, so the L1 and every retry attempt share one buffer. Its default turns the buffer into a `Vec<u8>` (a copy while another handle shares it) and calls `set`. Override it (with `bytes = "1"` as a dependency) if your backend can store a `Bytes` without copying, as the cachekit.io backend does with its request body. An override must store exactly what `set` would.
 
@@ -664,7 +667,7 @@ let breaker = cache.circuit_state();       // Option<CircuitState>: Closed / Ope
 | `CacheKit::stats()` | `L1Stats { l1_hits, l2_hits, misses, l1_enabled }`. Each value read (`get`, `interop_get`, SWR and `SecureCache` variants) counts one outcome: a hit by the layer that served it, or a miss. Each `#[cachekit]` call counts one outcome too: a hit by the layer that served its value, or one miss when it runs the function; its own reads, single-flight re-polls included, count nothing. `exists`, and reads that fail at the backend or on an oversized payload, are not counted; a plain read whose served entry then fails to decode or decrypt counts the layer that served it. |
 | `CacheKit::l1_entry_count()` | Exact L1 occupancy. Sweeps expired entries out first, a pass over every entry, so poll it; don't put it on a hot path. |
 | `CacheKit::circuit_state()` | Live breaker state (`reliability` feature); `None` when the client has no breaker. |
-| SaaS telemetry headers | The cachekit.io backends send `X-CacheKit-L1-Hits` / `L2-Hits` / `Misses` / `L1-Hit-Rate` from the **same counters**, wired automatically by `CacheKitBuilder::build()`. A `.metrics_provider(..)` set on the backend builder still takes precedence. One backend instance reports one client — the first built over it; once that client is gone the headers fall back to `disabled`. |
+| SaaS telemetry headers | The cachekit.io backends send `X-CacheKit-L1-Hits` / `L2-Hits` / `Misses` / `L1-Hit-Rate` from the **same counters**, wired automatically by `CacheKitBuilder::build()`, and a sampled L1 hit-latency histogram: see [Telemetry sent to cachekit.io](#telemetry-sent-to-cachekitio). A `.metrics_provider(..)` set on the backend builder still takes precedence. One backend instance reports one client's counters — the first built over it; once that client is gone the counters fall back to `disabled`. |
 | `tracing` feature | One `debug` event per completed operation (a `#[cachekit]` call's reads emit one `get` event, with the call's outcome), per failed fill-lock call, and per `#[cachekit]` result the macro could not store, on the `cachekit` target, and breaker transitions on `cachekit::reliability` (`warn` on open, `info` for half-open / closed). |
 
 With the `tracing` feature, point your subscriber at the crate:
@@ -684,6 +687,31 @@ Fields: `op` (`get` | `set` | `delete` | `lock` | `unlock`), `outcome` (`l1_hit`
 
 Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rust services bring their own registry and bridge `tracing` themselves.
 
+### Telemetry sent to cachekit.io
+
+*Unreleased: the latency headers and the switch ship in the next release after 0.13.1.*
+
+Only the cachekit.io backends, `CachekitIO` and `WorkersCachekitIO`, send telemetry, and only to the API they are built with; they never follow a redirect. A Redis, Memcached or File backend, or an L1-only client, sends none anywhere. While telemetry is on, each request carries these optional headers ([protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/saas-api.md#optional-metrics-headers)):
+
+| Header | Value |
+|:-------|:------|
+| `X-CacheKit-Session-ID` | A random UUID for the process |
+| `X-CacheKit-Session-Start` | When the process started its session, in milliseconds since the epoch |
+| `X-CacheKit-L1-Hits`, `X-CacheKit-L2-Hits`, `X-CacheKit-Misses` | The client's read counters, as `stats()` returns them, since the session started |
+| `X-CacheKit-L1-Hit-Rate` | `L1-Hits / (L1-Hits + L2-Hits + Misses)`, three decimals, `0.000` before any read |
+| `X-CacheKit-L1-Latency-Buckets` | The L1 hits timed since the previous report, counted into 16 duration buckets that double from 128 ns up to 2.1 ms, and a last one up to 60 s |
+| `X-CacheKit-L1-Latency-Sum-Ns` | The total duration of those hits, in nanoseconds |
+| `X-CacheKit-L1-Latency-One-In` | N: each call was timed with probability 1/N (128) |
+
+One value read in 128, drawn at random before the read starts, is timed, from the call's first step until it has its value: resolving the key, the L1 lookup, decryption and decoding. Only a read that L1 served and that returns a value counts; a `#[cachekit]` call that waited for another call's fill of the same key, an existence check, and the reads inside a `#[cachekit]` call are never timed. The report rides the backend's next request, except the health check, and is never sent again, even when that request fails. Hits timed after the last request are never sent. `WorkersCachekitIO` sends no latency headers: the Workers clock advances only on I/O, so it cannot time an in-memory hit.
+
+Telemetry is on by default during the closed beta, and becomes opt-in when cachekit.io reaches general availability. Two controls turn it off, and off from either wins:
+
+- `.telemetry(false)` on `CachekitIO::builder()` or `WorkersCachekitIO::builder()`. The setting is unset by default.
+- `CACHEKIT_TELEMETRY=false` in the environment. `false`, `0`, `off` and `no` turn telemetry off and `true`, `1`, `on` and `yes` turn it on, in any case and ignoring surrounding white space. Unset or empty leaves the default. Any other value also turns telemetry off and, with the `tracing` feature, logs one warning. On Workers the variable is read from `process.env` and from the bindings passed to `.bindings(&env)`.
+
+Both controls are read once, when the backend is built. With telemetry off the backend sends none of the headers above and times no read. It still sends `X-CacheKit-L1-Status`, which the service requires on every request and which describes that request only, and, natively, `User-Agent: cachekit-rs/<version>`.
+
 ---
 
 ## Environment Variables
@@ -693,6 +721,7 @@ Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rus
 | `CACHEKIT_API_KEY` | ✅ | API key for cachekit.io (`from_env()` and `CacheKit::io_from_env()`) |
 | `CACHEKIT_API_URL` | ❌ | Override API endpoint (default: `https://api.cachekit.io`) |
 | `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and the builder's `.encryption_from_env()`); use exactly 32 bytes (64 hex chars) — shorter, non-hex or non-UTF-8 values are rejected, never treated as unset. A key source, never a switch: `from_env()` validates it but does not encrypt, and while it is set a `from_env()` builder needs `.encryption_from_env()` or `.no_encryption()` |
+| `CACHEKIT_TELEMETRY` | ❌ | `false` / `0` / `off` / `no` turns off the optional telemetry headers a cachekit.io backend sends; read once when the backend is built. See [Telemetry sent to cachekit.io](#telemetry-sent-to-cachekitio) |
 | `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (`CacheKit::secure_from_env()` and `.encryption_from_env()`; max 3; a blank value is treated as unset). `from_env()` validates it and fails on a malformed value, even for a `.no_encryption()` client |
 
 > [!CAUTION]

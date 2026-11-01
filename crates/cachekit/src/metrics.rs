@@ -1,6 +1,7 @@
 //! Telemetry: live hit/miss counters, the `X-CacheKit-*` SaaS telemetry
-//! headers built from them, and — behind the `tracing` feature — structured
-//! events for cache operations.
+//! headers built from them, the sampled L1 hit-latency report, the switch
+//! that turns the optional headers off, and — behind the `tracing` feature —
+//! structured events for cache operations.
 //!
 //! Counters are owned by a [`CacheKit`](crate::CacheKit) and shared by its
 //! clones; read a snapshot with [`CacheKit::stats`](crate::CacheKit::stats).
@@ -9,7 +10,9 @@
 //! the backend ([`Backend::attach_metrics`](crate::backend::Backend::attach_metrics)),
 //! so the cachekit.io backends' telemetry headers report real numbers with no
 //! user plumbing. A provider given to the backend's own builder takes
-//! precedence.
+//! precedence. In the other direction, the client takes the backend's
+//! [`L1Latency`](crate::metrics::L1Latency) report ([`Backend::l1_latency`](crate::backend::Backend::l1_latency))
+//! and times a sample of its L1 hits into it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
