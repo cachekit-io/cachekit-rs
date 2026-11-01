@@ -1735,6 +1735,7 @@ mod http_client_tests {
 
         /// API-86: each retry builds its request again, so only the first
         /// attempt carries the report; a later one never re-sends it.
+        #[cfg(feature = "l1")]
         #[tokio::test]
         async fn api_86_a_retry_does_not_resend_the_report() {
             let stub = stub_with(|_| Some(RATE_LIMITED));

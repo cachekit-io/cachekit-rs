@@ -646,9 +646,9 @@ async fn workers_api_95_reads_process_env_and_bindings_once() {
     assert!(read_once, "the environment is read once, at build");
 }
 
-/// API-94: a backend built without its Worker's bindings cannot see a
-/// `CACHEKIT_TELEMETRY` binding, so it fails closed: telemetry is off unless
-/// the code turns it on.
+/// API-94 / API-95: a backend built without its Worker's bindings cannot see
+/// a `CACHEKIT_TELEMETRY` binding, which could be off, so it fails closed:
+/// telemetry is off even when the code turns it on, because off wins.
 #[wasm_bindgen_test]
 async fn workers_api_94_without_bindings_telemetry_is_off() {
     use cachekit::backend::workers::WorkersCachekitIO;
@@ -676,7 +676,7 @@ async fn workers_api_94_without_bindings_telemetry_is_off() {
 
     assert!(!unset_sends, "no bindings and no setting: off");
     assert!(
-        explicit_sends,
-        ".telemetry(true) turns it on without bindings"
+        !explicit_sends,
+        "an unread binding could be off, and off wins over .telemetry(true)"
     );
 }
