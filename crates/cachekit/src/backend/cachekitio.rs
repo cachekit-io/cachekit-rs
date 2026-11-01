@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -13,7 +15,11 @@ use crate::backend::{
 #[cfg(not(target_arch = "wasm32"))]
 use crate::backend::{nonzero_timeout, READ_TIMEOUT, WRITE_TIMEOUT};
 use crate::error::{BackendError, BackendErrorKind};
-use crate::metrics::{metrics_headers_named, MetricsProvider, METRICS_HEADER_NAMES};
+#[cfg(target_arch = "wasm32")]
+use crate::metrics::Switch;
+use crate::metrics::{metrics_headers_named, telemetry_on, MetricsProvider, METRICS_HEADER_NAMES};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::metrics::{L1Latency, DEFAULT_ONE_IN, LATENCY_HEADER_NAMES};
 use crate::session::session_headers;
 use crate::url_validator::cachekitio_base_url;
 
@@ -24,13 +30,23 @@ pub struct CachekitIO {
     client: reqwest::Client,
     api_key: Zeroizing<String>,
     api_url: String,
-    /// `Authorization` and the session headers, built once so no request
-    /// re-formats or re-parses them. The bearer value is marked sensitive, so
-    /// a request's `Debug` output redacts it, and its buffer is wiped when the
-    /// last clone drops.
-    static_headers: [(HeaderName, HeaderValue); 3],
+    /// `Authorization` and, with telemetry on, the session headers, built
+    /// once so no request re-formats or re-parses them. The bearer value is
+    /// marked sensitive, so a request's `Debug` output redacts it, and its
+    /// buffer is wiped when the last clone drops.
+    static_headers: Box<[(HeaderName, HeaderValue)]>,
     /// The telemetry header names, parsed once, in [`METRICS_HEADER_NAMES`] order.
     metrics_header_names: [HeaderName; 5],
+    /// Whether this backend sends the optional metrics headers
+    /// ([`CachekitIOBuilder::telemetry`]), resolved once at build.
+    telemetry: bool,
+    /// The L1 hit-latency report the client times into and the next request
+    /// carries; `None` with telemetry off.
+    #[cfg(not(target_arch = "wasm32"))]
+    latency: Option<Arc<L1Latency>>,
+    /// The latency header names, parsed once, in [`LATENCY_HEADER_NAMES`] order.
+    #[cfg(not(target_arch = "wasm32"))]
+    latency_header_names: [HeaderName; 3],
     /// Source of the `X-CacheKit-*` telemetry headers. Set once: by the
     /// builder when the user supplies one, otherwise by the client at build
     /// time via [`Backend::attach_metrics`] (first writer wins).
@@ -107,24 +123,58 @@ impl CachekitIO {
         format!("{}/v1/cache/health", self.api_url)
     }
 
-    /// Apply the read budget and the bearer token, session and metrics headers
-    /// to a request builder. A write sets its own budget afterwards.
+    /// Apply the read budget and the bearer token, session, metrics and
+    /// latency headers to a request builder. A write sets its own budget
+    /// afterwards.
     pub(crate) fn with_standard_headers(
         &self,
+        req: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        self.with_headers(req, true)
+    }
+
+    /// [`Self::with_standard_headers`], taking the L1 latency report only when
+    /// `report` is set: the health check never carries one, because the
+    /// server does not record it (spec/saas-api.md, API-84).
+    ///
+    /// Taking the report consumes it, whatever becomes of the request: a
+    /// request may reach the server and fail after, and nothing deduplicates
+    /// a report sent twice (API-86). reqwest never resends a request that
+    /// may have been delivered: its own retries cover only protocol refusals
+    /// and requests it never started, and a reliability-layer retry builds
+    /// the request again, taking whatever report has accumulated since.
+    fn with_headers(
+        &self,
         mut req: reqwest::RequestBuilder,
+        report: bool,
     ) -> reqwest::RequestBuilder {
         #[cfg(not(target_arch = "wasm32"))]
         {
             req = req.timeout(self.read_timeout);
         }
-        for (name, value) in &self.static_headers {
+        for (name, value) in self.static_headers.iter() {
             req = req.header(name.clone(), value.clone());
         }
-        for (name, value) in
-            metrics_headers_named(self.metrics_provider.get(), &self.metrics_header_names)
-        {
+        for (name, value) in metrics_headers_named(
+            self.metrics_provider.get(),
+            &self.metrics_header_names,
+            self.telemetry,
+        ) {
             req = req.header(name, value);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(values) = self
+            .latency
+            .as_ref()
+            .filter(|_| report)
+            .and_then(|l| l.take())
+        {
+            for (name, value) in self.latency_header_names.iter().zip(values) {
+                req = req.header(name.clone(), value);
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = report;
         req
     }
 
@@ -242,6 +292,10 @@ impl Backend for CachekitIO {
         self.metrics_provider.get_or_init(|| provider);
     }
 
+    fn l1_latency(&self) -> Option<Arc<L1Latency>> {
+        self.latency.clone()
+    }
+
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
         Ok(self.get_with_freshness(key).await?.map(|(bytes, _)| bytes))
     }
@@ -341,7 +395,7 @@ impl Backend for CachekitIO {
     async fn health(&self) -> Result<HealthStatus, BackendError> {
         let start = std::time::Instant::now();
 
-        let req = self.with_standard_headers(self.client.get(self.health_url()));
+        let req = self.with_headers(self.client.get(self.health_url()), false);
 
         let resp = req
             .send()
@@ -373,9 +427,10 @@ impl Backend for CachekitIO {
 // ── Prebuilt headers ──────────────────────────────────────────────────────────
 
 /// Build the per-client constant headers: `Authorization: Bearer <key>`,
-/// marked sensitive as `bearer_auth` would, and the process's session headers.
-/// The bearer outlives every request and each request clones it, so its buffer
-/// is a zeroising owner those clones share: the last drop wipes the key.
+/// marked sensitive as `bearer_auth` would, and, with `telemetry` on, the
+/// process's session headers. The bearer outlives every request and each
+/// request clones it, so its buffer is a zeroising owner those clones share:
+/// the last drop wipes the key.
 ///
 /// # Errors
 ///
@@ -383,7 +438,8 @@ impl Backend for CachekitIO {
 /// holds bytes an HTTP header cannot carry. The message never echoes the key.
 fn static_headers(
     api_key: &str,
-) -> Result<[(HeaderName, HeaderValue); 3], crate::error::CachekitError> {
+    telemetry: bool,
+) -> Result<Box<[(HeaderName, HeaderValue)]>, crate::error::CachekitError> {
     use crate::error::CachekitError;
 
     let mut bearer = Zeroizing::new(Vec::with_capacity("Bearer ".len() + api_key.len()));
@@ -403,11 +459,12 @@ fn static_headers(
                 .map_err(|e| CachekitError::Config(format!("header {name}: {e}")))?,
         ))
     };
-    Ok([
-        (reqwest::header::AUTHORIZATION, auth),
-        header(id_name, id)?,
-        header(start_name, start)?,
-    ])
+    let mut headers = vec![(reqwest::header::AUTHORIZATION, auth)];
+    if telemetry {
+        headers.push(header(id_name, id)?);
+        headers.push(header(start_name, start)?);
+    }
+    Ok(headers.into_boxed_slice())
 }
 
 /// A header value over `owner`'s buffer, not a copy of it: clones share the
@@ -420,11 +477,20 @@ fn header_over<T: AsRef<[u8]> + Send + 'static>(
 
 /// Parse [`METRICS_HEADER_NAMES`] once per client.
 fn metrics_header_names() -> Result<[HeaderName; 5], crate::error::CachekitError> {
-    let [a, b, c, d, e] = METRICS_HEADER_NAMES.map(|name| {
-        HeaderName::from_bytes(name.as_bytes())
-            .map_err(|e| crate::error::CachekitError::Config(format!("header name {name}: {e}")))
-    });
+    let [a, b, c, d, e] = METRICS_HEADER_NAMES.map(parse_header_name);
     Ok([a?, b?, c?, d?, e?])
+}
+
+/// Parse [`LATENCY_HEADER_NAMES`] once per client.
+#[cfg(not(target_arch = "wasm32"))]
+fn latency_header_names() -> Result<[HeaderName; 3], crate::error::CachekitError> {
+    let [a, b, c] = LATENCY_HEADER_NAMES.map(parse_header_name);
+    Ok([a?, b?, c?])
+}
+
+fn parse_header_name(name: &str) -> Result<HeaderName, crate::error::CachekitError> {
+    HeaderName::from_bytes(name.as_bytes())
+        .map_err(|e| crate::error::CachekitError::Config(format!("header name {name}: {e}")))
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
@@ -484,6 +550,7 @@ pub struct CachekitIOBuilder {
     api_url: Option<String>,
     allow_custom_host: bool,
     metrics_provider: Option<MetricsProvider>,
+    telemetry: Option<bool>,
     #[cfg(not(target_arch = "wasm32"))]
     read_timeout: Option<Duration>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -516,6 +583,26 @@ impl CachekitIOBuilder {
     /// to report numbers from somewhere else; it takes precedence.
     pub fn metrics_provider(mut self, provider: MetricsProvider) -> Self {
         self.metrics_provider = Some(provider);
+        self
+    }
+
+    /// Turn this backend's telemetry on or off. Unset by default.
+    ///
+    /// Telemetry is the optional `X-CacheKit-*` headers the backend sends to
+    /// cachekit.io, and nowhere else: the session ID and start time, the
+    /// client's L1 hit, L2 hit and miss counts with its L1 hit rate, and a
+    /// sampled histogram of L1 hit latency. With telemetry off none of them
+    /// is sent and no L1 hit is timed. `X-CacheKit-L1-Status`, which the
+    /// service requires on every request, and the `User-Agent` still are.
+    ///
+    /// The environment variable `CACHEKIT_TELEMETRY` is the other control:
+    /// `false`, `0`, `off` or `no` (any case, surrounding white space
+    /// ignored) turns telemetry off, `true`, `1`, `on` or `yes` on, and any
+    /// other non-empty value off. Off from either control wins; with neither
+    /// set telemetry is on during the closed beta. `build` reads both, once:
+    /// changing the variable later does not change a built backend.
+    pub fn telemetry(mut self, on: bool) -> Self {
+        self.telemetry = Some(on);
         self
     }
 
@@ -593,7 +680,14 @@ impl CachekitIOBuilder {
         let client = http_client()
             .map_err(|e| CachekitError::Config(format!("failed to build HTTP client: {e}")))?;
 
-        let static_headers = static_headers(&api_key)?;
+        // wasm32 has no process environment; there, only the setting applies.
+        #[cfg(not(target_arch = "wasm32"))]
+        let env = crate::metrics::telemetry_env();
+        #[cfg(target_arch = "wasm32")]
+        let env = Switch::Unset;
+        let telemetry = telemetry_on(self.telemetry, env);
+
+        let static_headers = static_headers(&api_key, telemetry)?;
         let metrics_header_names = metrics_header_names()?;
 
         Ok(CachekitIO {
@@ -602,6 +696,11 @@ impl CachekitIOBuilder {
             api_url,
             static_headers,
             metrics_header_names,
+            telemetry,
+            #[cfg(not(target_arch = "wasm32"))]
+            latency: telemetry.then(|| Arc::new(L1Latency::new(DEFAULT_ONE_IN))),
+            #[cfg(not(target_arch = "wasm32"))]
+            latency_header_names: latency_header_names()?,
             metrics_provider: self
                 .metrics_provider
                 .map_or_else(OnceLock::new, OnceLock::from),

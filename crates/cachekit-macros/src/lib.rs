@@ -553,6 +553,12 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     // Build the new function body.
     let new_body: syn::Block = syn::parse_quote! {
         {
+            // Whether this call's latency is timed, drawn as its first step,
+            // before its key or outcome is known. Only a call served from L1
+            // on its own first read is timed, through to the value it
+            // returns; one that joins another worker's fill never is.
+            let __ck_sample = #client_ident.__l1_sample();
+
             // interop/v1 key: {namespace}:{operation}:{args_hash} — the same
             // key is computable from any SDK (protocol spec/interop-mode.md).
             // The prefix is validated and joined once per function, so a call
@@ -589,6 +595,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             match #get_swr_expr {
                 Ok(cachekit::SwrRead::Fresh((__ck_cached, __ck_by))) => {
                     #client_ident.__count(&__ck_key, __ck_by);
+                    #client_ident.__l1_timed(__ck_sample, __ck_by);
                     return Ok(__ck_cached);
                 }
                 // Stale (past the freshness threshold, before hard expiry):
@@ -642,6 +649,9 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                         }
                         .await;
                     });
+                    // The stale serve's own work, spawning the refresh
+                    // included, is part of the call.
+                    #client_ident.__l1_timed(__ck_sample, __ck_by);
                     return Ok(__ck_cached);
                 }
                 Ok(cachekit::SwrRead::Miss) => {}

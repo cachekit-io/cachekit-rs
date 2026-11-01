@@ -10,7 +10,9 @@ use crate::backend::Backend;
 #[cfg(feature = "l1")]
 use crate::backend::{ttl_wire_secs, Freshness};
 use crate::error::CachekitError;
-use crate::metrics::{CacheCounters, L1Stats, ReadOutcome};
+#[cfg(all(feature = "l1", not(target_arch = "wasm32")))]
+use crate::metrics::L1Latency;
+use crate::metrics::{CacheCounters, L1Sample, L1Stats, ReadOutcome};
 use crate::serializer::{self, Payload};
 
 // ── SharedBackend type alias ──────────────────────────────────────────────────
@@ -250,6 +252,11 @@ pub struct CacheKit {
     /// Read counters behind [`Self::stats`]; the backend holds a
     /// `MetricsProvider` over the same allocation.
     counters: Arc<CacheCounters>,
+    /// The backend's L1 hit-latency report ([`Backend::l1_latency`]), which
+    /// a sample of this client's L1 hits is timed into; `None` for a backend
+    /// that sends no report, and then no draw is made and no clock read.
+    #[cfg(all(feature = "l1", not(target_arch = "wasm32")))]
+    latency: Option<Arc<L1Latency>>,
 
     /// The reliability stack's breaker, when configured — kept so
     /// [`Self::circuit_state`] can read it through the type-erased backend.
@@ -532,11 +539,20 @@ impl CacheKit {
         if let Some(secure) = self.encrypting() {
             return secure.get(key).await;
         }
+        let clock = self.l1_clock();
         let full_key = self.resolve_key(key)?;
-        match self.get_bytes(&full_key).await? {
-            Some(payload) => Ok(Some(serializer::deserialize_payload(&payload)?)),
-            None => Ok(None),
-        }
+        // An L1 hit is served here, synchronously: no read future is built
+        // or polled for it.
+        let (payload, by) = match self.get_l1(&full_key)? {
+            Some(payload) => (payload, ReadOutcome::L1Hit),
+            None => match self.get_bytes_past_l1(&full_key).await? {
+                Some(read) => read,
+                None => return Ok(None),
+            },
+        };
+        let value = serializer::deserialize_payload(&payload)?;
+        self.l1_timed(clock, by);
+        Ok(Some(value))
     }
 
     /// Retrieve and deserialize an interop-mode value stored under `key`.
@@ -582,12 +598,21 @@ impl CacheKit {
         if let Some(secure) = self.encrypting() {
             return secure.interop_get(key).await;
         }
+        let clock = self.l1_clock();
         self.reject_namespaced_interop()?;
         let full_key = self.resolve_key(key)?;
-        match self.get_bytes(&full_key).await? {
-            Some(payload) => Ok(Some(crate::interop::deserialize_payload(&payload)?)),
-            None => Ok(None),
-        }
+        // An L1 hit is served here, synchronously: no read future is built
+        // or polled for it.
+        let (payload, by) = match self.get_l1(&full_key)? {
+            Some(payload) => (payload, ReadOutcome::L1Hit),
+            None => match self.get_bytes_past_l1(&full_key).await? {
+                Some(read) => read,
+                None => return Ok(None),
+            },
+        };
+        let value = crate::interop::deserialize_payload(&payload)?;
+        self.l1_timed(clock, by);
+        Ok(Some(value))
     }
 
     /// Interop keys must reach the backend verbatim; a client namespace prefix
@@ -648,48 +673,101 @@ impl CacheKit {
         if let Some(secure) = self.encrypting() {
             return secure.interop_get_swr(key).await;
         }
+        let clock = self.l1_clock();
         self.reject_namespaced_interop()?;
         let full_key = self.resolve_key(key)?;
-        match self.get_bytes_swr(&full_key).await? {
-            SwrRead::Fresh(p) => Ok(SwrRead::Fresh(crate::interop::deserialize_payload(&p)?)),
-            SwrRead::Stale(p, token) => Ok(SwrRead::Stale(
-                crate::interop::deserialize_payload(&p)?,
-                token,
-            )),
-            SwrRead::Miss => Ok(SwrRead::Miss),
-        }
+        let (read, by) = match self.get_bytes_swr(&full_key).await? {
+            SwrRead::Fresh((p, by)) => {
+                (SwrRead::Fresh(crate::interop::deserialize_payload(&p)?), by)
+            }
+            SwrRead::Stale((p, by), token) => (
+                SwrRead::Stale(crate::interop::deserialize_payload(&p)?, token),
+                by,
+            ),
+            SwrRead::Miss => return Ok(SwrRead::Miss),
+        };
+        self.l1_timed(clock, by);
+        Ok(read)
     }
 
     /// Fetch raw payload bytes with SWR classification and count the read:
-    /// one outcome, by the layer that served it, or one miss. `full_key` comes
-    /// from [`Self::resolve_key`], so an encrypted read can bind the same key
-    /// in its AAD without resolving it again.
-    async fn get_bytes_swr(&self, full_key: &str) -> Result<SwrRead<Payload>, CachekitError> {
-        Ok(match self.read_bytes_swr(full_key).await? {
-            SwrRead::Fresh((bytes, by)) => {
-                self.counters.record(by, full_key);
-                SwrRead::Fresh(bytes)
-            }
-            SwrRead::Stale((bytes, by), token) => {
-                self.counters.record(by, full_key);
-                SwrRead::Stale(bytes, token)
-            }
-            SwrRead::Miss => {
-                self.counters.record(ReadOutcome::Miss, full_key);
-                SwrRead::Miss
-            }
-        })
+    /// one outcome, by the layer that served it, or one miss. The bytes come
+    /// with that layer. `full_key` comes from [`Self::resolve_key`], so an
+    /// encrypted read can bind the same key in its AAD without resolving it
+    /// again.
+    async fn get_bytes_swr(
+        &self,
+        full_key: &str,
+    ) -> Result<SwrRead<(Payload, ReadOutcome)>, CachekitError> {
+        let read = self.read_bytes_swr(full_key).await?;
+        let by = match &read {
+            SwrRead::Fresh((_, by)) | SwrRead::Stale((_, by), _) => *by,
+            SwrRead::Miss => ReadOutcome::Miss,
+        };
+        self.counters.record(by, full_key);
+        Ok(read)
     }
 
-    /// Fetch raw payload bytes for `full_key` (L1, then L2 with L1 backfill)
-    /// and count the read: one outcome, by the layer that served it, or one
-    /// miss. `full_key` comes from [`Self::resolve_key`], as for
-    /// [`Self::get_bytes_swr`].
-    async fn get_bytes(&self, full_key: &str) -> Result<Option<Payload>, CachekitError> {
-        let read = self.read_bytes(full_key).await?;
+    /// A value read's first step: serve `full_key` from L1 and count the hit,
+    /// or `None` on an L1 miss (always, without the `l1` feature), which
+    /// counts nothing yet. Synchronous, so a read serves an L1 hit without
+    /// building or polling a read future.
+    #[inline]
+    fn get_l1(&self, full_key: &str) -> Result<Option<Payload>, CachekitError> {
+        #[cfg(feature = "l1")]
+        if let Some(hit) = self.read_l1(full_key)? {
+            self.counters.record(ReadOutcome::L1Hit, full_key);
+            return Ok(Some(hit));
+        }
+        #[cfg(not(feature = "l1"))]
+        let _ = full_key;
+        Ok(None)
+    }
+
+    /// A value read's rest, after [`Self::get_l1`] missed: L2 with L1
+    /// backfill, counted as one outcome by the layer that served the bytes
+    /// (an L1 hit when a same-key write filled L1 meanwhile), or one miss.
+    /// The bytes come with that layer. `full_key` comes from
+    /// [`Self::resolve_key`], as for [`Self::get_bytes_swr`].
+    async fn get_bytes_past_l1(
+        &self,
+        full_key: &str,
+    ) -> Result<Option<(Payload, ReadOutcome)>, CachekitError> {
+        let read = self.read_bytes_past_l1(full_key).await?;
         let by = read.as_ref().map_or(ReadOutcome::Miss, |(_, by)| *by);
         self.counters.record(by, full_key);
-        Ok(read.map(|(bytes, _)| bytes))
+        Ok(read)
+    }
+
+    // ── L1 hit latency ───────────────────────────────────────────────────────
+    //
+    // spec/saas-api.md, "L1 hit latency". Each public value read draws as its
+    // first step whether to time itself, by `l1_clock`; a drawn call's clock
+    // stops where the call has produced its value, and only an L1 hit's
+    // duration is kept. Without an accumulator (a backend that sends no
+    // report) there is no draw.
+
+    /// Draw whether to time this call, before anything about its outcome is
+    /// known, and start its clock if so.
+    #[inline]
+    fn l1_clock(&self) -> L1Sample {
+        #[cfg(all(feature = "l1", not(target_arch = "wasm32")))]
+        if let Some(latency) = &self.latency {
+            if latency.draw() {
+                return L1Sample::start();
+            }
+        }
+        L1Sample::NONE
+    }
+
+    /// Stop `clock` where the call has produced its value; the duration
+    /// counts only for a drawn call that L1 served (`by`).
+    #[inline]
+    fn l1_timed(&self, clock: L1Sample, by: ReadOutcome) {
+        #[cfg(all(feature = "l1", not(target_arch = "wasm32")))]
+        clock.stop(by, self.latency.as_deref());
+        #[cfg(not(all(feature = "l1", not(target_arch = "wasm32"))))]
+        let _ = (clock, by);
     }
 
     /// The uncounted read behind [`Self::get_bytes_swr`]: an L1 hit is split
@@ -750,13 +828,31 @@ impl CacheKit {
         &self,
         full_key: &str,
     ) -> Result<Option<(Payload, ReadOutcome)>, CachekitError> {
-        // L1 hit
         #[cfg(feature = "l1")]
-        if let Some(payload) = self.l1_get(full_key) {
-            self.check_payload_size(payload.bytes().len())?;
+        if let Some(payload) = self.read_l1(full_key)? {
             return Ok(Some((payload, ReadOutcome::L1Hit)));
         }
+        self.read_bytes_past_l1(full_key).await
+    }
 
+    /// The optimistic L1 lookup every read starts with: the entry, checked
+    /// against the payload cap, or `None`.
+    #[cfg(feature = "l1")]
+    #[inline]
+    fn read_l1(&self, full_key: &str) -> Result<Option<Payload>, CachekitError> {
+        let Some(payload) = self.l1_get(full_key) else {
+            return Ok(None);
+        };
+        self.check_payload_size(payload.bytes().len())?;
+        Ok(Some(payload))
+    }
+
+    /// The uncounted rest of [`Self::read_bytes`], after its optimistic L1
+    /// lookup missed.
+    async fn read_bytes_past_l1(
+        &self,
+        full_key: &str,
+    ) -> Result<Option<(Payload, ReadOutcome)>, CachekitError> {
         // Serialize an L2 read/backfill with same-key writes. Re-check L1
         // after taking the lock because another operation may have filled it
         // between the optimistic read above and lock acquisition.
@@ -1083,6 +1179,25 @@ impl CacheKit {
         self.counters.record(outcome, &self.namespaced_key(key));
     }
 
+    /// Draw whether to time a `#[cachekit]` call's latency, as the call's
+    /// first step, and start its clock if so. Macro plumbing for
+    /// `#[cachekit]` — not public API.
+    #[doc(hidden)]
+    #[inline]
+    pub fn __l1_sample(&self) -> L1Sample {
+        self.l1_clock()
+    }
+
+    /// Stop a `#[cachekit]` call's clock as it returns its value; the
+    /// duration counts only when `outcome` is an L1 hit. Never called for a
+    /// call that joined another worker's fill. Macro plumbing for
+    /// `#[cachekit]` — not public API.
+    #[doc(hidden)]
+    #[inline]
+    pub fn __l1_timed(&self, sample: L1Sample, outcome: ReadOutcome) {
+        self.l1_timed(sample, outcome);
+    }
+
     // ── Secure cache ─────────────────────────────────────────────────────────
 
     /// Return a [`SecureCache`] handle that encrypts all values before storage.
@@ -1279,10 +1394,21 @@ impl SecureCache<'_> {
     /// is [`CachekitError::Serialization`] naming only `T`: the decoder's own
     /// message would quote the plaintext.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, CachekitError> {
-        match self.get_plaintext(key).await? {
-            Some(plaintext) => Ok(Some(redact_decode(serializer::deserialize(&plaintext))?)),
-            None => Ok(None),
-        }
+        let clock = self.client.l1_clock();
+        let full_key = self.client.resolve_key(key)?;
+        // An L1 hit is served here, synchronously: no read future is built
+        // or polled for it.
+        let (ciphertext, by) = match self.client.get_l1(&full_key)? {
+            Some(ciphertext) => (ciphertext, ReadOutcome::L1Hit),
+            None => match self.client.get_bytes_past_l1(&full_key).await? {
+                Some(read) => read,
+                None => return Ok(None),
+            },
+        };
+        let plaintext = self.decrypt_or_evict(ciphertext.bytes(), &full_key)?;
+        let value = redact_decode(serializer::deserialize(&plaintext))?;
+        self.client.l1_timed(clock, by);
+        Ok(Some(value))
     }
 
     /// Retrieve, decrypt, and deserialize an interop-mode value stored under `key`.
@@ -1304,13 +1430,22 @@ impl SecureCache<'_> {
         &self,
         key: &str,
     ) -> Result<Option<T>, CachekitError> {
+        let clock = self.client.l1_clock();
         self.client.reject_namespaced_interop()?;
-        match self.get_plaintext(key).await? {
-            Some(plaintext) => Ok(Some(redact_decode(crate::interop::deserialize(
-                &plaintext,
-            ))?)),
-            None => Ok(None),
-        }
+        let full_key = self.client.resolve_key(key)?;
+        // An L1 hit is served here, synchronously: no read future is built
+        // or polled for it.
+        let (ciphertext, by) = match self.client.get_l1(&full_key)? {
+            Some(ciphertext) => (ciphertext, ReadOutcome::L1Hit),
+            None => match self.client.get_bytes_past_l1(&full_key).await? {
+                Some(read) => read,
+                None => return Ok(None),
+            },
+        };
+        let plaintext = self.decrypt_or_evict(ciphertext.bytes(), &full_key)?;
+        let value = redact_decode(crate::interop::deserialize(&plaintext))?;
+        self.client.l1_timed(clock, by);
+        Ok(Some(value))
     }
 
     /// Retrieve, decrypt, and deserialize an interop-mode value with SWR
@@ -1327,20 +1462,21 @@ impl SecureCache<'_> {
         &self,
         key: &str,
     ) -> Result<SwrRead<T>, CachekitError> {
+        let clock = self.client.l1_clock();
         self.client.reject_namespaced_interop()?;
         let full_key = self.client.resolve_key(key)?;
-        match self.client.get_bytes_swr(&full_key).await? {
-            SwrRead::Fresh(ct) => Ok(SwrRead::Fresh(redact_decode(crate::interop::deserialize(
-                &self.decrypt_or_evict(ct.bytes(), &full_key)?,
-            ))?)),
-            SwrRead::Stale(ct, token) => Ok(SwrRead::Stale(
-                redact_decode(crate::interop::deserialize(
-                    &self.decrypt_or_evict(ct.bytes(), &full_key)?,
-                ))?,
-                token,
-            )),
-            SwrRead::Miss => Ok(SwrRead::Miss),
-        }
+        let decode = |ct: &[u8]| -> Result<T, CachekitError> {
+            redact_decode(crate::interop::deserialize(
+                &self.decrypt_or_evict(ct, &full_key)?,
+            ))
+        };
+        let (read, by) = match self.client.get_bytes_swr(&full_key).await? {
+            SwrRead::Fresh((ct, by)) => (SwrRead::Fresh(decode(ct.bytes())?), by),
+            SwrRead::Stale((ct, by), token) => (SwrRead::Stale(decode(ct.bytes())?, token), by),
+            SwrRead::Miss => return Ok(SwrRead::Miss),
+        };
+        self.client.l1_timed(clock, by);
+        Ok(read)
     }
 
     /// The secure twin of [`CacheKit::__interop_read`], which hands an
@@ -1380,19 +1516,6 @@ impl SecureCache<'_> {
             SwrRead::Stale((ct, by), token) => SwrRead::Stale((decode(ct.bytes())?, by), token),
             SwrRead::Miss => SwrRead::Miss,
         })
-    }
-
-    /// Fetch ciphertext (L1, then L2 with L1 backfill) and decrypt it.
-    ///
-    /// Ciphertext retrieval delegates to [`CacheKit::get_bytes`], which returns
-    /// the stored bytes untransformed — for a secure cache exactly the AES-GCM
-    /// ciphertext, so decrypt receives the same bytes the backend holds.
-    async fn get_plaintext(&self, key: &str) -> Result<Option<Vec<u8>>, CachekitError> {
-        let full_key = self.client.resolve_key(key)?;
-        match self.client.get_bytes(&full_key).await? {
-            Some(ciphertext) => Ok(Some(self.decrypt_or_evict(ciphertext.bytes(), &full_key)?)),
-            None => Ok(None),
-        }
     }
 
     /// Decrypt ciphertext read for `full_key`, the key this client passed to
@@ -1927,6 +2050,10 @@ impl CacheKitBuilder {
         let l1_enabled = false;
         let counters = Arc::new(CacheCounters::new(l1_enabled));
         backend.attach_metrics(counters.provider());
+        // The backend's latency report, also taken from the raw backend. A
+        // client without an L1 has no L1 hit to time, so it takes none.
+        #[cfg(all(feature = "l1", not(target_arch = "wasm32")))]
+        let latency = backend.l1_latency().filter(|_| l1_enabled);
 
         // Apply the reliability stack last so it decorates the final backend.
         // A disabled config is the documented opt-out: skip the (no-op)
@@ -1948,6 +2075,8 @@ impl CacheKitBuilder {
             max_payload_bytes: self.max_payload_bytes.unwrap_or(5 * 1024 * 1024),
             flight: SharedFlight::default(),
             counters,
+            #[cfg(all(feature = "l1", not(target_arch = "wasm32")))]
+            latency,
 
             #[cfg(all(feature = "reliability", not(target_arch = "wasm32")))]
             breaker,
