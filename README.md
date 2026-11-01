@@ -511,7 +511,7 @@ When the `l1` feature is enabled (default), CacheKit keeps an in-process cache i
 
 | Behavior | Detail |
 |:---------|:-------|
-| **Write-through** | `set()` writes to L2 first, then to L1 once L2 accepted the write. The L1 copy lives no longer than the write's TTL. On cachekit.io, an `X-CacheKit-Fresh-For` on the `PUT` response (the store applied a shorter TTL, as a plan maximum does) bounds it further, from when the response arrives; a malformed value or `0` keeps no L1 copy at all, so the next read goes to the server. A `refresh_ttl()` (`PATCH /ttl`) never lengthens an L1 copy |
+| **Write-through** | `set()` writes to L2 first, then to L1 once L2 accepted the write. The L1 copy lives no longer than the write's TTL. On cachekit.io, an `X-CacheKit-Fresh-For` on the `PUT` response (the store applied a shorter TTL, as a plan maximum does) bounds it further. Both bounds run from when the `PUT` response arrives, not from when the copy enters L1, so a delay in between (a slow backend wrapper) shortens the copy; a malformed value or `0` keeps no L1 copy at all, so the next read goes to the server. A `refresh_ttl()` (`PATCH /ttl`) never lengthens an L1 copy |
 | **Backfill on miss** | L2 hits populate L1 for at most 30 s. On cachekit.io a shorter `X-CacheKit-Fresh-For` bounds it further, and a hit labelled stale or with `Fresh-For: 0` is not backfilled at all, so the next read goes back to the server |
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
 | **Encrypted L1** | A client with encryption configured stores ciphertext in L1 (never plaintext) |

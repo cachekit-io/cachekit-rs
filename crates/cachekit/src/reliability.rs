@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::backend::{Backend, Freshness, GetOrLock, HealthStatus, LockableBackend};
+use crate::backend::{Backend, Freshness, GetOrLock, HealthStatus, LockableBackend, WriteBound};
 use crate::client::SharedBackend;
 use crate::error::BackendError;
 use crate::random_unit;
@@ -894,13 +894,15 @@ impl Backend for ReliableBackend {
     }
 
     // Forwarded, not defaulted: the default would call `self.set_bytes` and
-    // drop the inner backend's bound, unbounding the writer's L1 copy.
+    // drop the inner backend's bound, unbounding the writer's L1 copy. The
+    // bound keeps the receipt of the attempt that succeeded, so the retries
+    // and backoff before it do not count against the copy.
     async fn set_bytes_with_freshness(
         &self,
         key: &str,
         value: Bytes,
         ttl: Option<Duration>,
-    ) -> Result<Option<Duration>, BackendError> {
+    ) -> Result<Option<WriteBound>, BackendError> {
         self.guarded(self.deadlines.map(|d| d.write), || {
             self.inner.set_bytes_with_freshness(key, value.clone(), ttl)
         })

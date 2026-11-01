@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -38,6 +38,20 @@ pub struct Freshness {
     pub is_stale: bool,
     /// Remaining server freshness, or `None` when the header was absent. Zero
     /// forbids the backfill.
+    pub fresh_for: Option<Duration>,
+}
+
+/// The store's bound on the writer's own copy of one write, from the write's
+/// `2xx` (`spec/saas-api.md` API-103): the copy must not be served past
+/// `received` plus the smaller of the write's TTL and `fresh_for`.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteBound {
+    /// When the `2xx` arrived. The copy's clock starts here, not at its
+    /// insertion in L1.
+    pub received: Instant,
+    /// The `X-CacheKit-Fresh-For` bound, or `None` when the header was absent.
+    /// Zero forbids the copy.
     pub fresh_for: Option<Duration>,
 }
 
@@ -104,24 +118,27 @@ pub trait Backend: Send + Sync {
         self.set(key, Vec::from(value), ttl).await
     }
 
-    /// Store `value` as [`Self::set_bytes`] does and return the store's bound
-    /// on the entry it wrote: the `X-CacheKit-Fresh-For` of the write's `2xx`
-    /// (`spec/saas-api.md` § Remaining Freshness, the writer's own copy).
+    /// Store `value` as [`Self::set_bytes`] does and return the store's
+    /// [`WriteBound`] on the entry it wrote: when the write's `2xx` arrived
+    /// and its `X-CacheKit-Fresh-For` (`spec/saas-api.md` § Remaining
+    /// Freshness, the writer's own copy).
     ///
     /// Client plumbing for the L1 write-through, not part of the documented
-    /// surface. `None` means the store reported no bound, so the copy keeps
-    /// the write's own TTL; `Some(Duration::ZERO)` means the copy must not be
-    /// kept. The default wraps [`Self::set_bytes`] and reports no bound, so a
-    /// backend without the signal keeps today's behaviour. A backend that
-    /// wraps another must forward this method and
-    /// [`Self::__reports_write_bound`], or the bound is lost.
+    /// surface. `None` means the backend reported nothing, so the copy keeps
+    /// the write's own TTL from its insertion in L1. The default wraps
+    /// [`Self::set_bytes`] and returns `None`, so a backend without the signal
+    /// keeps today's behaviour. A backend that wraps another must forward this
+    /// method and [`Self::__reports_write_bound`], or the bound is lost, and
+    /// must return the inner [`WriteBound`] unchanged: its `received` is when
+    /// the copy's clock starts, so time the wrapper spends after the inner
+    /// call shortens the copy instead of restarting it.
     #[doc(hidden)]
     async fn set_bytes_with_freshness(
         &self,
         key: &str,
         value: Bytes,
         ttl: Option<Duration>,
-    ) -> Result<Option<Duration>, BackendError> {
+    ) -> Result<Option<WriteBound>, BackendError> {
         self.set_bytes(key, value, ttl).await.map(|()| None)
     }
 
@@ -247,24 +264,27 @@ pub trait Backend {
         self.set(key, Vec::from(value), ttl).await
     }
 
-    /// Store `value` as [`Self::set_bytes`] does and return the store's bound
-    /// on the entry it wrote: the `X-CacheKit-Fresh-For` of the write's `2xx`
-    /// (`spec/saas-api.md` § Remaining Freshness, the writer's own copy).
+    /// Store `value` as [`Self::set_bytes`] does and return the store's
+    /// [`WriteBound`] on the entry it wrote: when the write's `2xx` arrived
+    /// and its `X-CacheKit-Fresh-For` (`spec/saas-api.md` § Remaining
+    /// Freshness, the writer's own copy).
     ///
     /// Client plumbing for the L1 write-through, not part of the documented
-    /// surface. `None` means the store reported no bound, so the copy keeps
-    /// the write's own TTL; `Some(Duration::ZERO)` means the copy must not be
-    /// kept. The default wraps [`Self::set_bytes`] and reports no bound, so a
-    /// backend without the signal keeps today's behaviour. A backend that
-    /// wraps another must forward this method and
-    /// [`Self::__reports_write_bound`], or the bound is lost.
+    /// surface. `None` means the backend reported nothing, so the copy keeps
+    /// the write's own TTL from its insertion in L1. The default wraps
+    /// [`Self::set_bytes`] and returns `None`, so a backend without the signal
+    /// keeps today's behaviour. A backend that wraps another must forward this
+    /// method and [`Self::__reports_write_bound`], or the bound is lost, and
+    /// must return the inner [`WriteBound`] unchanged: its `received` is when
+    /// the copy's clock starts, so time the wrapper spends after the inner
+    /// call shortens the copy instead of restarting it.
     #[doc(hidden)]
     async fn set_bytes_with_freshness(
         &self,
         key: &str,
         value: Bytes,
         ttl: Option<Duration>,
-    ) -> Result<Option<Duration>, BackendError> {
+    ) -> Result<Option<WriteBound>, BackendError> {
         self.set_bytes(key, value, ttl).await.map(|()| None)
     }
 

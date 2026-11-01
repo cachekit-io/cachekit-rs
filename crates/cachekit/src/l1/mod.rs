@@ -205,7 +205,19 @@ impl L1Cache {
     /// [`Self::set`] without the copy: L1 keeps `value`'s buffer and its
     /// walked mark.
     pub(crate) fn set_shared(&self, key: &str, value: Payload, ttl: Duration) {
-        let created_at = Instant::now();
+        self.set_shared_from(key, value, ttl, Instant::now());
+    }
+
+    /// [`Self::set_shared`] for an entry whose life began at `created_at`,
+    /// before its insertion: its TTL and freshness window run from then, so
+    /// it expires at `created_at + ttl` however late it is inserted.
+    pub(crate) fn set_shared_from(
+        &self,
+        key: &str,
+        value: Payload,
+        ttl: Duration,
+        created_at: Instant,
+    ) {
         self.store.insert(
             key.to_owned(),
             L1Entry {

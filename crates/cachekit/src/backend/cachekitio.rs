@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 
 use crate::backend::{
     delete_succeeded, encode_key, ttl_header, Backend, Freshness, HealthStatus, LockableBackend,
+    WriteBound,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::backend::{nonzero_timeout, READ_TIMEOUT, WRITE_TIMEOUT};
@@ -359,13 +360,14 @@ impl Backend for CachekitIO {
 
     // The store reports the bound it applied (a plan maximum TTL can clamp
     // the write) as `X-CacheKit-Fresh-For` on the `2xx`, read with the `GET`
-    // grammar: absent is no bound, malformed is `0`.
+    // grammar: absent is no bound, malformed is `0`. The copy's clock starts
+    // here, at receipt (API-103), so nothing after this call can restart it.
     async fn set_bytes_with_freshness(
         &self,
         key: &str,
         value: Bytes,
         ttl: Option<Duration>,
-    ) -> Result<Option<Duration>, BackendError> {
+    ) -> Result<Option<WriteBound>, BackendError> {
         let resp = self
             .put_request(key, value, ttl)?
             .timeout(self.write_timeout)
@@ -375,7 +377,10 @@ impl Backend for CachekitIO {
 
         let status = resp.status().as_u16();
         if (200..300).contains(&status) {
-            Ok(fresh_for_from_headers(resp.headers()))
+            Ok(Some(WriteBound {
+                received: std::time::Instant::now(),
+                fresh_for: fresh_for_from_headers(resp.headers()),
+            }))
         } else {
             Err(self.error_from_response(resp).await)
         }
@@ -1642,11 +1647,14 @@ mod http_client_tests {
             let stub = stub_with(answer);
             let backend = backend_at(&stub);
             assert!(backend.__reports_write_bound());
+            let sent = std::time::Instant::now();
             let got = backend
                 .set_bytes_with_freshness("k", bytes::Bytes::from_static(b"v"), None)
                 .await
-                .expect("PUT 200");
-            assert_eq!(got, want);
+                .expect("PUT 200")
+                .expect("CachekitIO reports a bound on every 2xx");
+            assert_eq!(got.fresh_for, want);
+            assert!(sent <= got.received && got.received <= std::time::Instant::now());
         }
     }
 
@@ -1654,6 +1662,7 @@ mod http_client_tests {
     mod writer_l1_copy {
         use super::*;
         use crate::client::{CacheKit, SharedBackend};
+        use crate::error::BackendError;
 
         /// A client with an L1 and no reliability stack over `backend`.
         fn client_over(backend: Arc<CachekitIO>) -> CacheKit {
@@ -1740,6 +1749,124 @@ mod http_client_tests {
                 .await
                 .expect("set");
             assert!(!served_from_l1(&client).await);
+        }
+
+        /// A wrapper that forwards the write bound, then holds the write for
+        /// its delay after the inner `PUT` returns: the gap between receipt of
+        /// the `2xx` and the L1 insertion.
+        struct SlowWriter(Arc<CachekitIO>, Duration);
+
+        #[async_trait::async_trait]
+        impl Backend for SlowWriter {
+            async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
+                self.0.get(key).await
+            }
+
+            async fn set(
+                &self,
+                key: &str,
+                value: Vec<u8>,
+                ttl: Option<Duration>,
+            ) -> Result<(), BackendError> {
+                self.0.set(key, value, ttl).await
+            }
+
+            async fn set_bytes_with_freshness(
+                &self,
+                key: &str,
+                value: bytes::Bytes,
+                ttl: Option<Duration>,
+            ) -> Result<Option<crate::backend::WriteBound>, BackendError> {
+                let bound = self.0.set_bytes_with_freshness(key, value, ttl).await;
+                tokio::time::sleep(self.1).await;
+                bound
+            }
+
+            fn __reports_write_bound(&self) -> bool {
+                self.0.__reports_write_bound()
+            }
+
+            async fn delete(&self, key: &str) -> Result<bool, BackendError> {
+                self.0.delete(key).await
+            }
+
+            async fn exists(&self, key: &str) -> Result<bool, BackendError> {
+                self.0.exists(key).await
+            }
+
+            async fn health(&self) -> Result<crate::backend::HealthStatus, BackendError> {
+                self.0.health().await
+            }
+        }
+
+        /// Write `key` for `ttl` through a [`SlowWriter`] holding each write
+        /// for `delay`, over a stub whose `PUT` replies `put` and whose every
+        /// later request is a `404`.
+        async fn written_slowly(put: Answer, ttl: Duration, delay: Duration) -> (Stub, CacheKit) {
+            let stub = stub_with(put);
+            let shared: SharedBackend = Arc::new(SlowWriter(Arc::new(backend_at(&stub)), delay));
+            let client = CacheKit::builder()
+                .backend(shared)
+                .l1_capacity(100)
+                .build()
+                .expect("client builds");
+            client
+                .set_with_ttl("k", &"v".to_owned(), ttl)
+                .await
+                .expect("set");
+            (stub, client)
+        }
+
+        /// API-103 times the bound from receipt of the `2xx`, so a delay
+        /// after it shortens the copy instead of restarting its clock.
+        #[tokio::test]
+        async fn fresh_for_runs_from_receipt_not_insertion() {
+            let (_stub, client) = written_slowly(
+                |n| Some(if n == 0 { PUT_FRESH_FOR_1 } else { NOT_FOUND }),
+                Duration::from_secs(300),
+                Duration::from_millis(1200),
+            )
+            .await;
+            assert!(
+                !served_from_l1(&client).await,
+                "served 1.2 s after a Fresh-For: 1 receipt"
+            );
+        }
+
+        /// A delay shorter than the bound: the copy is admitted, and expires
+        /// at receipt plus `Fresh-For`, not at insertion plus it. At the
+        /// second read it is 1.2 s past receipt but only 0.6 s past insertion.
+        #[tokio::test]
+        async fn an_admitted_copy_expires_at_receipt_plus_fresh_for() {
+            let (_stub, client) = written_slowly(
+                |n| Some(if n == 0 { PUT_FRESH_FOR_1 } else { NOT_FOUND }),
+                Duration::from_secs(300),
+                Duration::from_millis(600),
+            )
+            .await;
+            assert!(served_from_l1(&client).await, "admitted for 0.4 s");
+            // Real time: L1 ages entries by std Instant.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert!(
+                !served_from_l1(&client).await,
+                "served 1.2 s after a Fresh-For: 1 receipt"
+            );
+        }
+
+        /// The same with no header: the write's own TTL is the bound, and it
+        /// too runs from receipt.
+        #[tokio::test]
+        async fn the_write_ttl_runs_from_receipt_not_insertion() {
+            let (_stub, client) = written_slowly(
+                |n| Some(if n == 0 { OK } else { NOT_FOUND }),
+                Duration::from_secs(1),
+                Duration::from_millis(1200),
+            )
+            .await;
+            assert!(
+                !served_from_l1(&client).await,
+                "served 1.2 s after receipt of a 1 s write"
+            );
         }
 
         /// API-104: a `PATCH /ttl` reply never extends the writer's copy. The
