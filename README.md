@@ -55,15 +55,15 @@
 ```toml
 # Defaults: SaaS + encryption + L1
 [dependencies]
-cachekit-rs = "0.13.1"
+cachekit-rs = "0.14.0"
 
 # With Redis backend
 [dependencies]
-cachekit-rs = { version = "0.13.1", features = ["redis"] }
+cachekit-rs = { version = "0.14.0", features = ["redis"] }
 
 # For Cloudflare Workers (no L1, no Redis)
 [dependencies]
-cachekit-rs = { version = "0.13.1", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.14.0", default-features = false, features = ["workers", "encryption"] }
 ```
 <!-- x-release-please-end -->
 
@@ -368,7 +368,7 @@ Known issue ([#220](https://github.com/cachekit-io/cachekit-rs/issues/220)): beh
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.13.1", features = ["redis"] }
+cachekit-rs = { version = "0.14.0", features = ["redis"] }
 ```
 <!-- x-release-please-end -->
 
@@ -407,7 +407,7 @@ TTLs above memcached's 30-day ceiling are clamped (larger values would be misrea
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.13.1", features = ["memcached"] }
+cachekit-rs = { version = "0.14.0", features = ["memcached"] }
 ```
 <!-- x-release-please-end -->
 
@@ -426,7 +426,7 @@ Local disk cache, **byte-compatible with cachekit-py's File backend** — a py a
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.13.1", features = ["file"] }
+cachekit-rs = { version = "0.14.0", features = ["file"] }
 ```
 <!-- x-release-please-end -->
 
@@ -448,7 +448,7 @@ The Workers runtime's `fetch` has no timeout of its own and can hold a request f
 
 <!-- x-release-please-start-version -->
 ```toml
-cachekit-rs = { version = "0.13.1", default-features = false, features = ["workers", "encryption"] }
+cachekit-rs = { version = "0.14.0", default-features = false, features = ["workers", "encryption"] }
 ```
 <!-- x-release-please-end -->
 

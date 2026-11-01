@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.14.0](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.13.1...cachekit-rs-v0.14.0) (2026-11-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **telemetry:** report sampled L1 hit latency and add a telemetry off switch (LAB-12081) ([#221](https://github.com/cachekit-io/cachekit-rs/issues/221))
+
+### Features
+
+* **backend:** add a defaulted Backend::set_bytes so writes share one buffer (LAB-7175) ([#203](https://github.com/cachekit-io/cachekit-rs/issues/203)) ([d94a839](https://github.com/cachekit-io/cachekit-rs/commit/d94a839fdbd3dc8c5b18c63b48c5792dd08486fe))
+* **backend:** add RedisBackendBuilder::disable_offline_queue (LAB-11726) ([#199](https://github.com/cachekit-io/cachekit-rs/issues/199)) ([6519615](https://github.com/cachekit-io/cachekit-rs/commit/6519615c44295859cca49372f6fe4f1e6457910e))
+* **macros:** let #[cachekit] opt out of the distributed fill lock (LAB-7171) ([#201](https://github.com/cachekit-io/cachekit-rs/issues/201)) ([2358ae6](https://github.com/cachekit-io/cachekit-rs/commit/2358ae6e1221f7ecb53aede590d7986da8e20606))
+* **telemetry:** report sampled L1 hit latency and add a telemetry off switch (LAB-12081) ([#221](https://github.com/cachekit-io/cachekit-rs/issues/221)) ([70c7ae9](https://github.com/cachekit-io/cachekit-rs/commit/70c7ae96f959246804b324a57f3a8e13e7113a29))
+
+
+### Bug Fixes
+
+* **deps:** pin cachekit-macros exactly so a newer macro never meets an older runtime (LAB-12165) ([b82a0a8](https://github.com/cachekit-io/cachekit-rs/commit/b82a0a8e8a6796101ffc179b69fdb8b9843170d7))
+* **l1:** bound the writer's L1 copy by the PUT response's Fresh-For (LAB-12090) ([#224](https://github.com/cachekit-io/cachekit-rs/issues/224)) ([4faa7c7](https://github.com/cachekit-io/cachekit-rs/commit/4faa7c76d1efc9ac598b155cc894a8049045a52e))
+* **l1:** time the writer's L1 bound from the PUT receipt, not from L1 insertion (LAB-12351) ([#226](https://github.com/cachekit-io/cachekit-rs/issues/226)) ([351509e](https://github.com/cachekit-io/cachekit-rs/commit/351509e664a37662ea1d0f34bffa7dad1f069517))
+* **macros:** reject parameters in the reserved __ck/__CK prefix (LAB-12171) ([#223](https://github.com/cachekit-io/cachekit-rs/issues/223)) ([7546322](https://github.com/cachekit-io/cachekit-rs/commit/754632271cba9180638ab55e7a6263cabf7f6111))
+* **memcached:** set socket timeouts on UDP and Unix-socket connections (LAB-11947) ([#204](https://github.com/cachekit-io/cachekit-rs/issues/204)) ([7efb4f3](https://github.com/cachekit-io/cachekit-rs/commit/7efb4f37d9e131e58a19b4ac0b2f11efcde0e1d2))
+* **redis:** re-read with a retried GET when the combined read and lock is lost (LAB-12277) ([#225](https://github.com/cachekit-io/cachekit-rs/issues/225)) ([3517f01](https://github.com/cachekit-io/cachekit-rs/commit/3517f01a1278b813c4c44bf5f19430512645eb54))
+
+
+### Performance Improvements
+
+* **client:** build a namespaced key once per read, without format! (LAB-12105) ([#211](https://github.com/cachekit-io/cachekit-rs/issues/211)) ([7b1685f](https://github.com/cachekit-io/cachekit-rs/commit/7b1685f3b296c4200f21ef1436283c9cfd44b574))
+* **flight:** sweep the mutation map on growth, not on every op (LAB-12106) ([#210](https://github.com/cachekit-io/cachekit-rs/issues/210)) ([c7e63f3](https://github.com/cachekit-io/cachekit-rs/commit/c7e63f3d3ea143ff0cc0bf5463aae7d64ef4deab))
+* **l1:** skip the decode-bounds walk on L1 hits already walked (LAB-12107) ([#214](https://github.com/cachekit-io/cachekit-rs/issues/214)) ([9858b9d](https://github.com/cachekit-io/cachekit-rs/commit/9858b9db10b2901d1e843f2debbaabb2522abfaa))
+* **macros:** build the #[cachekit] key prefix once per function (LAB-12104) ([#212](https://github.com/cachekit-io/cachekit-rs/issues/212)) ([a73e4a3](https://github.com/cachekit-io/cachekit-rs/commit/a73e4a36032798f6271d0bf4975e366ca2423443))
+* **memcached:** drop the per-op version ping; discard connections on error (LAB-7133) ([#202](https://github.com/cachekit-io/cachekit-rs/issues/202)) ([86112c2](https://github.com/cachekit-io/cachekit-rs/commit/86112c2b193bbb1261ec2438ee177eed9033a428))
+* **redis:** read and take the fill lock in one round trip on a cold miss (LAB-12108) ([#217](https://github.com/cachekit-io/cachekit-rs/issues/217)) ([b14afb5](https://github.com/cachekit-io/cachekit-rs/commit/b14afb5745c4f0b43e3bf721ebf242d3ca94f5ab))
+
 ## [0.13.1](https://github.com/cachekit-io/cachekit-rs/compare/cachekit-rs-v0.13.0...cachekit-rs-v0.13.1) (2026-10-27)
 
 
