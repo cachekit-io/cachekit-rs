@@ -472,16 +472,15 @@ impl CacheKit {
     ) {
         #[cfg(feature = "l1")]
         if let (Some(l1), Some(bytes)) = (&self.l1, bytes) {
-            // `ttl` is non-zero (`validate_ttl`), so only `fresh_for` can
-            // make the bound zero.
             let bound = ttl.min(Duration::from_secs(ttl_wire_secs(ttl)));
             let Some(write_bound) = write_bound else {
                 l1.set_shared(full_key, self.admit(bytes), bound);
                 return;
             };
             let bound = write_bound.fresh_for.map_or(bound, |f| bound.min(f));
-            // A copy whose bound ran out before this call could never be
-            // served, and at capacity it would evict a live entry.
+            // A copy whose bound ran out before this call, a zero
+            // `fresh_for` included, could never be served, and at capacity
+            // it would evict a live entry.
             let expired = write_bound
                 .received
                 .checked_add(bound)

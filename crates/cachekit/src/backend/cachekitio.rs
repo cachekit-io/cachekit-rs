@@ -1752,13 +1752,9 @@ mod http_client_tests {
         }
 
         /// A wrapper that forwards the write bound, then holds the write for
-        /// [`Self::DELAY`] after the inner `PUT` returns: the gap between
-        /// receipt of the `2xx` and the L1 insertion.
-        struct SlowWriter(Arc<CachekitIO>);
-
-        impl SlowWriter {
-            const DELAY: Duration = Duration::from_millis(1200);
-        }
+        /// its delay after the inner `PUT` returns: the gap between receipt of
+        /// the `2xx` and the L1 insertion.
+        struct SlowWriter(Arc<CachekitIO>, Duration);
 
         #[async_trait::async_trait]
         impl Backend for SlowWriter {
@@ -1782,7 +1778,7 @@ mod http_client_tests {
                 ttl: Option<Duration>,
             ) -> Result<Option<crate::backend::WriteBound>, BackendError> {
                 let bound = self.0.set_bytes_with_freshness(key, value, ttl).await;
-                tokio::time::sleep(Self::DELAY).await;
+                tokio::time::sleep(self.1).await;
                 bound
             }
 
@@ -1803,11 +1799,12 @@ mod http_client_tests {
             }
         }
 
-        /// Write `key` for `ttl` through a [`SlowWriter`] over a stub whose
-        /// `PUT` replies `put` and whose every later request is a `404`.
-        async fn written_slowly(put: Answer, ttl: Duration) -> (Stub, CacheKit) {
+        /// Write `key` for `ttl` through a [`SlowWriter`] holding each write
+        /// for `delay`, over a stub whose `PUT` replies `put` and whose every
+        /// later request is a `404`.
+        async fn written_slowly(put: Answer, ttl: Duration, delay: Duration) -> (Stub, CacheKit) {
             let stub = stub_with(put);
-            let shared: SharedBackend = Arc::new(SlowWriter(Arc::new(backend_at(&stub))));
+            let shared: SharedBackend = Arc::new(SlowWriter(Arc::new(backend_at(&stub)), delay));
             let client = CacheKit::builder()
                 .backend(shared)
                 .l1_capacity(100)
@@ -1827,8 +1824,29 @@ mod http_client_tests {
             let (_stub, client) = written_slowly(
                 |n| Some(if n == 0 { PUT_FRESH_FOR_1 } else { NOT_FOUND }),
                 Duration::from_secs(300),
+                Duration::from_millis(1200),
             )
             .await;
+            assert!(
+                !served_from_l1(&client).await,
+                "served 1.2 s after a Fresh-For: 1 receipt"
+            );
+        }
+
+        /// A delay shorter than the bound: the copy is admitted, and expires
+        /// at receipt plus `Fresh-For`, not at insertion plus it. At the
+        /// second read it is 1.2 s past receipt but only 0.6 s past insertion.
+        #[tokio::test]
+        async fn an_admitted_copy_expires_at_receipt_plus_fresh_for() {
+            let (_stub, client) = written_slowly(
+                |n| Some(if n == 0 { PUT_FRESH_FOR_1 } else { NOT_FOUND }),
+                Duration::from_secs(300),
+                Duration::from_millis(600),
+            )
+            .await;
+            assert!(served_from_l1(&client).await, "admitted for 0.4 s");
+            // Real time: L1 ages entries by std Instant.
+            tokio::time::sleep(Duration::from_millis(600)).await;
             assert!(
                 !served_from_l1(&client).await,
                 "served 1.2 s after a Fresh-For: 1 receipt"
@@ -1842,6 +1860,7 @@ mod http_client_tests {
             let (_stub, client) = written_slowly(
                 |n| Some(if n == 0 { OK } else { NOT_FOUND }),
                 Duration::from_secs(1),
+                Duration::from_millis(1200),
             )
             .await;
             assert!(
