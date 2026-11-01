@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 
 use crate::backend::{
     delete_succeeded, encode_key, ttl_header, Backend, Freshness, HealthStatus, LockableBackend,
+    WriteBound,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::backend::{nonzero_timeout, READ_TIMEOUT, WRITE_TIMEOUT};
@@ -359,13 +360,14 @@ impl Backend for CachekitIO {
 
     // The store reports the bound it applied (a plan maximum TTL can clamp
     // the write) as `X-CacheKit-Fresh-For` on the `2xx`, read with the `GET`
-    // grammar: absent is no bound, malformed is `0`.
+    // grammar: absent is no bound, malformed is `0`. The copy's clock starts
+    // here, at receipt (API-103), so nothing after this call can restart it.
     async fn set_bytes_with_freshness(
         &self,
         key: &str,
         value: Bytes,
         ttl: Option<Duration>,
-    ) -> Result<Option<Duration>, BackendError> {
+    ) -> Result<Option<WriteBound>, BackendError> {
         let resp = self
             .put_request(key, value, ttl)?
             .timeout(self.write_timeout)
@@ -375,7 +377,10 @@ impl Backend for CachekitIO {
 
         let status = resp.status().as_u16();
         if (200..300).contains(&status) {
-            Ok(fresh_for_from_headers(resp.headers()))
+            Ok(Some(WriteBound {
+                received: std::time::Instant::now(),
+                fresh_for: fresh_for_from_headers(resp.headers()),
+            }))
         } else {
             Err(self.error_from_response(resp).await)
         }
@@ -1642,11 +1647,14 @@ mod http_client_tests {
             let stub = stub_with(answer);
             let backend = backend_at(&stub);
             assert!(backend.__reports_write_bound());
+            let sent = std::time::Instant::now();
             let got = backend
                 .set_bytes_with_freshness("k", bytes::Bytes::from_static(b"v"), None)
                 .await
-                .expect("PUT 200");
-            assert_eq!(got, want);
+                .expect("PUT 200")
+                .expect("CachekitIO reports a bound on every 2xx");
+            assert_eq!(got.fresh_for, want);
+            assert!(sent <= got.received && got.received <= std::time::Instant::now());
         }
     }
 
@@ -1772,7 +1780,7 @@ mod http_client_tests {
                 key: &str,
                 value: bytes::Bytes,
                 ttl: Option<Duration>,
-            ) -> Result<Option<Duration>, BackendError> {
+            ) -> Result<Option<crate::backend::WriteBound>, BackendError> {
                 let bound = self.0.set_bytes_with_freshness(key, value, ttl).await;
                 tokio::time::sleep(Self::DELAY).await;
                 bound

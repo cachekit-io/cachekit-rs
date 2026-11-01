@@ -304,10 +304,10 @@ pub struct CacheKit {
 }
 
 /// Write `$bytes` through `$client`'s backend and evaluate to the store's
-/// bound for this writer's L1 copy: `None` for no bound, zero for no copy
-/// (API-103). Only a client with `l1_write_bound` set asks the backend for
-/// it; every other write goes through [`Backend::set_bytes`] and reports no
-/// bound. A macro, not an async helper: the nested future cost `set/plain`
+/// [`WriteBound`](crate::backend::WriteBound) for this writer's L1 copy, or
+/// `None` when the backend reported none (API-103). Only a client with
+/// `l1_write_bound` set asks the backend for it; every other write goes
+/// through [`Backend::set_bytes`] and reports none. A macro, not an async helper: the nested future cost `set/plain`
 /// about 100 instructions per op, as [`CacheKit::share_with_l1`] found.
 macro_rules! write_backend {
     ($client:expr, $full_key:expr, $bytes:expr, $ttl:expr) => {
@@ -452,12 +452,15 @@ impl CacheKit {
 
     /// Write-through to L1 after a write the backend accepted. The entry lives
     /// no longer than the TTL the write sent on the wire ([`ttl_wire_secs`])
-    /// nor than `fresh_for`, the store's bound from the write's `2xx`
-    /// ([`Backend::set_bytes_with_freshness`]): `spec/saas-api.md` forbids
-    /// serving it past `min(local_ttl, effective_ttl, fresh_for)` from receipt
-    /// (API-103), and the wire truncates a fractional TTL from 1 s up (1.5 s
-    /// goes as 1). A zero bound keeps no copy and drops the key's older one,
-    /// which would otherwise outlive the write. `None` bytes, from
+    /// nor than the store's `fresh_for` from the write's `2xx`
+    /// ([`Backend::set_bytes_with_freshness`]), both timed from `received`,
+    /// when that `2xx` arrived: `spec/saas-api.md` forbids serving it past
+    /// `min(local_ttl, effective_ttl, fresh_for)` from receipt (API-103), and
+    /// the wire truncates a fractional TTL from 1 s up (1.5 s goes as 1). Any
+    /// delay between receipt and this call shortens the copy. A zero bound
+    /// keeps no copy and drops the key's older one, which would otherwise
+    /// outlive the write. With no [`WriteBound`](crate::backend::WriteBound),
+    /// the TTL runs from insertion. `None` bytes, from
     /// [`Self::share_with_l1`] on a client without an L1, do nothing.
     #[cfg_attr(not(feature = "l1"), allow(clippy::unused_self))]
     fn l1_set(
@@ -465,14 +468,18 @@ impl CacheKit {
         full_key: &str,
         bytes: Option<Bytes>,
         ttl: Duration,
-        fresh_for: Option<Duration>,
+        write_bound: Option<crate::backend::WriteBound>,
     ) {
         #[cfg(feature = "l1")]
         if let (Some(l1), Some(bytes)) = (&self.l1, bytes) {
             // `ttl` is non-zero (`validate_ttl`), so only `fresh_for` can
             // make the bound zero.
             let bound = ttl.min(Duration::from_secs(ttl_wire_secs(ttl)));
-            let bound = match fresh_for {
+            let Some(write_bound) = write_bound else {
+                l1.set_shared(full_key, self.admit(bytes), bound);
+                return;
+            };
+            let bound = match write_bound.fresh_for {
                 None => bound,
                 Some(fresh_for) if fresh_for.is_zero() => {
                     l1.delete(full_key);
@@ -480,10 +487,10 @@ impl CacheKit {
                 }
                 Some(fresh_for) => bound.min(fresh_for),
             };
-            l1.set_shared(full_key, self.admit(bytes), bound);
+            l1.set_shared_from(full_key, self.admit(bytes), bound, write_bound.received);
         }
         #[cfg(not(feature = "l1"))]
-        let _ = (full_key, bytes, ttl, fresh_for);
+        let _ = (full_key, bytes, ttl, write_bound);
     }
 
     /// Wrap a write's payload for the backend, plus a handle to the same
@@ -549,8 +556,8 @@ impl CacheKit {
             return Ok(false);
         }
         let (bytes, l1_bytes) = self.share_with_l1(bytes);
-        let fresh_for = write_backend!(self, &full_key, bytes, ttl);
-        self.l1_set(&full_key, l1_bytes, ttl, fresh_for);
+        let write_bound = write_backend!(self, &full_key, bytes, ttl);
+        self.l1_set(&full_key, l1_bytes, ttl, write_bound);
         mutation.advance();
         crate::metrics::trace_write(&full_key, ttl);
         Ok(true)
@@ -1059,8 +1066,8 @@ impl CacheKit {
         }
 
         let (bytes, l1_bytes) = self.share_with_l1(bytes);
-        let fresh_for = write_backend!(self, &full_key, bytes, ttl);
-        self.l1_set(&full_key, l1_bytes, ttl, fresh_for);
+        let write_bound = write_backend!(self, &full_key, bytes, ttl);
+        self.l1_set(&full_key, l1_bytes, ttl, write_bound);
 
         crate::metrics::trace_write(&full_key, ttl);
         Ok(())
@@ -1466,8 +1473,8 @@ impl SecureCache<'_> {
         }
 
         let (ciphertext, l1_bytes) = self.client.share_with_l1(ciphertext);
-        let fresh_for = write_backend!(self.client, &full_key, ciphertext, ttl);
-        self.client.l1_set(&full_key, l1_bytes, ttl, fresh_for);
+        let write_bound = write_backend!(self.client, &full_key, ciphertext, ttl);
+        self.client.l1_set(&full_key, l1_bytes, ttl, write_bound);
 
         crate::metrics::trace_write(&full_key, ttl);
         Ok(())
