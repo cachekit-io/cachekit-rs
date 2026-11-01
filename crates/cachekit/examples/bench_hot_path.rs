@@ -61,7 +61,16 @@ const OPS: [&str; 8] = [
 ];
 /// `ns` and `nsenc` are `plain` and `enc` on a client with a namespace, so
 /// every op builds `{namespace}:{key}`.
-const MODES: [&str; 6] = ["plain", "rel", "enc", "prev", "ns", "nsenc"];
+const MODES: [&str; 8] = [
+    "plain",
+    "rel",
+    "enc",
+    "prev",
+    "ns",
+    "nsenc",
+    "parked256",
+    "parked1024",
+];
 /// The current master key of every encrypting reader and every writer but
 /// `prev`'s.
 const KEY: [u8; 32] = [0x42; 32];
@@ -89,6 +98,11 @@ const MACRO_NAMESPACE: &str = "bench.accounts.v2";
 const MACRO_OPERATION: &str = "users.fetch_profile_by_email_and_size";
 const MACRO_EMAIL: &str = "alice@example.com";
 const MACRO_ID: u64 = 42;
+/// Key prefix whose backend delete never returns (see [`parked`]).
+const PARKED: &str = "bench:parked:";
+/// The one value size a `parked<N>` case runs at: the map it prices never
+/// sees the value.
+const PARKED_SIZE: usize = 64;
 
 /// The value of `l1_hit_row`: a struct of 20 named fields, stored as a
 /// MessagePack map of 20 entries, so a bounds walk, where one runs, covers 41
@@ -157,6 +171,8 @@ type FixedMap = HashMap<String, Bytes, BuildHasherDefault<DefaultHasher>>;
 #[derive(Default)]
 struct MemBackend {
     store: Mutex<FixedMap>,
+    /// Deletes of [`PARKED`] keys that have reached the backend and wait forever.
+    parked: AtomicUsize,
 }
 
 impl MemBackend {
@@ -191,6 +207,10 @@ impl Backend for MemBackend {
         Ok(())
     }
     async fn delete(&self, key: &str) -> Result<bool, BackendError> {
+        if key.starts_with(PARKED) {
+            self.parked.fetch_add(1, Ordering::Relaxed);
+            std::future::pending::<()>().await;
+        }
         Ok(self.map().remove(key).is_some())
     }
     async fn exists(&self, key: &str) -> Result<bool, BackendError> {
@@ -287,14 +307,28 @@ fn writer(backend: &Arc<MemBackend>, mode: &str) -> Result<CacheKit, CachekitErr
         .build()
 }
 
-/// Whether `<op>/<mode>` is a case. `prev` is the rotation read path, so it
-/// pairs only with reads; `oneshot` prices building an encrypting client, so
-/// it pairs only with the encrypted modes; `macro_hit` exists only with the
+/// How many deletes a `parked<N>` mode parks: `N` deletes of other keys,
+/// spawned before the timed loop, that never return. Each holds its key's
+/// mutation lock, as a delete waiting on a slow backend does, so the timed
+/// deletes run with `N` keys mid-mutation. 0 for every other mode.
+fn parked(mode: &str) -> usize {
+    mode.strip_prefix("parked")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Whether `<op>/<mode>/<size>` is a case. `prev` is the rotation read path,
+/// so it pairs only with reads; `oneshot` prices building an encrypting
+/// client, so it pairs only with the encrypted modes; `parked<N>` pairs only
+/// with `delete`, at [`PARKED_SIZE`]; `macro_hit` exists only with the
 /// `macros` feature, and its `enc` mode reads through a `secure` function.
 /// A namespace adds the same key build to every op, so `ns` and `nsenc` price
 /// it on the reads and `set` only; not on `macro_hit`, whose interop read a
 /// namespaced client refuses.
-fn is_case(op: &str, mode: &str) -> bool {
+fn is_case(op: &str, mode: &str, size: usize) -> bool {
+    if parked(mode) > 0 {
+        return op == "delete" && size == PARKED_SIZE;
+    }
     match op {
         "oneshot" => matches!(mode, "enc" | "prev"),
         "macro_hit" => cfg!(feature = "macros") && !matches!(mode, "prev" | "ns" | "nsenc"),
@@ -320,7 +354,7 @@ impl Bench {
             .into_iter()
             .find(|m| *m == mode)
             .ok_or_else(|| CachekitError::Config(format!("unknown mode in case {case:?}")))?;
-        if !is_case(op, mode) {
+        if !is_case(op, mode, size) {
             return Err(CachekitError::Config(format!(
                 "{case:?} is not a case; `bench_hot_path list` names them"
             )));
@@ -380,6 +414,23 @@ impl Bench {
                     .await?;
             }
             _ => write(&bench.reader, bench.enc, &bench.keys[0], &bench.value).await?,
+        }
+        let parked = parked(mode);
+        let deletes: Vec<_> = (0..parked)
+            .map(|i| {
+                let reader = bench.reader.clone();
+                tokio::spawn(async move { reader.delete(&format!("{PARKED}{i:08}")).await })
+            })
+            .collect();
+        // Each spawned delete runs once the setup yields, and takes its lock
+        // before it reaches the backend. One that returns never parks.
+        while bench.backend.parked.load(Ordering::Relaxed) < parked {
+            if deletes.iter().any(tokio::task::JoinHandle::is_finished) {
+                return Err(CachekitError::Config(
+                    "a parked delete returned before reaching the backend".into(),
+                ));
+            }
+            tokio::task::yield_now().await;
         }
         Ok(bench)
     }
@@ -508,8 +559,8 @@ fn measured_warm(
 fn cases(filter: Option<&str>) -> Result<Vec<(String, usize)>, String> {
     let mut out = Vec::new();
     for op in OPS {
-        for mode in MODES.into_iter().filter(|m| is_case(op, m)) {
-            for size in SIZES {
+        for mode in MODES {
+            for size in SIZES.into_iter().filter(|s| is_case(op, mode, *s)) {
                 let case = format!("{op}/{mode}");
                 if filter.is_none_or(|f| format!("{case}/{size}").contains(f)) {
                     out.push((case, size));
