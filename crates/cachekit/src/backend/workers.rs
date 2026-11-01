@@ -25,7 +25,10 @@ use crate::backend::{
     LockableBackend, TtlInspectable, READ_TIMEOUT, WRITE_TIMEOUT,
 };
 use crate::error::BackendError;
-use crate::metrics::{metrics_headers, MetricsProvider};
+use crate::metrics::{
+    metrics_headers_named, telemetry_on, MetricsProvider, Switch, METRICS_HEADER_NAMES,
+    TELEMETRY_ENV,
+};
 use crate::session::session_headers;
 use crate::url_validator::cachekitio_base_url;
 
@@ -106,6 +109,11 @@ pub struct WorkersCachekitIO {
     /// builder when the user supplies one, otherwise by the client at build
     /// time via [`Backend::attach_metrics`] (first writer wins).
     metrics_provider: OnceLock<MetricsProvider>,
+    /// Whether this backend sends the optional metrics headers
+    /// ([`WorkersCachekitIOBuilder::telemetry`]), resolved once at build. It
+    /// never sends the latency headers: the Workers clock advances only on
+    /// I/O, so it cannot time an in-memory hit.
+    telemetry: bool,
 }
 
 /// Redact `api_key` from debug output.
@@ -119,9 +127,18 @@ impl std::fmt::Debug for WorkersCachekitIO {
 }
 
 impl WorkersCachekitIO {
-    /// Start building a [`WorkersCachekitIO`] instance.
-    pub fn builder() -> WorkersCachekitIOBuilder {
-        WorkersCachekitIOBuilder::default()
+    /// Start building a [`WorkersCachekitIO`] over the Worker's bindings (the
+    /// `env` your handler receives). `build` reads a `CACHEKIT_TELEMETRY`
+    /// variable or secret from them ([`telemetry`](WorkersCachekitIOBuilder::telemetry)).
+    pub fn builder(env: &worker::Env) -> WorkersCachekitIOBuilder {
+        WorkersCachekitIOBuilder {
+            api_key: None,
+            api_url: None,
+            allow_custom_host: false,
+            metrics_provider: None,
+            telemetry: None,
+            bindings: env.clone(),
+        }
     }
 
     /// Return the configured API URL.
@@ -203,14 +220,20 @@ impl WorkersCachekitIO {
         }
 
         // Inject session headers
-        for (name, value) in session_headers() {
-            headers.set(name, &value).map_err(|e| {
-                BackendError::permanent(format!("failed to set session header {name}: {e}"))
-            })?;
+        if self.telemetry {
+            for (name, value) in session_headers() {
+                headers.set(name, value).map_err(|e| {
+                    BackendError::permanent(format!("failed to set session header {name}: {e}"))
+                })?;
+            }
         }
 
-        // Inject metrics headers
-        for (name, value) in metrics_headers(self.metrics_provider.get()) {
+        // Inject metrics headers: with telemetry off, only L1-Status
+        for (name, value) in metrics_headers_named(
+            self.metrics_provider.get(),
+            &METRICS_HEADER_NAMES,
+            self.telemetry,
+        ) {
             headers.set(name, &value).map_err(|e| {
                 BackendError::permanent(format!("failed to set metrics header {name}: {e}"))
             })?;
@@ -507,13 +530,18 @@ impl TtlInspectable for WorkersCachekitIO {
 // ── Builder ──────────────────────────────────────────────────────────────────
 
 /// Builder for [`WorkersCachekitIO`].
-#[derive(Default)]
+///
+/// Made only by [`WorkersCachekitIO::builder`], so every backend has the
+/// bindings it reads `CACHEKIT_TELEMETRY` from: a binding the SDK could not
+/// see might be off, and off wins.
 #[must_use]
 pub struct WorkersCachekitIOBuilder {
     api_key: Option<Zeroizing<String>>,
     api_url: Option<String>,
     allow_custom_host: bool,
     metrics_provider: Option<MetricsProvider>,
+    telemetry: Option<bool>,
+    bindings: worker::Env,
 }
 
 impl WorkersCachekitIOBuilder {
@@ -545,6 +573,27 @@ impl WorkersCachekitIOBuilder {
         self
     }
 
+    /// Turn this backend's telemetry on or off. Unset by default.
+    ///
+    /// Telemetry is the optional `X-CacheKit-*` headers the backend sends to
+    /// cachekit.io, and nowhere else: the session ID and start time, and the
+    /// client's L1 hit, L2 hit and miss counts with its L1 hit rate. With
+    /// telemetry off none of them is sent; `X-CacheKit-L1-Status`, which the
+    /// service requires on every request, still is. This backend never sends
+    /// L1 hit latency: the Workers clock advances only on I/O.
+    ///
+    /// The variable `CACHEKIT_TELEMETRY` is the other control, read from the
+    /// bindings passed to [`WorkersCachekitIO::builder`] and from
+    /// `process.env` (present with the `nodejs_compat` flag): `false`, `0`,
+    /// `off` or `no` (any case, surrounding white space ignored) turns
+    /// telemetry off, `true`, `1`, `on` or `yes` on, and any other non-empty
+    /// value off. Off from any source wins; with none set telemetry is on
+    /// during the closed beta. `build` reads them once.
+    pub fn telemetry(mut self, on: bool) -> Self {
+        self.telemetry = Some(on);
+        self
+    }
+
     /// Consume the builder and construct a [`WorkersCachekitIO`].
     ///
     /// # Errors
@@ -569,12 +618,38 @@ impl WorkersCachekitIOBuilder {
 
         let api_url = cachekitio_base_url(&api_url, self.allow_custom_host)?;
 
+        let process_env = Reflect::get(&js_sys::global(), &"process".into())
+            .ok()
+            .and_then(|process| Reflect::get(&process, &"env".into()).ok());
+        let env =
+            telemetry_var(process_env.as_ref()).either(telemetry_var(Some(self.bindings.as_ref())));
+
         Ok(WorkersCachekitIO {
             api_key,
             api_url,
             metrics_provider: self
                 .metrics_provider
                 .map_or_else(OnceLock::new, OnceLock::from),
+            telemetry: telemetry_on(self.telemetry, env),
         })
     }
+}
+
+/// `CACHEKIT_TELEMETRY` on a JS object (`process.env` or the bindings), read
+/// by the spec's rule. A value that is not a string reads as its JSON text, so
+/// a `[vars]` boolean or number means what it says.
+fn telemetry_var(source: Option<&JsValue>) -> Switch {
+    let Some(source) = source.filter(|s| s.is_object()) else {
+        return Switch::Unset;
+    };
+    let value = Reflect::get(source, &TELEMETRY_ENV.into()).unwrap_or(JsValue::UNDEFINED);
+    if value.is_undefined() || value.is_null() {
+        return Switch::Unset;
+    }
+    let text = value.as_string().or_else(|| {
+        js_sys::JSON::stringify(&value)
+            .ok()
+            .and_then(|json| json.as_string())
+    });
+    Switch::from_env_value(Some(text.as_deref().ok_or(())))
 }

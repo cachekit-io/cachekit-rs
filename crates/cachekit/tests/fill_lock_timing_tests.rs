@@ -59,6 +59,9 @@ struct State {
     held: std::collections::HashSet<String>,
     /// Another process holds every key's lock.
     remote_holds: bool,
+    /// The next combined calls fail with these kinds after their round
+    /// trip, one call each, last first.
+    fail_combined: Vec<BackendErrorKind>,
     /// Every completed backend call, with when it completed.
     ops: Vec<(&'static str, Instant)>,
     gets: u32,
@@ -76,8 +79,6 @@ struct Timed {
     /// Reads and locks in one round trip (`get_or_lock`, a GET's latency),
     /// as a single-node Redis does.
     combines: bool,
-    /// The combined call fails with this kind after its round trip.
-    combined_fails: Option<BackendErrorKind>,
 }
 
 impl Timed {
@@ -89,7 +90,6 @@ impl Timed {
             hang_after_gets: None,
             instant: false,
             combines: false,
-            combined_fails: None,
         }
     }
 
@@ -235,9 +235,10 @@ impl LockableBackend for Timed {
 
     async fn __get_or_lock(&self, key: &str, _timeout_ms: u64) -> Result<GetOrLock, BackendError> {
         self.leg("get_or_lock", GET).await;
-        if let Some(kind) = &self.combined_fails {
+        let fail = self.st().fail_combined.pop();
+        if let Some(kind) = fail {
             return Err(BackendError {
-                kind: kind.clone(),
+                kind,
                 message: "scripted failure".to_owned(),
                 source: None,
             });
@@ -858,8 +859,8 @@ async fn combined_local_follower_reads_plainly_and_queues() {
 /// on a backend that does not combine, instead of failing the call.
 #[tokio::test(start_paused = true)]
 async fn refused_combined_call_falls_back_to_a_read_and_a_lock_call() {
-    let mut backend = Timed::combining();
-    backend.combined_fails = Some(BackendErrorKind::Permanent);
+    let backend = Timed::combining();
+    backend.st().fail_combined.push(BackendErrorKind::Permanent);
     let cache = backend.client();
 
     assert_eq!(fill(&cache, 26).await.unwrap(), 260);
@@ -873,17 +874,110 @@ async fn refused_combined_call_falls_back_to_a_read_and_a_lock_call() {
 }
 
 /// A combined call that timed out may have taken the lock, so it is neither
-/// retried nor followed by a lock call: the plain path fails open and leads
-/// without the lock.
+/// retried nor followed by a lock call: the cold miss re-reads with a plain
+/// GET and, on a miss, leads without the lock.
 #[tokio::test(start_paused = true)]
 async fn timed_out_combined_call_leads_without_the_lock() {
-    let mut backend = Timed::combining();
-    backend.combined_fails = Some(BackendErrorKind::Timeout);
+    let backend = Timed::combining();
+    backend.st().fail_combined.push(BackendErrorKind::Timeout);
     let cache = backend.client();
 
     assert_eq!(fill(&cache, 27).await.unwrap(), 270);
     tokio::time::sleep(ms(FILL_LOCK_TIMEOUT)).await;
-    assert_eq!(backend.ops_by(Instant::now()), ["get_or_lock", "set"]);
+    assert_eq!(
+        backend.ops_by(Instant::now()),
+        ["get_or_lock", "get", "set"]
+    );
+}
+
+/// A combined call lost to a connection reset on a key that holds a value
+/// does not cost the value: the plain re-read serves it, and the body does
+/// not run.
+#[tokio::test(start_paused = true)]
+async fn transient_combined_call_on_a_held_key_serves_the_value() {
+    let backend = Timed::combining();
+    let bytes = serialize_value(&InteropValue::from(280_u64)).unwrap();
+    backend.st().store.insert(fill_key(28), bytes);
+    backend.st().fail_combined.push(BackendErrorKind::Transient);
+    let cache = backend.client();
+
+    assert_eq!(fill(&cache, 28).await.unwrap(), 280);
+    assert!(ORIGIN_STARTED.get().is_none(), "a hit runs no body");
+    assert_eq!(outcomes(&cache), (0, 1, 0));
+    tokio::time::sleep(ms(FILL_LOCK_TIMEOUT)).await;
+    assert_eq!(backend.ops_by(Instant::now()), ["get_or_lock", "get"]);
+}
+
+/// A secure function has no fail-open arm, so a lost combined call must not
+/// reach its caller: the plain re-read serves the stored ciphertext.
+#[cfg(feature = "encryption")]
+#[tokio::test(start_paused = true)]
+async fn transient_combined_call_on_a_held_key_serves_a_secure_call() {
+    #[cachekit(client = cache, ttl = 600, interop = "sealed", namespace = "timing", secure)]
+    async fn sealed(cache: &CacheKit, id: u64) -> Result<u64, CachekitError> {
+        SEALED_RUNS.set(SEALED_RUNS.get() + 1);
+        Ok(id * 10)
+    }
+    thread_local! {
+        static SEALED_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    let backend = Timed::combining();
+    #[cfg(not(feature = "unsync"))]
+    let shared: SharedBackend = Arc::new(backend.clone());
+    #[cfg(feature = "unsync")]
+    let shared: SharedBackend = std::rc::Rc::new(backend.clone());
+    let cache = CacheKit::builder()
+        .backend(shared)
+        .encryption_from_bytes(&[7u8; 32], "default")
+        .expect("encryption configures")
+        .no_l1()
+        .build()
+        .expect("client builds");
+
+    assert_eq!(sealed(&cache, 29).await.unwrap(), 290, "the fill");
+    backend.st().fail_combined.push(BackendErrorKind::Transient);
+    assert_eq!(sealed(&cache, 29).await.unwrap(), 290, "the re-read's hit");
+    assert_eq!(SEALED_RUNS.get(), 1, "the body ran for the fill only");
+}
+
+/// One connection reset under 5 concurrent cold reads does not open the
+/// breaker (threshold 5): a lost combined call is not a health sample, and
+/// each re-read that answers is a success.
+#[tokio::test(start_paused = true)]
+async fn transient_combined_calls_leave_the_breaker_closed() {
+    let backend = Timed::combining();
+    backend.st().fail_combined = vec![BackendErrorKind::Transient; 5];
+    #[cfg(not(feature = "unsync"))]
+    let shared: SharedBackend = Arc::new(backend.clone());
+    #[cfg(feature = "unsync")]
+    let shared: SharedBackend = std::rc::Rc::new(backend.clone());
+    let cache = CacheKit::builder()
+        .backend(shared)
+        .reliability(cachekit::reliability::ReliabilityConfig::default())
+        .build()
+        .expect("client builds");
+
+    let reads = tokio::join!(
+        fill(&cache, 40),
+        fill(&cache, 41),
+        fill(&cache, 42),
+        fill(&cache, 43),
+        fill(&cache, 44),
+    );
+    assert_eq!(
+        [reads.0, reads.1, reads.2, reads.3, reads.4].map(Result::unwrap),
+        [400, 410, 420, 430, 440]
+    );
+    assert_eq!(backend.count(&["get_or_lock"]), 5);
+    assert!(
+        backend.st().fail_combined.is_empty(),
+        "each combined call failed"
+    );
+    assert_eq!(
+        cache.circuit_state(),
+        Some(cachekit::reliability::CircuitState::Closed)
+    );
 }
 
 /// `distributed_lock = false` reads with a plain GET even where the backend

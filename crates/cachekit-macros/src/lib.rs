@@ -2,6 +2,7 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{quote, quote_spanned};
 use syn::{
+    ext::IdentExt,
     parse::{Parse, ParseStream},
     parse_macro_input,
     spanned::Spanned,
@@ -246,10 +247,14 @@ fn extract_ok_type(ret: &ReturnType) -> syn::Result<Type> {
 ///   converted through `From`. The error type is taken from the return type
 ///   as written, so a one-argument alias such as `anyhow::Result<T>` works.
 /// - Every non-client argument must be a plain identifier (no destructuring
-///   patterns, no `self`) and must convert into
+///   patterns, no `x @ pattern`, no `self`) and must convert into
 ///   `cachekit::interop::InteropValue` via `From` (`bool`, `i32`/`i64`/
 ///   `u32`/`u64`/`i128`, `f64`, `&str`/`String`, `Uuid`). Unsupported
 ///   argument types fail at compile time.
+/// - No parameter, the client included, may start with `__ck` or `__CK`
+///   (a raw `r#__ck_x` too): that prefix is reserved for the macro's
+///   generated locals, which would otherwise shadow the argument. Such a
+///   name is a compile error.
 /// - In-model *values* outside the interop ranges fail at CALL time with
 ///   `CachekitError::Serialization` before the body runs: non-finite floats
 ///   (`NAN`, `±INFINITY`) and `i128` outside `[-2^63, 2^64-1]`. This
@@ -374,6 +379,30 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             }
             syn::FnArg::Typed(pat) => match pat.pat.as_ref() {
                 syn::Pat::Ident(pi) => {
+                    // The expansion binds its own locals under `__ck` / `__CK`
+                    // (`__ck_key`, `__CK_KEY_PREFIX`, ...). A parameter with
+                    // such a name would silently take the generated value in
+                    // the body — and in the SWR refresh, replace the key the
+                    // refresh locks and writes. One prefix rule covers every
+                    // generated name, present and future.
+                    let name = pi.ident.unraw().to_string();
+                    if name.starts_with("__ck") || name.starts_with("__CK") {
+                        return Err(syn::Error::new_spanned(
+                            &pi.ident,
+                            "#[cachekit] reserves the `__ck` / `__CK` identifier prefix for \
+                             its generated locals: a parameter with that prefix would be \
+                             shadowed by them — rename the parameter",
+                        ));
+                    }
+                    // `x @ pattern` can bind further names the check above
+                    // cannot see, and none of them could reach the key.
+                    if let Some((at, _)) = &pi.subpat {
+                        return Err(syn::Error::new_spanned(
+                            at,
+                            "#[cachekit] parameters must be plain identifiers: an `@` \
+                             subpattern cannot contribute to the cache key",
+                        ));
+                    }
                     if pi.ident != *client_ident {
                         non_client_params.push((&pi.ident, pat.ty.as_ref()));
                     }
@@ -576,6 +605,12 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
     // Build the new function body.
     let new_body: syn::Block = syn::parse_quote! {
         {
+            // Whether this call's latency is timed, drawn as its first step,
+            // before its key or outcome is known. Only a call served from L1
+            // on its own first read is timed, through to the value it
+            // returns; one that joins another worker's fill never is.
+            let __ck_sample = #client_ident.__l1_sample();
+
             // interop/v1 key: {namespace}:{operation}:{args_hash} — the same
             // key is computable from any SDK (protocol spec/interop-mode.md).
             // The prefix is validated and joined once per function, so a call
@@ -613,6 +648,7 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
             match #get_swr_expr {
                 Ok(cachekit::SwrRead::Fresh((__ck_cached, __ck_by))) => {
                     #client_ident.__count(&__ck_key, __ck_by);
+                    #client_ident.__l1_stop(__ck_sample, __ck_by);
                     return Ok(__ck_cached);
                 }
                 // Stale (past the freshness threshold, before hard expiry):
@@ -666,6 +702,9 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
                         }
                         .await;
                     });
+                    // The stale serve's own work, spawning the refresh
+                    // included, is part of the call.
+                    #client_ident.__l1_stop(__ck_sample, __ck_by);
                     return Ok(__ck_cached);
                 }
                 Ok(cachekit::SwrRead::Miss) => {}
@@ -738,7 +777,8 @@ fn expand(args: &MacroArgs, mut func: ItemFn) -> syn::Result<TokenStream2> {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand, segment_is_valid, MacroArgs};
+    use super::{expand, segment_is_valid, MacroArgs, TokenStream2};
+    use quote::quote;
 
     /// A sync fn must fail at decoration time with a clear, actionable error
     /// — never a cascade of "await is only allowed inside async" diagnostics,
@@ -785,6 +825,82 @@ mod tests {
             err.to_string().contains("`&mut` parameters"),
             "error must name the constraint, got: {err}"
         );
+    }
+
+    fn expand_params(params: &TokenStream2) -> syn::Result<TokenStream2> {
+        let args: MacroArgs = syn::parse_quote!(
+            client = cache,
+            ttl = 60,
+            interop = "get_user",
+            namespace = "users"
+        );
+        let func: syn::ItemFn = syn::parse_quote! {
+            async fn get_user(#params) -> Result<String, CachekitError> {
+                Ok(String::new())
+            }
+        };
+        expand(&args, func)
+    }
+
+    /// A parameter in the reserved `__ck` / `__CK` space would be silently
+    /// shadowed by a generated local, so it fails at decoration time —
+    /// whatever its binding mode, raw spelling, or role (client included).
+    #[test]
+    fn reserved_prefix_param_is_a_clear_decoration_time_error() {
+        for params in [
+            quote!(cache: &CacheKit, __ck_key: String),
+            quote!(cache: &CacheKit, __CK_KEY_PREFIX: u64),
+            quote!(cache: &CacheKit, __ck_args: u64),
+            quote!(cache: &CacheKit, mut __ck_val: u64),
+            quote!(cache: &CacheKit, ref __ck_val: u64),
+            quote!(cache: &CacheKit, r#__ck_key: String),
+            quote!(cache: &CacheKit, id: u64, __ck: u64),
+        ] {
+            let Err(err) = expand_params(&params) else {
+                panic!("{params}: reserved name must be rejected");
+            };
+            assert!(
+                err.to_string()
+                    .contains("reserves the `__ck` / `__CK` identifier prefix"),
+                "{params}: error must name the reserved prefix, got: {err}"
+            );
+        }
+        let args: MacroArgs = syn::parse_quote!(
+            client = __ck_cache,
+            ttl = 60,
+            interop = "get_user",
+            namespace = "users"
+        );
+        let func: syn::ItemFn = syn::parse_quote! {
+            async fn get_user(__ck_cache: &CacheKit, id: u64) -> Result<String, CachekitError> {
+                Ok(String::new())
+            }
+        };
+        let err = expand(&args, func).expect_err("reserved client name must be rejected");
+        assert!(err.to_string().contains("`__ck` / `__CK`"), "got: {err}");
+    }
+
+    /// An `@` subpattern could bind names the prefix check cannot see.
+    #[test]
+    fn at_subpattern_param_is_a_clear_decoration_time_error() {
+        let err =
+            expand_params(&quote!(cache: &CacheKit, id @ _: u64)).expect_err("@ must be rejected");
+        assert!(err.to_string().contains("`@`"), "got: {err}");
+    }
+
+    /// Names that merely resemble the reserved prefix still expand.
+    #[test]
+    fn near_reserved_param_names_expand() {
+        for params in [
+            quote!(cache: &CacheKit, ck_key: u64),
+            quote!(cache: &CacheKit, __c: u64),
+            quote!(cache: &CacheKit, _ck_key: u64),
+            quote!(cache: &CacheKit, __Ck_key: u64),
+        ] {
+            if let Err(err) = expand_params(&params) {
+                panic!("{params}: must expand, got: {err}");
+            }
+        }
     }
 
     /// The same function with `async` added expands cleanly — proving the

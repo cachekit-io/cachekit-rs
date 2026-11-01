@@ -53,6 +53,25 @@ fn redis_err(e: RedisError) -> BackendError {
     }
 }
 
+/// fred's error for a command that exhausted its write attempts, raised when
+/// it replays its buffer after a reconnect (fred 9.4 `decr_check_attempted`).
+#[cfg(not(target_arch = "wasm32"))]
+const ATTEMPTS_EXHAUSTED: &str = "Too many failed write attempts.";
+
+/// [`redis_err`] for the combined read and lock. Sent with one attempt, it
+/// fails with [`ATTEMPTS_EXHAUSTED`] when its connection drops after the
+/// write: the server may have run it, so it is a lost call (`Transient`),
+/// not a refused one, and must not be followed by a lock call.
+#[cfg(not(target_arch = "wasm32"))]
+fn get_or_lock_err(e: RedisError) -> BackendError {
+    let lost = *e.kind() == RedisErrorKind::Unknown && e.details() == ATTEMPTS_EXHAUSTED;
+    let mut err = redis_err(e);
+    if lost {
+        err.kind = BackendErrorKind::Transient;
+    }
+    err
+}
+
 // ── RedisBackend ──────────────────────────────────────────────────────────────
 
 /// Redis backend powered by the `fred` client.
@@ -484,7 +503,7 @@ impl LockableBackend for RedisBackend {
             .with_options(&once)
             .custom(eval, args)
             .await
-            .map_err(redis_err)?;
+            .map_err(get_or_lock_err)?;
         match reply {
             RedisValue::Integer(1) => Ok(GetOrLock::Locked(lock_id)),
             RedisValue::Integer(0) => Ok(GetOrLock::Contested),
@@ -764,6 +783,37 @@ mod tests {
         assert_eq!(connection.unresponsive.max_timeout, None);
         let (_, connection) = fred_options(true, COMMAND_TIMEOUT);
         assert_eq!(connection.unresponsive.max_timeout, Some(COMMAND_TIMEOUT));
+    }
+
+    /// A combined call whose attempt fred spent before the connection dropped
+    /// is lost, not refused: it routes to the lock-less lead and the plain
+    /// re-read, never to a lock call that could find this process's own lock.
+    /// Every other error keeps `redis_err`'s kind.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_exhausted_combined_call_is_transient() {
+        let kind =
+            |kind, details: &'static str| get_or_lock_err(RedisError::new(kind, details)).kind;
+        assert_eq!(
+            kind(RedisErrorKind::Unknown, "Too many failed write attempts."),
+            BackendErrorKind::Transient
+        );
+        assert_eq!(
+            kind(RedisErrorKind::Unknown, "Too many redirections."),
+            BackendErrorKind::Permanent
+        );
+        assert_eq!(
+            kind(RedisErrorKind::Unknown, "something else"),
+            BackendErrorKind::Permanent
+        );
+        assert_eq!(
+            kind(RedisErrorKind::Timeout, "Request timed out."),
+            BackendErrorKind::Timeout
+        );
+        assert_eq!(
+            kind(RedisErrorKind::Auth, ATTEMPTS_EXHAUSTED),
+            BackendErrorKind::Authentication
+        );
     }
 
     const URL: &str = "redis://localhost:6379";

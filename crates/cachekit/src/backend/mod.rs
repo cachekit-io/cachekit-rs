@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::error::BackendError;
-use crate::metrics::MetricsProvider;
+use crate::metrics::{L1Latency, MetricsProvider};
 
 // ── HealthStatus ─────────────────────────────────────────────────────────────
 
@@ -172,6 +172,19 @@ pub trait Backend: Send + Sync {
     /// weakly and reports `None` once that client is gone. Backends with
     /// nothing to report keep this default no-op.
     fn attach_metrics(&self, _provider: MetricsProvider) {}
+
+    /// The accumulator for this backend's L1 hit-latency reports, if it sends
+    /// them.
+    ///
+    /// `CacheKitBuilder::build` asks once, on the raw backend before any
+    /// reliability decorator, and the client times a sample of its L1 hits
+    /// into what it gets back. Only the native cachekit.io backend with
+    /// telemetry on returns one; every other backend keeps this default
+    /// `None`, and a client over it reads no clock. A backend that wraps
+    /// another and passes its requests through forwards the inner one's.
+    fn l1_latency(&self) -> Option<std::sync::Arc<L1Latency>> {
+        None
+    }
 }
 
 /// Async cache backend abstraction (`?Send` variant).
@@ -302,6 +315,19 @@ pub trait Backend {
     /// weakly and reports `None` once that client is gone. Backends with
     /// nothing to report keep this default no-op.
     fn attach_metrics(&self, _provider: MetricsProvider) {}
+
+    /// The accumulator for this backend's L1 hit-latency reports, if it sends
+    /// them.
+    ///
+    /// `CacheKitBuilder::build` asks once, on the raw backend before any
+    /// reliability decorator, and the client times a sample of its L1 hits
+    /// into what it gets back. Only the native cachekit.io backend with
+    /// telemetry on returns one; every other backend keeps this default
+    /// `None`, and a client over it reads no clock. A backend that wraps
+    /// another and passes its requests through forwards the inner one's.
+    fn l1_latency(&self) -> Option<std::sync::Arc<L1Latency>> {
+        None
+    }
 }
 
 // ── TtlInspectable ───────────────────────────────────────────────────────────
@@ -387,6 +413,13 @@ pub trait LockableBackend: Backend {
     /// token and expiry, so a holder that took the lock either way excludes
     /// the other. Never retry it: after a lost reply, a retry finds the lock
     /// the first attempt took and reports [`GetOrLock::Contested`].
+    ///
+    /// The error kind decides what the cold miss does next. Report a call
+    /// that may have run, its reply lost, as retryable (`Transient` or
+    /// `Timeout`): the cold miss re-reads with [`Backend::get_with_freshness`]
+    /// and, on a miss, leads without the lock. Report a call the server
+    /// refused, which took no lock, as non-retryable: the cold miss reads,
+    /// then calls [`Self::acquire_lock`].
     ///
     /// The default makes those two calls. Override it, and
     /// [`Self::__combines_get_and_lock`], when the backend can do both in one

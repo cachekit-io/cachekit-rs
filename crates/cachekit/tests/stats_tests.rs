@@ -92,6 +92,7 @@ fn reads(stats: L1Stats) -> u64 {
 
 // ── stats() ──────────────────────────────────────────────────────────────────
 
+/// API-75: a plain read counts one outcome, by the layer that served it.
 #[tokio::test]
 async fn stats_count_every_read_by_the_layer_that_served_it() {
     let (shared, _store) = MockBackend::new_with_handle();
