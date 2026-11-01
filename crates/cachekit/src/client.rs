@@ -457,9 +457,9 @@ impl CacheKit {
     /// when that `2xx` arrived: `spec/saas-api.md` forbids serving it past
     /// `min(local_ttl, effective_ttl, fresh_for)` from receipt (API-103), and
     /// the wire truncates a fractional TTL from 1 s up (1.5 s goes as 1). Any
-    /// delay between receipt and this call shortens the copy. A zero bound
-    /// keeps no copy and drops the key's older one, which would otherwise
-    /// outlive the write. With no [`WriteBound`](crate::backend::WriteBound),
+    /// delay between receipt and this call shortens the copy. A bound that
+    /// has run out by this call, a zero one included, keeps no copy and drops
+    /// the key's older one, which would otherwise outlive the write. With no [`WriteBound`](crate::backend::WriteBound),
     /// the TTL runs from insertion. `None` bytes, from
     /// [`Self::share_with_l1`] on a client without an L1, do nothing.
     #[cfg_attr(not(feature = "l1"), allow(clippy::unused_self))]
@@ -479,14 +479,17 @@ impl CacheKit {
                 l1.set_shared(full_key, self.admit(bytes), bound);
                 return;
             };
-            let bound = match write_bound.fresh_for {
-                None => bound,
-                Some(fresh_for) if fresh_for.is_zero() => {
-                    l1.delete(full_key);
-                    return;
-                }
-                Some(fresh_for) => bound.min(fresh_for),
-            };
+            let bound = write_bound.fresh_for.map_or(bound, |f| bound.min(f));
+            // A copy whose bound ran out before this call could never be
+            // served, and at capacity it would evict a live entry.
+            let expired = write_bound
+                .received
+                .checked_add(bound)
+                .is_some_and(|deadline| deadline <= std::time::Instant::now());
+            if expired {
+                l1.delete(full_key);
+                return;
+            }
             l1.set_shared_from(full_key, self.admit(bytes), bound, write_bound.received);
         }
         #[cfg(not(feature = "l1"))]
