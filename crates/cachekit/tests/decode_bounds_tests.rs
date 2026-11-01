@@ -32,6 +32,8 @@ use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::Value as Json;
 
+#[cfg(feature = "l1")]
+use crate::common::read_every_path_twice_through_l1;
 use crate::common::{decode_both, read_every_path};
 
 const VECTORS_JSON: &str = include_str!("vectors/decode-bounds.json");
@@ -137,6 +139,82 @@ fn every_reject_vector_is_rejected_by_the_guard_on_every_read_path() {
                 assert_guard_rejected(name, path, result);
             }
         }
+    });
+}
+
+/// With L1 on, a read backfills the backend entry into L1 before anything
+/// decodes it, and an L1 hit on an entry marked walked skips the walk. A
+/// hostile entry must never be marked: the read that fetches it fails, and so
+/// does the next read of the key, which L1 serves.
+///
+/// A marked decode skips the walk, so a wrong mark shows as a reject vector
+/// that decodes, or fails with rmp-serde's error instead of the guard's.
+#[cfg(feature = "l1")]
+#[test]
+fn a_hostile_entry_fails_from_the_backend_and_again_from_l1() {
+    on_default_stack(|| {
+        for vector in vectors()["reject_vectors"].as_array().unwrap() {
+            let name = vector["name"].as_str().unwrap();
+            let bytes = unhex(vector["input_hex"].as_str().unwrap());
+            for (path, first, second) in read_every_path_twice_through_l1::<Json>(&bytes) {
+                assert_guard_rejected(name, &format!("{path} (backend)"), first);
+                assert_guard_rejected(name, &format!("{path} (L1)"), second);
+            }
+        }
+    });
+}
+
+/// An accept vector decodes the same from the backend and from its walked L1
+/// copy.
+#[cfg(feature = "l1")]
+#[test]
+fn every_accept_vector_decodes_from_the_backend_and_from_l1() {
+    on_default_stack(|| {
+        for vector in vectors()["accept_vectors"].as_array().unwrap() {
+            let name = vector["name"].as_str().unwrap();
+            let bytes = unhex(vector["input_hex"].as_str().unwrap());
+            for (path, first, second) in read_every_path_twice_through_l1::<Json>(&bytes) {
+                let first = first.unwrap_or_else(|e| panic!("{name}: {path} (backend): {e}"));
+                let second = second.unwrap_or_else(|e| panic!("{name}: {path} (L1): {e}"));
+                assert_eq!(first, second, "{name}: {path}");
+            }
+        }
+    });
+}
+
+/// rmp-serde's depth limit does not count an enum's variant map, so it does
+/// not bound a recursive enum: only the walk does. A value this process wrote
+/// gets no pass on that. 60 levels of `List` are 120 MessagePack levels, which
+/// the walk rejects from L1 as from the backend; rmp-serde alone counts 60
+/// arrays and would decode them, and a few thousand levels overflow the stack.
+#[cfg(feature = "l1")]
+#[test]
+fn an_own_write_of_a_deep_recursive_enum_fails_from_l1() {
+    #[derive(serde::Serialize, Deserialize)]
+    enum Node {
+        Leaf(i64),
+        List(Vec<Node>),
+    }
+    on_default_stack(|| {
+        let client = cachekit::CacheKit::builder()
+            .backend(common::MockBackend::shared())
+            .l1_capacity(16)
+            .build()
+            .expect("client builds");
+        let mut value = Node::Leaf(0);
+        for _ in 0..60 {
+            value = Node::List(vec![value]);
+        }
+        common::runtime().block_on(async {
+            client.set("enum", &value).await.expect("set");
+            let read = client
+                .get::<Node>("enum")
+                .await
+                .map(|v| v.expect("written"))
+                .map(|_| Json::Null);
+            assert_eq!(client.stats().l1_hits, 1, "L1 served it");
+            assert_guard_rejected("own enum write", "CacheKit::get (L1)", read);
+        });
     });
 }
 

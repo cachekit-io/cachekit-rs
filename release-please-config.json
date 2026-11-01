@@ -36,7 +36,8 @@
     "crates/cachekit-macros": {
       "package-name": "cachekit-macros",
       "changelog-path": "CHANGELOG.md",
-      "component": "cachekit-macros"
+      "component": "cachekit-macros",
+      "extra-files": [{"type": "generic", "path": "/Cargo.toml"}]
     }
   }
 }

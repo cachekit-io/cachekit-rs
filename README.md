@@ -330,7 +330,7 @@ let user: Option<User> = cache.interop_get(&key).await?; // strict read: exactly
 
 `ns` and `nsapi` are reserved as namespaces — the CachekitIO server parses a key starting `ns:` or `nsapi:` as namespace-prefixed — so `interop_key` rejects them with `InvalidKey` and `#[cachekit(namespace = ...)]` with a compile error; operations are unaffected. Neither segment may contain `..` (`a..b` is rejected the same two ways; a lone `.`, as in `app.v1`, is fine), because the server rejects `..` anywhere in a key.
 
-Argument hashing is byte-identical across SDKs (canonical MessagePack + Blake2b-256), verified against the shared [protocol](https://github.com/cachekit-io/protocol) test vectors ([`interop-mode.json`](crates/cachekit/tests/vectors/interop-mode.json), vendored) in this repo's test suite. `get` and `interop_get` (also on `SecureCache`) both read exactly one MessagePack document and reject trailing bytes, so neither silently misreads a Python-internal CK frame as the integer 67; `interop_get` names the CK frame in its error. On a client without encryption, `get`, `interop_get` and `interop_get_swr` refuse every CK frame in the protocol's shared [`python-frame.json`](crates/cachekit/tests/vectors/python-frame.json) vectors (vendored); an encrypted client refuses them at decrypt. A bare ByteStorage envelope (another SDK's auto-mode container) is one well-formed MessagePack document, so no structural check can refuse it: on a client without encryption, a read of one fails only when its shape does not fit the requested type, and rmp-serde decodes by position, so a type whose four elements line up with the envelope's (bytes, 8 integers, an integer, a string) does read one. An encrypting client fails at decrypt, whatever the type. Every decode of backend-supplied bytes (`get` and `interop_get` alike) first passes a header-only structural walk that rejects, before anything is decoded, a document nested deeper than `serializer::MAX_DECODE_DEPTH` (100 levels, matching the TypeScript SDK; every collection header counts, empty ones included) or declaring more elements or bytes than the input can back, verified against the protocol's shared [`decode-bounds.json`](crates/cachekit/tests/vectors/decode-bounds.json) vectors (vendored) — a forged nested-header entry is a bounded `Serialization` error, not a memory blow-up or a stack overflow. Encryption works unchanged — interop keys are identical across SDKs, so the AAD verifies cross-SDK. On a client with encryption configured, `set_with_ttl` stores the AES-GCM ciphertext of that MessagePack and `interop_get` decrypts it.
+Argument hashing is byte-identical across SDKs (canonical MessagePack + Blake2b-256), verified against the shared [protocol](https://github.com/cachekit-io/protocol) test vectors ([`interop-mode.json`](crates/cachekit/tests/vectors/interop-mode.json), vendored) in this repo's test suite. `get` and `interop_get` (also on `SecureCache`) both read exactly one MessagePack document and reject trailing bytes, so neither silently misreads a Python-internal CK frame as the integer 67; `interop_get` names the CK frame in its error. On a client without encryption, `get`, `interop_get` and `interop_get_swr` refuse every CK frame in the protocol's shared [`python-frame.json`](crates/cachekit/tests/vectors/python-frame.json) vectors (vendored); an encrypted client refuses them at decrypt. A bare ByteStorage envelope (another SDK's auto-mode container) is one well-formed MessagePack document, so no structural check can refuse it: on a client without encryption, a read of one fails only when its shape does not fit the requested type, and rmp-serde decodes by position, so a type whose four elements line up with the envelope's (bytes, 8 integers, an integer, a string) does read one. An encrypting client fails at decrypt, whatever the type. Every decode of backend-supplied bytes (`get` and `interop_get` alike) first passes a header-only structural walk that rejects, before anything is decoded, a document nested deeper than `serializer::MAX_DECODE_DEPTH` (100 levels, matching the TypeScript SDK; every collection header counts, empty ones included) or declaring more elements or bytes than the input can back, verified against the protocol's shared [`decode-bounds.json`](crates/cachekit/tests/vectors/decode-bounds.json) vectors (vendored) — a forged nested-header entry is a bounded `Serialization` error, not a memory blow-up or a stack overflow. A client without encryption walks the bytes when a backend read or its own write admits them, and a later L1 hit on bytes that passed decodes without walking again. Encryption works unchanged — interop keys are identical across SDKs, so the AAD verifies cross-SDK. On a client with encryption configured, `set_with_ttl` stores the AES-GCM ciphertext of that MessagePack and `interop_get` decrypts it.
 
 > [!WARNING]
 > Every service that binds one `(namespace, operation)` must agree on encryption: on in all of them or off in all of them, with the same master key and `tenant_id` (decrypt-only previous master keys may differ). If an unencrypted service shares the operation with an encrypted one, values end up **stored unencrypted** at the shared key: the unencrypted service writes in the clear whenever it fills the entry, and a `#[cachekit]` function on a client without encryption also replaces ciphertext it cannot decode. See [Shared entries are a contract](https://docs.cachekit.io/concepts/using-interop-mode/#shared-entries-are-a-contract).
@@ -903,16 +903,38 @@ make bench-instr BASE=../bench-base FILTER=l2_hit   # A/B against another build
 Wall time on a shared machine moves by tens of percent between runs, so
 `bench-instr` is the number a change is judged on. It counts only the timed
 loop (`--toggle-collect`), on a single-threaded tokio runtime, five runs per
-case, and reports the median and the spread. For an A/B, build the example at
-the base commit, copy `target/release/examples/bench_hot_path` outside
-`target/`, and pass it as `BASE`; the runs interleave ABBA, a delta counts only
-when it beats `max(3 × spread, 0.5%)`, and the target exits 1 when a case got
-slower by more than that, or 2 when it measured nothing (an unknown flag, a
-filter that matches no case, a base that runs none of them, a valgrind
-failure). A case the base build does not list, because it was added since, is
-named as skipped rather than compared. Most cases repeat within 0.8%; the `delete` cases
-spread more (up to about 10%, from the per-key mutation lock map, a hash table seeded afresh in
-each process), so their floor is wider.
+case, and reports the median and the spread. `JOBS=<n>` measures n cases at a
+time; counts do not depend on it. For an A/B, check out the base commit, copy
+your working tree's `crates/cachekit/examples/bench_hot_path.rs` into it so
+both builds run one workload, build the example there, copy its
+`target/release/examples/bench_hot_path` outside `target/`, and pass it as
+`BASE`. The example copies both builds to paths of equal length
+before it measures them, because the length of a binary's path moves its
+counts (by 6 instructions per `exists` op). The runs interleave ABBA, and a
+delta counts only when it beats the case's floor, which is fixed per op and
+never taken from a run's spread, so a change that makes a case noisy cannot
+widen its own floor. Every op's floor is 0.5%, new ops included, and its
+cases also fail when the head's runs spread by more than 0.5%, because new
+nondeterminism on a hot path is itself a finding. Two ops vary between runs
+of one build, from the single-flight and per-key mutation lock maps, hash
+tables seeded afresh in each process: `l2_hit` by up to about 2% in CI, and
+`delete` by up to about 10%. `l2_hit` gets a fixed 2% floor and no spread
+check (in CI, an unchanged build moved its median by at most 0.52%). `delete`
+is reported but never fails the comparison: a floor that wide would hide any
+regression worth catching. The example exits 1 when a gated case got slower
+or noisier, and 2 when nothing was measured or the run stopped part way (an
+unknown flag, a filter that matches no case, a valgrind failure); `make`
+reports either one as exit 2.
+
+CI runs this comparison on every pull request (the **Instruction counts vs
+base** check): it builds the pull request and the commit it merges into, each
+in its own target directory and with `--features macros` (the `#[cachekit]`
+cases need it), measures both on the same runner, and posts the verdict as
+one comment it edits in place (a pull request from a fork gets no comment; its
+verdict is in the run summary). A case it did not measure reads
+INCOMPLETE, never PASS. A release pull request is measured against the last
+release tag instead. The check is not required: a deliberate cost increase is
+accepted at review.
 
 **Client wall time** — `examples/wall_time_probe.rs` times `CacheKit` calls
 against the cachekit.io dev endpoint and writes one JSON object per request. It runs
@@ -967,6 +989,25 @@ keeping the job name green. Two properties make that visible:
   body contains the exact, case-sensitive string `[gate-change-approved]` (add
   it after human sign-off, *then* push a commit — the marker is read from the
   push-time event, so a body edit alone does not re-trigger).
+
+### Why cachekit-macros is pinned exactly
+
+`cachekit-rs` requires `cachekit-macros` with `=`, never a caret, so each
+runtime release that carries the pin only ever meets the macros released with
+it; releases published before the pin require a caret. `#[cachekit]`
+expands to calls into `#[doc(hidden)]` items of `cachekit-rs`, and a patch
+release of the macros can call one that an older runtime lacks. Under a caret,
+a project that holds `cachekit-rs` at an exact older patch would still resolve
+the newest macros in that minor line, and stop compiling at every
+`#[cachekit]` site.
+
+The requirement lives in the root `Cargo.toml` under `[workspace.dependencies]`,
+and `crates/cachekit/Cargo.toml` inherits it. release-please rewrites a
+dependency version in a member manifest to the bare new version, dropping the
+`=`, so the root line carries a release-please version marker instead, and a
+generic `extra-files` entry in `release-please-config.json` bumps only the
+number. `crates/cachekit/tests/macros_pin_tests.rs` fails if the requirement
+is not `=` this crate's version.
 
 ## Minimum Supported Rust Version
 
