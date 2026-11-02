@@ -55,7 +55,7 @@ Install with `cargo add cachekit-rs` (defaults), `cargo add cachekit-rs --featur
 
 <!-- x-release-please-start-version -->
 ```toml
-# Defaults: CacheKit Cloud (`cachekitio`) + encryption + L1
+# Defaults: CacheKit Cloud (`cachekitio`) + encryption + L1 + reliability
 [dependencies]
 cachekit-rs = "0.13.1"
 
