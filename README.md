@@ -21,13 +21,13 @@
 
 ## Overview
 
-`cachekit-rs` is the Rust SDK for [cachekit.io](https://cachekit.io). Pick an [intent preset](#intent-presets-recommended) — `minimal`, `production`, `secure`, or `io` — and get a pre-configured cache in one call, from bare Redis speed to dual-layer with client-side encryption. Pick `secure` and bytes never leave your process in plaintext.
+`cachekit-rs` is the Rust SDK for [cachekit.io](https://cachekit.io). Pick an [intent preset](#intent-presets-recommended) — `minimal`, `production`, `secure`, or `io` — and get a pre-configured cache in one call, from bare Redis speed to dual-layer with client-side encryption. Pick `secure` and values never leave your process in plaintext; cache keys travel in clear.
 
 | Component | What it does |
 |:----------|:-------------|
 | **CacheKit** | `get` / `set` / `delete` / `exists` with automatic L1 → L2 layering; with a master key configured, every value is AES-256-GCM encrypted before storage (zero-knowledge) |
 | **SecureCache** | The same encryption as a handle (`cache.secure_cache()`) that refuses a client without a key |
-| **Backend** | Pluggable trait — cachekit.io SaaS, Redis, Memcached, local File, Cloudflare Workers |
+| **Backend** | Pluggable trait — CacheKit Cloud, Redis, Memcached, local File, Cloudflare Workers |
 | **L1 Cache** | In-process cache ([quick_cache](https://crates.io/crates/quick_cache)) with per-entry TTL, write-through + backfill |
 
 > [!TIP]
@@ -40,7 +40,7 @@
 
 | Feature | Default | Description |
 |:--------|:-------:|:------------|
-| `cachekitio` | ✅ | HTTP backend for [api.cachekit.io](https://api.cachekit.io) via [reqwest](https://crates.io/crates/reqwest) + rustls |
+| `cachekitio` | ✅ | CacheKit Cloud HTTP backend ([api.cachekit.io](https://api.cachekit.io)) via [reqwest](https://crates.io/crates/reqwest) + rustls |
 | `encryption` | ✅ | Zero-knowledge AES-256-GCM via [cachekit-core](https://crates.io/crates/cachekit-core). Without it, every builder encryption call (`.encryption()`, `.encryption_with_previous()`, `.encryption_from_env()`, `.encryption_from_bytes()`, `.encryption_from_bytes_with_previous()`) returns a config error |
 | `l1` | ✅ | In-process L1 cache via [quick_cache](https://crates.io/crates/quick_cache), with per-entry TTL and stale-while-revalidate (native). Not supported on `wasm32-unknown-unknown` (compile error: no clock there) |
 | `reliability` | ✅ | Retry with backoff + jitter, circuit breaker, backpressure, distributed fill locks (native only) |
@@ -51,9 +51,11 @@
 | `macros` | ❌ | `#[cachekit]` proc-macro decorator (mints [interop/v1](#cross-sdk-interop-mode) keys) |
 | `tracing` | ❌ | [`tracing`](https://crates.io/crates/tracing) events per cache operation and breaker transition — see [Observability](#observability) |
 
+Install with `cargo add cachekit-rs` (defaults), `cargo add cachekit-rs --features redis`, or, for Cloudflare Workers, `cargo add cachekit-rs --no-default-features --features workers,encryption`. The equivalent `Cargo.toml` entries:
+
 <!-- x-release-please-start-version -->
 ```toml
-# Defaults: SaaS + encryption + L1
+# Defaults: CacheKit Cloud (`cachekitio`) + encryption + L1
 [dependencies]
 cachekit-rs = "0.13.1"
 
@@ -75,7 +77,7 @@ cachekit-rs = { version = "0.13.1", default-features = false, features = ["worke
 > - `workers` + `memcached` — Workers runtime has no TCP sockets
 > - `workers` + `file` — Workers runtime has no filesystem
 >
-> `l1` is also a compile error on `wasm32-unknown-unknown` with any feature set: `std::time::Instant` has no clock there, so the client's first L1 read or write would panic. Build for that target with `default-features = false, features = ["encryption"]` plus your backend feature (`workers` for cachekit.io); `wasm32-wasip1` keeps L1.
+> `l1` is also a compile error on `wasm32-unknown-unknown` with any feature set: `std::time::Instant` has no clock there, so the client's first L1 read or write would panic. Build for that target with `default-features = false, features = ["encryption"]` plus your backend feature (`workers` for CacheKit Cloud); `wasm32-wasip1` keeps L1.
 
 ---
 
@@ -90,7 +92,7 @@ One call that names your use case. Each preset returns a pre-configured builder 
 | `CacheKit::minimal(url)` | Development, public data, product catalogs — speed first, no extras | Redis³ | ✅ (no SWR) | ❌ | ❌ | ❌ | 300 s |
 | `CacheKit::production(url)` | User sessions, API responses, production services | Redis³ | ✅ | ❌ | ✅ | ✅ | 600 s |
 | `CacheKit::secure(url, master_key_hex)`⁵ | PII, payments, GDPR/HIPAA-sensitive data — zero-knowledge AES-256-GCM | Redis³ | ✅ | ✅ | ✅ | ✅ | 600 s |
-| `CacheKit::io(api_key)`⁴ | Serverless, edge compute, managed caching without running Redis | cachekit.io | ✅ | ❌ | ✅ | n/a (HTTP) | 3 600 s |
+| `CacheKit::io(api_key)`⁴ | Serverless, edge compute, managed caching without running Redis | CacheKit Cloud | ✅ | ❌ | ✅ | n/a (HTTP) | 3 600 s |
 
 ¹ Retry with backoff + jitter, circuit breaker, backpressure — the [reliability stack](#reliability). Requires the default-on `reliability` feature.
 ² See the resilience contract below.
@@ -169,7 +171,7 @@ let cache = CacheKit::builder()
 > [!IMPORTANT]
 > Never hardcode API keys or master keys. Use environment variables or a secrets manager.
 
-Each cachekit.io request attempt times out after 5 s, the protocol's
+Each CacheKit Cloud request attempt times out after 5 s, the protocol's
 `CACHEKIT_TIMEOUT` default; a write (`set`, `delete`) gets 10 s. The timeout
 covers connect, TLS and the whole response body, and surfaces as
 `BackendErrorKind::Timeout`. The same budgets apply on native targets and on
@@ -188,7 +190,7 @@ a silently dead connection within about 60 s; Windows keeps its own fixed
 probe count, so detection there takes about 165 s. On wasm32 the platform's
 `fetch` decides pooling and the User-Agent.
 
-Neither CachekitIO client follows a redirect: a 3xx from the API is a
+Neither CacheKit Cloud client (`CachekitIO`, `WorkersCachekitIO`) follows a redirect: a 3xx from the API is a
 permanent error. On wasm32, use the [Workers backend](#cloudflare-workers).
 
 ### Values and binary payloads
@@ -232,8 +234,9 @@ let secure = cache.secure_cache()?;
 ```
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
 │  Your Code   │────>│   CacheKit   │────>│   Backend    │
-│              │     │  AES-256-GCM │     │  (cachekit.io│
-│  plaintext   │     │  encrypt /   │     │   or Redis)  │
+│              │     │  AES-256-GCM │     │  (CacheKit   │
+│  plaintext   │     │  encrypt /   │     │  Cloud or    │
+│              │     │              │     │  Redis)      │
 │              │<────│  decrypt     │<────│              │
 └──────────────┘     └──────────────┘     └──────────────┘
                       L1 stores ciphertext
@@ -261,9 +264,9 @@ let secure = cache.secure_cache()?;
 | **AAD Binding** | The key the client passes to its backend, `.namespace()` prefix included, bound to ciphertext (prevents substitution between keys and namespaces) |
 | **Memory Safety** | [zeroize](https://crates.io/crates/zeroize) on drop for all key material |
 | **L1 Guarantee** | L1 stores ciphertext, never plaintext |
-| **Cache-key path encoding (CWE-22)** | Keys are percent-encoded into the CachekitIO request path; the empty key, and a key encoding to a reserved segment (`.`, `..`, `health`, `ttl`, `lock`), are **rejected** rather than sent |
+| **Cache-key path encoding (CWE-22)** | Keys are percent-encoded into the `CachekitIO` request path; the empty key, and a key encoding to a reserved segment (`.`, `..`, `health`, `ttl`, `lock`), are **rejected** rather than sent |
 
-**Cache-key path encoding (CWE-22):** CachekitIO keys are percent-encoded (`urlencoding::encode`) so a key can only ever address `/v1/cache/{key}`. The empty key, and a key whose encoded form is one of the five reserved path segments — `.`, `..`, `health`, `ttl`, `lock` — are **rejected** with a permanent error rather than sent (protocol `spec/saas-api.md` § Cache-Key Path Encoding, rule 2). The empty key encodes to an empty segment, so `/v1/cache/{key}` becomes `/v1/cache/` and `/v1/cache/{key}/ttl` becomes `/v1/cache//ttl`, neither of which addresses a stored entry. `.`/`..` are dot segments that `reqwest`'s WHATWG URL parser (rust-url) strips *before the request leaves the process* (`/v1/cache/..` → `/v1/`); `health`/`ttl`/`lock` are live route tokens (`/v1/cache/health` is the health endpoint, a trailing `ttl`/`lock` selects a sub-resource). Encoding can't neutralise either — WHATWG collapses `%2E%2E` too — so the SDK refuses rather than emit a request whose path was rewritten. This matches the cachekit-ts twin and is stricter than cachekit-py's older `%2E` rewrite; none of these is ever a canonical CacheKit key (those are non-empty and contain `:`), so nothing legitimate is affected. Every other key encodes to the same bytes as cachekit-py; cachekit-ts may leave `! * ' ( )` raw, and every conformant form decodes once to the same key (spec rule 4).
+**Cache-key path encoding (CWE-22):** `CachekitIO` keys are percent-encoded (`urlencoding::encode`) so a key can only ever address `/v1/cache/{key}`. The empty key, and a key whose encoded form is one of the five reserved path segments — `.`, `..`, `health`, `ttl`, `lock` — are **rejected** with a permanent error rather than sent (protocol `spec/saas-api.md` § Cache-Key Path Encoding, rule 2). The empty key encodes to an empty segment, so `/v1/cache/{key}` becomes `/v1/cache/` and `/v1/cache/{key}/ttl` becomes `/v1/cache//ttl`, neither of which addresses a stored entry. `.`/`..` are dot segments that `reqwest`'s WHATWG URL parser (rust-url) strips *before the request leaves the process* (`/v1/cache/..` → `/v1/`); `health`/`ttl`/`lock` are live route tokens (`/v1/cache/health` is the health endpoint, a trailing `ttl`/`lock` selects a sub-resource). Encoding can't neutralise either — WHATWG collapses `%2E%2E` too — so the SDK refuses rather than emit a request whose path was rewritten. This matches the cachekit-ts twin and is stricter than cachekit-py's older `%2E` rewrite; none of these is ever a canonical CacheKit key (those are non-empty and contain `:`), so nothing legitimate is affected. Every other key encodes to the same bytes as cachekit-py; cachekit-ts may leave `! * ' ( )` raw, and every conformant form decodes once to the same key (spec rule 4).
 
 **AAD v0x03 wire format:**
 
@@ -276,7 +279,7 @@ Cross-SDK compatible — ciphertext produced by the Python SDK decrypts with the
 
 </details>
 
-**Is AES hardware-accelerated on this host?** `cache.secure_cache()?.hardware_acceleration_enabled()` (also on `EncryptionLayer`) forwards cachekit-core's detection. Informational only: `ring`/`aes-gcm` pick their implementation independently, so use it to explain secure-cache latency, not to change behaviour. The per-architecture semantics are core's — as of cachekit-core 0.7.0 a runtime AES-NI probe on x86/x86_64, a runtime probe for the Armv8 Crypto Extension's AES instructions on aarch64 (a Raspberry Pi 4, a Cortex-A72 without the Crypto Extension, reports `false`), and `false` on wasm32.
+**Is AES hardware-accelerated on this host?** `cache.secure_cache()?.hardware_acceleration_enabled()` (also on `EncryptionLayer`) forwards cachekit-core's detection. Informational only: `ring`/`aes-gcm` pick their implementation independently, so use it to explain secure-cache latency, not to change behaviour. The per-architecture semantics are core's: a runtime AES-NI probe on x86/x86_64, a runtime probe for the Armv8 Crypto Extension's AES instructions on aarch64 (a Raspberry Pi 4, a Cortex-A72 without the Crypto Extension, reports `false`), and `false` on wasm32.
 
 ### Key Rotation
 
@@ -328,7 +331,7 @@ cache.set_with_ttl(&key, &user, ttl).await?;          // plain MessagePack — a
 let user: Option<User> = cache.interop_get(&key).await?; // strict read: exactly one document
 ```
 
-`ns` and `nsapi` are reserved as namespaces — the CachekitIO server parses a key starting `ns:` or `nsapi:` as namespace-prefixed — so `interop_key` rejects them with `InvalidKey` and `#[cachekit(namespace = ...)]` with a compile error; operations are unaffected. Neither segment may contain `..` (`a..b` is rejected the same two ways; a lone `.`, as in `app.v1`, is fine), because the server rejects `..` anywhere in a key. On a `#[cachekit]` function, a parameter whose name starts with `__ck` or `__CK` is a compile error too: that prefix is reserved for the macro's generated locals, which would otherwise shadow the argument.
+`ns` and `nsapi` are reserved as namespaces — the CacheKit Cloud server parses a key starting `ns:` or `nsapi:` as namespace-prefixed — so `interop_key` rejects them with `InvalidKey` and `#[cachekit(namespace = ...)]` with a compile error; operations are unaffected. Neither segment may contain `..` (`a..b` is rejected the same two ways; a lone `.`, as in `app.v1`, is fine), because the server rejects `..` anywhere in a key. On a `#[cachekit]` function, a parameter whose name starts with `__ck` or `__CK` is a compile error too: that prefix is reserved for the macro's generated locals, which would otherwise shadow the argument.
 
 Argument hashing is byte-identical across SDKs (canonical MessagePack + Blake2b-256), verified against the shared [protocol](https://github.com/cachekit-io/protocol) test vectors ([`interop-mode.json`](crates/cachekit/tests/vectors/interop-mode.json), vendored) in this repo's test suite. `get` and `interop_get` (also on `SecureCache`) both read exactly one MessagePack document and reject trailing bytes, so neither silently misreads a Python-internal CK frame as the integer 67; `interop_get` names the CK frame in its error. On a client without encryption, `get`, `interop_get` and `interop_get_swr` refuse every CK frame in the protocol's shared [`python-frame.json`](crates/cachekit/tests/vectors/python-frame.json) vectors (vendored); an encrypted client refuses them at decrypt. A bare ByteStorage envelope (another SDK's auto-mode container) is one well-formed MessagePack document, so no structural check can refuse it: on a client without encryption, a read of one fails only when its shape does not fit the requested type, and rmp-serde decodes by position, so a type whose four elements line up with the envelope's (bytes, 8 integers, an integer, a string) does read one. An encrypting client fails at decrypt, whatever the type. Every decode of backend-supplied bytes (`get` and `interop_get` alike) first passes a header-only structural walk that rejects, before anything is decoded, a document nested deeper than `serializer::MAX_DECODE_DEPTH` (100 levels, matching the TypeScript SDK; every collection header counts, empty ones included) or declaring more elements or bytes than the input can back, verified against the protocol's shared [`decode-bounds.json`](crates/cachekit/tests/vectors/decode-bounds.json) vectors (vendored) — a forged nested-header entry is a bounded `Serialization` error, not a memory blow-up or a stack overflow. A client without encryption walks the bytes when a backend read or its own write admits them, and a later L1 hit on bytes that passed decodes without walking again. Encryption works unchanged — interop keys are identical across SDKs, so the AAD verifies cross-SDK. On a client with encryption configured, `set_with_ttl` stores the AES-GCM ciphertext of that MessagePack and `interop_get` decrypts it.
 
@@ -344,9 +347,9 @@ Interop mode in production: [Skyline](https://github.com/cachekit-io/bluesky-thi
 
 ## Backends
 
-### cachekit.io SaaS (default)
+### CacheKit Cloud (default feature)
 
-HTTP backend targeting [api.cachekit.io](https://api.cachekit.io) with SSRF-safe URL validation, distributed locking, TTL inspection, and [telemetry](#telemetry-sent-to-cachekitio) you can turn off.
+HTTP backend targeting [api.cachekit.io](https://api.cachekit.io) with SSRF-safe URL validation, distributed locking, TTL inspection, and [telemetry](#telemetry-sent-to-cachekit-cloud) you can turn off.
 
 ```rust
 use cachekit::backend::cachekitio::CachekitIO;
@@ -358,7 +361,7 @@ let backend = CachekitIO::builder()
     .build()?;
 ```
 
-How fresh a cachekit.io read is, and how long a deleted project's data stays readable: [Consistency and Deletion](https://docs.cachekit.io/concepts/consistency/).
+How fresh a CacheKit Cloud read is, and how long a deleted project's data stays readable: [Consistency and Deletion](https://docs.cachekit.io/concepts/consistency/).
 
 ### Redis
 
@@ -440,11 +443,11 @@ let backend = FileBackend::builder()
 
 ### Cloudflare Workers
 
-`wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the SaaS lock/TTL endpoints. It is the CachekitIO backend on wasm32. Requires the `workers` feature with default features disabled.
+`wasm32-unknown-unknown` backend using `worker::Fetch`, with distributed locking and TTL inspection against the CacheKit Cloud lock/TTL endpoints. It is the `CachekitIO` backend on wasm32. Requires the `workers` feature with default features disabled.
 
 The Workers runtime's `fetch` has no timeout of its own and can hold a request for tens of seconds, so the backend bounds each request itself: 5 s for a read and 10 s for a write (`set`, `delete`), from send through the last byte of the response body. Past that the request is aborted and the call fails with `BackendErrorKind::Timeout`. The `reliability` feature is native-only, so a Workers call makes one attempt and does not retry.
 
-`WorkersCachekitIO::builder(&env)` takes the Worker's bindings (the `env` your fetch handler receives): the backend reads a `CACHEKIT_TELEMETRY` variable or secret there, and in `process.env` (with the `nodejs_compat` flag), to turn [telemetry](#telemetry-sent-to-cachekitio) off.
+`WorkersCachekitIO::builder(&env)` takes the Worker's bindings (the `env` your fetch handler receives): the backend reads a `CACHEKIT_TELEMETRY` variable or secret there, and in `process.env` (with the `nodejs_compat` flag), to turn [telemetry](#telemetry-sent-to-cachekit-cloud) off.
 
 <!-- x-release-please-start-version -->
 ```toml
@@ -475,9 +478,9 @@ impl Backend for MyBackend {
 }
 ```
 
-Optional extension traits: `TtlInspectable` (TTL queries), `LockableBackend` (distributed locking). A backend that wraps the cachekit.io backend and passes its requests through should forward `attach_metrics` and `l1_latency` to it, so its [telemetry](#telemetry-sent-to-cachekitio) keeps working.
+Optional extension traits: `TtlInspectable` (TTL queries), `LockableBackend` (distributed locking). A backend that wraps the `CachekitIO` backend and passes its requests through should forward `attach_metrics` and `l1_latency` to it, so its [telemetry](#telemetry-sent-to-cachekit-cloud) keeps working.
 
-The client writes through `async fn set_bytes(&self, key: &str, value: bytes::Bytes, ttl: Option<Duration>)`, so the L1 and every retry attempt share one buffer. Its default turns the buffer into a `Vec<u8>` (a copy while another handle shares it) and calls `set`. Override it (with `bytes = "1"` as a dependency) if your backend can store a `Bytes` without copying, as the cachekit.io backend does with its request body. An override must store exactly what `set` would.
+The client writes through `async fn set_bytes(&self, key: &str, value: bytes::Bytes, ttl: Option<Duration>)`, so the L1 and every retry attempt share one buffer. Its default turns the buffer into a `Vec<u8>` (a copy while another handle shares it) and calls `set`. Override it (with `bytes = "1"` as a dependency) if your backend can store a `Bytes` without copying, as the `CachekitIO` backend does with its request body. An override must store exactly what `set` would.
 
 </details>
 
@@ -504,15 +507,15 @@ When the `l1` feature is enabled (default), CacheKit keeps an in-process cache i
 │  invalidate L1 first ──► delete from L2 backend         │
 │                                                         │
 ├─────────────┬───────────────────────────────────────────┤
-│  L1         │  L2 (cachekit.io / Redis / Workers)       │
+│  L1         │  L2 (CacheKit Cloud / Redis / Workers)    │
 │  in-process │  one backend round trip                   │
 └─────────────┴───────────────────────────────────────────┘
 ```
 
 | Behavior | Detail |
 |:---------|:-------|
-| **Write-through** | `set()` writes to L2 first, then to L1 once L2 accepted the write. The L1 copy lives no longer than the write's TTL. On cachekit.io, an `X-CacheKit-Fresh-For` on the `PUT` response (the store applied a shorter TTL, as a plan maximum does) bounds it further. Both bounds run from when the `PUT` response arrives, not from when the copy enters L1, so a delay in between (a slow backend wrapper) shortens the copy; a malformed value or `0` keeps no L1 copy at all, so the next read goes to the server. A `refresh_ttl()` (`PATCH /ttl`) never lengthens an L1 copy |
-| **Backfill on miss** | L2 hits populate L1 for at most 30 s. On cachekit.io a shorter `X-CacheKit-Fresh-For` bounds it further, and a hit labelled stale or with `Fresh-For: 0` is not backfilled at all, so the next read goes back to the server |
+| **Write-through** | `set()` writes to L2 first, then to L1 once L2 accepted the write. The L1 copy lives no longer than the write's TTL. On CacheKit Cloud, an `X-CacheKit-Fresh-For` on the `PUT` response (the store applied a shorter TTL, as a plan maximum does) bounds it further. Both bounds run from when the `PUT` response arrives, not from when the copy enters L1, so a delay in between (a slow backend wrapper) shortens the copy; a malformed value or `0` keeps no L1 copy at all, so the next read goes to the server. A `refresh_ttl()` (`PATCH /ttl`) never lengthens an L1 copy |
+| **Backfill on miss** | L2 hits populate L1 for at most 30 s. On CacheKit Cloud a shorter `X-CacheKit-Fresh-For` bounds it further, and a hit labelled stale or with `Fresh-For: 0` is not backfilled at all, so the next read goes back to the server |
 | **Invalidate-first** | `delete()` evicts L1 before touching L2 |
 | **Encrypted L1** | A client with encryption configured stores ciphertext in L1 (never plaintext) |
 | **Evict on decrypt failure** | A read on an encrypted client that fails decryption drops the key's L1 copy and returns the error; the backend entry is kept, so the next read reaches the backend: a hit once the entry is replaced with ciphertext the client can decrypt, a miss once it expires or is deleted |
@@ -561,7 +564,7 @@ fraction; enabled by default) and cachekit-ts (`getWithSwr`). Worth knowing:
   bounds staleness of L2-derived data, but SWR replaces its expiry cliff with
   a background refresh that restores the full write-path TTL. The configured
   ratio is never silently clamped; the window follows the entry.
-- **The server's freshness bound is a hard limit.** When cachekit.io sends a
+- **The server's freshness bound is a hard limit.** When CacheKit Cloud sends a
   shorter `X-CacheKit-Fresh-For`, the backfilled entry's TTL is that bound, so
   SWR goes stale at ~`ratio × Fresh-For` and never serves the copy past it.
   The same holds for a write: a `PUT` response's `Fresh-For` bounds the
@@ -605,7 +608,7 @@ What one call costs in the client: the public `CacheKit` API over an in-memory b
 | `secure_cache()` `set_with_ttl` | 1.2 µs | 1.5 µs |
 
 - **L1 hit**: the value comes from the in-process cache; the backend is not asked.
-- **L2 hit**: L1 does not hold the key, so `get` reads the backend, decodes the MessagePack and backfills L1. A real backend adds its round trip, which for Redis or cachekit.io is a network call.
+- **L2 hit**: L1 does not hold the key, so `get` reads the backend, decodes the MessagePack and backfills L1. A real backend adds its round trip, which for Redis or CacheKit Cloud is a network call.
 - **Encrypted** (`secure_cache()`): L1 holds the same ciphertext as the backend, so every hit decrypts (AES-256-GCM) and checks the AAD.
 - **Larger values**: at 64 KiB most of the time is copying and allocating. It ran to tens of microseconds for L2 hits and encrypted calls, but repeat runs disagreed by up to 3.5x, so the table stops at 1 KiB.
 
@@ -619,11 +622,11 @@ With the `reliability` feature (default, native only), the `production`, `secure
 
 | Layer | What it does | Defaults |
 |:------|:-------------|:---------|
-| **Retry** | Truncated exponential backoff + jitter on transient/timeout errors (`BackendErrorKind::is_retryable`); permanent and auth errors propagate immediately. Under `io`, all attempts of one op share a deadline: an attempt still running at it is cancelled with `BackendErrorKind::Timeout`, and no retry starts past it, so a cachekit.io request that stops answering costs one attempt, not three. Other presets and custom backends get no deadline. A cachekit.io `429` for a spent quota or balance (`X-CacheKit-Deny-Reason`) is not retried; it stays `Transient` and counts toward the breaker, so a plain `#[cachekit]` function fails open while a direct client call returns the error and `#[cachekit(secure)]` fails closed | 3 attempts, 100 ms base, 5 s cap, jitter ×[0.5, 1.5); `io` deadline 5 s per read, 10 s per write |
+| **Retry** | Truncated exponential backoff + jitter on transient/timeout errors (`BackendErrorKind::is_retryable`); permanent and auth errors propagate immediately. Under `io`, all attempts of one op share a deadline: an attempt still running at it is cancelled with `BackendErrorKind::Timeout`, and no retry starts past it, so a CacheKit Cloud request that stops answering costs one attempt, not three. Other presets and custom backends get no deadline. A CacheKit Cloud `429` for a spent quota or balance (`X-CacheKit-Deny-Reason`) is not retried; it stays `Transient` and counts toward the breaker, so a plain `#[cachekit]` function fails open while a direct client call returns the error and `#[cachekit(secure)]` fails closed | 3 attempts, 100 ms base, 5 s cap, jitter ×[0.5, 1.5); `io` deadline 5 s per read, 10 s per write |
 | **Circuit breaker** | closed → open after N retryable failures in a rolling window; fails fast (`BackendErrorKind::CircuitOpen`) while open; half-open probes recovery | threshold 5, window 60 s, open 5 s, 3 probes, close after 3 successes |
 | **Backpressure** | Bounds concurrent backend data ops with a semaphore + bounded waiting queue; over-limit calls are shed with `BackendErrorKind::Backpressure` before reaching the backend — a slow backend can't exhaust the caller's connection pool or memory | 100 concurrent, 1 000 queued, 100 ms wait (Python SDK parity) |
 | **Graceful degradation** | On outage-class backend failure (transient, timeout, open breaker, backpressure shed), `#[cachekit]`-wrapped functions run uncached (fail-open); permanent/auth errors propagate — a wrong API key fails loudly. `#[cachekit(secure)]` paths fail **closed** on everything — encrypted workloads never silently degrade | built into the macro |
-| **Single-flight** | Concurrent misses of one key collapse to a single execution: per-key in-process lock, plus a distributed fill lock across processes on lock-capable backends (cachekit.io, Redis). On single-node Redis the cold miss's first read carries the lock attempt (see [Redis](#redis)); under `reliability` that combined call passes the backpressure limiter and circuit breaker like a read but is never retried, since a retry after a lost reply would find its own lock and report it contested. A combined call that times out or loses its connection counts no breaker failure: the cold miss re-reads the key with a plain, retried `GET`, which is the breaker's sample, serves a value it finds, and on a miss leads without the lock. One the server refuses (a full or read-only server, scripting denied) falls back to the separate read and lock call. One the stack sheds or fails fast fails the read as a plain read would, and the lock call follows. `#[cachekit(..., distributed_lock = false)]` drops that lock for one function's cold misses: no lock or unlock round trip, in-process dedup kept, and processes that miss one key together may each run the function. Its SWR background refresh still sends the lock and unlock | in-process always on; cross-process on by default (`distributed_lock = true`); cross-process 5 s lock, 100 ms polls, and a contested waiter computes once 5 s have passed since its own lock attempt; with `l1` on a tokio runtime (never under `unsync`), a stored fill's unlock is sent without the caller waiting for it; the client's next lock attempt on that key re-sends it if the backend has not answered, and if the caller's runtime is dropped or idle first, the lease can stay held for up to its 5 s timeout |
+| **Single-flight** | Concurrent misses of one key collapse to a single execution: per-key in-process lock, plus a distributed fill lock across processes on lock-capable backends (CacheKit Cloud, Redis). On single-node Redis the cold miss's first read carries the lock attempt (see [Redis](#redis)); under `reliability` that combined call passes the backpressure limiter and circuit breaker like a read but is never retried, since a retry after a lost reply would find its own lock and report it contested. A combined call that times out or loses its connection counts no breaker failure: the cold miss re-reads the key with a plain, retried `GET`, which is the breaker's sample, serves a value it finds, and on a miss leads without the lock. One the server refuses (a full or read-only server, scripting denied) falls back to the separate read and lock call. One the stack sheds or fails fast fails the read as a plain read would, and the lock call follows. `#[cachekit(..., distributed_lock = false)]` drops that lock for one function's cold misses: no lock or unlock round trip, in-process dedup kept, and processes that miss one key together may each run the function. Its SWR background refresh still sends the lock and unlock | in-process always on; cross-process on by default (`distributed_lock = true`); cross-process 5 s lock, 100 ms polls, and a contested waiter computes once 5 s have passed since its own lock attempt; with `l1` on a tokio runtime (never under `unsync`), a stored fill's unlock is sent without the caller waiting for it; the client's next lock attempt on that key re-sends it if the backend has not answered, and if the caller's runtime is dropped or idle first, the lease can stay held for up to its 5 s timeout |
 | **Stale-while-revalidate** | Stale-but-unexpired L1 hits are served immediately while one single-flight-deduplicated background task re-executes the function ([details](#stale-while-revalidate-swr)) | on by default with `l1` (native); threshold 0.5 × entry TTL ±10% jitter |
 
 Retry sits *inside* the breaker (one exhausted retry sequence = one breaker failure) and backpressure sits *outside* both — one permit per logical operation, held across the whole retry sequence, so retry amplification is bounded and shed calls never skew breaker state. Degradation, single-flight, and SWR sit in the `#[cachekit]` macro around the read path — the same composition as the TypeScript SDK's `ReliabilityExecutor` and the Python decorator.
@@ -671,7 +674,7 @@ let breaker = cache.circuit_state();       // Option<CircuitState>: Closed / Ope
 | `CacheKit::stats()` | `L1Stats { l1_hits, l2_hits, misses, l1_enabled }`. Each value read (`get`, `interop_get`, SWR and `SecureCache` variants) counts one outcome: a hit by the layer that served it, or a miss. Each `#[cachekit]` call counts one outcome too: a hit by the layer that served its value, or one miss when it runs the function; its own reads, single-flight re-polls included, count nothing. `exists`, and reads that fail at the backend or on an oversized payload, are not counted; a plain read whose served entry then fails to decode or decrypt counts the layer that served it. |
 | `CacheKit::l1_entry_count()` | Exact L1 occupancy. Sweeps expired entries out first, a pass over every entry, so poll it; don't put it on a hot path. |
 | `CacheKit::circuit_state()` | Live breaker state (`reliability` feature); `None` when the client has no breaker. |
-| SaaS telemetry headers | The cachekit.io backends send `X-CacheKit-L1-Hits` / `L2-Hits` / `Misses` / `L1-Hit-Rate` from the **same counters**, wired automatically by `CacheKitBuilder::build()`, and a sampled L1 hit-latency histogram: see [Telemetry sent to cachekit.io](#telemetry-sent-to-cachekitio). A `.metrics_provider(..)` set on the backend builder still takes precedence. One backend instance reports one client's counters — the first built over it; once that client is gone the counters fall back to `disabled`. |
+| CacheKit Cloud telemetry headers | The CacheKit Cloud backends send `X-CacheKit-L1-Hits` / `L2-Hits` / `Misses` / `L1-Hit-Rate` from the **same counters**, wired automatically by `CacheKitBuilder::build()`, and a sampled L1 hit-latency histogram: see [Telemetry sent to CacheKit Cloud](#telemetry-sent-to-cachekit-cloud). A `.metrics_provider(..)` set on the backend builder still takes precedence. One backend instance reports one client's counters — the first built over it; once that client is gone the counters fall back to `disabled`. |
 | `tracing` feature | One `debug` event per completed operation (a `#[cachekit]` call's reads emit one `get` event, with the call's outcome), per failed fill-lock call, and per `#[cachekit]` result the macro could not store, on the `cachekit` target, and breaker transitions on `cachekit::reliability` (`warn` on open, `info` for half-open / closed). |
 
 With the `tracing` feature, point your subscriber at the crate:
@@ -691,11 +694,11 @@ Fields: `op` (`get` | `set` | `delete` | `lock` | `unlock`), `outcome` (`l1_hit`
 
 Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rust services bring their own registry and bridge `tracing` themselves.
 
-### Telemetry sent to cachekit.io
+### Telemetry sent to CacheKit Cloud
 
-**Unreleased.** The latency headers and the telemetry switch are on `main` and in no published release yet. Releases up to 0.13.1 send the session and counter headers with no way to turn them off, and their `WorkersCachekitIO::builder()` takes no bindings.
+**Unreleased.** The latency headers and the telemetry switch are on `main` and in no published release yet. The current release sends the session and counter headers with no way to turn them off, and its `WorkersCachekitIO::builder()` takes no bindings.
 
-Only the cachekit.io backends, `CachekitIO` and `WorkersCachekitIO`, send telemetry, and only to the API they are built with; they never follow a redirect. A Redis, Memcached or File backend, or an L1-only client, sends none anywhere. While telemetry is on, each request carries these optional headers ([protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/saas-api.md#optional-metrics-headers)):
+Only the CacheKit Cloud backends, `CachekitIO` and `WorkersCachekitIO`, send telemetry, and only to the API they are built with; they never follow a redirect. A Redis, Memcached or File backend sends none anywhere. While telemetry is on, each request carries these optional headers ([protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/saas-api.md#optional-metrics-headers)):
 
 | Header | Value |
 |:-------|:------|
@@ -709,7 +712,7 @@ Only the cachekit.io backends, `CachekitIO` and `WorkersCachekitIO`, send teleme
 
 One value read in 128, drawn at random before the read starts, is timed, from the call's first step until it has its value: resolving the key, the L1 lookup, decryption and decoding. Only a read that L1 served and that returns a value counts; a `#[cachekit]` call that waited for another call's fill of the same key, an existence check, and the reads inside a `#[cachekit]` call are never timed. The report rides the backend's next request, except the health check, and is never sent again, even when that request fails. Hits timed after the last request are never sent. `WorkersCachekitIO` sends no latency headers: the Workers clock advances only on I/O, so it cannot time an in-memory hit.
 
-Telemetry is on by default during the closed beta, and becomes opt-in when cachekit.io reaches general availability. Two controls turn it off, and off from either wins:
+Telemetry is on by default during the closed beta, and becomes opt-in when CacheKit Cloud reaches general availability. Two controls turn it off, and off from either wins:
 
 - `.telemetry(false)` on `CachekitIO::builder()` or `WorkersCachekitIO::builder()`. The setting is unset by default.
 - `CACHEKIT_TELEMETRY=false` in the environment. `false`, `0`, `off` and `no` turn telemetry off and `true`, `1`, `on` and `yes` turn it on, in any case and ignoring surrounding white space. Unset or empty leaves the default. Any other value also turns telemetry off and warns once: through `tracing` natively (with the `tracing` feature), and to the console on Workers. On Workers the variable is read from the bindings passed to `WorkersCachekitIO::builder(&env)` and from `process.env`.
@@ -722,10 +725,10 @@ Both controls are read once, when the backend is built. With telemetry off the b
 
 | Variable | Required | Description |
 |:---------|:--------:|:------------|
-| `CACHEKIT_API_KEY` | ✅ | API key for cachekit.io (`from_env()` and `CacheKit::io_from_env()`) |
+| `CACHEKIT_API_KEY` | ✅ | API key for CacheKit Cloud (`from_env()` and `CacheKit::io_from_env()`) |
 | `CACHEKIT_API_URL` | ❌ | Override API endpoint (default: `https://api.cachekit.io`) |
 | `CACHEKIT_MASTER_KEY` | ❌ | Hex-encoded master key for encryption (`CacheKit::secure_from_env()` and the builder's `.encryption_from_env()`); use exactly 32 bytes (64 hex chars) — shorter, non-hex or non-UTF-8 values are rejected, never treated as unset. A key source, never a switch: `from_env()` validates it but does not encrypt, and while it is set a `from_env()` builder needs `.encryption_from_env()` or `.no_encryption()` |
-| `CACHEKIT_TELEMETRY` | ❌ | `false` / `0` / `off` / `no` turns off the optional telemetry headers a cachekit.io backend sends; read once when the backend is built. See [Telemetry sent to cachekit.io](#telemetry-sent-to-cachekitio) |
+| `CACHEKIT_TELEMETRY` | ❌ | `false` / `0` / `off` / `no` turns off the optional telemetry headers a CacheKit Cloud backend sends; read once when the backend is built. See [Telemetry sent to CacheKit Cloud](#telemetry-sent-to-cachekit-cloud) |
 | `CACHEKIT_PREVIOUS_MASTER_KEYS` | ❌ | Comma-separated hex-encoded decrypt-only previous master keys for key rotation (`CacheKit::secure_from_env()` and `.encryption_from_env()`; max 3; a blank value is treated as unset). `from_env()` validates it and fails on a malformed value, even for a `.no_encryption()` client |
 
 > [!CAUTION]
@@ -748,17 +751,17 @@ cachekit-rs/
 │   │       ├── encryption.rs  # AES-256-GCM + AAD v0x03
 │   │       ├── error.rs       # CachekitError, BackendError
 │   │       ├── interop.rs     # interop/v1 cross-SDK keys + strict reads
-│   │       ├── metrics.rs     # Live counters, SaaS telemetry headers, tracing events
+│   │       ├── metrics.rs     # Live counters, CacheKit Cloud telemetry headers, tracing events
 │   │       ├── session.rs     # SDK session tracking
 │   │       ├── url_validator.rs # SSRF-safe URL validation
 │   │       ├── serializer/    # MessagePack serialization
 │   │       ├── l1/            # L1 cache: quick_cache plus TTL and SWR (feature = "l1")
 │   │       └── backend/
 │   │           ├── mod.rs     # Backend + TtlInspectable + LockableBackend traits
-│   │           ├── cachekitio.rs      # cachekit.io HTTP backend
+│   │           ├── cachekitio.rs      # CacheKit Cloud HTTP backend
 │   │           ├── cachekitio_lock.rs # Distributed locking
 │   │           ├── cachekitio_ttl.rs  # TTL inspection
-│   │           ├── saas_wire.rs       # SaaS lock/TTL JSON wire bodies
+│   │           ├── saas_wire.rs       # CacheKit Cloud lock/TTL JSON wire bodies
 │   │           ├── redis.rs           # Redis backend (feature = "redis")
 │   │           └── workers.rs         # Workers backend (feature = "workers")
 │   │
@@ -979,7 +982,7 @@ release tag instead. The check is not required: a deliberate cost increase is
 accepted at review.
 
 **Client wall time** — `examples/wall_time_probe.rs` times `CacheKit` calls
-against the cachekit.io dev endpoint and writes one JSON object per request. It runs
+against the CacheKit Cloud dev endpoint and writes one JSON object per request. It runs
 two arms in one process, interleaved in ABBA blocks, with a new client
 (warmed by one GET miss) for every block: `sdk` is the real
 `CachekitIO` backend, and `transport` is a copy of it over the same `reqwest`
