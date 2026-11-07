@@ -928,8 +928,8 @@ targets turn on.
 `l1_hit_row` reads an L1 hit whose value is a 20-field struct, stored as a
 MessagePack map of 20 entries, so it prices decoding a many-field value: a
 bounds walk, where one runs, covers 41 headers where a `String` value has one.
-It runs `plain` only, since it prices a plaintext decode: the encrypted modes
-decode decrypted plaintext, which is walked on every read.
+It runs `plain` and `enc`, where the value decoded is the decrypted
+plaintext.
 `ns` and `nsenc` run `l1_hit`, `l2_hit` and `set` as `plain` and `enc` on a
 client with a `.namespace()`, which builds `{namespace}:{key}` on every op.
 `delete/parked256` and `delete/parked1024` run the plain 64 B `delete` while
