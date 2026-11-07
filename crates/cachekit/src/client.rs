@@ -1302,14 +1302,13 @@ impl CacheKit {
         self.reject_namespaced_interop()?;
         let full_key = self.resolve_key(key)?;
         let read = self.read_bytes_swr(&full_key, lead).await?;
-        // An encrypting client reads the same bytes and decodes them
-        // differently, so it branches after this one await, synchronously.
-        // Awaiting a secure read here instead stored that read's future in
-        // this one, and any change to the secure read changed the code of
-        // every plain read.
+        // Plain and encrypting clients read the same bytes and differ only in
+        // the decode, so branch after the await, synchronously: an awaited
+        // secure read's future would sit in this future's state, which every
+        // plain read shares.
         #[cfg(feature = "encryption")]
         if let Some(secure) = self.encrypting() {
-            return secure.decode_swr(read, &full_key);
+            return secure.open_swr(read, &full_key);
         }
         Ok(match read {
             SwrRead::Fresh((payload, by)) => {
@@ -1637,10 +1636,10 @@ impl SecureCache<'_> {
         }
     }
 
-    /// The secure decode of [`CacheKit::__interop_read_swr`] and
-    /// [`CacheKit::__interop_read_swr_leading`]: `read` is what an encrypting
-    /// client's read returned for `full_key`.
-    fn decode_swr<T: DeserializeOwned>(
+    /// [`Self::open`] over `read`, what an encrypting client's
+    /// [`CacheKit::__interop_read_swr`] or
+    /// [`CacheKit::__interop_read_swr_leading`] read for `full_key`.
+    fn open_swr<T: DeserializeOwned>(
         &self,
         read: SwrRead<(Payload, ReadOutcome)>,
         full_key: &str,
