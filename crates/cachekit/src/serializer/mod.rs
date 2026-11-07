@@ -1,3 +1,6 @@
+#[cfg(feature = "encryption")]
+use std::cell::Cell;
+
 use bytes::Bytes;
 use cachekit_core::msgpack_document_len;
 use rmp_serde::decode::ReadRefReader;
@@ -22,7 +25,9 @@ use crate::error::CachekitError;
 /// runs before every decode in [`deserialize`] and
 /// [`crate::interop::deserialize`]. A client without encryption also runs it
 /// once when a backend read or its own write admits bytes, and a decode of
-/// bytes that passed then skips it (see `Payload`). Depth
+/// bytes that passed then skips it (see `Payload`). An encrypting client
+/// runs it on decrypted plaintext until an L1 hit's plaintext passes, and
+/// later hits on that L1 ciphertext skip it (see `Decrypted`). Depth
 /// counts every array and map header on the deepest path, empty ones included;
 /// scalars, str, bin and ext are leaves.
 /// Exactly `MAX_DECODE_DEPTH` levels are accepted, and one more is rejected
@@ -37,8 +42,11 @@ pub(crate) type SliceDeserializer<'a> = rmp_serde::Deserializer<ReadRefReader<'a
 ///
 /// Every decode of backend-supplied bytes (auto-mode [`deserialize`] and
 /// [`crate::interop::deserialize`]) MUST go through here, or through
-/// `Payload::deserializer`, which skips the walk only for bytes whose mark
-/// `Payload::walk` set after running these same checks. It runs cachekit-core's header-only
+/// `Payload::deserializer` or `Decrypted::deserializer`, which skip the walk
+/// only when a mark says these same checks already passed on the same bytes:
+/// minted by `Payload::walk`, or by `Decrypted::marked` after
+/// `Decrypted::deserializer`'s walk of the plaintext a ciphertext decrypts
+/// to passed. It runs cachekit-core's header-only
 /// `msgpack_document_len` walk first. The walk proves that a complete
 /// document lies within `bytes`, that it nests no deeper than
 /// [`MAX_DECODE_DEPTH`], and that no header declares more elements or bytes
@@ -114,37 +122,61 @@ fn depth_limited(bytes: &[u8]) -> SliceDeserializer<'_> {
     de
 }
 
-/// Stored value bytes, and whether they already passed [`check_bounds`].
+/// Stored value bytes, and what about them already passed [`check_bounds`].
 ///
 /// The walk guards a decode against bytes the backend controls, and a value
 /// this process wrote needs it too: rmp-serde's own depth limit does not count
 /// enum nesting, so a deep recursive enum would overflow the stack without it.
-/// Bytes need the walk once, not on every read. [`Self::walk`] is the only way
-/// to set the mark, and sets it only when the bytes pass, so a marked payload
-/// decodes without walking again. L1 keeps the mark for the entry's lifetime.
+/// Bytes need the walk once, not on every read. [`Self::walk`] and
+/// [`Decrypted::marked`] are the only ways to mint a mark, and mint it only
+/// when the walk passed. [`Self::deserializer`] honours only a
+/// [`Walked::Bytes`] mark and [`Decrypted::deserializer`] only a
+/// [`Walked::Plaintext`] one; either skips the walk on a mark it honours.
+/// L1 keeps the mark for the entry's lifetime.
 #[derive(Clone, Debug)]
 pub(crate) struct Payload {
-    // Private, with `walked`: nothing outside `walk` can pair a mark with
-    // other bytes.
+    // Private, with `walked`: nothing outside this module can pair a mark
+    // with other bytes.
     bytes: Bytes,
-    walked: bool,
+    walked: Walked,
+}
+
+/// What a [`Payload`]'s mark says passed [`check_bounds`]. Two kinds, so a
+/// mark one kind of decode earned is never honoured by the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Walked {
+    /// Nothing yet: every decode walks.
+    No,
+    /// The stored bytes, on a client without encryption.
+    Bytes,
+    /// The plaintext the stored bytes, AES-GCM ciphertext, decrypt to. The
+    /// client's keyring is fixed when it is built and the AAD binds the key
+    /// the entry is stored under, so the same ciphertext read under the same
+    /// key fails authentication or yields the same plaintext: the walk's
+    /// verdict on it cannot change. Every read still decrypts.
+    #[cfg(feature = "encryption")]
+    Plaintext,
 }
 
 impl Payload {
-    /// Bytes every decode walks: ciphertext, whose decrypted plaintext is
-    /// walked instead, and bytes nothing has checked.
+    /// Bytes every decode walks: ciphertext not yet decrypted and walked, and
+    /// bytes nothing has checked.
     #[cfg_attr(not(any(feature = "l1", feature = "encryption")), allow(dead_code))]
     pub(crate) fn unwalked(bytes: Bytes) -> Self {
         Self {
             bytes,
-            walked: false,
+            walked: Walked::No,
         }
     }
 
     /// Walk `bytes` now and mark them only if they pass. A failure is not
     /// reported here; a decode walks the unmarked bytes again and reports it.
     pub(crate) fn walk(bytes: Bytes) -> Self {
-        let walked = check_bounds(&bytes).is_ok();
+        let walked = if check_bounds(&bytes).is_ok() {
+            Walked::Bytes
+        } else {
+            Walked::No
+        };
         Self { bytes, walked }
     }
 
@@ -153,21 +185,97 @@ impl Payload {
         &self.bytes
     }
 
+    /// Whether `self` and `other` share one buffer. The address comparison is
+    /// sound while both are alive: each holds a reference, so the buffer
+    /// cannot be freed and its address reused.
+    #[cfg(all(feature = "l1", feature = "encryption"))]
+    pub(crate) fn same_buffer(&self, other: &Self) -> bool {
+        self.bytes.as_ptr() == other.bytes.as_ptr() && self.bytes.len() == other.bytes.len()
+    }
+
     /// Whether the bytes passed the walk.
     #[cfg(all(test, feature = "l1", not(feature = "unsync")))]
     pub(crate) fn is_walked(&self) -> bool {
-        self.walked
+        self.walked == Walked::Bytes
+    }
+
+    /// Whether the plaintext these bytes decrypt to passed the walk.
+    #[cfg(all(test, feature = "l1", feature = "encryption", not(feature = "unsync")))]
+    pub(crate) fn is_plaintext_walked(&self) -> bool {
+        self.walked == Walked::Plaintext
     }
 
     /// [`bounded_deserializer`] over the bytes, without the walk when they
     /// already passed it.
     pub(crate) fn deserializer(&self) -> Result<SliceDeserializer<'_>, CachekitError> {
-        if self.walked {
+        if self.walked == Walked::Bytes {
             Ok(depth_limited(&self.bytes))
         } else {
             bounded_deserializer(&self.bytes)
         }
     }
+
+    /// Decrypt the bytes with `decrypt`, which must decrypt for the key this
+    /// payload was read under, keeping the plaintext with its ciphertext.
+    #[cfg(feature = "encryption")]
+    pub(crate) fn decrypt(
+        &self,
+        decrypt: impl FnOnce(&[u8]) -> Result<Vec<u8>, CachekitError>,
+    ) -> Result<Decrypted<'_>, CachekitError> {
+        Ok(Decrypted {
+            plaintext: decrypt(&self.bytes)?,
+            ciphertext: self,
+            passed: Cell::new(false),
+        })
+    }
+}
+
+/// The plaintext a ciphertext [`Payload`] decrypted to.
+#[cfg(feature = "encryption")]
+pub(crate) struct Decrypted<'a> {
+    plaintext: Vec<u8>,
+    ciphertext: &'a Payload,
+    /// [`Self::deserializer`] walked the plaintext and it passed.
+    passed: Cell<bool>,
+}
+
+#[cfg(feature = "encryption")]
+impl Decrypted<'_> {
+    /// The decrypted bytes.
+    pub(crate) fn plaintext(&self) -> &[u8] {
+        &self.plaintext
+    }
+
+    /// [`bounded_deserializer`] over the plaintext, without the walk when the
+    /// ciphertext's mark says it already passed.
+    pub(crate) fn deserializer(&self) -> Result<SliceDeserializer<'_>, CachekitError> {
+        if self.ciphertext.walked == Walked::Plaintext {
+            return Ok(depth_limited(&self.plaintext));
+        }
+        let de = bounded_deserializer(&self.plaintext)?;
+        self.passed.set(true);
+        Ok(de)
+    }
+
+    /// The ciphertext marked as decrypting to plaintext that passed the walk,
+    /// when [`Self::deserializer`] walked it here and it passed: for the
+    /// caller to put back in L1 (`L1Cache::adopt`). `None` otherwise.
+    #[cfg(feature = "l1")]
+    pub(crate) fn marked(&self) -> Option<Payload> {
+        self.passed.get().then(|| Payload {
+            bytes: self.ciphertext.bytes.clone(),
+            walked: Walked::Plaintext,
+        })
+    }
+}
+
+/// [`deserialize`] for decrypted plaintext: skips the walk when the
+/// ciphertext's mark says it already passed (see [`Decrypted::deserializer`]).
+#[cfg(feature = "encryption")]
+pub(crate) fn deserialize_decrypted<T: DeserializeOwned>(
+    decrypted: &Decrypted<'_>,
+) -> Result<T, CachekitError> {
+    decode(decrypted.deserializer()?)
 }
 
 /// [`deserialize`] for a payload a read returned: a marked payload skips the

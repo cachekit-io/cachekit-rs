@@ -156,7 +156,7 @@ fn a_hostile_entry_fails_from_the_backend_and_again_from_l1() {
         for vector in vectors()["reject_vectors"].as_array().unwrap() {
             let name = vector["name"].as_str().unwrap();
             let bytes = unhex(vector["input_hex"].as_str().unwrap());
-            for (path, first, second) in read_every_path_twice_through_l1::<Json>(&bytes) {
+            for (path, [first, second]) in read_every_path_twice_through_l1::<Json>(&bytes) {
                 assert_guard_rejected(name, &format!("{path} (backend)"), first);
                 assert_guard_rejected(name, &format!("{path} (L1)"), second);
             }
@@ -173,7 +173,7 @@ fn every_accept_vector_decodes_from_the_backend_and_from_l1() {
         for vector in vectors()["accept_vectors"].as_array().unwrap() {
             let name = vector["name"].as_str().unwrap();
             let bytes = unhex(vector["input_hex"].as_str().unwrap());
-            for (path, first, second) in read_every_path_twice_through_l1::<Json>(&bytes) {
+            for (path, [first, second]) in read_every_path_twice_through_l1::<Json>(&bytes) {
                 let first = first.unwrap_or_else(|e| panic!("{name}: {path} (backend): {e}"));
                 let second = second.unwrap_or_else(|e| panic!("{name}: {path} (L1): {e}"));
                 assert_eq!(first, second, "{name}: {path}");
@@ -190,23 +190,14 @@ fn every_accept_vector_decodes_from_the_backend_and_from_l1() {
 #[cfg(feature = "l1")]
 #[test]
 fn an_own_write_of_a_deep_recursive_enum_fails_from_l1() {
-    #[derive(serde::Serialize, Deserialize)]
-    enum Node {
-        Leaf(i64),
-        List(Vec<Node>),
-    }
     on_default_stack(|| {
         let client = cachekit::CacheKit::builder()
             .backend(common::MockBackend::shared())
             .l1_capacity(16)
             .build()
             .expect("client builds");
-        let mut value = Node::Leaf(0);
-        for _ in 0..60 {
-            value = Node::List(vec![value]);
-        }
         common::runtime().block_on(async {
-            client.set("enum", &value).await.expect("set");
+            client.set("enum", &deep_enum()).await.expect("set");
             let read = client
                 .get::<Node>("enum")
                 .await
@@ -214,6 +205,109 @@ fn an_own_write_of_a_deep_recursive_enum_fails_from_l1() {
                 .map(|_| Json::Null);
             assert_eq!(client.stats().l1_hits, 1, "L1 served it");
             assert_guard_rejected("own enum write", "CacheKit::get (L1)", read);
+        });
+    });
+}
+
+/// `List` nested 60 deep: 120 MessagePack levels, which the walk rejects and
+/// rmp-serde alone would decode (see the test above).
+#[cfg(feature = "l1")]
+#[derive(serde::Serialize, Deserialize)]
+enum Node {
+    Leaf(i64),
+    List(Vec<Node>),
+}
+
+#[cfg(feature = "l1")]
+fn deep_enum() -> Node {
+    let mut value = Node::Leaf(0);
+    for _ in 0..60 {
+        value = Node::List(vec![value]);
+    }
+    value
+}
+
+/// An encrypting client's first L1 hit whose decrypted plaintext passes the
+/// walk marks the entry, and later hits skip the walk. Hostile plaintext
+/// under a valid tag must never be marked: the read from the backend fails,
+/// and so does every read L1 serves after it.
+///
+/// The secure path replaces the decoder's message, so a reject vector shows
+/// only that each read failed. The recursive enum is the case a wrong mark
+/// would let through: without the walk it decodes.
+#[cfg(all(feature = "l1", feature = "encryption"))]
+#[test]
+fn sealed_hostile_plaintext_fails_from_the_backend_and_every_time_from_l1() {
+    on_default_stack(|| {
+        let mut cases: Vec<(String, Vec<u8>)> = vectors()["reject_vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                let name = v["name"].as_str().unwrap().to_owned();
+                (name, unhex(v["input_hex"].as_str().unwrap()))
+            })
+            .collect();
+        cases.push((
+            "deep recursive enum".to_owned(),
+            serializer::serialize(&deep_enum()).unwrap(),
+        ));
+        for (name, plaintext) in cases {
+            let reads = common::read_every_path_sealed_through_l1::<Node>(&plaintext);
+            for (path, reads) in reads {
+                for (layer, read) in ["backend", "L1", "L1 again"].into_iter().zip(reads) {
+                    assert!(
+                        matches!(read, Err(CachekitError::Serialization(_))),
+                        "{name}: {path} ({layer}) must refuse sealed hostile plaintext"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// A sealed accept vector decodes the same from the backend, from the L1 hit
+/// that walks and marks it, and from the marked hit after it.
+#[cfg(all(feature = "l1", feature = "encryption"))]
+#[test]
+fn every_sealed_accept_vector_decodes_from_the_backend_and_from_l1() {
+    on_default_stack(|| {
+        for vector in vectors()["accept_vectors"].as_array().unwrap() {
+            let name = vector["name"].as_str().unwrap();
+            let bytes = unhex(vector["input_hex"].as_str().unwrap());
+            for (path, reads) in common::read_every_path_sealed_through_l1::<Json>(&bytes) {
+                let [backend, l1, l1_again] =
+                    reads.map(|r| r.unwrap_or_else(|e| panic!("{name}: {path}: {e}")));
+                assert_eq!(backend, l1, "{name}: {path}");
+                assert_eq!(l1, l1_again, "{name}: {path}");
+            }
+        }
+    });
+}
+
+/// The encrypting twin of `an_own_write_of_a_deep_recursive_enum_fails_from_l1`:
+/// an own write is not trusted either, so every L1 hit on it walks and fails.
+#[cfg(all(feature = "l1", feature = "encryption"))]
+#[test]
+fn an_own_encrypted_write_of_a_deep_recursive_enum_fails_from_l1_every_time() {
+    on_default_stack(|| {
+        let client = cachekit::CacheKit::builder()
+            .backend(common::MockBackend::shared())
+            .l1_capacity(16)
+            .encryption_from_bytes(&[0x42; 32], "own-write")
+            .expect("key and tenant")
+            .build()
+            .expect("client builds");
+        common::runtime().block_on(async {
+            client.set("enum", &deep_enum()).await.expect("set");
+            for hit in 1..=2 {
+                let read = client.get::<Node>("enum").await;
+                assert_eq!(client.stats().l1_hits, hit, "L1 served it");
+                assert!(
+                    matches!(read, Err(CachekitError::Serialization(_))),
+                    "L1 hit {hit} must refuse the deep enum"
+                );
+            }
         });
     });
 }

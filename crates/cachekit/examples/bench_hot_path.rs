@@ -333,9 +333,8 @@ fn is_case(op: &str, mode: &str, size: usize) -> bool {
         "oneshot" => matches!(mode, "enc" | "prev"),
         "macro_hit" => cfg!(feature = "macros") && !matches!(mode, "prev" | "ns" | "nsenc"),
         "l1_hit" | "l2_hit" => true,
-        // A plaintext decode: the encrypted modes decode decrypted plaintext,
-        // which is walked on every read.
-        "l1_hit_row" => mode == "plain",
+        // A many-field decode, of the stored bytes or of decrypted plaintext.
+        "l1_hit_row" => matches!(mode, "plain" | "enc"),
         "set" => mode != "prev",
         _ => !matches!(mode, "prev" | "ns" | "nsenc"),
     }

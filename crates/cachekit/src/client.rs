@@ -440,7 +440,8 @@ impl CacheKit {
     /// read that is before the L1 backfill, which runs before any decode, so
     /// L1 only holds a mark the bytes earned, and the read's own decode does
     /// not walk again. An encrypting client's bytes are ciphertext: they are
-    /// not MessagePack, and the decrypted plaintext is walked on every read.
+    /// not MessagePack, so they are admitted unwalked, and the first L1 hit
+    /// whose decrypted plaintext passes the walk marks them (`SecureCache::open`).
     #[cfg_attr(not(feature = "encryption"), allow(clippy::unused_self))]
     fn admit(&self, bytes: Bytes) -> Payload {
         #[cfg(feature = "encryption")]
@@ -524,6 +525,14 @@ impl CacheKit {
     fn l1_delete(&self, full_key: &str) {
         if let Some(ref l1) = self.l1 {
             l1.delete(full_key);
+        }
+    }
+
+    /// See [`crate::l1::L1Cache::adopt`].
+    #[cfg(all(feature = "l1", feature = "encryption"))]
+    fn l1_adopt(&self, full_key: &str, marked: Payload) {
+        if let Some(ref l1) = self.l1 {
+            l1.adopt(full_key, marked);
         }
     }
 
@@ -1290,13 +1299,18 @@ impl CacheKit {
         key: &str,
         lead: LeadSlot<'_>,
     ) -> Result<SwrRead<(T, ReadOutcome)>, CachekitError> {
-        #[cfg(feature = "encryption")]
-        if let Some(secure) = self.encrypting() {
-            return secure.__interop_read_swr(key, lead).await;
-        }
         self.reject_namespaced_interop()?;
         let full_key = self.resolve_key(key)?;
-        Ok(match self.read_bytes_swr(&full_key, lead).await? {
+        let read = self.read_bytes_swr(&full_key, lead).await?;
+        // Plain and encrypting clients read the same bytes and differ only in
+        // the decode, so branch after the await, synchronously: an awaited
+        // secure read's future would sit in this future's state, which every
+        // plain read shares.
+        #[cfg(feature = "encryption")]
+        if let Some(secure) = self.encrypting() {
+            return secure.open_swr(read, &full_key);
+        }
+        Ok(match read {
             SwrRead::Fresh((payload, by)) => {
                 SwrRead::Fresh((crate::interop::deserialize_payload(&payload)?, by))
             }
@@ -1532,8 +1546,12 @@ impl SecureCache<'_> {
         let Some((ciphertext, by)) = read_l1_first!(self.client, &full_key) else {
             return Ok(None);
         };
-        let plaintext = self.decrypt_or_evict(ciphertext.bytes(), &full_key)?;
-        let value = redact_decode(serializer::deserialize(&plaintext))?;
+        let value = self.open(
+            &ciphertext,
+            by,
+            &full_key,
+            serializer::deserialize_decrypted,
+        )?;
         self.client.l1_stop(sample, by);
         Ok(Some(value))
     }
@@ -1563,8 +1581,12 @@ impl SecureCache<'_> {
         let Some((ciphertext, by)) = read_l1_first!(self.client, &full_key) else {
             return Ok(None);
         };
-        let plaintext = self.decrypt_or_evict(ciphertext.bytes(), &full_key)?;
-        let value = redact_decode(crate::interop::deserialize(&plaintext))?;
+        let value = self.open(
+            &ciphertext,
+            by,
+            &full_key,
+            crate::interop::deserialize_decrypted,
+        )?;
         self.client.l1_stop(sample, by);
         Ok(Some(value))
     }
@@ -1586,14 +1608,11 @@ impl SecureCache<'_> {
         let sample = self.client.l1_sample();
         self.client.reject_namespaced_interop()?;
         let full_key = self.client.resolve_key(key)?;
-        let decode = |ct: &[u8]| -> Result<T, CachekitError> {
-            redact_decode(crate::interop::deserialize(
-                &self.decrypt_or_evict(ct, &full_key)?,
-            ))
-        };
+        let decode =
+            |ct: &Payload, by| self.open(ct, by, &full_key, crate::interop::deserialize_decrypted);
         let (read, by) = match self.client.get_bytes_swr(&full_key).await? {
-            SwrRead::Fresh((ct, by)) => (SwrRead::Fresh(decode(ct.bytes())?), by),
-            SwrRead::Stale((ct, by), token) => (SwrRead::Stale(decode(ct.bytes())?, token), by),
+            SwrRead::Fresh((ct, by)) => (SwrRead::Fresh(decode(&ct, by)?), by),
+            SwrRead::Stale((ct, by), token) => (SwrRead::Stale(decode(&ct, by)?, token), by),
             SwrRead::Miss => return Ok(SwrRead::Miss),
         };
         self.client.l1_stop(sample, by);
@@ -1610,35 +1629,60 @@ impl SecureCache<'_> {
         let full_key = self.client.resolve_key(key)?;
         match self.client.read_bytes(&full_key, None).await? {
             Some((ct, by)) => Ok(Some((
-                redact_decode(crate::interop::deserialize(
-                    &self.decrypt_or_evict(ct.bytes(), &full_key)?,
-                ))?,
+                self.open(&ct, by, &full_key, crate::interop::deserialize_decrypted)?,
                 by,
             ))),
             None => Ok(None),
         }
     }
 
-    /// The secure twin of [`CacheKit::__interop_read_swr`] and
-    /// [`CacheKit::__interop_read_swr_leading`], which hand an encrypting
-    /// client's reads here.
-    async fn __interop_read_swr<T: DeserializeOwned>(
+    /// [`Self::open`] over `read`, what an encrypting client's
+    /// [`CacheKit::__interop_read_swr`] or
+    /// [`CacheKit::__interop_read_swr_leading`] read for `full_key`.
+    fn open_swr<T: DeserializeOwned>(
         &self,
-        key: &str,
-        lead: LeadSlot<'_>,
+        read: SwrRead<(Payload, ReadOutcome)>,
+        full_key: &str,
     ) -> Result<SwrRead<(T, ReadOutcome)>, CachekitError> {
-        self.client.reject_namespaced_interop()?;
-        let full_key = self.client.resolve_key(key)?;
-        let decode = |ct: &[u8]| -> Result<T, CachekitError> {
-            redact_decode(crate::interop::deserialize(
-                &self.decrypt_or_evict(ct, &full_key)?,
-            ))
-        };
-        Ok(match self.client.read_bytes_swr(&full_key, lead).await? {
-            SwrRead::Fresh((ct, by)) => SwrRead::Fresh((decode(ct.bytes())?, by)),
-            SwrRead::Stale((ct, by), token) => SwrRead::Stale((decode(ct.bytes())?, by), token),
+        let decode =
+            |ct: &Payload, by| self.open(ct, by, full_key, crate::interop::deserialize_decrypted);
+        Ok(match read {
+            SwrRead::Fresh((ct, by)) => SwrRead::Fresh((decode(&ct, by)?, by)),
+            SwrRead::Stale((ct, by), token) => SwrRead::Stale((decode(&ct, by)?, by), token),
             SwrRead::Miss => SwrRead::Miss,
         })
+    }
+
+    /// Decrypt `ciphertext`, read for `full_key` from the layer `by`, and
+    /// decode its plaintext with `decode`, which walks the plaintext unless
+    /// the ciphertext's mark says it already passed. An L1 hit whose
+    /// plaintext passes the walk here marks its L1 entry, if L1 still holds
+    /// that ciphertext ([`crate::l1::L1Cache::adopt`]), so later hits on it
+    /// decode without the walk. An L2 hit marks nothing: L1 then pays one
+    /// write per key read twice, not one per key read.
+    ///
+    /// `decode` is a type parameter, not a function pointer, so each read
+    /// inlines its decoder as it did before the mark.
+    fn open<T>(
+        &self,
+        ciphertext: &Payload,
+        by: ReadOutcome,
+        full_key: &str,
+        decode: impl FnOnce(&serializer::Decrypted<'_>) -> Result<T, CachekitError>,
+    ) -> Result<T, CachekitError> {
+        let decrypted = ciphertext.decrypt(|ct| self.decrypt_or_evict(ct, full_key))?;
+        // Marked before the result is checked: a plaintext that passed the
+        // walk and does not decode as `T` still passed the walk.
+        let decoded = decode(&decrypted);
+        #[cfg(feature = "l1")]
+        if matches!(by, ReadOutcome::L1Hit | ReadOutcome::L1Stale) {
+            if let Some(marked) = decrypted.marked() {
+                self.client.l1_adopt(full_key, marked);
+            }
+        }
+        #[cfg(not(feature = "l1"))]
+        let _ = by;
+        decoded.map_err(redact::<T>)
     }
 
     /// Decrypt ciphertext read for `full_key`, the key this client passed to
@@ -1680,14 +1724,14 @@ impl SecureCache<'_> {
 /// …`), and that value is the plaintext encryption exists to protect
 /// (CWE-532).
 #[cfg(feature = "encryption")]
-fn redact_decode<T>(decoded: Result<T, CachekitError>) -> Result<T, CachekitError> {
-    decoded.map_err(|e| match e {
+fn redact<T>(e: CachekitError) -> CachekitError {
+    match e {
         CachekitError::Serialization(_) => CachekitError::Serialization(format!(
             "decrypted entry does not decode as {}",
             std::any::type_name::<T>()
         )),
         other => other,
-    })
+    }
 }
 
 // ── CacheKitBuilder ───────────────────────────────────────────────────────────
@@ -2605,5 +2649,121 @@ mod walked_mark_tests {
             Some("v")
         );
         assert!(walked(&client, "good"));
+    }
+}
+
+/// An encrypting client's L1 entry is marked once an L1 hit's decrypted
+/// plaintext passes the walk, and only while L1 still holds the ciphertext
+/// that hit read. That hostile plaintext stays unmarked is pinned on every
+/// read path by `tests/decode_bounds_tests.rs`.
+#[cfg(all(test, feature = "l1", feature = "encryption", not(feature = "unsync")))]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test-only: a failed setup step should panic loudly
+mod plaintext_mark_tests {
+    use super::{CacheKit, SharedBackend};
+    use crate::backend::MemoryBackend;
+
+    fn secure_client(backend: &MemoryBackend) -> CacheKit {
+        let shared: SharedBackend = std::sync::Arc::new(backend.clone());
+        CacheKit::builder()
+            .backend(shared)
+            .l1_capacity(16)
+            .encryption_from_bytes(&[0x42; 32], "marks")
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_public_l1_set_stays_unwalked() {
+        let l1 = crate::l1::L1Cache::new(16);
+        l1.set("k", &[0x01], std::time::Duration::from_secs(60));
+        let entry = l1.get_shared("k").unwrap();
+        assert!(!entry.is_walked() && !entry.is_plaintext_walked());
+    }
+
+    fn is_marked(client: &CacheKit, key: &str) -> bool {
+        let entry = client.l1_get(key).expect("an L1 entry");
+        assert!(
+            !entry.is_walked(),
+            "ciphertext never carries the plain mark"
+        );
+        entry.is_plaintext_walked()
+    }
+
+    #[tokio::test]
+    async fn an_own_write_is_marked_by_its_first_l1_hit() {
+        let client = secure_client(&MemoryBackend::default());
+        client.set("k", &vec![1u32, 2, 3]).await.unwrap();
+        assert!(!is_marked(&client, "k"), "a write is not trusted");
+        for _ in 0..2 {
+            assert_eq!(
+                client.get::<Vec<u32>>("k").await.unwrap(),
+                Some(vec![1, 2, 3])
+            );
+            assert!(is_marked(&client, "k"));
+        }
+    }
+
+    /// The mark records the walk, not the decode: a plaintext that passes the
+    /// walk and is read as the wrong type is marked, and the error stays.
+    #[tokio::test]
+    async fn a_walk_that_passes_marks_even_when_the_type_does_not_fit() {
+        let client = secure_client(&MemoryBackend::default());
+        client.set("k", &7u32).await.unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                client.get::<String>("k").await,
+                Err(crate::CachekitError::Serialization(_))
+            ));
+            assert!(is_marked(&client, "k"));
+        }
+        assert_eq!(client.get::<u32>("k").await.unwrap(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn an_l2_hit_marks_nothing_and_the_next_l1_hit_does() {
+        let backend = MemoryBackend::default();
+        secure_client(&backend).set("k", &"v").await.unwrap();
+        let client = secure_client(&backend);
+        assert_eq!(
+            client.get::<String>("k").await.unwrap().as_deref(),
+            Some("v")
+        );
+        assert_eq!(client.stats().l2_hits, 1);
+        assert!(!is_marked(&client, "k"));
+        assert_eq!(
+            client.get::<String>("k").await.unwrap().as_deref(),
+            Some("v")
+        );
+        assert_eq!(client.stats().l1_hits, 1);
+        assert!(is_marked(&client, "k"));
+    }
+
+    /// A mark lands only on the entry its read returned: a write or a delete
+    /// between the read and the mark leaves L1 as that write or delete left it.
+    #[tokio::test]
+    async fn a_mark_never_lands_on_a_rewritten_or_deleted_entry() {
+        let client = secure_client(&MemoryBackend::default());
+        let l1 = client.l1.as_ref().unwrap();
+        client.set("k", &1u32).await.unwrap();
+        let read = client.l1_get("k").unwrap();
+        let encryption = client.encryption.as_deref().unwrap();
+        let decrypted = read.decrypt(|ct| encryption.decrypt(ct, "k")).unwrap();
+        assert!(
+            decrypted.marked().is_none(),
+            "nothing is marked before the walk"
+        );
+        decrypted.deserializer().unwrap();
+        let marked = decrypted.marked().expect("the walk passed");
+
+        client.set("k", &2u32).await.unwrap();
+        l1.adopt("k", marked.clone());
+        assert!(!is_marked(&client, "k"), "the rewrite stays unmarked");
+        assert_eq!(client.get::<u32>("k").await.unwrap(), Some(2));
+
+        client.delete("k").await.unwrap();
+        l1.adopt("k", marked);
+        assert!(client.l1_get("k").is_none(), "a mark adds no entry");
+        assert_eq!(l1.entry_count(), 0);
     }
 }

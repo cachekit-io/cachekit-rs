@@ -230,6 +230,27 @@ impl L1Cache {
         );
     }
 
+    /// Put `marked`, a read's payload with the mark its decode just earned,
+    /// in place of `key`'s entry's payload, if that entry still holds the
+    /// same buffer. A rewrite holds another buffer and keeps its own mark;
+    /// after a delete or eviction there is no entry and none is added. The
+    /// entry's TTL and freshness window are unchanged; the swap counts as one
+    /// more access for eviction, as a read does.
+    #[cfg(feature = "encryption")]
+    pub(crate) fn adopt(&self, key: &str, marked: Payload) {
+        // Under the shard's write lock, so no write can land between the
+        // check and the swap. A zero timeout never waits on a placeholder;
+        // L1 inserts none, so only another `adopt` of an absent key holds
+        // one. On an absent key `entry` returns a placeholder guard, and
+        // dropping it uninserted removes the placeholder and nothing else.
+        let _ = self.store.entry(key, Some(Duration::ZERO), |_, entry| {
+            if entry.data.same_buffer(&marked) {
+                entry.data = marked;
+            }
+            quick_cache::sync::EntryAction::Retain(())
+        });
+    }
+
     /// Remove an entry by key.
     pub fn delete(&self, key: &str) {
         self.store.remove(key);
