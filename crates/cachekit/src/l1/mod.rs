@@ -234,7 +234,8 @@ impl L1Cache {
     /// in place of `key`'s entry's payload, if that entry still holds the
     /// same buffer. A rewrite holds another buffer and keeps its own mark;
     /// after a delete or eviction there is no entry and none is added. The
-    /// entry's TTL, freshness window and eviction state are unchanged.
+    /// entry's TTL and freshness window are unchanged; the swap counts as one
+    /// more access for eviction, as a read does.
     #[cfg(feature = "encryption")]
     pub(crate) fn adopt(&self, key: &str, marked: Payload) {
         // Under the shard's write lock, so no write can land between the

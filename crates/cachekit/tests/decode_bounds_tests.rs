@@ -156,7 +156,7 @@ fn a_hostile_entry_fails_from_the_backend_and_again_from_l1() {
         for vector in vectors()["reject_vectors"].as_array().unwrap() {
             let name = vector["name"].as_str().unwrap();
             let bytes = unhex(vector["input_hex"].as_str().unwrap());
-            for (path, first, second) in read_every_path_twice_through_l1::<Json>(&bytes) {
+            for (path, [first, second]) in read_every_path_twice_through_l1::<Json>(&bytes) {
                 assert_guard_rejected(name, &format!("{path} (backend)"), first);
                 assert_guard_rejected(name, &format!("{path} (L1)"), second);
             }
@@ -173,7 +173,7 @@ fn every_accept_vector_decodes_from_the_backend_and_from_l1() {
         for vector in vectors()["accept_vectors"].as_array().unwrap() {
             let name = vector["name"].as_str().unwrap();
             let bytes = unhex(vector["input_hex"].as_str().unwrap());
-            for (path, first, second) in read_every_path_twice_through_l1::<Json>(&bytes) {
+            for (path, [first, second]) in read_every_path_twice_through_l1::<Json>(&bytes) {
                 let first = first.unwrap_or_else(|e| panic!("{name}: {path} (backend): {e}"));
                 let second = second.unwrap_or_else(|e| panic!("{name}: {path} (L1): {e}"));
                 assert_eq!(first, second, "{name}: {path}");

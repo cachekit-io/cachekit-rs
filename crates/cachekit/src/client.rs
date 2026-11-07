@@ -1668,7 +1668,9 @@ impl SecureCache<'_> {
         decode: impl FnOnce(&serializer::Decrypted<'_>) -> Result<T, CachekitError>,
     ) -> Result<T, CachekitError> {
         let decrypted = ciphertext.decrypt(|ct| self.decrypt_or_evict(ct, full_key))?;
-        let value = decode(&decrypted).map_err(redact::<T>)?;
+        // Marked before the result is checked: a plaintext that passed the
+        // walk and does not decode as `T` still passed the walk.
+        let decoded = decode(&decrypted);
         #[cfg(feature = "l1")]
         if matches!(by, ReadOutcome::L1Hit | ReadOutcome::L1Stale) {
             if let Some(marked) = decrypted.marked() {
@@ -1677,7 +1679,7 @@ impl SecureCache<'_> {
         }
         #[cfg(not(feature = "l1"))]
         let _ = by;
-        Ok(value)
+        decoded.map_err(redact::<T>)
     }
 
     /// Decrypt ciphertext read for `full_key`, the key this client passed to
@@ -2697,6 +2699,22 @@ mod plaintext_mark_tests {
             );
             assert!(is_marked(&client, "k"));
         }
+    }
+
+    /// The mark records the walk, not the decode: a plaintext that passes the
+    /// walk and is read as the wrong type is marked, and the error stays.
+    #[tokio::test]
+    async fn a_walk_that_passes_marks_even_when_the_type_does_not_fit() {
+        let client = secure_client(&MemoryBackend::default());
+        client.set("k", &7u32).await.unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                client.get::<String>("k").await,
+                Err(crate::CachekitError::Serialization(_))
+            ));
+            assert!(is_marked(&client, "k"));
+        }
+        assert_eq!(client.get::<u32>("k").await.unwrap(), Some(7));
     }
 
     #[tokio::test]

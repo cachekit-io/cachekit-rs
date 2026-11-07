@@ -44,8 +44,9 @@ pub(crate) type SliceDeserializer<'a> = rmp_serde::Deserializer<ReadRefReader<'a
 /// [`crate::interop::deserialize`]) MUST go through here, or through
 /// `Payload::deserializer` or `Decrypted::deserializer`, which skip the walk
 /// only when a mark says these same checks already passed on the same bytes:
-/// set by `Payload::walk`, or by `Decrypted::deserializer` on the plaintext a
-/// ciphertext decrypts to. It runs cachekit-core's header-only
+/// minted by `Payload::walk`, or by `Decrypted::marked` after
+/// `Decrypted::deserializer`'s walk of the plaintext a ciphertext decrypts
+/// to passed. It runs cachekit-core's header-only
 /// `msgpack_document_len` walk first. The walk proves that a complete
 /// document lies within `bytes`, that it nests no deeper than
 /// [`MAX_DECODE_DEPTH`], and that no header declares more elements or bytes
@@ -121,15 +122,17 @@ fn depth_limited(bytes: &[u8]) -> SliceDeserializer<'_> {
     de
 }
 
-/// Stored value bytes, and whether they already passed [`check_bounds`].
+/// Stored value bytes, and what about them already passed [`check_bounds`].
 ///
 /// The walk guards a decode against bytes the backend controls, and a value
 /// this process wrote needs it too: rmp-serde's own depth limit does not count
 /// enum nesting, so a deep recursive enum would overflow the stack without it.
 /// Bytes need the walk once, not on every read. [`Self::walk`] and
-/// [`Decrypted::deserializer`] are the only ways to set the mark, and set it
-/// only when the walk passes, so a marked payload decodes without walking
-/// again. L1 keeps the mark for the entry's lifetime.
+/// [`Decrypted::marked`] are the only ways to mint a mark, and mint it only
+/// when the walk passed. [`Self::deserializer`] honours only a
+/// [`Walked::Bytes`] mark and [`Decrypted::deserializer`] only a
+/// [`Walked::Plaintext`] one; either skips the walk on a mark it honours.
+/// L1 keeps the mark for the entry's lifetime.
 #[derive(Clone, Debug)]
 pub(crate) struct Payload {
     // Private, with `walked`: nothing outside this module can pair a mark
