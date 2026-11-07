@@ -265,6 +265,53 @@ pub fn read_every_path_twice_through_l1<T: DeserializeOwned>(bytes: &[u8]) -> Ve
     })
 }
 
+/// One path of an encrypting client read three times: from the backend, from
+/// L1, and from L1 again.
+#[cfg(all(feature = "l1", feature = "encryption"))]
+pub type ReadThrice<T> = (&'static str, [Result<T, CachekitError>; 3]);
+
+/// [`read_every_path_twice_through_l1`] on an encrypting client, whose
+/// backend entry is `plaintext` sealed under the client's own key for the
+/// entry's key, so it passes authentication and only the decode can refuse
+/// it. Each path reads it from the backend, then, with the backend copy
+/// removed, twice from L1: the first L1 hit walks the plaintext, and the
+/// second skips the walk only if the first marked the entry. A miss panics,
+/// so L1 served both of those reads.
+#[cfg(all(feature = "l1", feature = "encryption"))]
+pub fn read_every_path_sealed_through_l1<T: DeserializeOwned>(
+    plaintext: &[u8],
+) -> Vec<ReadThrice<T>> {
+    const KEY: [u8; 32] = [0x42; 32];
+    const TENANT: &str = "sealed-reads";
+    let runtime = runtime();
+    let (backend, handle) = MockBackend::new_with_handle();
+    let client = CacheKit::builder()
+        .backend(backend)
+        .l1_capacity(64)
+        .encryption_from_bytes(&KEY, TENANT)
+        .expect("key and tenant")
+        .build()
+        .expect("client builds");
+    let layer = cachekit::EncryptionLayer::new(&KEY, TENANT).expect("key and tenant");
+    let found = |r: Result<Option<T>, CachekitError>| {
+        r.map(|v| v.expect("the sealed entry must be found, not missed"))
+    };
+    runtime.block_on(async {
+        let mut reads = Vec::new();
+        for path in L1_READS {
+            let key = format!("sealed:{path}");
+            let sealed = layer.encrypt(plaintext, &key).expect("seal");
+            handle.store.lock().await.insert(key.clone(), sealed);
+            let backend = found(read_by::<T>(&client, path, &key).await);
+            handle.store.lock().await.remove(&key);
+            let l1 = found(read_by::<T>(&client, path, &key).await);
+            let l1_again = found(read_by::<T>(&client, path, &key).await);
+            reads.push((path, [backend, l1, l1_again]));
+        }
+        reads
+    })
+}
+
 /// An encrypting client, L1 off so every read reaches the backend, holding
 /// `bytes` at the backend key `stored_key`.
 #[cfg(feature = "encryption")]
