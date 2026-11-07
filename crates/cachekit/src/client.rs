@@ -1657,21 +1657,26 @@ impl SecureCache<'_> {
     /// that ciphertext ([`crate::l1::L1Cache::adopt`]), so later hits on it
     /// decode without the walk. An L2 hit marks nothing: L1 then pays one
     /// write per key read twice, not one per key read.
+    ///
+    /// `decode` is a type parameter, not a function pointer, so each read
+    /// inlines its decoder as it did before the mark.
     fn open<T>(
         &self,
         ciphertext: &Payload,
         by: ReadOutcome,
         full_key: &str,
-        decode: DecodeDecrypted<T>,
+        decode: impl FnOnce(&serializer::Decrypted<'_>) -> Result<T, CachekitError>,
     ) -> Result<T, CachekitError> {
         let decrypted = ciphertext.decrypt(|ct| self.decrypt_or_evict(ct, full_key))?;
-        let (value, marked) = decode(&decrypted).map_err(redact::<T>)?;
+        let value = decode(&decrypted).map_err(redact::<T>)?;
         #[cfg(feature = "l1")]
-        if let (Some(marked), ReadOutcome::L1Hit | ReadOutcome::L1Stale) = (marked, by) {
-            self.client.l1_adopt(full_key, marked);
+        if matches!(by, ReadOutcome::L1Hit | ReadOutcome::L1Stale) {
+            if let Some(marked) = decrypted.marked() {
+                self.client.l1_adopt(full_key, marked);
+            }
         }
         #[cfg(not(feature = "l1"))]
-        let _ = (marked, by);
+        let _ = by;
         Ok(value)
     }
 
@@ -1723,12 +1728,6 @@ fn redact<T>(e: CachekitError) -> CachekitError {
         other => other,
     }
 }
-
-/// A decoder of decrypted plaintext, auto-mode or interop, returning the
-/// ciphertext marked when it walked the plaintext and it passed.
-#[cfg(feature = "encryption")]
-type DecodeDecrypted<T> =
-    fn(&serializer::Decrypted<'_>) -> Result<(T, Option<Payload>), CachekitError>;
 
 // ── CacheKitBuilder ───────────────────────────────────────────────────────────
 
@@ -2721,11 +2720,12 @@ mod plaintext_mark_tests {
         let read = client.l1_get("k").unwrap();
         let encryption = client.encryption.as_deref().unwrap();
         let decrypted = read.decrypt(|ct| encryption.decrypt(ct, "k")).unwrap();
-        let marked = decrypted
-            .deserializer()
-            .unwrap()
-            .1
-            .expect("the walk passed");
+        assert!(
+            decrypted.marked().is_none(),
+            "nothing is marked before the walk"
+        );
+        decrypted.deserializer().unwrap();
+        let marked = decrypted.marked().expect("the walk passed");
 
         client.set("k", &2u32).await.unwrap();
         l1.adopt("k", marked.clone());

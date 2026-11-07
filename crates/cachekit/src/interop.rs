@@ -485,15 +485,15 @@ pub(crate) fn deserialize_payload<T: DeserializeOwned>(
     decode(payload.deserializer()?)
 }
 
-/// [`deserialize`] for decrypted plaintext, with the ciphertext marked when
-/// this decode walked it (see `crate::serializer::Decrypted::deserializer`).
+/// [`deserialize`] for decrypted plaintext: skips the walk when the
+/// ciphertext's mark says it already passed (see
+/// `crate::serializer::Decrypted::deserializer`).
 #[cfg(feature = "encryption")]
 pub(crate) fn deserialize_decrypted<T: DeserializeOwned>(
     decrypted: &crate::serializer::Decrypted<'_>,
-) -> Result<(T, Option<crate::serializer::Payload>), CachekitError> {
+) -> Result<T, CachekitError> {
     reject_ck_frame(decrypted.plaintext())?;
-    let (de, marked) = decrypted.deserializer()?;
-    Ok((decode(de)?, marked))
+    decode(decrypted.deserializer()?)
 }
 
 fn reject_ck_frame(bytes: &[u8]) -> Result<(), CachekitError> {

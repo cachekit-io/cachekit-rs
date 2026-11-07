@@ -1,3 +1,6 @@
+#[cfg(feature = "encryption")]
+use std::cell::Cell;
+
 use bytes::Bytes;
 use cachekit_core::msgpack_document_len;
 use rmp_serde::decode::ReadRefReader;
@@ -215,6 +218,7 @@ impl Payload {
         Ok(Decrypted {
             plaintext: decrypt(&self.bytes)?,
             ciphertext: self,
+            passed: Cell::new(false),
         })
     }
 }
@@ -224,6 +228,8 @@ impl Payload {
 pub(crate) struct Decrypted<'a> {
     plaintext: Vec<u8>,
     ciphertext: &'a Payload,
+    /// [`Self::deserializer`] walked the plaintext and it passed.
+    passed: Cell<bool>,
 }
 
 #[cfg(feature = "encryption")]
@@ -234,32 +240,35 @@ impl Decrypted<'_> {
     }
 
     /// [`bounded_deserializer`] over the plaintext, without the walk when the
-    /// ciphertext's mark says it already passed. When this call walked the
-    /// plaintext and it passed, it also returns the ciphertext marked so, for
-    /// the caller to put back in L1 (`L1Cache::adopt`).
-    pub(crate) fn deserializer(
-        &self,
-    ) -> Result<(SliceDeserializer<'_>, Option<Payload>), CachekitError> {
+    /// ciphertext's mark says it already passed.
+    pub(crate) fn deserializer(&self) -> Result<SliceDeserializer<'_>, CachekitError> {
         if self.ciphertext.walked == Walked::Plaintext {
-            return Ok((depth_limited(&self.plaintext), None));
+            return Ok(depth_limited(&self.plaintext));
         }
         let de = bounded_deserializer(&self.plaintext)?;
-        let marked = Payload {
+        self.passed.set(true);
+        Ok(de)
+    }
+
+    /// The ciphertext marked as decrypting to plaintext that passed the walk,
+    /// when [`Self::deserializer`] walked it here and it passed: for the
+    /// caller to put back in L1 (`L1Cache::adopt`). `None` otherwise.
+    #[cfg(feature = "l1")]
+    pub(crate) fn marked(&self) -> Option<Payload> {
+        self.passed.get().then(|| Payload {
             bytes: self.ciphertext.bytes.clone(),
             walked: Walked::Plaintext,
-        };
-        Ok((de, Some(marked)))
+        })
     }
 }
 
-/// [`deserialize`] for decrypted plaintext, with the ciphertext marked when
-/// this decode walked it (see [`Decrypted::deserializer`]).
+/// [`deserialize`] for decrypted plaintext: skips the walk when the
+/// ciphertext's mark says it already passed (see [`Decrypted::deserializer`]).
 #[cfg(feature = "encryption")]
 pub(crate) fn deserialize_decrypted<T: DeserializeOwned>(
     decrypted: &Decrypted<'_>,
-) -> Result<(T, Option<Payload>), CachekitError> {
-    let (de, marked) = decrypted.deserializer()?;
-    Ok((decode(de)?, marked))
+) -> Result<T, CachekitError> {
+    decode(decrypted.deserializer()?)
 }
 
 /// [`deserialize`] for a payload a read returned: a marked payload skips the
