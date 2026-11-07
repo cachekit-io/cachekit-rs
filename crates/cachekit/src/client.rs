@@ -1299,13 +1299,19 @@ impl CacheKit {
         key: &str,
         lead: LeadSlot<'_>,
     ) -> Result<SwrRead<(T, ReadOutcome)>, CachekitError> {
-        #[cfg(feature = "encryption")]
-        if let Some(secure) = self.encrypting() {
-            return secure.__interop_read_swr(key, lead).await;
-        }
         self.reject_namespaced_interop()?;
         let full_key = self.resolve_key(key)?;
-        Ok(match self.read_bytes_swr(&full_key, lead).await? {
+        let read = self.read_bytes_swr(&full_key, lead).await?;
+        // An encrypting client reads the same bytes and decodes them
+        // differently, so it branches after this one await, synchronously.
+        // Awaiting a secure read here instead stored that read's future in
+        // this one, and any change to the secure read changed the code of
+        // every plain read.
+        #[cfg(feature = "encryption")]
+        if let Some(secure) = self.encrypting() {
+            return secure.decode_swr(read, &full_key);
+        }
+        Ok(match read {
             SwrRead::Fresh((payload, by)) => {
                 SwrRead::Fresh((crate::interop::deserialize_payload(&payload)?, by))
             }
@@ -1631,19 +1637,17 @@ impl SecureCache<'_> {
         }
     }
 
-    /// The secure twin of [`CacheKit::__interop_read_swr`] and
-    /// [`CacheKit::__interop_read_swr_leading`], which hand an encrypting
-    /// client's reads here.
-    async fn __interop_read_swr<T: DeserializeOwned>(
+    /// The secure decode of [`CacheKit::__interop_read_swr`] and
+    /// [`CacheKit::__interop_read_swr_leading`]: `read` is what an encrypting
+    /// client's read returned for `full_key`.
+    fn decode_swr<T: DeserializeOwned>(
         &self,
-        key: &str,
-        lead: LeadSlot<'_>,
+        read: SwrRead<(Payload, ReadOutcome)>,
+        full_key: &str,
     ) -> Result<SwrRead<(T, ReadOutcome)>, CachekitError> {
-        self.client.reject_namespaced_interop()?;
-        let full_key = self.client.resolve_key(key)?;
         let decode =
-            |ct: &Payload, by| self.open(ct, by, &full_key, crate::interop::deserialize_decrypted);
-        Ok(match self.client.read_bytes_swr(&full_key, lead).await? {
+            |ct: &Payload, by| self.open(ct, by, full_key, crate::interop::deserialize_decrypted);
+        Ok(match read {
             SwrRead::Fresh((ct, by)) => SwrRead::Fresh((decode(&ct, by)?, by)),
             SwrRead::Stale((ct, by), token) => SwrRead::Stale((decode(&ct, by)?, by), token),
             SwrRead::Miss => SwrRead::Miss,
