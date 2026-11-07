@@ -1390,9 +1390,9 @@ impl CacheKit {
     }
 
     /// The encrypting handle when encryption is configured. Every value
-    /// method routes through it first, so a configured key leaves no
-    /// plaintext path (protocol `spec/intent-presets.md` § Encryption
-    /// Activation, rule 1).
+    /// method branches on it before it encodes or decodes a value, so a
+    /// configured key leaves no plaintext path (protocol
+    /// `spec/intent-presets.md` § Encryption Activation, rule 1).
     #[cfg(feature = "encryption")]
     fn encrypting(&self) -> Option<SecureCache<'_>> {
         self.encryption.as_deref().map(|encryption| SecureCache {
