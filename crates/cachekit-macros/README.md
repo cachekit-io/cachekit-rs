@@ -22,7 +22,7 @@ This crate is not intended to be used directly. Add it via the `macros` feature 
 <!-- x-release-please-start-version -->
 ```toml
 [dependencies]
-cachekit-rs = { version = "0.13.1", features = ["macros"] }
+cachekit-rs = { version = "0.14.0", features = ["macros"] }
 ```
 <!-- x-release-please-end -->
 
