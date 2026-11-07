@@ -1254,16 +1254,23 @@ impl CacheKit {
         &self,
         key: &str,
     ) -> Result<Option<(T, ReadOutcome)>, CachekitError> {
-        #[cfg(feature = "encryption")]
-        if let Some(secure) = self.encrypting() {
-            return secure.__interop_read(key).await;
-        }
         self.reject_namespaced_interop()?;
         let full_key = self.resolve_key(key)?;
-        match self.read_bytes(&full_key, None).await? {
-            Some((payload, by)) => Ok(Some((crate::interop::deserialize_payload(&payload)?, by))),
-            None => Ok(None),
+        let Some((payload, by)) = self.read_bytes(&full_key, None).await? else {
+            return Ok(None);
+        };
+        // Branch after the await, synchronously, as `interop_read_swr` does.
+        #[cfg(feature = "encryption")]
+        if let Some(secure) = self.encrypting() {
+            let value = secure.open(
+                &payload,
+                by,
+                &full_key,
+                crate::interop::deserialize_decrypted,
+            )?;
+            return Ok(Some((value, by)));
         }
+        Ok(Some((crate::interop::deserialize_payload(&payload)?, by)))
     }
 
     /// [`Self::interop_get_swr`] for a `#[cachekit]` call, uncounted like
@@ -1617,23 +1624,6 @@ impl SecureCache<'_> {
         };
         self.client.l1_stop(sample, by);
         Ok(read)
-    }
-
-    /// The secure twin of [`CacheKit::__interop_read`], which hands an
-    /// encrypting client's reads here.
-    async fn __interop_read<T: DeserializeOwned>(
-        &self,
-        key: &str,
-    ) -> Result<Option<(T, ReadOutcome)>, CachekitError> {
-        self.client.reject_namespaced_interop()?;
-        let full_key = self.client.resolve_key(key)?;
-        match self.client.read_bytes(&full_key, None).await? {
-            Some((ct, by)) => Ok(Some((
-                self.open(&ct, by, &full_key, crate::interop::deserialize_decrypted)?,
-                by,
-            ))),
-            None => Ok(None),
-        }
     }
 
     /// [`Self::open`] over `read`, what an encrypting client's
