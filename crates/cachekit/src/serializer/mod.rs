@@ -25,7 +25,9 @@ use crate::error::CachekitError;
 /// runs before every decode in [`deserialize`] and
 /// [`crate::interop::deserialize`]. A client without encryption also runs it
 /// once when a backend read or its own write admits bytes, and a decode of
-/// bytes that passed then skips it (see `Payload`). Depth
+/// bytes that passed then skips it (see `Payload`). An encrypting client
+/// runs it on decrypted plaintext until an L1 hit's plaintext passes, and
+/// later hits on that L1 ciphertext skip it (see `Decrypted`). Depth
 /// counts every array and map header on the deepest path, empty ones included;
 /// scalars, str, bin and ext are leaves.
 /// Exactly `MAX_DECODE_DEPTH` levels are accepted, and one more is rejected
@@ -40,8 +42,10 @@ pub(crate) type SliceDeserializer<'a> = rmp_serde::Deserializer<ReadRefReader<'a
 ///
 /// Every decode of backend-supplied bytes (auto-mode [`deserialize`] and
 /// [`crate::interop::deserialize`]) MUST go through here, or through
-/// `Payload::deserializer`, which skips the walk only for bytes whose mark
-/// `Payload::walk` set after running these same checks. It runs cachekit-core's header-only
+/// `Payload::deserializer` or `Decrypted::deserializer`, which skip the walk
+/// only when a mark says these same checks already passed on the same bytes:
+/// set by `Payload::walk`, or by `Decrypted::deserializer` on the plaintext a
+/// ciphertext decrypts to. It runs cachekit-core's header-only
 /// `msgpack_document_len` walk first. The walk proves that a complete
 /// document lies within `bytes`, that it nests no deeper than
 /// [`MAX_DECODE_DEPTH`], and that no header declares more elements or bytes

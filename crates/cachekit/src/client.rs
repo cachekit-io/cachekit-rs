@@ -2668,6 +2668,14 @@ mod plaintext_mark_tests {
             .unwrap()
     }
 
+    #[test]
+    fn the_public_l1_set_stays_unwalked() {
+        let l1 = crate::l1::L1Cache::new(16);
+        l1.set("k", &[0x01], std::time::Duration::from_secs(60));
+        let entry = l1.get_shared("k").unwrap();
+        assert!(!entry.is_walked() && !entry.is_plaintext_walked());
+    }
+
     fn is_marked(client: &CacheKit, key: &str) -> bool {
         let entry = client.l1_get(key).expect("an L1 entry");
         assert!(
