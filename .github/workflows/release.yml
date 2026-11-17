@@ -88,7 +88,7 @@ jobs:
     outputs:
       sha: ${{ steps.sha.outputs.sha }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # On dispatch, build and publish the tag's content — never main HEAD.
           # inputs.tag is empty on push events, so github.sha keeps the default
@@ -209,7 +209,7 @@ jobs:
       macros-sha256: ${{ steps.sboms.outputs.macros-sha256 }}
       rs-sha256: ${{ steps.sboms.outputs.rs-sha256 }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
           persist-credentials: false
@@ -282,7 +282,7 @@ jobs:
       # `verify`), no Swatinem/rust-cache, and no third-party action besides
       # rust-lang/crates-io-auth-action, which mints the token. The rest are
       # first-party actions/*.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
           persist-credentials: false
