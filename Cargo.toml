@@ -14,7 +14,7 @@ repository = "https://github.com/cachekit-io/cachekit-rs"
 # dropping the `=`; the marker has the release bump only the number instead
 # (`extra-files` in release-please-config.json).
 [workspace.dependencies]
-cachekit-macros = { version = "=0.13.1", path = "crates/cachekit-macros" } # x-release-please-version
+cachekit-macros = { version = "=0.14.0", path = "crates/cachekit-macros" } # x-release-please-version
 
 # ── Workspace lints ──────────────────────────────────────────────────────────
 [workspace.lints.rust]
