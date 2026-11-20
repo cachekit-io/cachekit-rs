@@ -104,22 +104,23 @@ const FILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 /// Per-key async mutexes for in-process fill dedup. Weak entries let finished
 /// flights drop their state without an explicit removal protocol.
 ///
-/// Each mutex guards a stand-down note: `true` when the last holder to try
-/// the distributed lock found it contested, so it may have filled nothing (a
-/// refresh stands down; a cold miss polls and may be cancelled or fail), and
-/// a queued cold miss whose re-check misses must contest that lock before
-/// computing. A holder that leads clears the note: on acquire, or when its
-/// own lease contest makes it a leader. A leader that never asked for the
+/// Each mutex guards a stand-down note: `true` when the last holder held no
+/// lease that kept other processes out: it found the lock contested, or led
+/// with `distributed_lock = false`. A contested holder may have filled
+/// nothing (a refresh stands down; a cold miss polls and may be cancelled or
+/// fail), and a queued cold miss whose re-check misses must contest that lock
+/// before computing. A holder that leads clears the note: on acquire, or when
+/// its own lease contest makes it a leader. A leader that never asked for the
 /// lease (`#[cachekit(distributed_lock = false)]`) sets it instead: it cannot
 /// vouch that no other process holds the lease. So does a cold miss whose
 /// combined read and lock ([`ColdLead`]) frees the flight without a lock
-/// attempt: on a hit, or on a call that was refused or never sent. (A leader whose lock call
-/// failed, or whose backend cannot lock, clears it like any leader, so an
-/// outage does not make every queued follower send a lock call.) A follower
-/// leaves it as it found it,
-/// whether it finds a fill, errors out or is dropped, so the next follower
-/// still sees it. A stale `true` costs at most one lock call, by a follower
-/// that was about to compute anyway.
+/// attempt: on a hit, or on a call that was refused or never sent. (A leader
+/// whose lock call failed, or whose backend cannot lock, clears it like any
+/// leader, so an outage does not make every queued follower send a lock
+/// call.) A follower leaves it as it found it, whether it finds a fill, errors
+/// out or is dropped, so the next follower still sees it. A stale `true`
+/// costs at most one lock call, by a follower that was about to compute
+/// anyway.
 #[derive(Default)]
 pub(crate) struct FlightMap {
     entries: Mutex<Entries>,
@@ -448,9 +449,9 @@ enum Role {
     Leader,
     /// Queued behind a local holder that has since finished: re-check the
     /// cache once — a leader's fill is in L1 — then compute if it missed.
-    /// `contest_lease` is the stand-down note this follower found (see
-    /// [`FlightMap`]): another process may be filling, so a missed re-check
-    /// contests the lease before computing.
+    /// `contest_lease` is the stand-down note this follower found if it takes
+    /// the distributed lock (see [`FlightMap`]): another process may be
+    /// filling, so a missed re-check contests the lease before computing.
     LocalFollower {
         rechecked: bool,
         #[cfg_attr(

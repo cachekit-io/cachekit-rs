@@ -943,6 +943,8 @@ mod tests {
         ] {
             let code = expand_with(extra).expect("expands");
             assert_eq!(code.contains("__local_single_flight"), local, "{extra:?}");
+            // The SWR refresh keeps its distributed lock either way.
+            assert!(code.contains("__refresh_flight"), "{extra:?}");
         }
         assert!(expand_with(", distributed_lock = \"no\"").is_err());
         assert!(expand_with(", distributed_lock").is_err());
