@@ -696,7 +696,7 @@ Prometheus exposition and OpenTelemetry spans are deliberately not built in: Rus
 
 ### Telemetry sent to CacheKit Cloud
 
-**Unreleased.** The latency headers and the telemetry switch are on `main` and in no published release yet. The current release sends the session and counter headers with no way to turn them off, and its `WorkersCachekitIO::builder()` takes no bindings.
+**Since 0.14.0.** Earlier releases send the session and counter headers with no way to turn them off, and their `WorkersCachekitIO::builder()` takes no bindings.
 
 Only the CacheKit Cloud backends, `CachekitIO` and `WorkersCachekitIO`, send telemetry, and only to the API they are built with; they never follow a redirect. A Redis, Memcached or File backend sends none anywhere. While telemetry is on, each request carries these optional headers ([protocol spec](https://github.com/cachekit-io/protocol/blob/main/spec/saas-api.md#optional-metrics-headers)):
 
@@ -714,7 +714,7 @@ One value read in 128, drawn at random before the read starts, is timed, from th
 
 Telemetry is on by default during the closed beta, and becomes opt-in when CacheKit Cloud reaches general availability. Two controls turn it off, and off from either wins:
 
-- `.telemetry(false)` on `CachekitIO::builder()` or `WorkersCachekitIO::builder()`. The setting is unset by default.
+- `.telemetry(false)` on `CachekitIO::builder()` or `WorkersCachekitIO::builder(&env)`. The setting is unset by default.
 - `CACHEKIT_TELEMETRY=false` in the environment. `false`, `0`, `off` and `no` turn telemetry off and `true`, `1`, `on` and `yes` turn it on, in any case and ignoring surrounding white space. Unset or empty leaves the default. Any other value also turns telemetry off and warns once: through `tracing` natively (with the `tracing` feature), and to the console on Workers. On Workers the variable is read from the bindings passed to `WorkersCachekitIO::builder(&env)` and from `process.env`.
 
 Both controls are read once, when the backend is built. With telemetry off the backend sends none of the headers above and times no read. It still sends `X-CacheKit-L1-Status`, which the service requires on every request and which describes that request only, and, natively, `User-Agent: cachekit-rs/<version>`.
