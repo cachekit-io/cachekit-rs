@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Caching for Rust — dual-layer L1/L2, zero-knowledge encryption, multi-backend.**
+**Caching for Python, TypeScript and Rust, with opt-in zero-knowledge encryption, circuit breakers and stampede protection.**
 
 [![Crates.io](https://img.shields.io/crates/v/cachekit-rs.svg)](https://crates.io/crates/cachekit-rs)
 [![docs.rs](https://docs.rs/cachekit-rs/badge.svg)](https://docs.rs/cachekit-rs)
