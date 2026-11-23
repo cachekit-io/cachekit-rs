@@ -294,8 +294,8 @@ impl EncryptionLayer {
     ///
     /// Forwards `ZeroKnowledgeEncryptor::hardware_acceleration_enabled()`.
     /// Informational only — `ring`/`aes-gcm` dispatch independently of it; the
-    /// per-architecture semantics are core's ([README → Zero-Knowledge
-    /// Encryption](https://github.com/cachekit-io/cachekit-rs#zero-knowledge-encryption)).
+    /// per-architecture semantics are core's ([README →
+    /// Encryption](https://github.com/cachekit-io/cachekit-rs#encryption)).
     pub fn hardware_acceleration_enabled(&self) -> bool {
         self.encryptor.hardware_acceleration_enabled()
     }
