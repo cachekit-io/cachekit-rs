@@ -25,7 +25,7 @@
 //! reports the median instructions per op and the run-to-run spread. With
 //! `--base`, it runs a second build of this example interleaved (ABBA) and
 //! calls a delta only when it beats the case's floor, which is fixed per op
-//! (see `Compared::new`; the README's "Measuring performance" states the
+//! (see `Compared::new`; CONTRIBUTING.md's "Measuring performance" states the
 //! rule). `--report` writes the verdict as Markdown, for CI's PR comment, and
 //! `--jobs` measures that many cases at a time. Exit codes: 1 when any gated case got slower or noisier; 2 when
 //! nothing was measured or the run stopped part way (an unknown flag, a filter
@@ -925,8 +925,8 @@ fn render(all: &[(String, usize)], rows: &[Option<Compared>], error: Option<&str
         " A case fails when its median is slower than the base by its floor or more (SLOWER). \
          The floor is {:.1}%, and such a case also fails when the head's runs spread by more \
          than that (NOISIER), except `{}`, whose floor is {:.0}% because its count varies \
-         between runs. `{}` cases are reported, never failed. Method: README, *Measuring \
-         performance*.\n\n",
+         between runs. `{}` cases are reported, never failed. Method: CONTRIBUTING.md, \
+         *Measuring performance*.\n\n",
         100.0 * FLOOR,
         NOISY,
         100.0 * NOISY_FLOOR,

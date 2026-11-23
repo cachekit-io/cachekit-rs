@@ -7,7 +7,7 @@ CARGO := cargo
 # with redis/l1/reliability/memcached/file (compile_error! guards in
 # crates/cachekit/src/lib.rs), so --all-features can never compile. `deny`
 # keeps --all-features on purpose: cargo-deny resolves the graph without
-# compiling (see README).
+# compiling (see CONTRIBUTING.md).
 NATIVE_FEATURES := cachekitio,redis,encryption,l1,macros,memcached,file,tracing
 
 quick-check: fmt clippy test
@@ -46,12 +46,12 @@ test-wasm:
 		exit 1; \
 	fi
 
-# Hot-path CPU cost (examples/bench_hot_path.rs; README "Measuring performance").
+# Hot-path CPU cost (examples/bench_hot_path.rs; CONTRIBUTING.md "Measuring performance").
 # `bench` prints wall time per op, which is indicative only. `bench-instr`
 # counts instructions per op under valgrind's callgrind: the number a change is
 # judged on. BASE=<a copy of the example built at the base commit, from this
 # tree's bench_hot_path.rs so both run one workload> compares two builds; the
-# floors and exit codes are in the README's "Measuring performance". make
+# floors and exit codes are in CONTRIBUTING.md's "Measuring performance". make
 # reports a failing comparison as exit 2. FILTER=<text> narrows the cases
 # (e.g. FILTER=l2_hit); JOBS=<n> measures n cases at a time.
 # CI's `perf-ir` job runs the same comparison on every PR.
@@ -69,7 +69,7 @@ bench-instr:
 # local equivalent; make stops at the first failure.)
 # Kept out of `quick-check`: both tools fetch the RustSec advisory database over
 # the network, which does not belong in a per-commit loop.
-# Why both tools, and why --all-features: see the table in README.md.
+# Why both tools, and why --all-features: see the table in CONTRIBUTING.md.
 security: deny audit
 
 deny:
