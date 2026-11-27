@@ -1250,7 +1250,7 @@ mod tests {
         );
         // Ready on the first poll is the queue-full shed: every other shed
         // path is only reachable after parking.
-        let third = poll_once(Box::pin(limiter.acquire()).as_mut());
+        let third = poll_once(std::pin::pin!(limiter.acquire()));
         assert!(
             matches!(&third, Poll::Ready(Err(err)) if err.kind == BackendErrorKind::Backpressure),
             "queue of 1 is full, so the third caller sheds on its first poll: {third:?}"
