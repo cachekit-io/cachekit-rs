@@ -987,7 +987,7 @@ pub(crate) fn wrap_reliable(
 #[cfg(test)]
 #[allow(clippy::expect_used)] // test-only: failed acquire/probe should panic loudly
 mod tests {
-    use std::pin::Pin;
+    use std::pin::{pin, Pin};
     use std::task::{Context, Poll, Waker};
 
     use super::*;
@@ -1250,7 +1250,7 @@ mod tests {
         );
         // Ready on the first poll is the queue-full shed: every other shed
         // path is only reachable after parking.
-        let third = poll_once(Box::pin(limiter.acquire()).as_mut());
+        let third = poll_once(pin!(limiter.acquire()));
         assert!(
             matches!(&third, Poll::Ready(Err(err)) if err.kind == BackendErrorKind::Backpressure),
             "queue of 1 is full, so the third caller sheds on its first poll: {third:?}"
